@@ -58,8 +58,8 @@ impl From<FrameStreamInfo> for Stream {
     }
 }
 
-/// What the driver needs for an `avcC` / `hvcC` stream, or why it is declined: 4:2:0 progressive at
-/// 8 or 10 bits, in one of the profiles a VA-API decoder is configured for.
+/// What the driver needs for an `avcC` / `hvcC` stream, or why it is declined: 4:2:0 progressive,
+/// 8-bit H.264 in one of the profiles a VA-API decoder is configured for, or 10-bit HEVC Main 10.
 pub fn plan_nal(info: &NalStreamInfo) -> Result<Plan, String> {
     if info.interlaced {
         return Err("field-coded video".into());
@@ -74,26 +74,38 @@ pub fn plan_nal(info: &NalStreamInfo) -> Result<Plan, String> {
     if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
         return Err(format!("picture size {w}x{h}"));
     }
+    // The surfaces are created at the coded size, so that is what `MAX_SIDE` bounds as well: VA's
+    // surface attributes are `uint16_t` wide to begin with, and a size a driver cannot be asked
+    // for is a bitstream FilmCraft does not hand to one.
+    let (cw, ch) = info.coded;
+    if cw == 0 || ch == 0 || cw > MAX_SIDE || ch > MAX_SIDE {
+        return Err(format!("coded picture size {cw}x{ch}"));
+    }
     // A crop that does not fit the coded picture is a bitstream that says something the surfaces
     // would not hold; it is declined rather than trimmed to what does fit.
-    if cx.saturating_add(w) > info.coded.0 || cy.saturating_add(h) > info.coded.1 {
-        return Err(format!("crop {cx},{cy} {w}x{h} is outside the {}x{} coded picture", info.coded.0, info.coded.1));
+    if cx.saturating_add(w) > cw || cy.saturating_add(h) > ch {
+        return Err(format!("crop {cx},{cy} {w}x{h} is outside the {cw}x{ch} coded picture"));
     }
     let ten = info.bit_depth_luma == 10;
     let format = if ten { RtFormat::Yuv420_10 } else { RtFormat::Nv12 };
-    // The depth is the render format here rather than a profile of its own: libva names one
-    // profile per profile_idc, and a driver that cannot decode one of the two depths for it
-    // refuses the config it is asked for, which leaves the stream to FilmCraft's own decoder.
     let profile = match (info.codec, info.profile_idc, ten) {
-        // Baseline, Main and High: the H.264 profiles a VA-API driver lists.
-        (NalCodec::H264, 66, _) => Profile::H264ConstrainedBaseline,
-        (NalCodec::H264, 77, _) => Profile::H264Main,
-        (NalCodec::H264, 100, _) => Profile::H264High,
+        // Baseline, Main and High at 8 bits: the profiles a VA-API driver lists (libva's own
+        // `VAProfileH264Baseline` is 5 but deprecated, so Constrained Baseline is what is asked for).
+        (NalCodec::H264, 66, false) => Profile::H264ConstrainedBaseline,
+        (NalCodec::H264, 77, false) => Profile::H264Main,
+        (NalCodec::H264, 100, false) => Profile::H264High,
+        // 10-bit H.264 is declined rather than planned into the 8-bit profile above: libva names it
+        // `VAProfileH264High10` (36, va.h:542), which `Profile` does not carry, and asking for High
+        // with a 10-bit render format would pass `supports` (every driver lists High with VLD) and
+        // then be refused at `vaCreateConfig` — a capability claimed and not verified. Taken when
+        // there is a 10-bit fixture to prove a hardware path for and the profile to name it with.
+        (NalCodec::H264, _, true) => return Err(format!("10-bit H.264 (profile {})", info.profile_idc)),
         (NalCodec::H264, p, _) => return Err(format!("H.264 profile {p} at {} bits", info.bit_depth_luma)),
-        // Main, Main 10 and Main Still Picture (Main 10 at 8 bits is not a thing, and is declined
-        // with the profile that asked for it).
-        (NalCodec::Hevc, 1..=3, true) => Profile::HevcMain10,
+        // Main (1) and Main Still Picture (3) at 8 bits, Main 10 (2) at 10 bits. H.265 has no Main 10
+        // Still Picture, so a profile 1 or 3 at 10 bits is a self-contradictory sequence parameter
+        // set and is declined rather than asked for as Main 10.
         (NalCodec::Hevc, 1 | 3, false) => Profile::HevcMain,
+        (NalCodec::Hevc, 2, true) => Profile::HevcMain10,
         (NalCodec::Hevc, p, _) => return Err(format!("HEVC profile {p} at {} bits", info.bit_depth_luma)),
     };
     Ok(Plan { profile, entrypoint: Entrypoint::Vld, format, size: info.coded })
@@ -105,6 +117,8 @@ pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
     if info.mono || info.subsampling != (1, 1) {
         return Err(format!("chroma subsampling {:?}{}", info.subsampling, if info.mono { " (monochrome)" } else { "" }));
     }
+    // The one size a frame-coded stream has: it is both the surface size `Plan.size` carries and the
+    // picture `first_geometry` describes, so bounding it here bounds both.
     let (w, h) = info.size;
     if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
         return Err(format!("picture size {w}x{h}"));
@@ -265,13 +279,14 @@ mod tests {
 
     #[test]
     fn takes_the_four_codecs_at_8_and_10_bit() {
-        for (codec, profile, ten) in
-            [(NalCodec::H264, 66u8, false), (NalCodec::H264, 100, false), (NalCodec::H264, 100, true), (NalCodec::Hevc, 1, false), (NalCodec::Hevc, 2, true)]
-        {
+        for (codec, profile, ten) in [(NalCodec::H264, 66u8, false), (NalCodec::H264, 100, false), (NalCodec::Hevc, 1, false), (NalCodec::Hevc, 2, true)] {
             let p = plan_nal(&nal(codec, profile, if ten { 10 } else { 8 }, 1)).unwrap_or_else(|e| panic!("{codec:?} {profile} {ten}: {e}"));
             assert_eq!(p.entrypoint, Entrypoint::Vld);
             assert_eq!(p.format, if ten { RtFormat::Yuv420_10 } else { RtFormat::Nv12 });
         }
+        // 10-bit H.264 is the one depth this backend declines (see `plan_nal`): libva names it
+        // `VAProfileH264High10`, which `Profile` does not carry, so there is nothing to verify.
+        assert!(plan_nal(&nal(NalCodec::H264, 100, 10, 1)).is_err(), "10-bit H.264 High");
         // `for_tests` is the crate's own hand-built description (hw_frame.rs:195)
         for (profile, bits) in [(0u8, 8u32), (2, 10)] {
             assert!(plan_frame(&FrameStreamInfo::for_tests(FrameCodec::Vp9, profile, bits, (1, 1), (1920, 1080))).is_ok(), "VP9 profile {profile} at {bits}");
@@ -293,18 +308,41 @@ mod tests {
 
     #[test]
     fn declines_oversized_and_out_of_range_crops() {
-        let mut i = nal(NalCodec::H264, 100, 8, 1);
-        i.crop = (0, 0, 9000, 100);
-        assert!(plan_nal(&i).is_err(), "wider than 8192");
-        // a crop that leaves the coded picture
+        // the model's crop table: empty, oversized, off the coded edge, and a crop origin that
+        // overflows when added to its width (`saturating_add` is the line that has to hold here)
+        for crop in [
+            (0, 0, 9000, 100),
+            (0, 0, 0, 1080),
+            (0, 0, 1920, 0),
+            (0, 0, 1080, 9000),
+            (8, 0, 1920, 1080),
+            (0, 16, 1920, 1080),
+            (u32::MAX, 0, 16, 16),
+            (u32::MAX, u32::MAX, 1, 1),
+        ] {
+            let mut i = nal(NalCodec::H264, 100, 8, 1);
+            i.crop = crop;
+            assert!(plan_nal(&i).is_err(), "{crop:?}");
+        }
+        // a crop that leaves the coded picture it was read from
         let mut i = nal(NalCodec::H264, 100, 8, 1);
         i.crop = (100, 0, 640, 100);
         i.coded = (640, 360);
         assert!(plan_nal(&i).is_err(), "crop outside the coded picture");
-        // a zero-size crop
-        let mut i = nal(NalCodec::H264, 100, 8, 1);
-        i.crop = (0, 0, 0, 100);
-        assert!(plan_nal(&i).is_err(), "empty crop");
+    }
+
+    /// The coded size is what the surfaces are created at, so it is bounded like the crop: VA's
+    /// surface attributes are `uint16_t` to begin with, and `Plan.size` carries it.
+    #[test]
+    fn declines_an_unbounded_coded_picture() {
+        for coded in [(100_000, 100_000), (0, 1080), (1920, 0), (9000, 1080), (u32::MAX, u32::MAX)] {
+            let mut i = nal(NalCodec::H264, 100, 8, 1);
+            i.coded = coded;
+            assert!(plan_nal(&i).is_err(), "coded {coded:?}");
+        }
+        let mut big = nal(NalCodec::H264, 100, 8, 1);
+        big.coded = (MAX_SIDE, MAX_SIDE);
+        assert_eq!(plan_nal(&big).unwrap().size, (MAX_SIDE, MAX_SIDE), "a coded picture of exactly MAX_SIDE is taken");
     }
 
     /// Every profile the mapping accepts, and the depth it takes it at: libva names one profile
@@ -312,21 +350,26 @@ mod tests {
     #[test]
     fn the_nal_profiles_map_to_the_ones_a_vaapi_driver_lists() {
         for (p, profile) in [(66u8, Profile::H264ConstrainedBaseline), (77, Profile::H264Main), (100, Profile::H264High)] {
-            for bits in [8, 10] {
-                let plan = plan_nal(&nal(NalCodec::H264, p, bits, 1)).unwrap();
-                assert_eq!((plan.profile, plan.entrypoint, plan.size), (profile, Entrypoint::Vld, (1920, 1088)), "H.264 profile {p} at {bits} bits");
-                assert_eq!(plan.format, if bits == 10 { RtFormat::Yuv420_10 } else { RtFormat::Nv12 });
-            }
+            let plan = plan_nal(&nal(NalCodec::H264, p, 8, 1)).unwrap();
+            assert_eq!(
+                (plan.profile, plan.format, plan.entrypoint, plan.size),
+                (profile, RtFormat::Nv12, Entrypoint::Vld, (1920, 1088)),
+                "H.264 profile {p} at 8 bits"
+            );
+            // every H.264 profile this backend takes is 8-bit only (see `plan_nal`)
+            assert!(plan_nal(&nal(NalCodec::H264, p, 10, 1)).is_err(), "H.264 profile {p} at 10 bits");
         }
-        // HEVC Main and Main Still Picture at either depth, Main 10 only at 10 bits
+        // HEVC Main and Main Still Picture at 8 bits; neither is a 10-bit profile (H.265 has no
+        // Main 10 Still Picture), so both are declined above 8 bits rather than planned as Main 10
         for p in [1u8, 3] {
             assert_eq!(plan_nal(&nal(NalCodec::Hevc, p, 8, 1)).unwrap().profile, Profile::HevcMain, "HEVC profile {p} at 8 bits");
-            assert_eq!(plan_nal(&nal(NalCodec::Hevc, p, 10, 1)).unwrap().profile, Profile::HevcMain10, "HEVC profile {p} at 10 bits");
+            assert!(plan_nal(&nal(NalCodec::Hevc, p, 10, 1)).is_err(), "HEVC profile {p} at 10 bits");
         }
-        assert_eq!(plan_nal(&nal(NalCodec::Hevc, 2, 10, 1)).unwrap().profile, Profile::HevcMain10);
+        let main10 = plan_nal(&nal(NalCodec::Hevc, 2, 10, 1)).unwrap();
+        assert_eq!((main10.profile, main10.format), (Profile::HevcMain10, RtFormat::Yuv420_10));
         assert!(plan_nal(&nal(NalCodec::Hevc, 2, 8, 1)).is_err(), "Main 10 at 8 bits is not a stream");
-        for (codec, p) in [(NalCodec::H264, 110u8), (NalCodec::H264, 118), (NalCodec::H264, 244), (NalCodec::Hevc, 4)] {
-            assert!(plan_nal(&nal(codec, p, 8, 1)).is_err(), "{codec:?} profile {p}");
+        for (codec, p) in [(NalCodec::H264, 110u8), (NalCodec::H264, 118), (NalCodec::H264, 244), (NalCodec::Hevc, 4), (NalCodec::Hevc, 5)] {
+            assert!(plan_nal(&nal(codec, p, 8, 1)).is_err(), "{codec:?} profile {p} at 8 bits");
         }
     }
 
@@ -346,6 +389,10 @@ mod tests {
             let plan = plan_frame(&frame(FrameCodec::Av1, 0, bits, (1, 1))).unwrap();
             assert_eq!((plan.profile, plan.format, plan.entrypoint), (Profile::Av1Main, format, Entrypoint::Vld), "AV1 profile 0 at {bits} bits");
         }
+        // a picture of exactly MAX_SIDE is the largest one taken, and it is what `Plan.size` carries
+        let mut big = frame(FrameCodec::Vp9, 0, 8, (1, 1));
+        big.size = (MAX_SIDE, MAX_SIDE);
+        assert_eq!(plan_frame(&big).unwrap().size, (MAX_SIDE, MAX_SIDE));
     }
 
     #[test]
@@ -410,8 +457,10 @@ mod tests {
         assert!(a.input(&[], true).is_err(), "an empty sample");
     }
 
-    /// What the driver itself says it offers: the plan is supported exactly when the driver lists
-    /// the profile with the video decoder for it. A machine without libva or a display skips.
+    /// What the driver itself says it offers: `supports` approves a plan exactly when the driver
+    /// lists the profile with the video decoder for it, and declines what the driver does not. A
+    /// machine with no libva, no display, or a driver naming none of the profiles this backend
+    /// plans has nothing to check and skips with the reason printed.
     #[test]
     fn the_driver_is_asked_whether_it_offers_the_plan() {
         let Ok(api) = load() else {
@@ -422,15 +471,35 @@ mod tests {
             eprintln!("SKIPPED: no VA display");
             return;
         };
+        // Every profile this backend can plan (`plan_nal` / `plan_frame`), so the check is asked
+        // about each one the driver names rather than about one arbitrary profile.
+        let ours = [
+            Profile::H264ConstrainedBaseline,
+            Profile::H264Main,
+            Profile::H264High,
+            Profile::HevcMain,
+            Profile::HevcMain10,
+            Profile::Vp9(0),
+            Profile::Vp9(2),
+            Profile::Av1Main,
+        ];
+        let reported = d.profiles().expect("vaQueryConfigProfiles");
+        let planned: Vec<Profile> = ours.iter().copied().filter(|p| reported.contains(p)).collect();
+        if planned.is_empty() {
+            eprintln!("SKIPPED: this driver names none of the profiles this backend plans: {reported:?}");
+            return;
+        }
+        for profile in planned {
+            let vld = d.entrypoints(profile).expect("vaQueryConfigEntrypoints").contains(&Entrypoint::Vld);
+            let plan = Plan { profile, entrypoint: Entrypoint::Vld, format: RtFormat::Nv12, size: (1920, 1080) };
+            assert_eq!(vld, supports(&d, &plan).is_ok(), "{profile:?} through VLD: the driver says {vld}");
+        }
         let plan = Plan { profile: Profile::H264High, entrypoint: Entrypoint::Vld, format: RtFormat::Nv12, size: (1920, 1080) };
-        let offered = d.profiles().expect("vaQueryConfigProfiles").contains(&Profile::H264High)
-            && d.entrypoints(Profile::H264High).expect("vaQueryConfigEntrypoints").contains(&Entrypoint::Vld);
-        assert_eq!(offered, supports(&d, &plan).is_ok(), "the driver offers H.264 High through VLD: {offered}");
         // an entry point no driver offers for any profile: not a decode path, so never supported
         assert!(supports(&d, &Plan { entrypoint: Entrypoint::Other(4242), ..plan }).is_err(), "an entry point that is not VLD");
-        // and a profile the driver does not list is declined, even for a codec we do take
+        // and a profile libva has no number for is declined, even for a codec this backend takes
         let unknown = Profile::Other(4241);
-        assert!(!d.profiles().expect("vaQueryConfigProfiles").contains(&unknown), "libva has no profile {unknown:?}");
+        assert!(!reported.contains(&unknown), "libva has no profile {unknown:?}");
         assert!(supports(&d, &Plan { profile: unknown, ..plan }).is_err(), "a profile this driver does not list");
     }
 }

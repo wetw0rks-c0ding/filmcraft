@@ -17,9 +17,10 @@
 
 #[allow(unsafe_code)]
 mod ffi;
-// Safe code with nothing OS-specific in it: `stream.rs` is written so that its tests run wherever
-// the backend is built, and the allow is what keeps that true once the module it lives in is no
-// longer Linux-only — which is `ffi`'s gate to open (it needs `dlopen`), not this file's.
+// Safe code with nothing OS-specific in it, so its tables could be tested on any machine. The module
+// it lives in is Linux-only today (`ffi` needs `dlopen`), so that is where these tests run, and
+// compiling them on macOS and Windows is tracked follow-up work: the allow below is what keeps that
+// from needing changes in this file when the gate moves.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod stream;
 
