@@ -199,20 +199,44 @@ pub struct H264Decoder {
     avcc: Vec<u8>,
     dec: filmcraft_h264::Decoder,
     length_size: usize,
+    /// Worker threads [`VideoDecoder::reset`] rebuilds this decoder with, so a reset gives the same
+    /// decoder back and not one with a different thread count.
+    threads: usize,
     draft: bool,
 }
 
 impl H264Decoder {
+    /// A decoder using [`h264_threads`] frame threads.
     pub fn new(avcc: Vec<u8>) -> Result<Self> {
+        Self::with_threads(avcc, h264_threads())
+    }
+
+    /// A decoder for `avcc` using at most `threads` frame threads (1 decodes on the calling thread).
+    ///
+    /// **A complete run is the same at every thread count; what the count changes is how much of it
+    /// arrives before the flush.** Measured on `h264_high.mp4` (x264 High, three B frames, 72
+    /// pictures), ten runs each at 1, 4 and 16 threads: every run returned all 72 pictures, with one
+    /// set of presentation times and one set of pixels (hashed over every plane). The pictures
+    /// `decode` returns *before* `flush` are not the whole run and depend on how far the worker pool
+    /// has got: 70 at one thread, 65 at four, 45–53 at sixteen, and the sixteen-thread figure moves
+    /// between runs. That is the reorder delay a caller has to flush for, not a lost picture — a
+    /// caller that counts what `decode` returned and never flushes is how this was first noticed
+    /// (`crates/platform/examples/vaparity.rs`).
+    ///
+    /// Pinning the count is what a test comparing against a hardware decoder needs, so its reference
+    /// does not depend on the machine's core count, and [`VideoDecoder::reset`] keeps the count so a
+    /// reset does not change it either.
+    pub fn with_threads(avcc: Vec<u8>, threads: usize) -> Result<Self> {
         recycle_h264_planes();
-        let dec = filmcraft_h264::Decoder::from_avcc(&avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let mut dec = filmcraft_h264::Decoder::with_threads(threads);
+        dec.configure_avcc(&avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
         let length_size = avcc_length_size(&avcc);
-        Ok(Self { avcc, dec, length_size, draft: false })
+        Ok(Self { avcc, dec, length_size, threads, draft: false })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: MXF, TS).
     pub fn annexb() -> Self {
         recycle_h264_planes();
-        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::new(), length_size: 0, draft: false }
+        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::new(), length_size: 0, threads: h264_threads(), draft: false }
     }
     fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
         use std::sync::Arc;
@@ -246,9 +270,14 @@ impl VideoDecoder for H264Decoder {
     }
     fn reset(&mut self) {
         if self.avcc.is_empty() {
-            self.dec = filmcraft_h264::Decoder::new();
-        } else if let Ok(d) = filmcraft_h264::Decoder::from_avcc(&self.avcc) {
-            self.dec = d;
+            self.dec = filmcraft_h264::Decoder::with_threads(self.threads);
+        } else {
+            // The same thread count as the constructor was given: a reset hands back the same
+            // decoder, and a decoder with a different frame-threading setup is not that.
+            let mut fresh = filmcraft_h264::Decoder::with_threads(self.threads);
+            if fresh.configure_avcc(&self.avcc).is_ok() {
+                self.dec = fresh;
+            }
         }
         self.dec.set_draft(self.draft);
     }

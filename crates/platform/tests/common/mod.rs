@@ -152,14 +152,72 @@ pub fn assert_same(what: &str, a: &[DecodedFrame], b: &[DecodedFrame]) {
     }
 }
 
-fn max_diff8(a: &[u8], b: &[u8]) -> String {
+/// Assert two decoders' outputs are the same pictures, matched by presentation time rather than by
+/// position.
+///
+/// [`assert_same`] compares position by position, which is only right when both decoders emit in the
+/// same order. A backend that decodes one picture synchronously returns each picture from the
+/// `decode` call that produced it, so its output is in *decode* order, while a decoder that holds
+/// pictures back for reordering emits *presentation* order (H.264 7.4.2.4.1). Comparing "the sixth
+/// picture" of each then compares two different frames. This compares the same checks
+/// picture-for-picture, keyed by pts, which is what `examples/vaparity.rs` does for the same reason.
+pub fn assert_same_by_pts(what: &str, a: &[DecodedFrame], b: &[DecodedFrame]) {
+    let (pa, pb) = (by_pts(a), by_pts(b));
+    assert_eq!(pa.keys().collect::<Vec<_>>(), pb.keys().collect::<Vec<_>>(), "{what}: presentation times");
+    for (pts, x) in &pa {
+        let y = pb[pts];
+        let (fx, fy) = (&x.frame, &y.frame);
+        assert_eq!((fx.width, fx.height, fx.par, fx.color), (fy.width, fy.height, fy.par, fy.color), "{what}: pts {pts} geometry / colour");
+        match (&fx.data, &fy.data) {
+            (PixelData::Yuv8 { planes: p, chroma: c, .. }, PixelData::Yuv8 { planes: q, chroma: d, .. }) => {
+                assert_eq!(c, d, "{what}: pts {pts} chroma");
+                for i in 0..3 {
+                    assert!(p[i] == q[i], "{what}: pts {pts} plane {i} differs (max diff {})", max_diff8(&p[i], &q[i]));
+                }
+            }
+            (PixelData::Yuv16 { planes: p, chroma: c, bits: bx, .. }, PixelData::Yuv16 { planes: q, chroma: d, bits: by, .. }) => {
+                assert_eq!((c, bx), (d, by), "{what}: pts {pts} chroma / bits");
+                for i in 0..3 {
+                    assert!(p[i] == q[i], "{what}: pts {pts} plane {i} differs (max diff {})", max_diff16(&p[i], &q[i]));
+                }
+            }
+            _ => panic!("{what}: pts {pts}: pixel formats differ"),
+        }
+    }
+}
+
+/// `out` keyed by presentation time, in presentation order.
+///
+/// Keying a map by pts is what hides a picture: two pictures with the same presentation time
+/// collapse into one entry and a comparison then never sees either of them. So this refuses to
+/// produce the map unless every picture has its own presentation time, and says which one is
+/// repeated. Every comparison that matches by presentation time goes through here, so a decoder
+/// that returns a picture twice fails instead of quietly matching.
+pub fn by_pts(out: &[DecodedFrame]) -> std::collections::BTreeMap<i64, &DecodedFrame> {
+    let mut counts: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    for f in out {
+        *counts.entry(f.pts).or_default() += 1;
+    }
+    let map: std::collections::BTreeMap<i64, &DecodedFrame> = out.iter().map(|f| (f.pts, f)).collect();
+    let repeated: Vec<String> = counts.iter().filter(|(_, c)| **c > 1).map(|(p, c)| format!("{p} ({c} times)")).collect();
+    assert!(
+        repeated.is_empty(),
+        "{} pictures but {} distinct presentation times: {} is returned more than once, and matching by presentation time would hide it",
+        out.len(),
+        map.len(),
+        repeated.join(", ")
+    );
+    map
+}
+
+pub fn max_diff8(a: &[u8], b: &[u8]) -> String {
     if a.len() != b.len() {
         return format!("sizes {} vs {}", a.len(), b.len());
     }
     a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0).to_string()
 }
 
-fn max_diff16(a: &[u16], b: &[u16]) -> String {
+pub fn max_diff16(a: &[u16], b: &[u16]) -> String {
     if a.len() != b.len() {
         return format!("sizes {} vs {}", a.len(), b.len());
     }
