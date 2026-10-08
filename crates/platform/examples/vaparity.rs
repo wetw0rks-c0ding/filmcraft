@@ -151,6 +151,7 @@ fn parity(path: &str, hw: bool) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn args_dump() -> bool {
     std::env::args().any(|a| a == "--dump")
 }

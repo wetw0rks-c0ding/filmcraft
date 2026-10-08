@@ -50,7 +50,7 @@ fn probe(path: &str, time: bool, pixels: bool) {
         return;
     };
     println!(
-        "{path}: {:?} profile {} {}x{} {} bits, {} surfaces needed",
+        "{path}: {:?} profile {} {}x{} {} bits, decoded picture buffer declares {} pictures",
         info.codec,
         info.profile_idc,
         info.coded.0,
@@ -145,12 +145,15 @@ fn describe(frame: &filmcraft_frame::VideoFrame) -> String {
     // length by a hard-coded 640, which for a 640-wide frame stepped a whole row per tap and so
     // printed one sample per *column* under a `row0` label.
     let width = usize::try_from(frame.width).unwrap_or(bytes.len()).max(1);
-    let sample_bytes = (bits as usize / 8).max(1);
+    // Bytes per luma sample: a 10-bit sample is a 16-bit word, which is how `biplanar::to_frame`
+    // writes it. `(bits / 8).max(1)` said 1 for 10 bits, so a 10-bit plane reported twice its
+    // samples and every index into it was odd — hence `luma[last]=2` and a byte-shifted row.
+    let sample_bytes = if bits > 8 { 2 } else { 1 };
     let samples = bytes.len() / sample_bytes;
     let at = |i: usize| -> u32 {
         let start = i.min(samples.saturating_sub(1)) * sample_bytes;
         let lo = bytes.get(start).copied().unwrap_or(0);
-        if bits > 8 { u32::from(u16::from_le_bytes([lo, bytes.get(start + 1).copied().unwrap_or(0)])) } else { u32::from(lo) }
+        if sample_bytes == 2 { u32::from(u16::from_le_bytes([lo, bytes.get(start + 1).copied().unwrap_or(0)])) } else { u32::from(lo) }
     };
     let row: Vec<u32> = (0..12).map(|k| at(k * width / 12)).collect();
     let sum: u64 = (0..samples).map(|i| u64::from(at(i))).sum();

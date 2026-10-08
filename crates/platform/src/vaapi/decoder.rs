@@ -318,11 +318,18 @@ impl VideoDecoder for VaDecoder {
         if let Some(g) = self.stream.declared_picture(sample) {
             self.geometry = g;
         }
-        // The sample as the decoder's input: Annex B with the parameter sets in front when the
-        // decoder has just started (the first sample, after a seek or a flush). A sample whose NAL
-        // units do not add up is refused here rather than parsed into a picture record.
-        let annex_b = self.stream.input(sample, self.need_headers).map_err(CodecError::Decode)?;
-        debug_assert!(!annex_b.is_empty(), "a sample that converts to nothing is refused by input()");
+        // `need_headers` says the decoder has just started — the first sample, after a seek or a flush —
+        // and the stream's parameter sets go in front of it. This backend builds its records from the
+        // sample entry's parameter sets rather than from an Annex B stream, so there are no bytes
+        // here to hand the driver; what `Stream::input` gives the decode loop is its *error*: it
+        // refuses a sample whose NAL units do not add up, or a parameter set that will not convert,
+        // and doing that once at the start of a run is where `need_headers` is spent. It is
+        // deliberately not done per picture: `input` allocates, and at 600 pictures a second an
+        // allocation per picture to produce bytes nothing reads is waste.
+        if self.need_headers {
+            let with_headers = self.stream.input(sample, true).map_err(CodecError::Decode)?;
+            debug_assert!(!with_headers.is_empty(), "a sample that converts to nothing is refused by input()");
+        }
         self.need_headers = false;
         self.in_flight.push(pts);
         if self.in_flight.len() > MAX_IN_FLIGHT {

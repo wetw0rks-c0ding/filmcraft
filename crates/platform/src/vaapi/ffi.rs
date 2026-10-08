@@ -1661,7 +1661,11 @@ impl Session {
             }
         };
         if st != OK {
-            // SAFETY: the image this function created, destroyed once, on its way out.
+            // Under the gate like every other libva call in this file: this display is shared, and a
+            // destroy that ran beside another thread's call would be a data race in the driver.
+            let _gate = self.display.gate();
+            // SAFETY: `image.image_id` is the image `vaCreateImage` filled in above, it was never
+            // mapped (so never unmapped), and nothing else holds it — this is its one destroy.
             unsafe { destroy_image(self.display.dpy, image.image_id) };
             return Err(format!("vaPutImage failed on surface {surface}: {}", api.status_text(st)));
         }

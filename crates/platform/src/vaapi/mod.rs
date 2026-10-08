@@ -51,11 +51,19 @@ pub fn available() -> bool {
     ffi::load().and_then(|api| Display::new(&api)).is_ok()
 }
 
-/// How many surfaces a stream needs, or why they cannot be counted: the size of the decoded picture
-/// buffer its own sequence parameter set declares, which is what the decode loop allocates. This is
-/// [`decoder::VaDecoder::surfaces`]'s input, exposed on its own because it is answerable from a
-/// stream description alone — before any display is opened, so a caller can ask on a machine with no
-/// GPU at all (`examples/vaprobe.rs` does).
+/// How many pictures a stream's sequence parameter set says its decoded picture buffer holds, or why
+/// that cannot be counted.
+///
+/// **This is not the number of surfaces the decode loop allocates.** The loop allocates
+/// [`picture::surface_pool`], which comes from the record's own reference-slot count rather than from
+/// the declaration, because the declaration is not a bound the buffer respects — HEVC decides what
+/// stays a reference from each picture's own set, and consecutive sets can name more pictures between
+/// them than `sps_max_dec_pic_buffering_minus1` counts. A decoder's pool is therefore normally
+/// larger than what this reports, and `examples/vaprobe.rs` prints this number under "surfaces
+/// needed", which is about the stream and not about the decoder.
+///
+/// It is exposed on its own because it is answerable from a stream description alone, before any
+/// display is opened, so a caller can ask on a machine with no GPU at all.
 pub fn surfaces_for(info: &filmcraft_codecs::hw::NalStreamInfo) -> Result<usize, String> {
     picture::reference_pictures(info)
 }

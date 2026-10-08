@@ -895,9 +895,19 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
 
     for (nal, offset) in &nals {
         let hdr = filmcraft_h264::slice::NalHeader::parse(nal.first().copied().ok_or("empty NAL unit")?).map_err(|e| format!("NAL header: {e}"))?;
+        // A parameter set *inside* a sample is declined rather than skipped. `H264Sets::parse` reads
+        // the sample entry's sets, and this backend does not fold a sample's own in — so a stream
+        // that changes its sequence parameter set mid-stream would be decoded with the quantizer,
+        // the geometry and the whole reference-list layout of the *sample entry's* set, and nothing
+        // would say so: the pictures would simply come out wrong. `H264ParameterSets` is the fix, and
+        // until it lands a decline is the answer. (An MP4 sample entry carries its parameter sets in
+        // `avcC` and repeats them in-band only at a keyframe, so this is rare rather than usual.)
+        if matches!(hdr.nal_unit_type, 7 | 8) {
+            return Err(format!("in-band parameter set (NAL type {}) in an access unit", hdr.nal_unit_type));
+        }
         // Only a slice or an IDR slice carries a slice header; everything else in a sample — SEI,
-        // AUD, filler, parameter sets the sample entry also carries — is skipped, as a driver that
-        // is given parameter sets in a picture parameter buffer would be told a second story.
+        // AUD, filler — is skipped, as a driver that is given parameter sets in a picture parameter
+        // buffer would be told a second story.
         if !matches!(hdr.nal_unit_type, 1 | 5) {
             continue;
         }
@@ -979,9 +989,11 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         // picture's lists are built from. See `h264_mark` for why this happens before the render.
         h264_mark(poc, &first, sps, surface, p.top);
     }
-    // The scaling lists come from the picture's own sequence parameter set, so this is submitted
-    // per picture rather than per stream — a stream whose sets differ between pictures (an
-    // in-band parameter set) changes its quantizer without changing its sample entry.
+    // The scaling lists, from the sequence parameter set the picture's first slice named — which is one
+    // of the sets `H264Sets::parse` read, and those come from `info.parameter_sets`: the sample
+    // entry's, i.e. the container's, not the sample's. An in-band parameter set that differs from the
+    // sample entry's is therefore **not** honoured, and neither is the geometry it implies. The
+    // record is rebuilt for every picture rather than cached, but from the same tables each time.
     Ok(Picture { params: record_bytes(&params), iq_matrix: h264_iq_matrix(sps), slices, slice_offsets })
 }
 
@@ -1150,11 +1162,19 @@ fn explicit_bipred_without_weights(sh: &filmcraft_h264::slice::SliceHeader, pps:
 /// The mandatory cases are the two `filmcraft_h264` parses the table for: a P slice with
 /// `weighted_pred_flag`, and a B slice with `weighted_bipred_idc == 1` (implicit). `weighted_bipred_idc
 /// == 2` (explicit) is not one of them: there the *slice* opts in, through a `weighted_bipred_flag`
-/// that `filmcraft_h264` does not expose. A slice with no table in that mode is submitted with the
-/// weight flags clear, which is libva's own encoding of "explicit mode, not weighted here" and is
-/// what FilmCraft's own decoder does with those slices — its conformance suite is bit-exact against
-/// ffmpeg on a stream whose picture parameter set says `weighted_bipred_idc == 2`. This task's
-/// report carries the evidence and the one-clause alternative, and
+/// that `filmcraft_h264` does not expose.
+///
+/// A slice with no table in that mode is submitted with the weight flags clear — which is what
+/// libva's own encoding says for "explicit mode, this slice not weighted", and is also what a
+/// `weighted_bipred_flag` of 0 means. **It is a guess, and on a stream that really does weight its
+/// bipred slices it decodes the wrong picture.** Measured on this machine: an H.264 fixture with
+/// `weighted_bipred_idc == 2` and B pictures (x264's default for High profile, so this is most
+/// H.264) comes out of this backend differing from `filmcraft_h264` on *every* B picture — 51 of 51 —
+/// while the same fixture with `weightb=0` is bit-exact. `filmcraft_h264` cannot be used as evidence
+/// here: it does not read `weighted_bipred_flag` either, so it sends the same empty table, and the
+/// two agree on what is *submitted* while disagreeing with ffmpeg on what is *decoded*. The fix
+/// belongs in `filmcraft-h264`, which would have to expose the flag; it is tracked there and is
+/// deliberately not attempted from here.
 /// [`NalPoc::warn_explicit_bipred_once`] puts the limitation in the log once per decoder.
 fn h264_weights(sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::params::Pps) -> Result<VaSliceParameterBufferH264, String> {
     let mandatory = (pps.weighted_pred && sh.slice_type.is_p()) || (pps.weighted_bipred_idc == 1 && sh.slice_type.is_b());
@@ -1393,18 +1413,17 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         slices.push(SliceParam { offset: *at, length: *length, params: hevc_slice_record(nal, sh, pps, *at, i == last, &lists)? });
         slice_offsets.push(*offset);
     }
-    // No IQ matrix: HEVC carries its scaling lists in `sps_scaling_list_data_present_flag`'s tables
-    // `VAIQMatrixBufferHEVC`, and only that — **not** part of the picture parameter record. My earlier
-    // comment here said it was, citing `va_dec_hevc.h`; that was wrong, and the test beside it
-    // asserted the wrong fact. The header is explicit: `VAPictureParameterBufferHEVC` has no
-    // scaling-list field, and `VAIQMatrixBufferHEVC` "is sent once per frame, and only when
-    // scaling_list_enabled_flag = 1". The `iHD` driver happened to tolerate omitting it for a stream
-    // with the flag clear, because the flat default is what it would decode with anyway — but a
-    // driver that does not default is exactly the plausible-wrong-picture case this backend exists to
-    // avoid, so the flag is checked rather than assumed.
-    //
-    // `sps_scaling_list_enabled_flag == 1` is declined above, so an empty `iq_matrix` here means the
-    // flag was clear and no record is needed. See `hevc_scaling_lists_declined`.
+    // No IQ matrix, because there is none to send. HEVC's scaling lists go in `VAIQMatrixBufferHEVC` and
+    // **nowhere else** — `VAPictureParameterBufferHEVC` has no scaling-list field, and
+    // `va_dec_hevc.h` says of that buffer "This structure is sent once per frame, and only when
+    // scaling_list_enabled_flag = 1". (An earlier comment here said they were inside the picture
+    // parameter record, citing that header; it was wrong, and the test beside it asserted the wrong
+    // fact.) So a stream with `sps_scaling_list_enabled_flag == 1` is declined above rather than
+    // submitted without a record the driver may fill in from its own default: iHD happens to default
+    // to the flat quantizer, which is correct only for a stream that wanted the flat quantizer, and
+    // a driver that does not default is exactly the plausible-wrong-picture case this backend exists
+    // to avoid. An empty `iq_matrix` therefore means the flag was clear — see
+    // `hevc_scaling_lists_declined`.
     Ok(Picture { params: record_bytes(&params), iq_matrix: Vec::new(), slices, slice_offsets })
 }
 
@@ -2035,7 +2054,25 @@ mod tests {
     /// which would have hidden a stream that needs a record this backend does not build.
     ///
     /// The fixture is encoded with x265's default, which leaves the flag clear, so this is the case
-    /// that must work; the decline for the other case is `the_hevc_record_for_a_stream_with_scaling_lists`.
+    /// that must work; the decline for the other case is
+    /// `an_hevc_stream_with_scaling_lists_is_declined_rather_than_guessed`.
+    #[test]
+    fn hevc_without_scaling_lists_submits_no_iq_matrix() {
+        let Some((info, samples)) = hevc_stream() else { return };
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let mut poc = super::NalPoc::default();
+        let p = super::build_nal(&info, &samples[0], &mut poc, 4, 640, 360).unwrap_or_else(|e| panic!("{e}"));
+        assert!(p.iq_matrix.is_empty(), "scaling_list_enabled_flag is clear, so no buffer is needed");
+        // And the picture parameter record is exactly the structure `va_dec_hevc.h` declares — which
+        // is what makes omitting the buffer right rather than a default: there is nowhere in it for
+        // a scaling list to go.
+        assert_eq!(
+            p.params.len(),
+            std::mem::size_of::<crate::vaapi::ffi::VaPictureParameterBufferHevc>(),
+            "the picture record is the declared structure, scaling lists and all (there are none)"
+        );
+    }
+
     /// Every `ReferenceFrames` entry the current picture's set does not name is
     /// `VA_PICTURE_HEVC_INVALID`.
     ///
@@ -2071,26 +2108,6 @@ mod tests {
             }
         }
         assert!(named_somewhere, "the run refers to pictures, so some entry was flagged");
-    }
-
-    /// HEVC submits no IQ matrix buffer **because the flag is clear**, not because its scaling lists
-    /// are in the picture parameter record — which the test above is the companion to: the record has
-    /// no slot for them, and one does exist in libva that a stream with the flag set needs.
-    #[test]
-    fn hevc_without_scaling_lists_submits_no_iq_matrix() {
-        let Some((info, samples)) = hevc_stream() else { return };
-        let info = info.unwrap_or_else(|e| panic!("{e}"));
-        let mut poc = super::NalPoc::default();
-        let p = super::build_nal(&info, &samples[0], &mut poc, 4, 640, 360).unwrap_or_else(|e| panic!("{e}"));
-        assert!(p.iq_matrix.is_empty(), "scaling_list_enabled_flag is clear, so no buffer is needed");
-        // And the picture parameter record is exactly the structure `va_dec_hevc.h` declares — which
-        // is what makes omitting the buffer right rather than a default: there is nowhere in it for
-        // a scaling list to go.
-        assert_eq!(
-            p.params.len(),
-            std::mem::size_of::<crate::vaapi::ffi::VaPictureParameterBufferHevc>(),
-            "the picture record is the declared structure, scaling lists and all (there are none)"
-        );
     }
 
     /// The two records an ffmpeg-made H.264 fixture's first picture is submitted as: one picture
@@ -2268,6 +2285,25 @@ mod tests {
         forbidden[4] = 0x85 | 0x80;
         let mut poc = super::NalPoc::default();
         assert!(super::build_nal(&info, &forbidden, &mut poc, 1, 40, 23).is_err(), "forbidden_zero_bit set");
+    }
+
+    /// An access unit carrying its own parameter set is declined, not decoded with the sample entry's.
+    #[test]
+    fn an_in_band_parameter_set_is_declined_rather_than_ignored() {
+        // `H264Sets::parse` reads the sample entry's parameter sets and nothing folds a sample's own
+        // in, so a stream that changes its sequence parameter set mid-stream would otherwise be
+        // decoded with the sample entry's quantizer, geometry and reference-list layout — and the
+        // pictures would simply come out wrong, with nothing saying so.
+        let sps: &[u8] = &[0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x00, 0xf0, 0x88, 0x46, 0xa0];
+        let pps: &[u8] = &[0x68, 0xce, 0x38, 0x80];
+        let mut poc = super::NalPoc::default();
+        for (what, unit) in [("SPS", sps), ("PPS", pps)] {
+            // A well-formed length-prefixed access unit carrying just that parameter set.
+            let mut sample = (unit.len() as u32).to_be_bytes().to_vec();
+            sample.extend_from_slice(unit);
+            let why = super::build_nal(&h264_info(4), &sample, &mut poc, 1, 40, 23).expect_err(what);
+            assert!(why.contains("in-band parameter set"), "{what}: the decline says why: {why}");
+        }
     }
 
     /// Every hostile shape a length-prefixed sample can have is a clean error: no unit, an empty unit,
