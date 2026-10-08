@@ -37,6 +37,8 @@ pub mod hybrid;
 pub mod media_foundation;
 #[cfg(target_os = "windows")]
 pub mod nvenc;
+#[cfg(target_os = "linux")]
+pub mod vaapi;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub mod videotoolbox;
