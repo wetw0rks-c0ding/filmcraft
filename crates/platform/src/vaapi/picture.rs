@@ -895,16 +895,21 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
 
     for (nal, offset) in &nals {
         let hdr = filmcraft_h264::slice::NalHeader::parse(nal.first().copied().ok_or("empty NAL unit")?).map_err(|e| format!("NAL header: {e}"))?;
-        // A parameter set *inside* a sample is declined rather than skipped. `H264Sets::parse` reads
-        // the sample entry's sets, and this backend does not fold a sample's own in — so a stream
-        // that changes its sequence parameter set mid-stream would be decoded with the quantizer,
-        // the geometry and the whole reference-list layout of the *sample entry's* set, and nothing
-        // would say so: the pictures would simply come out wrong. Folding a sample's own sets into
-        // `H264Sets` is the fix, and until that lands a decline is the answer. (An MP4 sample entry
-        // carries its parameter sets in `avcC` and repeats them in-band only at a keyframe, so this
-        // is rare rather than usual.)
-        if matches!(hdr.nal_unit_type, 7 | 8) {
-            return Err(format!("in-band parameter set (NAL type {}) in an access unit", hdr.nal_unit_type));
+        // A parameter set inside a sample is skipped when it is **byte-identical** to one the sample
+        // entry already carries, and declined when it is not. Repeating the `avcC` sets at every
+        // key frame is legal and common, and this backend reads the sample entry's sets — so such a
+        // repeat changes nothing and must not cost the stream its hardware decoder. That is the
+        // same test `StreamInfo::parameters_changed` makes, which is what keeps the two consistent:
+        // a sample this backend declines is a sample `HybridDecoder` believes changed, and one it
+        // accepts is one it believes did not.
+        //
+        // A set that *differs* is declined rather than skipped: `H264Sets::parse` does not fold a
+        // sample's own sets in, so the picture would be decoded with the quantizer, the geometry
+        // and the whole reference-list layout of the *sample entry's* set, and nothing would say so.
+        // Folding them in is the fix; until that lands a decline is the answer, and an error hands
+        // the stream to the software decoder rather than feeding it the wrong picture.
+        if matches!(hdr.nal_unit_type, 7 | 8) && !info.parameter_sets.iter().any(|p| p.as_slice() == *nal) {
+            return Err(format!("in-band parameter set (NAL type {}) differs from the sample entry's", hdr.nal_unit_type));
         }
         // Only a slice or an IDR slice carries a slice header; everything else in a sample — SEI,
         // AUD, filler — is skipped, as a driver that is given parameter sets in a picture parameter
@@ -1335,8 +1340,18 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
 
     for (nal, offset) in &nals {
         let hdr = filmcraft_hevc::slice::NalHeader::parse(nal).map_err(|e| format!("NAL header: {e}"))?;
-        // Only a VCL NAL unit carries a slice segment header; parameter sets, access unit
-        // delimiters and SEI are skipped, as on the H.264 side.
+        // A parameter set inside a sample is handled exactly as on the H.264 side, because it has to be:
+        // `HevcSets::parse` reads the sample entry's sets and does not fold a sample's own in, so a
+        // *differing* in-band set would leave the picture being decoded with the `hvcC`'s geometry and
+        // bit depth while the stream has moved on. A repeat of a set the sample entry already carries
+        // changes nothing and must not cost the stream its hardware decoder. One test, the same test
+        // `StreamInfo::parameters_changed` makes, so a sample this backend declines is a sample
+        // `HybridDecoder` believes changed and one it accepts is a sample it believes did not.
+        if info.is_parameter_set(hdr.nal_type) && !info.parameter_sets.iter().any(|p| p.as_slice() == *nal) {
+            return Err(format!("in-band parameter set (NAL type {}) differs from the sample entry's", hdr.nal_type));
+        }
+        // Only a VCL NAL unit carries a slice segment header; the rest — access unit delimiters,
+        // SEI, and the parameter sets just dealt with — are skipped.
         if !hdr.is_vcl() {
             continue;
         }
@@ -2074,6 +2089,38 @@ mod tests {
         );
     }
 
+    /// HEVC treats an in-band parameter set exactly as H.264 does: a repeat of a set the `hvcC` already
+    /// carries is skipped, a set that differs is declined.
+    ///
+    /// Left silent this was the same wrong-quantizer/geometry exposure finding 1 was about on the
+    /// other codec: `HevcSets::parse` reads the configuration record's sets and does not fold the
+    /// sample's in, so a differing in-band SPS would have had its picture decoded with the `hvcC`'s
+    /// geometry and bit depth while the stream had moved on.
+    #[test]
+    fn hevc_declines_a_differing_in_band_parameter_set_and_accepts_a_repeat() {
+        let Some((info, _samples)) = hevc_stream() else { return };
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        assert!(!info.parameter_sets.is_empty(), "the fixture's hvcC carries its parameter sets");
+
+        // A repeat of one the sample entry already has must not be a reason to refuse.
+        let repeat = info.parameter_sets[0].clone();
+        let mut poc = super::NalPoc::default();
+        let sample = access_unit(4, &[repeat.as_slice()]);
+        match super::build_nal(&info, &sample, &mut poc, 3, 640, 360) {
+            Ok(_) => {}
+            Err(why) => assert!(!why.contains("in-band parameter set"), "a repeat is not a reason to refuse: {why}"),
+        }
+        // A set that differs — here, one that is not the one the entry has — is.
+        for n in info.parameter_sets.iter().take(2) {
+            let mut other = n.clone();
+            other.push(0x00);
+            let mut poc = super::NalPoc::default();
+            let sample = access_unit(4, &[other.as_slice()]);
+            let why = super::build_nal(&info, &sample, &mut poc, 3, 640, 360).expect_err("a differing in-band set");
+            assert!(why.contains("in-band parameter set"), "the decline says why: {why}");
+        }
+    }
+
     /// Every `ReferenceFrames` entry the current picture's set does not name is
     /// `VA_PICTURE_HEVC_INVALID`.
     ///
@@ -2288,21 +2335,55 @@ mod tests {
         assert!(super::build_nal(&info, &forbidden, &mut poc, 1, 40, 23).is_err(), "forbidden_zero_bit set");
     }
 
-    /// An access unit carrying its own parameter set is declined, not decoded with the sample entry's.
+    /// A length-prefixed access unit carrying `units`, for the in-band parameter set tests.
+    fn access_unit(length_size: u32, units: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for u in units {
+            out.extend_from_slice(&(u.len() as u32).to_be_bytes()[4 - length_size as usize..]);
+            out.extend_from_slice(u);
+        }
+        out
+    }
+
+    /// An in-band parameter set is declined when it **differs** from the sample entry's, and accepted
+    /// when it does not. Both halves matter: declining a repeat would cost a stream that re-sends
+    /// its `avcC` sets at every key frame its hardware decoder, for no gain — that is the whole
+    /// difference between an error and a capability.
+    ///
+    /// The test is the same one `StreamInfo::parameters_changed` makes, deliberately: a sample this
+    /// backend declines should be a sample `HybridDecoder` believes changed, or the guard in front of
+    /// it and the guard inside it would disagree about the same samples.
     #[test]
-    fn an_in_band_parameter_set_is_declined_rather_than_ignored() {
-        // `H264Sets::parse` reads the sample entry's parameter sets and nothing folds a sample's own
-        // in, so a stream that changes its sequence parameter set mid-stream would otherwise be
-        // decoded with the sample entry's quantizer, geometry and reference-list layout — and the
-        // pictures would simply come out wrong, with nothing saying so.
+    fn an_in_band_parameter_set_is_declined_only_when_it_differs() {
         let sps: &[u8] = &[0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x00, 0xf0, 0x88, 0x46, 0xa0];
         let pps: &[u8] = &[0x68, 0xce, 0x38, 0x80];
+        // A stream description whose sample entry carries exactly those two sets.
+        let mut info = h264_info(4);
+        info.parameter_sets = vec![sps.to_vec(), pps.to_vec()];
+        let access_unit = |unit: &[u8]| access_unit(4, &[unit]);
+
+        // A repeat of a set the sample entry already carries: the picture builds. (It stops being
+        // "builds" if the set does not parse, which is not what this half is about — what it is
+        // about is that the *in-band* half is not the reason for a refusal.)
         let mut poc = super::NalPoc::default();
-        for (what, unit) in [("SPS", sps), ("PPS", pps)] {
-            // A well-formed length-prefixed access unit carrying just that parameter set.
-            let mut sample = (unit.len() as u32).to_be_bytes().to_vec();
-            sample.extend_from_slice(unit);
-            let why = super::build_nal(&h264_info(4), &sample, &mut poc, 1, 40, 23).expect_err(what);
+        let repeat = super::build_nal(&info, &access_unit(sps), &mut poc, 1, 40, 23);
+        match &repeat {
+            Ok(_) => {}
+            Err(why) => assert!(!why.contains("in-band parameter set"), "a repeat of the sample entry's own set is not a reason to refuse: {why}"),
+        }
+        let mut poc = super::NalPoc::default();
+        let repeat = super::build_nal(&info, &access_unit(pps), &mut poc, 1, 40, 23);
+        match &repeat {
+            Ok(_) => {}
+            Err(why) => assert!(!why.contains("in-band parameter set"), "same for the PPS: {why}"),
+        }
+
+        // A set that differs from the one the sample entry carries is declined, for both kinds. The entry
+        // keeps the valid pair above so the refusal is the in-band half and not the parameter-set
+        // parse: only the bytes inside the sample change, and they are not the ones the entry has.
+        for (what, in_band) in [("SPS", &[0x67u8, 0x42, 0xc0][..]), ("PPS", &[0x68, 0xce][..])] {
+            let mut poc = super::NalPoc::default();
+            let why = super::build_nal(&info, &access_unit(in_band), &mut poc, 1, 40, 23).expect_err(what);
             assert!(why.contains("in-band parameter set"), "{what}: the decline says why: {why}");
         }
     }
