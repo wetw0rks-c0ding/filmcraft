@@ -5,3 +5,5 @@ plan/
 /log
 .DS_Store
 .claude/worktrees/
+.worktrees/
+.superpowers/
