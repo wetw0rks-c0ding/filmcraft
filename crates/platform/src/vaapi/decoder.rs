@@ -318,18 +318,18 @@ impl VideoDecoder for VaDecoder {
         if let Some(g) = self.stream.declared_picture(sample) {
             self.geometry = g;
         }
-        // `need_headers` says the decoder has just started — the first sample, after a seek or a flush —
-        // and the stream's parameter sets go in front of it. This backend builds its records from the
-        // sample entry's parameter sets rather than from an Annex B stream, so there are no bytes
-        // here to hand the driver; what `Stream::input` gives the decode loop is its *error*, and
-        // that error is only about the sample's own shape: `annexb::to_annex_b` walks the length
+        // `need_headers` says the decoder has just started — the first sample, after a seek or a
+        // flush — and the stream's parameter sets go in front of it. This backend builds its records
+        // from the sample entry's parameter sets rather than from an Annex B stream, so there are no
+        // bytes here to hand the driver; what `Stream::input` gives the decode loop is its *error*,
+        // and that error is only about the sample's own shape: `annexb::to_annex_b` walks the length
         // prefixes and refuses a sample whose NAL units do not add up, run past its end, are empty,
-        //        or are followed by bytes no prefix accounts for. It parses nothing — the parameter sets it
+        // or are followed by bytes no prefix accounts for. It parses nothing — the parameter sets it
         // copies in front are the sample entry's bytes, unexamined — so it says nothing about
-        // whether those sets are usable, and nothing here should be read as if it did.
-        //        Doing that once at the start of a run is where `need_headers` is spent; it is deliberately
-        // not done per picture, because `input` allocates and at 600 pictures a second an allocation
-        // per picture to produce bytes nothing reads is waste.
+        // whether those sets are usable, and nothing here should be read as if it did. Doing that
+        // once at the start of a run is where `need_headers` is spent; it is deliberately not done
+        // per picture, because `input` allocates and at 600 pictures a second an allocation per
+        // picture to produce bytes nothing reads is waste.
         if self.need_headers {
             let with_headers = self.stream.input(sample, true).map_err(CodecError::Decode)?;
             debug_assert!(!with_headers.is_empty(), "a sample that converts to nothing is refused by input()");
