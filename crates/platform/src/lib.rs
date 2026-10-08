@@ -3,9 +3,11 @@
 //!
 //! [`register`] puts the platform's hardware decoder factory in front of FilmCraft's own decoders
 //! (`filmcraft_codecs::register_video_decoder`). Today that is VideoToolbox on macOS for H.264
-//! (`avcC`) and HEVC (`hvcC`) streams, 8- and 10-bit, 4:2:0 and 4:2:2; on other systems
-//! registration does nothing and reports [`Availability::Unavailable`]. It also registers a
-//! hardware H.264 encoder factory (`filmcraft_export::register_encoder`) that only acts when an
+//! (`avcC`) and HEVC (`hvcC`) streams, 8- and 10-bit, 4:2:0 and 4:2:2; Media Foundation on Windows for
+//! H.264 / HEVC / VP9 / AV1 with DXVA; and VA-API on Linux for the H.264 / HEVC streams the machine's
+//! own driver offers a video decoder for, 8-bit H.264 and 8- or 10-bit HEVC at 4:2:0. On other
+//! systems registration does nothing and reports [`Availability::Unavailable`]. It also registers
+//! a hardware H.264 encoder factory (`filmcraft_export::register_encoder`) that only acts when an
 //! export asks for it (`ExportSettings::hardware_encoding` = `Auto`), see [`hardware_encode`].
 //!
 //! Hardware decoding never makes a file undecodable:
@@ -79,7 +81,13 @@ pub fn register() -> Availability {
         filmcraft_codecs::hw::set_hw_backend("Media Foundation");
         Availability::Available("Media Foundation")
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        filmcraft_codecs::register_video_decoder(vaapi_factory);
+        filmcraft_codecs::hw::set_hw_backend("VA-API");
+        Availability::Available("VA-API")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Availability::Unavailable("no hardware video decoder for this system yet")
     }
@@ -95,7 +103,11 @@ pub fn registered() -> bool {
     {
         filmcraft_codecs::video_decoder_registered(media_foundation_factory)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        filmcraft_codecs::video_decoder_registered(vaapi_factory)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         false
     }
@@ -112,7 +124,11 @@ pub fn hardware_decoder_for(entry: &filmcraft_isobmff::SampleEntry) -> bool {
     {
         media_foundation::stream_info(entry).is_some_and(|info| media_foundation::MfDecoder::new(info).is_ok())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        vaapi::stream_info(entry).is_some_and(|info| vaapi::VaDecoder::new(info).is_ok())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = entry;
         false
@@ -148,6 +164,24 @@ pub fn media_foundation_factory(entry: &filmcraft_isobmff::SampleEntry) -> Optio
     let info = media_foundation::stream_info(entry)?;
     match media_foundation::MfDecoder::new(info.clone()) {
         Ok(mf) => Some(Ok(Box::new(HybridDecoder::new(Box::new(mf), entry.clone(), info)))),
+        Err(why) => {
+            log::info!("hardware decoding declined for {} video: {why}", entry.codec.name());
+            filmcraft_codecs::hw::note_hw_declined();
+            None
+        }
+    }
+}
+
+/// The VA-API factory: a [`HybridDecoder`] around [`vaapi::VaDecoder`] for the H.264 / HEVC
+/// streams this machine's VA-API driver really offers a video decoder for, `None` otherwise.
+#[cfg(target_os = "linux")]
+pub fn vaapi_factory(entry: &filmcraft_isobmff::SampleEntry) -> Option<filmcraft_codecs::Result<Box<dyn filmcraft_codecs::VideoDecoder>>> {
+    if !filmcraft_codecs::hw::hardware_decoding() {
+        return None;
+    }
+    let info = vaapi::stream_info(entry)?;
+    match vaapi::VaDecoder::new(info.clone()) {
+        Ok(va) => Some(Ok(Box::new(HybridDecoder::new(Box::new(va), entry.clone(), info)))),
         Err(why) => {
             log::info!("hardware decoding declined for {} video: {why}", entry.codec.name());
             filmcraft_codecs::hw::note_hw_declined();

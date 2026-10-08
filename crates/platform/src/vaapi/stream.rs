@@ -58,6 +58,20 @@ impl From<FrameStreamInfo> for Stream {
     }
 }
 
+/// The stream info of a sample entry this backend could take (`avcC` / `hvcC` / `vpcC` / `av1C`), or
+/// `None` for other codecs and unreadable configuration records.
+///
+/// The same helper the Windows backend has, for the same two callers (the factory in front of our
+/// decoders, and the diagnostics that ask what this machine can decode): a frame-coded entry is
+/// recognised here even though [`plan_frame`] declines every one of them, so that the recognition
+/// and the decline cannot drift apart.
+pub fn stream_info(entry: &filmcraft_isobmff::SampleEntry) -> Option<StreamInfo> {
+    match NalStreamInfo::from_entry(entry) {
+        Some(r) => r.ok().map(StreamInfo::Nal),
+        None => FrameStreamInfo::from_entry(entry)?.ok().map(StreamInfo::Frame),
+    }
+}
+
 /// What the driver needs for an `avcC` / `hvcC` stream, or why it is declined: 4:2:0 progressive,
 /// 8 or 10 bits — H.264 at 8 bits in `profile_idc` 66 (Baseline), 77 (Main) or 100 (High), and HEVC
 /// at 8 bits in 1 (Main) or 3 (Main Still Picture), or at 10 bits in 2 (Main 10). Nothing else, and

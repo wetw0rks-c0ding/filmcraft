@@ -42,6 +42,7 @@ pub use ffi::Display;
 pub use ffi::status;
 pub use picture::build_frame;
 pub use stream::Stream;
+pub use stream::stream_info;
 
 use ffi::VaImage;
 

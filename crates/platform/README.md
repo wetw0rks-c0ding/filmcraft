@@ -8,7 +8,7 @@ It is the one crate of the workspace allowed to contain `unsafe`, under the rule
 
 ```rust
 // at startup (the desktop app, filmcraft-cli, the bench)
-let availability = filmcraft_platform::register(); // Available("VideoToolbox") on macOS, Available("Media Foundation") on Windows
+let availability = filmcraft_platform::register(); // Available("VideoToolbox") on macOS, Available("Media Foundation") on Windows, Available("VA-API") on Linux
 ```
 
 ## What it does
@@ -70,6 +70,17 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
   It declines two-pass VBR, HDR, MXF, interlaced output, sizes outside NVENC's limits and systems
   without an NVIDIA GPU or driver, and the software encoder runs instead. A failure during an export
   ends it with an error, since a hardware stream cannot be finished in software.
+- **Linux: VA-API, H.264 (`avcC`) and HEVC (`hvcC`)**, 8-bit H.264 and 8- or 10-bit HEVC, 4:2:0
+  progressive (`vaapi/`). libva is `dlopen`ed at run time (LGPL, so never linked or shipped), and a
+  driver that does not list the profile with a video decoder for it is declined rather than used —
+  hardware is verified, not assumed. Container samples go in as Annex B and FilmCraft builds each
+  picture's parameter record itself from its own parsers, because VA-API does not work picture
+  structure out; pictures come back from a driver surface through a copy (`vaDeriveImage` +
+  `vaMapBuffer`) and into the same `biplanar::to_frame` the Windows backend reads. A drained
+  context cannot resume inside a run, so `flush` mid-GOP fails the stream and `HybridDecoder` replays
+  it in software. VP9 and AV1 are declined while still a stream description: libva wants their
+  per-frame header as a record and neither codec exposes it (`vaapi/stream.rs`, `plan_frame`).
+  10-bit H.264 is declined as well: libva names that profile and this backend does not carry it.
 - **Other systems:** `register()` does nothing and returns `Availability::Unavailable`.
 - **`HybridDecoder`** (`hybrid.rs`, safe code): the hardware decoder plus the means to build our
   software decoder for the same `SampleEntry` (`filmcraft_codecs::software_video_decoder`). On a
@@ -141,7 +152,8 @@ level and flags are the encoder's own. If it is missing the export stops with th
   when Settings ▸ Playback ▸ Hardware decoding is Off, for formats it does not take (field-coded
   H.264, bit depths other than 8 / 10, 4:4:4 or monochrome, luma / chroma depth mismatch, larger
   than 8192×8192; on Windows also 4:2:2 and the profiles listed above) and when the OS cannot
-  create a hardware session (VideoToolbox) or a GPU-backed decoder (Media Foundation).
+  create a hardware session (VideoToolbox), a GPU-backed decoder (Media Foundation) or a libva
+  profile with a video decoder (VA-API).
 - **Interchangeable:** colour, pixel aspect, pts, presentation order, `is_random_access` and
   `is_disposable` come from the software decoders' own helpers (`filmcraft_codecs::hw`,
   `video::vui_color`, `sar_par`).
@@ -157,7 +169,7 @@ level and flags are the encoder's own. If it is missing the export stops with th
 |---|---|
 | `tests/videotoolbox.rs` (macOS) | H.264 High, HEVC Main (open GOP: CRA + RASL) and HEVC Main 10, 640×360 (coded 368: cropping) with B-frames: every picture **bit-exact** with our software decoder, same pts order, count, colour and aspect, also after `reset` + reseek to every later sync sample, mid-stream `flush`, and a full pass after resets; forced mid-stream failures (`VtDecoder::fail_after`) at five points continue with the software decoder's exact output; seeded mutation of samples and parameter sets (bit flips, truncation, corrupt length prefixes) never panics or hangs; HEVC 4:2:2 10-bit is bit-exact with ffmpeg's decode |
 | `tests/fallback.rs` (every OS) | `HybridDecoder` with a stand-in hardware decoder failing after N samples (every sync sample ± a few, first / last sample, after a seek): output identical to the software decoder; in-band parameter sets identical to the sample entry's stay in hardware, different ones switch to software |
-| `tests/setting.rs` | Hardware decoding Off gives the software decoder through `make_video_decoder` and the media stack (no hardware frames); Auto gives VideoToolbox where available |
+| `tests/setting.rs` | Hardware decoding Off gives the software decoder through `make_video_decoder` and the media stack (no hardware frames); Auto gives the registered backend's decoder where available (VideoToolbox, Media Foundation or VA-API); the VA-API factory on its own on Linux |
 | `tests/hardware_encode.rs` (macOS) | what the hardware path takes and declines; round trip through our software decoder (every picture, in order, luma PSNR above 30 dB, keyframes no further apart than asked, no composition offsets); an export through `filmcraft_export` that decodes in our decoder and in ffmpeg / ffprobe (profile, size, frame count, BT.709); the built-in encoder still exporting everything hardware declines; exact output size at sizes that are not multiples of 16; hostile configurations (zero, huge, odd sizes, frame rates, bitrates, keyframe intervals, wrong planes) give errors and never panic; encoders dropped at any point do not crash or hang. The same for **HEVC**: Main profile, 8-bit 4:2:0, `hvc1` entry with VPS / SPS / PPS and 4-byte lengths, MP4 and QuickTime, AAC audio, two-pass refused, the format list agreeing with the probe, ffprobe reading `codec_name=hevc`, `profile=Main`, `codec_tag_string=hvc1`, `pix_fmt=yuv420p`, BT.709 |
 | `tests/nvenc.rs` (Windows, NVIDIA) | H.264 from NVENC (1280×720, 6 Mbps, 72 frames) decodes with our decoder at worst 46.9 dB luma PSNR; IDR at 0, 24 and 48; dts / pts right |
 | `tests/nvenc_export.rs` (Windows, NVIDIA) | Export with hardware encoding against the software encoder through the export pipeline: the two decoded files at worst 54.8 dB luma PSNR; ffmpeg decodes the file without errors; declined cases go to the software encoder; the counters |
@@ -188,6 +200,8 @@ playback with no dropped frames at Full, 1/2 and 1/4. Details in
 ## Not yet
 
 Zero-copy upload of decoded pictures into wgpu textures (`CVPixelBuffer`s on macOS, Direct3D 11
-textures on Windows); B-frames and 10-bit / HDR HEVC (Main 10) in hardware encoding; VA-API (Linux)
-decoders; field-coded H.264; HEVC, 10-bit and HDR encoding with NVENC, and encoders from other
-vendors on Windows (through Media Foundation); VP9 / AV1 4:4:4 and 12-bit on Windows.
+textures on Windows, libva surfaces on Linux); B-frames and 10-bit / HDR HEVC (Main 10) in hardware
+encoding; VP9 and AV1 decoding on Linux (their picture-parameter records are not built yet, so
+`vaapi/stream.rs` declines every frame-coded stream); field-coded H.264; HEVC, 10-bit and HDR
+encoding with NVENC, and encoders from other vendors on Windows (through Media Foundation);
+VP9 / AV1 4:4:4 and 12-bit on Windows.

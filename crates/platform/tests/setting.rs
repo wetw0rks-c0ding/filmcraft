@@ -7,9 +7,17 @@ mod common;
 use common::*;
 use filmcraft_media::FrameRequest;
 
+/// The Hardware decoding switch is process-wide, so the tests take turns with it.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn off_uses_the_software_decoder() {
     let ff = filmcraft_testkit::require_ffmpeg!();
+    let _turn = serial();
     let Some(path) = named(&ff, "hevc_main.mp4") else { return };
     let s = read_stream(&path);
     let available = filmcraft_platform::register();
@@ -36,7 +44,15 @@ fn off_uses_the_software_decoder() {
         assert_eq!(d.name(), "FilmCraft HEVC");
         return;
     }
-    let (backend, hw_name) = if cfg!(target_os = "macos") { ("VideoToolbox", "VideoToolbox HEVC") } else { ("Media Foundation", "Media Foundation HEVC") };
+    // The backend `register()` put in front of our decoders and the name its decoder reports for
+    // this stream, one arm per system that has one: a system with no backend returned above.
+    let (backend, hw_name) = if cfg!(target_os = "macos") {
+        ("VideoToolbox", "VideoToolbox HEVC")
+    } else if cfg!(target_os = "windows") {
+        ("Media Foundation", "Media Foundation HEVC")
+    } else {
+        ("VA-API", "VA-API HEVC")
+    };
     assert_eq!(d.name(), hw_name);
     assert_eq!(filmcraft_codecs::hw::hw_backend(), Some(backend), "perf.stats reports the backend");
     assert!(filmcraft_platform::registered(), "register() put the factory in the registry");
@@ -47,4 +63,26 @@ fn off_uses_the_software_decoder() {
     }
     let h2 = filmcraft_codecs::hw::hw_stats();
     assert!(h2.frames > h1.frames && h2.sessions > h1.sessions, "Auto: hardware frames {h1:?} → {h2:?}");
+}
+
+/// The Linux factory on its own: with Hardware decoding Auto it is the GPU's decoder for a stream
+/// libva takes, and with it Off it declines so FilmCraft's own decoder is used.
+#[test]
+#[cfg(target_os = "linux")]
+fn auto_uses_the_vaapi_decoder() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    let _turn = serial();
+    let Some(path) = named(&ff, "h264_high.mp4") else { return };
+    let s = read_stream(&path);
+    filmcraft_platform::register();
+    filmcraft_codecs::hw::set_hardware_decoding(true);
+    let Some(Ok(d)) = filmcraft_platform::vaapi_factory(&s.entry) else {
+        eprintln!("SKIPPED: no VA-API decoder for {}", s.entry.codec.name());
+        return;
+    };
+    assert!(d.name().starts_with("VA-API"), "{}", d.name());
+
+    // and Off still gives FilmCraft's own decoder
+    filmcraft_codecs::hw::set_hardware_decoding(false);
+    assert!(filmcraft_platform::vaapi_factory(&s.entry).is_none(), "Off declines");
 }

@@ -154,8 +154,8 @@ fn format_for(path: &str) -> Option<&'static str> {
     })
 }
 
-/// OS hardware video decoders (VideoToolbox on macOS, Media Foundation on Windows) in front of our
-/// own, as in the desktop app. Also what `mcp` and the headless commands decode with.
+/// OS hardware video decoders (VideoToolbox on macOS, Media Foundation on Windows, VA-API on Linux)
+/// in front of our own, as in the desktop app. Also what `mcp` and the headless commands decode with.
 fn register_hardware_decoders() -> filmcraft_platform::Availability {
     filmcraft_platform::register()
 }
@@ -388,7 +388,7 @@ mod format_tests {
     #[test]
     fn startup_registers_the_hardware_decoders() {
         let hardware = super::register_hardware_decoders();
-        assert_eq!(filmcraft_platform::registered(), cfg!(any(target_os = "macos", target_os = "windows")), "{hardware:?}");
+        assert_eq!(filmcraft_platform::registered(), cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux")), "{hardware:?}");
     }
 
     #[test]

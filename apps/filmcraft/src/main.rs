@@ -87,8 +87,9 @@ fn main() -> eframe::Result {
     // Panics anywhere go to <data dir>/Logs/crash-<day>.log with a backtrace; the UI pass and
     // frame workers catch them and keep running (see filmcraft_ui_egui::crash).
     filmcraft_ui_egui::crash::install(data_dir.clone().or_else(default_data_dir).map(|d| d.join("Logs")));
-    // OS hardware video decoders (VideoToolbox on macOS) in front of our own; Settings ▸ Playback ▸
-    // Hardware decoding switches them off. Unsupported streams and failures use our decoders.
+    // OS hardware video decoders (VideoToolbox on macOS, Media Foundation on Windows, VA-API on
+    // Linux) in front of our own; Settings ▸ Playback ▸ Hardware decoding switches them off.
+    // Unsupported streams and failures use our decoders.
     register_hardware_decoders();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -275,6 +276,6 @@ mod tests {
     fn startup_registers_the_hardware_decoders_without_a_logger() {
         assert!(!log::log_enabled!(log::Level::Info));
         let hardware = super::register_hardware_decoders();
-        assert_eq!(filmcraft_platform::registered(), cfg!(any(target_os = "macos", target_os = "windows")), "{hardware:?}");
+        assert_eq!(filmcraft_platform::registered(), cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux")), "{hardware:?}");
     }
 }
