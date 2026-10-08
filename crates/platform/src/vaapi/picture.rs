@@ -34,10 +34,14 @@ use super::ffi::{
 /// this; a stream claiming more cannot be described and is declined.
 const MAX_REF_FRAMES: usize = 16;
 
-/// How many slices one access unit may hold, since a record is submitted per slice and the NAL list
-/// comes from a sample. No stream FilmCraft decodes has anything like this many, so it bounds what a
-/// corrupt sample can make this module allocate rather than describing a real limit.
+/// How many slice segments one access unit may hold, since a record is submitted per segment and the
+/// NAL list comes from a sample. No stream FilmCraft decodes has anything like this many, so it
+/// bounds what a corrupt sample can make this module allocate rather than describing a real limit.
 const MAX_SLICES: usize = 256;
+
+/// The bytes of an HEVC NAL unit header (`nuh_layer_id` and `nuh_temporal_id_plus1`), which the
+/// slice segment header's byte offsets in a record are counted from.
+const HEVC_NAL_HEADER: [u8; 2] = [0; 2];
 
 /// Picture order count state carried across a stream's pictures, so each picture's POC is the one
 /// FilmCraft's own decoder would compute for it. One per decoder: a seek or a flush that starts
@@ -110,6 +114,11 @@ pub fn build_nal(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface:
     }
 }
 
+/// The tail both frame-codec declines end in: neither codec crate exposes the per-frame header a
+/// picture parameter record needs. [`super::plan_frame`] and [`build_frame`] both build their
+/// message from this, so a caller that hits either is told the same thing.
+pub(crate) const FRAME_HEADER_MISSING: &str = "does not expose the uncompressed frame header";
+
 /// The record one frame-coded (VP9 / AV1) sample is submitted as, or why it has none.
 ///
 /// VP9 and AV1 carry their picture structure in each frame's own uncompressed header, and libva
@@ -119,16 +128,18 @@ pub fn build_nal(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface:
 /// layout and quantizer). So this milestone submits neither, and says so, rather than hand a driver
 /// a record full of zeros it would read as a valid picture.
 ///
-/// Both profiles are planned and offered by `plan_frame` and checked against the driver by
-/// `supports`; what is missing here is the per-frame record, so a VP9 / AV1 stream takes the software
-/// decoder until the frame headers are exposed. [`FrameCodec`] and [`FrameStreamInfo`] are the
-/// arguments this takes so that the signature does not change when the records arrive.
+/// **This is a backstop, not the decision.** [`super::plan_frame`] declines every VP9 and AV1 stream
+/// while it is still a stream description, so a caller should never arrive here with one; the `Err`
+/// below says the same thing `plan_frame` says, for a caller that skips planning. The two must agree
+/// about what this backend supports: a decline that names a reason the other side does not is a bug
+/// in one of them. [`FrameCodec`] and [`FrameStreamInfo`] are the arguments this takes so that the
+/// signature does not change when the records arrive.
 pub fn build_frame(info: &FrameStreamInfo, _sample: &[u8]) -> Result<Picture, String> {
     match info.codec {
         // A key frame's parameters are public, but the record needs the whole frame header; saying
         // which codec it is makes the reason readable in the logs a decline ends up in.
-        FrameCodec::Vp9 => Err("VP9 picture parameters: the uncompressed frame header is not exposed by filmcraft-vp9".into()),
-        FrameCodec::Av1 => Err("AV1 picture parameters: the uncompressed frame header is not exposed by filmcraft-av1".into()),
+        FrameCodec::Vp9 => Err(format!("VP9 picture parameters: filmcraft-vp9 {FRAME_HEADER_MISSING}")),
+        FrameCodec::Av1 => Err(format!("AV1 picture parameters: filmcraft-av1 {FRAME_HEADER_MISSING}")),
     }
 }
 
@@ -247,7 +258,7 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         }
 
         let length = u32::try_from(nal.len()).map_err(|_| "slice length does not fit the record".to_string())?;
-        slices.push(SliceParam { offset: data_offset, length, params: h264_slice_record(nal, &sh, data_offset)? });
+        slices.push(SliceParam { offset: data_offset, length, params: h264_slice_record(nal, &sh, pps, data_offset)? });
         slice_offsets.push(*offset);
         data_offset = data_offset.checked_add(length).ok_or("slice data buffer size overflows")?;
     }
@@ -376,7 +387,8 @@ fn h264_dpb(sps: &filmcraft_h264::params::Sps) -> u32 {
 /// entries of the picture's `ReferenceFrames`, and which surfaces the DPB holds is the decode loop's
 /// to decide, since it owns the ring. A driver reading this finds no valid reference and reports it,
 /// which beats being handed a surface that decodes as a different picture.
-fn h264_slice_record(nal: &[u8], sh: &filmcraft_h264::slice::SliceHeader, data_offset: u32) -> Result<Vec<u8>, String> {
+fn h264_slice_record(nal: &[u8], sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::params::Pps, data_offset: u32) -> Result<Vec<u8>, String> {
+    let weights = h264_weights(sh, pps)?;
     let record = VaSliceParameterBufferH264 {
         slice_data_size: u32::try_from(nal.len()).map_err(|_| "slice length does not fit the record".to_string())?,
         slice_data_offset: data_offset,
@@ -397,9 +409,78 @@ fn h264_slice_record(nal: &[u8], sh: &filmcraft_h264::slice::SliceHeader, data_o
         slice_beta_offset_div2: field_i8(sh.slice_beta_offset_div2, "slice_beta_offset_div2")?,
         ref_pic_list0: [invalid_h264_picture(); 32],
         ref_pic_list1: [invalid_h264_picture(); 32],
-        ..Default::default()
+        ..weights
     };
     Ok(record_bytes(&record))
+}
+
+/// The prediction weight tables, from the slice header's own `pred_weight_table()`.
+///
+/// A slice whose weight table is mandatory and missing is declined rather than submitted with
+/// zeros: `pic_fields` would say `weighted_pred_flag` is in use, and a zeroed table alongside that
+/// says "no weighting" — a different picture from the stream's, which is worse than an error.
+///
+/// The mandatory cases are the two `filmcraft_h264` parses the table for: a P slice with
+/// `weighted_pred_flag`, and a B slice with `weighted_bipred_idc == 1` (implicit). `weighted_bipred_idc
+/// == 2` (explicit) is not one of them: there the *slice* opts in, through a `weighted_bipred_flag`
+/// that `filmcraft_h264` does not expose. A slice with no table in that mode is submitted with the
+/// weight flags clear, which is libva's own encoding of "explicit mode, not weighted here" and is
+/// what FilmCraft's own decoder does with those slices — its conformance suite is bit-exact against
+/// ffmpeg on a stream whose picture parameter set says `weighted_bipred_idc == 2`. This task's
+/// report carries the evidence and the one-clause alternative.
+fn h264_weights(sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::params::Pps) -> Result<VaSliceParameterBufferH264, String> {
+    let mandatory = (pps.weighted_pred && sh.slice_type.is_p()) || (pps.weighted_bipred_idc == 1 && sh.slice_type.is_b());
+    let Some(table) = sh.pred_weight_table.as_ref() else {
+        return if mandatory {
+            Err(format!("weighted {} prediction in a slice that carries no prediction weight table", if sh.slice_type.is_b() { "bipred" } else { "pred" }))
+        } else {
+            Ok(VaSliceParameterBufferH264::default())
+        };
+    };
+    // `pred_weight_table()` only produces entries for the references the slice actually lists, so
+    // the table is at most that long; the record's arrays are 32.
+    if table.l0.len() > 32 || table.l1.len() > 32 {
+        return Err(format!("prediction weight table of {} references does not fit the record", table.l0.len().max(table.l1.len())));
+    }
+    let mut record = VaSliceParameterBufferH264 {
+        luma_log2_weight_denom: field_u8(table.luma_log2_denom, "luma_log2_weight_denom")?,
+        chroma_log2_weight_denom: field_u8(table.chroma_log2_denom, "chroma_log2_weight_denom")?,
+        ..Default::default()
+    };
+    for (list, entries) in [(0, &table.l0), (1, &table.l1)] {
+        // The `*_flag` fields say the list carries luma weights at all (7.4.3.2): a stream that
+        // sets no flag means the default weight of 1 << denom, which the table already holds.
+        let luma_flag = u8::from(entries.iter().any(|e| e.luma_flag));
+        let chroma_flag = u8::from(entries.iter().any(|e| e.chroma_flag));
+        let mut luma_weight = [0i16; 32];
+        let mut luma_offset = [0i16; 32];
+        let mut chroma_weight = [[0i16; 2]; 32];
+        let mut chroma_offset = [[0i16; 2]; 32];
+        for (i, e) in entries.iter().enumerate() {
+            luma_weight[i] = field_i16(e.luma_weight, "luma weight")?;
+            luma_offset[i] = field_i16(e.luma_offset, "luma offset")?;
+            for c in 0..2 {
+                chroma_weight[i][c] = field_i16(e.chroma_weight[c], "chroma weight")?;
+                chroma_offset[i][c] = field_i16(e.chroma_offset[c], "chroma offset")?;
+            }
+        }
+        if list == 0 {
+            record.luma_weight_l0_flag = luma_flag;
+            record.chroma_weight_l0_flag = chroma_flag;
+            record.luma_weight_l0 = luma_weight;
+            record.luma_offset_l0 = luma_offset;
+            record.chroma_weight_l0 = chroma_weight;
+            record.chroma_offset_l0 = chroma_offset;
+        } else {
+            record.luma_weight_l1_flag = luma_flag;
+            record.chroma_weight_l1_flag = chroma_flag;
+            record.luma_weight_l1 = luma_weight;
+            record.luma_offset_l1 = luma_offset;
+            record.chroma_weight_l1 = chroma_weight;
+            record.chroma_offset_l1 = chroma_offset;
+        }
+    }
+    Ok(record)
 }
 
 /// H.264 `slice_type` as the record numbers it: the slice header's own `slice_type` modulo five.
@@ -518,10 +599,24 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         if sps.range_extension || sps.extension_flags & 0x7f != 0 {
             return Err("HEVC range extension / multilayer / screen content tools".into());
         }
+        // Separate colour planes are declined as on the H.264 side: the record's coding block
+        // geometry and chroma format describe 4:2:0 or 4:2:2, and there is nowhere in it for the
+        // three planes a `separate_colour_plane_flag` stream codes separately.
+        if sps.separate_colour_plane {
+            return Err("separate_colour_plane_flag".into());
+        }
 
         if first.is_none() {
             picture_poc = Some(fill_hevc_picture(&mut params, poc, &sh, &pps, &sps, surface, width, height)?);
             first = Some(sh.clone());
+        } else {
+            // Every segment of a picture shares the picture's parameter sets: the record was filled
+            // in from the first segment, so a later one naming a different picture parameter set
+            // would be described with the wrong tile grid, QP offsets and coding block geometry.
+            let first = first.as_ref().ok_or("first segment not set")?;
+            if !hevc_same_picture(first, &sh) {
+                return Err("a slice segment that does not match the first segment of its picture".into());
+            }
         }
         let length = u32::try_from(nal.len()).map_err(|_| "slice segment length does not fit the record".to_string())?;
         // The record is built once every segment is known, because `LastSliceOfPic` belongs to the
@@ -546,6 +641,13 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         slice_offsets.push(*offset);
     }
     Ok(Picture { params: record_bytes(&params), slices, slice_offsets })
+}
+
+/// Whether a slice segment belongs to the picture `first` opened: the same picture parameter set and
+/// the same NAL unit type and temporal layer, which is what says the two are one picture rather than
+/// two that happen to share an access unit.
+fn hevc_same_picture(first: &filmcraft_hevc::slice::SliceHeader, sh: &filmcraft_hevc::slice::SliceHeader) -> bool {
+    sh.pps_id == first.pps_id && sh.nal.nal_type == first.nal.nal_type && sh.nal.temporal_id == first.nal.temporal_id && sh.nal.layer_id == first.nal.layer_id
 }
 
 /// Fill the picture-level record from the picture's first segment, and return its POC.
@@ -720,9 +822,11 @@ fn hevc_slice_record(nal: &[u8], sh: &filmcraft_hevc::slice::SliceHeader, data_o
         five_minus_max_num_merge_cand: field_u8(5u32.saturating_sub(sh.max_num_merge_cand), "five_minus_max_num_merge_cand")?,
         num_entry_point_offsets: field_u16(u32::try_from(sh.entry_points.len()).map_err(|_| "too many entry points".to_string())?, "num_entry_point_offsets")?,
         entry_offset_to_subset_array: 0,
-        // The emulation prevention bytes in the header, which is what the entry point offsets and
-        // `slice_data_byte_offset` are counted without.
-        slice_data_num_emu_prevn_bytes: field_u16(u32::try_from(emu_prevention_bytes(nal)).unwrap_or(u32::MAX), "slice_data_num_emu_prevn_bytes")?,
+        // The emulation prevention bytes of the *slice header*, which is what the entry point
+        // offsets and `slice_data_byte_offset` are counted without, and what a driver adds back to
+        // find where `slice_segment_data()` starts. Counting the whole NAL unit would over-count
+        // every `00 00 03` in the residual data and mis-place every subset header after the first.
+        slice_data_num_emu_prevn_bytes: field_u16(header_emu_prevention_bytes(nal, sh.data_offset)?, "slice_data_num_emu_prevn_bytes")?,
         ..Default::default()
     };
     Ok(record_bytes(&record))
@@ -747,9 +851,25 @@ fn pack_hevc_long_slice_flags(sh: &filmcraft_hevc::slice::SliceHeader, last_of_p
         | bit(13, sh.loop_filter_across_slices)
 }
 
-/// Emulation prevention bytes (`00 00 03`) in `nal`.
-fn emu_prevention_bytes(nal: &[u8]) -> usize {
-    nal.windows(3).filter(|w| *w == [0, 0, 3]).count()
+/// Emulation prevention bytes (`00 00 03`) in the slice *header* of `nal`: the region
+/// `nal[HEVC_NAL_HEADER..][..data_offset]`, where `data_offset` is our parser's byte position of
+/// `slice_segment_data()` in the RBSP — the RBSP being the NAL unit with its two-byte header and its
+/// emulation prevention bytes removed.
+///
+/// Only the header counts. libva documents the field as "number of emulation prevention bytes in
+/// slice header", and a driver uses it to convert between the entry point offsets (counted without
+/// them) and byte positions in the original bitstream (counted with them). Counting the residual
+/// data as well would inflate the count by every `00 00 03` a tiled or wavefront picture happens to
+/// contain and put every subset header after the first in the wrong place.
+fn header_emu_prevention_bytes(nal: &[u8], data_offset: usize) -> Result<u32, String> {
+    // The RBSP starts after the two-byte HEVC NAL header and ends where the slice data starts, so
+    // both bounds are checked against the NAL unit rather than trusted: a header that claims to run
+    // past the NAL unit is a decline, not a shorter count.
+    let start = HEVC_NAL_HEADER.len();
+    let end = start.checked_add(data_offset).ok_or("slice segment header length overflows")?;
+    let header = nal.get(start..end).ok_or("slice segment header runs past the NAL unit")?;
+    let count = header.windows(3).filter(|w| *w == [0, 0, 3]).count();
+    u32::try_from(count).map_err(|_| "too many emulation prevention bytes".to_string())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -817,6 +937,11 @@ fn field_count(value: usize, what: &str) -> Result<u8, String> {
 /// `value` as an `i8` field.
 fn field_i8(value: i32, what: &str) -> Result<i8, String> {
     i8::try_from(value).map_err(|_| format!("{what} {value} does not fit the record"))
+}
+
+/// `value` as an `i16` field, which is what a prediction weight or offset is carried in.
+fn field_i16(value: i32, what: &str) -> Result<i16, String> {
+    i16::try_from(value).map_err(|_| format!("{what} {value} does not fit the record"))
 }
 
 /// `bit_depth - 8`, the form the records carry it in.
@@ -1079,6 +1204,182 @@ mod tests {
         Some((sps, pps))
     }
 
+    /// `slice_data_num_emu_prevn_bytes` counts the emulation prevention bytes of the **slice header**
+    /// only. libva's driver uses the count to convert the entry point offsets (counted without
+    /// emulation prevention bytes) into byte positions in the bitstream it was handed (counted with
+    /// them), so counting the residual data as well would put every subset header after the first in
+    /// the wrong place.
+    ///
+    /// The count is made here, over `nal[2..2 + data_offset]` — the NAL unit from after its two-byte
+    /// header to where the parser says the slice data starts — rather than by calling the module's
+    /// own helper, which is what made the first version of this assertion circular.
+    #[test]
+    fn the_emulation_prevention_count_is_the_slice_headers() {
+        let Some((info, sets, samples)) = hevc() else { return };
+        let mut checked = 0usize;
+        let mut header_only = 0usize;
+        for sample in &samples {
+            let Ok(p) = super::build_nal(&info, sample, &mut super::NalPoc::default(), 9, 640, 360) else { continue };
+            let nals = info.nals(sample);
+            for (slice, &at) in p.slices.iter().zip(&p.slice_offsets) {
+                let nal = nals.iter().find(|n| sample.get(at..at + n.len()) == Some(*n)).unwrap_or_else(|| panic!("no NAL unit at {at}"));
+                let hdr = filmcraft_hevc::slice::NalHeader::parse(nal).unwrap_or_else(|e| panic!("{e}"));
+                let rbsp = filmcraft_bitstream::unescape_rbsp(&nal[2..]);
+                let (sh, _, _) = filmcraft_hevc::slice::SliceHeader::parse(&rbsp, hdr, |id| sets.lookup(id), None).unwrap_or_else(|e| panic!("{e}"));
+                let r = crate::vaapi::ffi::slice_params_hevc(&slice.params).unwrap_or_else(|| panic!("not a slice record"));
+                assert_eq!(
+                    r.slice_data_num_emu_prevn_bytes as usize,
+                    emu_count(&nal[2..2 + sh.data_offset]),
+                    "the slice header's own emulation prevention bytes (NAL {} bytes, header {})",
+                    nal.len(),
+                    sh.data_offset
+                );
+                // The whole NAL unit of this fixture has `00 00 03` in its residual data in several
+                // pictures — x265's encoder emits them for long runs of zero coefficients — so the
+                // two counts really do differ, and an implementation that counted the whole unit
+                // would fail the assertion above rather than pass by luck.
+                if emu_count(&nal[2..2 + sh.data_offset]) == emu_count(nal) {
+                    header_only += 1;
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "the fixture's whole first GOP was checked ({checked} segments)");
+        assert!(header_only < checked, "at least one segment has an emulation prevention byte outside its header ({header_only} of {checked} do not)");
+    }
+
+    /// The emulation prevention bytes (`00 00 03`) in a region of a NAL unit, counted over the region
+    /// the assertion names. Counting the *region* is the point of these tests, so it is written out
+    /// at each call site rather than folded into a helper that would hide it.
+    fn emu_count(bytes: &[u8]) -> usize {
+        bytes.windows(3).filter(|w| *w == [0, 0, 3]).count()
+    }
+
+    /// The H.264 slice record's prediction weight tables come from the slice header's own
+    /// `pred_weight_table()`, entry by entry, rather than staying zeroed. A record that advertised
+    /// weighted prediction with an empty table would decode a different picture from the stream's,
+    /// so this fixture exists to carry real weights: `weightp=1` makes the encoder use weighted
+    /// prediction in its P slices, which are exactly the slices where the table is mandatory.
+    #[test]
+    fn the_h264_slice_record_carries_the_prediction_weights() {
+        let Some((info, sets, samples)) = h264_weighted() else { return };
+        let pps = sets.ppss.iter().flatten().next().unwrap_or_else(|| panic!("no PPS")).clone();
+        assert!(pps.weighted_pred, "the fixture's PPS allows weighted prediction");
+        let mut weighted = 0usize;
+        let mut checked = 0usize;
+        let mut poc = super::NalPoc::default();
+        for sample in samples.iter().take(6) {
+            let Ok(picture) = super::build_nal(&info, sample, &mut poc, 7, 40, 23) else { continue };
+            let nals = info.nals(sample);
+            for (slice, &at) in picture.slices.iter().zip(&picture.slice_offsets) {
+                let nal = nals.iter().find(|n| sample.get(at..at + n.len()) == Some(*n)).unwrap_or_else(|| panic!("no NAL unit at {at}"));
+                let hdr = filmcraft_h264::slice::NalHeader::parse(nal[0]).unwrap_or_else(|e| panic!("{e}"));
+                let rbsp = filmcraft_bitstream::unescape_rbsp(&nal[1..]);
+                let (sh, _, _) = filmcraft_h264::slice::SliceHeader::parse(&rbsp, hdr, |id| {
+                    let p = sets.ppss.get(id as usize).and_then(|p| p.as_ref()).unwrap_or_else(|| panic!("PPS {id}"));
+                    let s = sets.spss.get(p.sps_id as usize).and_then(|s| s.as_ref()).unwrap_or_else(|| panic!("SPS"));
+                    Ok((p, s))
+                })
+                .unwrap_or_else(|e| panic!("{e}"));
+                let r = crate::vaapi::ffi::slice_params_h264(&slice.params).unwrap_or_else(|| panic!("not a slice record"));
+                let Some(table) = sh.pred_weight_table.as_ref() else {
+                    // A slice the parser found no table in carries no weights, and says so.
+                    assert_eq!(r.luma_log2_weight_denom, 0, "no table means no weighting");
+                    assert!(r.luma_weight_l0 == [0; 32] && r.chroma_weight_l0 == [[0; 2]; 32], "and none are invented");
+                    continue;
+                };
+                weighted += 1;
+                checked += 1;
+                assert_eq!(u32::from(r.luma_log2_weight_denom), table.luma_log2_denom, "luma_log2_weight_denom");
+                assert_eq!(u32::from(r.chroma_log2_weight_denom), table.chroma_log2_denom, "chroma_log2_weight_denom");
+                assert_eq!(r.luma_weight_l0_flag, u8::from(table.l0.iter().any(|e| e.luma_flag)), "luma_weight_l0_flag");
+                assert_eq!(r.chroma_weight_l0_flag, u8::from(table.l0.iter().any(|e| e.chroma_flag)), "chroma_weight_l0_flag");
+                assert_eq!(r.luma_weight_l1_flag, u8::from(table.l1.iter().any(|e| e.luma_flag)), "luma_weight_l1_flag");
+                assert_eq!(r.chroma_weight_l1_flag, u8::from(table.l1.iter().any(|e| e.chroma_flag)), "chroma_weight_l1_flag");
+                for (i, e) in table.l0.iter().enumerate() {
+                    assert_eq!(r.luma_weight_l0[i], e.luma_weight as i16, "luma_weight_l0[{i}]");
+                    assert_eq!(r.luma_offset_l0[i], e.luma_offset as i16, "luma_offset_l0[{i}]");
+                    for c in 0..2 {
+                        assert_eq!(r.chroma_weight_l0[i][c], e.chroma_weight[c] as i16, "chroma_weight_l0[{i}][{c}]");
+                        assert_eq!(r.chroma_offset_l0[i][c], e.chroma_offset[c] as i16, "chroma_offset_l0[{i}][{c}]");
+                    }
+                }
+                for (i, e) in table.l1.iter().enumerate() {
+                    assert_eq!(r.luma_weight_l1[i], e.luma_weight as i16, "luma_weight_l1[{i}]");
+                    assert_eq!(r.luma_offset_l1[i], e.luma_offset as i16, "luma_offset_l1[{i}]");
+                }
+                // nothing is written past the slice's own references
+                assert!(r.luma_weight_l0[table.l0.len()..].iter().all(|&w| w == 0), "entries past the slice's references stay zero");
+                assert!(r.luma_weight_l1[table.l1.len()..].iter().all(|&w| w == 0), "entries past the slice's references stay zero");
+            }
+        }
+        assert!(weighted >= 2, "the fixture has weighted slices ({weighted})");
+        assert!(checked == weighted, "every weighted slice was checked");
+    }
+
+    /// A slice segment that does not belong to the picture the record was filled in from is an
+    /// error: the record carries the first segment's tile grid, QP offsets and coding block
+    /// geometry, so a second segment naming a different picture parameter set would be described
+    /// with the wrong ones and decode as something else.
+    ///
+    /// The check itself is what is tested here, on real parsed headers: this x265 build refuses the
+    /// tile and wavefront options through ffmpeg's `-x265-params`, so no fixture here splits a
+    /// picture into several segments, and a stream whose segments disagree about their picture is
+    /// one this backend cannot describe anyway.
+    #[test]
+    fn a_segment_must_match_the_picture_it_was_opened_with() {
+        let Some((info, sets, samples)) = hevc() else { return };
+        let header_of = |sample: &[u8]| -> filmcraft_hevc::slice::SliceHeader {
+            let nal = info.nals(sample).first().copied().expect("a NAL unit");
+            let hdr = filmcraft_hevc::slice::NalHeader::parse(nal).unwrap_or_else(|e| panic!("{e}"));
+            let rbsp = filmcraft_bitstream::unescape_rbsp(&nal[2..]);
+            let (sh, _, _) = filmcraft_hevc::slice::SliceHeader::parse(&rbsp, hdr, |id| sets.lookup(id), None).unwrap_or_else(|e| panic!("{e}"));
+            sh
+        };
+        let first = header_of(&samples[0]);
+        assert!(super::hevc_same_picture(&first, &first), "a segment is of its own picture");
+        // and a later picture's segment is not
+        let others: Vec<_> = samples.iter().skip(1).map(|s| header_of(s)).collect();
+        let different = others.iter().any(|sh| !super::hevc_same_picture(&first, sh));
+        assert!(different, "the fixture's other pictures are not the first one");
+        // two segments of the same picture would agree, which is what makes the check safe to skip
+        let same = others.iter().find(|sh| sh.pps_id == first.pps_id && sh.nal.nal_type == first.nal.nal_type);
+        if let Some(same) = same {
+            assert!(super::hevc_same_picture(&first, same), "two segments of one picture agree");
+        }
+    }
+
+    /// An H.264 stream whose encoder actually uses weighted prediction (`weightp=1`), so the slice
+    /// records carry real weights: the plain fixture's picture parameter set allows weighted
+    /// prediction but its P slices do not use it, which would leave the tables empty and the test
+    /// above vacuous.
+    fn h264_weighted() -> Option<(NalStreamInfo, super::H264Sets, Vec<Vec<u8>>)> {
+        let ff = filmcraft_testkit::require_ffmpeg!(None);
+        let path = filmcraft_testkit::fixtures::generate(&fixture("h264_weighted.mp4"), |tmp| {
+            let args = [
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=640x360:r=24:d=1",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "main",
+                "-preset",
+                "fast",
+                "-x264-params",
+                "bframes=0:weightp=1:weightb=0:keyint=24:min-keyint=24:scenecut=0",
+                "-pix_fmt",
+                "yuv420p",
+            ];
+            run(&ff, &args, tmp)
+        })?;
+        let (info, samples) = read(&path);
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let sets = super::H264Sets::parse(&info).unwrap_or_else(|e| panic!("{e}"));
+        Some((info, sets, samples))
+    }
+
     /// [`hevc`]: the fixture's description, its parameter sets as [`build_nal`] parses them, and its
     /// samples in decoding order.
     fn hevc() -> Option<(NalStreamInfo, super::HevcSets, Vec<Vec<u8>>)> {
@@ -1316,7 +1617,11 @@ mod tests {
             "the collocated index, or 0xFF with temporal MVP off"
         );
         assert_eq!(r.num_entry_point_offsets as usize, sh.entry_points.len(), "num_entry_point_offsets");
-        assert_eq!(r.slice_data_num_emu_prevn_bytes as usize, super::emu_prevention_bytes(nal), "the header's emulation prevention bytes");
+        assert_eq!(
+            r.slice_data_num_emu_prevn_bytes as usize,
+            emu_count(&nal[2..2 + sh.data_offset]),
+            "the slice header's own emulation prevention bytes, counted here and not by the module"
+        );
         assert_eq!(r.slice_data_size, slice.length);
         assert_eq!(r.slice_data_offset, slice.offset);
         assert_eq!(r.slice_data_flag, crate::vaapi::ffi::SLICE_DATA_FLAG_ALL);
@@ -1405,16 +1710,23 @@ mod tests {
         assert!(p.slice_offsets.windows(2).all(|w| w[0] < w[1]), "the offsets run in slice order: {:?}", p.slice_offsets);
     }
 
-    /// VP9 and AV1 are planned and offered by a driver, but their records need a per-frame header
-    /// FilmCraft does not expose, so they are declined with a reason rather than zeroed.
+    /// VP9 and AV1 need a per-frame header FilmCraft does not expose, so no record is built for them
+    /// and the reason is named rather than a record of zeros handed over. `plan_frame` is where the
+    /// decision is made; this is the backstop for a caller that skips it, and the two say the same
+    /// thing.
     #[test]
     fn frame_codecs_are_declined_until_their_frame_headers_are_public() {
         for codec in [FrameCodec::Vp9, FrameCodec::Av1] {
             let info = FrameStreamInfo::for_tests(codec, 0, 8, (1, 1), (1920, 1080));
             let e = super::build_frame(&info, &[0x9d, 0x01, 0x2a]).expect_err("a frame codec with no record built yet");
             assert!(e.contains("frame header"), "{codec:?}: {e}");
+            assert!(e.contains(super::FRAME_HEADER_MISSING), "{codec:?}: {e}");
             // an empty sample is declined too, and never reaches a parser
             assert!(super::build_frame(&info, &[]).is_err(), "{codec:?}");
+            // and `plan_frame` declines the same stream with the same reason, in the same words
+            let planned = crate::vaapi::stream::plan_frame(&info).expect_err("plan_frame declines every frame codec");
+            assert!(planned.contains(super::FRAME_HEADER_MISSING), "{codec:?}: {planned}");
+            assert!(planned.contains(if codec == FrameCodec::Vp9 { "filmcraft-vp9" } else { "filmcraft-av1" }), "{codec:?}: {planned}");
         }
     }
 
@@ -1470,6 +1782,12 @@ mod tests {
     fn hevc_stream() -> Option<(Result<NalStreamInfo, String>, Vec<Vec<u8>>)> {
         let ff = filmcraft_testkit::require_ffmpeg!(None);
         let path = filmcraft_testkit::fixtures::generate(&fixture("hevc_main.mp4"), |tmp| {
+            // The plain source is what the emulation-prevention test needs: x265's residual data
+            // for `testsrc2` contains `00 00 03` in several pictures, so a header-scoped count and
+            // a whole-NAL one really differ. (`noise`, tried for the same reason, breaks up the zero
+            // runs and removes them again.) This x265 build refuses the tile and wavefront options
+            // through `-x265-params`, so the pictures are single-segment; see
+            // `the_emulation_prevention_count_is_the_slice_headers`.
             let args = [
                 "-f",
                 "lavfi",

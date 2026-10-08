@@ -113,8 +113,20 @@ pub fn plan_nal(info: &NalStreamInfo) -> Result<Plan, String> {
     Ok(Plan { profile, entrypoint: Entrypoint::Vld, format, size: info.coded })
 }
 
-/// What the driver needs for a VP9 / AV1 stream, or why it is declined: 4:2:0 only, 8-bit or
-/// 10-bit, VP9 profiles 0 and 2 (at their own depth) and AV1 main profile.
+/// What the driver needs for a VP9 / AV1 stream, or why it is declined.
+///
+/// **Every frame-coded stream is declined in this milestone.** VP9 and AV1 carry their picture
+/// structure in each frame's own uncompressed header, and libva wants that header as a record
+/// (`VADecPictureParameterBufferVP9` / `VADecPictureParameterBufferAV1`); `build_frame` in
+/// `super::picture` builds neither, because `filmcraft_vp9` and `filmcraft_av1` expose only a key
+/// frame's stream parameters and the AV1 sequence header, not the per-frame header a record needs.
+/// A record of invented values would be one a driver reads as a valid picture.
+///
+/// Declining here rather than at the first frame is the point: a stream that cannot be described is
+/// refused while it is still a stream description, so the caller sees "this machine cannot take that
+/// stream" and takes the software decoder, rather than a mid-stream failure once a context exists.
+/// The table below is what would be planned once the records exist — chroma format, depth and profile
+/// — and its checks stay live, so adding the records is a matter of deleting the decline.
 pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
     if info.mono || info.subsampling != (1, 1) {
         return Err(format!("chroma subsampling {:?}{}", info.subsampling, if info.mono { " (monochrome)" } else { "" }));
@@ -125,6 +137,9 @@ pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
     if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
         return Err(format!("picture size {w}x{h}"));
     }
+    // The profile and format this stream would be planned into. Resolved before the decline so that
+    // a profile or depth this backend would not take is still reported as the reason, and so that the
+    // decline names what was on offer.
     let (profile, format) = match (info.codec, info.profile, info.bit_depth) {
         // the two VP9 profiles a VA-API driver decodes, each at its own depth
         (FrameCodec::Vp9, 0, 8) => (Profile::Vp9(0), RtFormat::Nv12),
@@ -135,7 +150,18 @@ pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
         (FrameCodec::Av1, 0, 10) => (Profile::Av1Main, RtFormat::Yuv420_10),
         (FrameCodec::Av1, p, b) => return Err(format!("AV1 profile {p} at {b} bits")),
     };
-    Ok(Plan { profile, entrypoint: Entrypoint::Vld, format, size: info.size })
+    Err(match info.codec {
+        FrameCodec::Vp9 => format!(
+            "VP9 picture parameters, which would be planned as {profile:?} at {format:?} in {} bits: filmcraft-vp9 {}",
+            info.bit_depth,
+            super::picture::FRAME_HEADER_MISSING
+        ),
+        FrameCodec::Av1 => format!(
+            "AV1 picture parameters, which would be planned as {profile:?} at {format:?} in {} bits: filmcraft-av1 {}",
+            info.bit_depth,
+            super::picture::FRAME_HEADER_MISSING
+        ),
+    })
 }
 
 /// Whether this driver really decodes `plan`: it lists the profile, and it lists the video decoder
@@ -280,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn takes_the_four_codecs_at_8_and_10_bit() {
+    fn takes_the_two_nal_codecs_at_8_and_10_bit() {
         for (codec, profile, ten) in [(NalCodec::H264, 66u8, false), (NalCodec::H264, 100, false), (NalCodec::Hevc, 1, false), (NalCodec::Hevc, 2, true)] {
             let p = plan_nal(&nal(codec, profile, if ten { 10 } else { 8 }, 1)).unwrap_or_else(|e| panic!("{codec:?} {profile} {ten}: {e}"));
             assert_eq!(p.entrypoint, Entrypoint::Vld);
@@ -289,23 +315,44 @@ mod tests {
         // 10-bit H.264 is the one depth this backend declines (see `plan_nal`): libva names it
         // `VAProfileH264High10`, which `Profile` does not carry, so there is nothing to verify.
         assert!(plan_nal(&nal(NalCodec::H264, 100, 10, 1)).is_err(), "10-bit H.264 High");
+    }
+
+    /// A frame-coded stream is declined while it is still a description, not at its first frame: the
+    /// picture parameter records `build_frame` would need cannot be built, because neither codec
+    /// exposes its per-frame header. Every profile and depth this backend would otherwise take is
+    /// declined with that reason, and a stream that would be declined anyway is reported as such.
+    #[test]
+    fn every_frame_codec_is_declined_before_a_context_exists() {
         // `for_tests` is the crate's own hand-built description (hw_frame.rs:195)
-        for (profile, bits) in [(0u8, 8u32), (2, 10)] {
-            assert!(plan_frame(&FrameStreamInfo::for_tests(FrameCodec::Vp9, profile, bits, (1, 1), (1920, 1080))).is_ok(), "VP9 profile {profile} at {bits}");
-        }
-        for bits in [8u32, 10] {
-            assert!(plan_frame(&FrameStreamInfo::for_tests(FrameCodec::Av1, 0, bits, (1, 1), (1920, 1080))).is_ok(), "AV1 profile 0 at {bits}");
+        for (codec, profile, bits) in [(FrameCodec::Vp9, 0u8, 8u32), (FrameCodec::Vp9, 2, 10), (FrameCodec::Av1, 0, 8), (FrameCodec::Av1, 0, 10)] {
+            let info = FrameStreamInfo::for_tests(codec, profile, bits, (1, 1), (1920, 1080));
+            let e = plan_frame(&info).expect_err("{codec:?} profile {profile} at {bits} is declined");
+            assert!(e.contains("frame header"), "{codec:?} profile {profile} at {bits}: {e}");
+            assert!(e.contains(crate::vaapi::picture::FRAME_HEADER_MISSING), "{codec:?} profile {profile} at {bits}: {e}");
+            // and the same stream through `Stream::plan`, which is what a decoder actually calls
+            assert!(Stream::from(info).plan().is_err(), "{codec:?} through Stream::plan");
         }
     }
 
+    /// A stream this backend would not take anyway is declined as *that*, not with the frame-header
+    /// reason: the table that would apply once the records exist stays live under the decline, so a
+    /// 4:4:4 or a profile 2 VP9 stream is told the truth about itself.
     #[test]
-    fn declines_frame_codecs_vaapi_does_not_take() {
-        // 4:2:0 is taken; the profiles and chroma formats below it are not (monochrome is in the next test)
-        assert!(plan_frame(&FrameStreamInfo::for_tests(FrameCodec::Vp9, 0, 8, (1, 1), (1920, 1080))).is_ok(), "4:2:0 VP9 is taken");
-        assert!(plan_frame(&FrameStreamInfo::for_tests(FrameCodec::Av1, 1, 8, (1, 1), (1920, 1080))).is_err(), "AV1 profile 1");
-        assert!(plan_frame(&FrameStreamInfo::for_tests(FrameCodec::Vp9, 1, 8, (1, 1), (1920, 1080))).is_err(), "VP9 profile 1 at 8 bits");
-        assert!(plan_frame(&FrameStreamInfo::for_tests(FrameCodec::Vp9, 0, 12, (1, 1), (1920, 1080))).is_err(), "VP9 profile 0 at 12 bits");
-        assert!(plan_frame(&FrameStreamInfo::for_tests(FrameCodec::Av1, 0, 8, (0, 0), (1920, 1080))).is_err(), "4:4:4");
+    fn declines_frame_codecs_vaapi_would_not_take_anyway() {
+        for (codec, profile, bits, why) in [
+            (FrameCodec::Av1, 1u8, 8u32, "AV1 profile 1"),
+            (FrameCodec::Vp9, 1, 8, "VP9 profile 1 at 8 bits"),
+            (FrameCodec::Vp9, 0, 12, "VP9 profile 0 at 12 bits"),
+        ] {
+            let info = FrameStreamInfo::for_tests(codec, profile, bits, (1, 1), (1920, 1080));
+            let e = plan_frame(&info).expect_err("{why}");
+            assert!(e.starts_with(why), "{why}: {e}");
+        }
+        // and the chroma formats below 4:2:0, which are refused before the profile is looked at
+        for (codec, subsampling) in [(FrameCodec::Av1, (0u8, 0u8)), (FrameCodec::Vp9, (1, 0))] {
+            let info = FrameStreamInfo::for_tests(codec, 0, 8, subsampling, (1920, 1080));
+            assert!(plan_frame(&info).expect_err("{subsampling:?}").starts_with("chroma subsampling"), "{subsampling:?}");
+        }
     }
 
     #[test]
@@ -377,26 +424,33 @@ mod tests {
         }
     }
 
-    /// Every profile a frame plan is for, the format the picture is created in, and the size: a
-    /// VA-API surface is allocated at the coded size and cropped on readback.
+    /// The profile and format each frame profile *would* be planned as, which the decline names and
+    /// `every_frame_codec_is_declined_before_a_context_exists` checks, plus the size bound that
+    /// applies to a frame stream whatever its profile: a VA-API surface is allocated at that size
+    /// and cropped on readback, so `MAX_SIDE` bounds it.
     #[test]
-    fn the_frame_profiles_map_to_the_ones_a_vaapi_driver_lists() {
-        for (p, bits, profile, format) in [(0u8, 8u32, Profile::Vp9(0), RtFormat::Nv12), (2, 10, Profile::Vp9(2), RtFormat::Yuv420_10)] {
-            let plan = plan_frame(&frame(FrameCodec::Vp9, p, bits, (1, 1))).unwrap();
-            assert_eq!(
-                (plan.profile, plan.format, plan.entrypoint, plan.size),
-                (profile, format, Entrypoint::Vld, (1920, 1080)),
-                "VP9 profile {p} at {bits} bits"
-            );
+    fn the_frame_profile_table_survives_the_decline() {
+        for (codec, p, bits, profile, format) in [
+            (FrameCodec::Vp9, 0u8, 8u32, Profile::Vp9(0), RtFormat::Nv12),
+            (FrameCodec::Vp9, 2, 10, Profile::Vp9(2), RtFormat::Yuv420_10),
+            (FrameCodec::Av1, 0, 8, Profile::Av1Main, RtFormat::Nv12),
+            (FrameCodec::Av1, 0, 10, Profile::Av1Main, RtFormat::Yuv420_10),
+        ] {
+            let e = plan_frame(&frame(codec, p, bits, (1, 1))).expect_err("{codec:?} profile {p} at {bits}");
+            assert!(e.contains(&format!("{profile:?}")), "{codec:?} profile {p} at {bits} would be planned as {profile:?}: {e}");
+            assert!(e.contains(&format!("{format:?}")), "{codec:?} profile {p} at {bits} would use {format:?}: {e}");
+            assert!(e.contains(&format!("{bits} bits")), "{codec:?} profile {p} at {bits}: {e}");
         }
-        for (bits, format) in [(8u32, RtFormat::Nv12), (10, RtFormat::Yuv420_10)] {
-            let plan = plan_frame(&frame(FrameCodec::Av1, 0, bits, (1, 1))).unwrap();
-            assert_eq!((plan.profile, plan.format, plan.entrypoint), (Profile::Av1Main, format, Entrypoint::Vld), "AV1 profile 0 at {bits} bits");
-        }
-        // a picture of exactly MAX_SIDE is the largest one taken, and it is what `Plan.size` carries
+        // and the size bound still applies to a frame stream, which is what bounds a surface
         let mut big = frame(FrameCodec::Vp9, 0, 8, (1, 1));
         big.size = (MAX_SIDE, MAX_SIDE);
-        assert_eq!(plan_frame(&big).unwrap().size, (MAX_SIDE, MAX_SIDE));
+        assert!(
+            plan_frame(&big).expect_err("{MAX_SIDE} is declined like any other size in bounds").contains("picture parameters"),
+            "MAX_SIDE is within the bounds, so only the decline stops it"
+        );
+        let mut huge = frame(FrameCodec::Vp9, 0, 8, (1, 1));
+        huge.size = (MAX_SIDE + 1, MAX_SIDE);
+        assert!(plan_frame(&huge).expect_err("an oversized stream").starts_with("picture size"), "an oversized frame stream is still refused on its size");
     }
 
     #[test]
@@ -414,16 +468,13 @@ mod tests {
 
     #[test]
     fn declines_monochrome_and_absurd_frame_pictures() {
-        for ss in [(1, 0), (0, 0)] {
-            assert!(plan_frame(&frame(FrameCodec::Vp9, 0, 8, ss)).is_err(), "4:2:2 or 4:4:4 VP9 is {ss:?}");
-        }
         let mut mono = frame(FrameCodec::Av1, 0, 8, (1, 1));
         mono.mono = true;
-        assert!(plan_frame(&mono).is_err(), "monochrome");
+        assert!(plan_frame(&mono).expect_err("monochrome").starts_with("chroma subsampling"), "monochrome");
         for size in [(0, 1080), (1920, 0), (9000, 1080), (1920, 9000)] {
             let mut i = frame(FrameCodec::Vp9, 0, 8, (1, 1));
             i.size = size;
-            assert!(plan_frame(&i).is_err(), "{size:?}");
+            assert!(plan_frame(&i).expect_err("{size:?}").starts_with("picture size"), "{size:?}");
         }
     }
 
@@ -475,18 +526,10 @@ mod tests {
             eprintln!("SKIPPED: no VA display");
             return;
         };
-        // Every profile this backend can plan (`plan_nal` / `plan_frame`), so the check is asked
-        // about each one the driver names rather than about one arbitrary profile.
-        let ours = [
-            Profile::H264ConstrainedBaseline,
-            Profile::H264Main,
-            Profile::H264High,
-            Profile::HevcMain,
-            Profile::HevcMain10,
-            Profile::Vp9(0),
-            Profile::Vp9(2),
-            Profile::Av1Main,
-        ];
+        // Every profile this backend can plan (`plan_nal`), so the check is asked about each one the driver
+        // names rather than about one arbitrary profile. The frame profiles are absent because
+        // `plan_frame` declines them all: nothing plans them, so nothing asks a driver about them.
+        let ours = [Profile::H264ConstrainedBaseline, Profile::H264Main, Profile::H264High, Profile::HevcMain, Profile::HevcMain10];
         let reported = d.profiles().expect("vaQueryConfigProfiles");
         let planned: Vec<Profile> = ours.iter().copied().filter(|p| reported.contains(p)).collect();
         if planned.is_empty() {

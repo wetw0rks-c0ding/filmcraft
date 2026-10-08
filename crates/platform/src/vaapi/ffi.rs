@@ -260,6 +260,14 @@ pub struct VaImage {
 // (`num_slice_groups_minus1`, `tg_start`, …), because a renamed field is one the next reader has
 // to look up and one a declaration fix has to match against the header.
 //
+// Where the C layout has a hole between two fields — alignment padding a C compiler inserts — the
+// Rust declaration names it `padding_*` and gives it a width, which is the same thing libva does with
+// its own `va_reserved` fields. Naming every byte matters here: `#[derive(Default)]` does not
+// initialise implicit padding, so a record with unnamed padding would have indeterminate bytes and
+// `record_bytes` could not hand them to a driver as a `[u8]`. With the holes named, every byte of a
+// record is a field, and every field is initialised. The widths are pinned with the rest of the
+// layout by `the_picture_parameter_records_match_the_header`.
+//
 // Sizes and offsets are libva 2.24's own (`va.h:3572` and `va_dec_hevc.h:57`), pinned by
 // `the_picture_parameter_records_match_the_header`.
 // ---------------------------------------------------------------------------------------------
@@ -297,6 +305,8 @@ pub struct VaPictureParameterBufferH264 {
     pub bit_depth_chroma_minus8: u8,
     /// How many entries of `reference_frames` are valid.
     pub num_ref_frames: u8,
+    /// The C layout's hole at offset 619, before `seq_fields`.
+    pub padding_after_num_ref_frames: [u8; 1],
     /// `seq_fields`: the sequence parameter set's flags, packed into the union's `value` member.
     pub seq_fields: u32,
     /// FMO is not supported, so these stay at what the picture parameter set says and the
@@ -313,6 +323,8 @@ pub struct VaPictureParameterBufferH264 {
     pub pic_fields: u32,
     /// `frame_num` of the first slice of the picture.
     pub frame_num: u16,
+    /// The C layout's hole at offsets 638-639, before `va_reserved`.
+    pub padding_after_frame_num: [u8; 2],
     pub va_reserved: [u32; VA_PADDING_MEDIUM],
 }
 
@@ -340,22 +352,34 @@ pub struct VaSliceParameterBufferH264 {
     pub disable_deblocking_filter_idc: u8,
     pub slice_alpha_c0_offset_div2: i8,
     pub slice_beta_offset_div2: i8,
+    /// The C layout's hole at offsets 25-27, before `RefPicList0[]`.
+    pub padding_before_ref_pic_list0: [u8; 3],
     pub ref_pic_list0: [VaPictureH264; 32],
     pub ref_pic_list1: [VaPictureH264; 32],
     pub luma_log2_weight_denom: u8,
     pub chroma_log2_weight_denom: u8,
     pub luma_weight_l0_flag: u8,
+    /// The C layout's hole at offset 2335, before `luma_weight_l0[]`.
+    pub padding_before_luma_weight_l0: [u8; 1],
     pub luma_weight_l0: [i16; 32],
     pub luma_offset_l0: [i16; 32],
     pub chroma_weight_l0_flag: u8,
+    /// The C layout's hole at offset 2465, before `chroma_weight_l0[][]`.
+    pub padding_before_chroma_weight_l0: [u8; 1],
     pub chroma_weight_l0: [[i16; 2]; 32],
     pub chroma_offset_l0: [[i16; 2]; 32],
     pub luma_weight_l1_flag: u8,
+    /// The C layout's hole at offset 2723, before `luma_weight_l1[]`.
+    pub padding_before_luma_weight_l1: [u8; 1],
     pub luma_weight_l1: [i16; 32],
     pub luma_offset_l1: [i16; 32],
     pub chroma_weight_l1_flag: u8,
+    /// The C layout's hole at offset 2853, before `chroma_weight_l1[][]`.
+    pub padding_before_chroma_weight_l1: [u8; 1],
     pub chroma_weight_l1: [[i16; 2]; 32],
     pub chroma_offset_l1: [[i16; 2]; 32],
+    /// The C layout's hole at offsets 3110-3111, before `va_reserved`.
+    pub padding_before_va_reserved: [u8; 2],
     pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
@@ -435,6 +459,8 @@ pub struct VaSliceParameterBufferHevc {
     pub slice_segment_address: u32,
     /// Indices into `reference_frames`; `0xFF` marks an entry the picture does not use.
     pub ref_pic_list: [[u8; 15]; 2],
+    /// The C layout's hole at offsets 50-51, before `LongSliceFlags`.
+    pub padding_before_long_slice_flags: [u8; 2],
     /// `LongSliceFlags`: the slice header's own syntax elements, packed into the union's `value`
     /// member.
     pub long_slice_flags: u32,
@@ -458,11 +484,15 @@ pub struct VaSliceParameterBufferHevc {
     pub delta_chroma_weight_l1: [[i8; 2]; 15],
     pub chroma_offset_l1: [[i8; 2]; 15],
     pub five_minus_max_num_merge_cand: u8,
+    /// The C layout's hole at offset 247, before `num_entry_point_offsets`.
+    pub padding_before_num_entry_point_offsets: [u8; 1],
     pub num_entry_point_offsets: u16,
     pub entry_offset_to_subset_array: u16,
     /// Emulation prevention bytes in this slice header, which is what the entry point offsets and
     /// `slice_data_byte_offset` are counted without.
     pub slice_data_num_emu_prevn_bytes: u16,
+    /// The C layout's hole at offsets 254-255, before `va_reserved`.
+    pub padding_before_va_reserved: [u8; 2],
     pub va_reserved: [u32; VA_PADDING_LOW - 2],
 }
 
@@ -493,13 +523,16 @@ unsafe fn record_of<T: Default + Copy>(bytes: &[u8]) -> Option<T> {
 /// The bytes of a record: exactly the bytes the driver reads, at the same addresses they land at
 /// when a buffer is made from them.
 ///
-/// Safe because a record is a plain `#[repr(C)]` value with no padding requirements beyond what the
-/// C declaration imposes, so any `size_of::<T>()` of its bytes are a valid `[u8]` of that length.
-/// `record` is borrowed for the copy and nothing is read back through a pointer.
+/// Safe because a record is a plain `#[repr(C)]` value whose every byte is a named field: the holes
+/// the C layout has between fields are declared as `padding_*` fields here (see the note above this
+/// file's structures), so `Default` initialises all of them and a record of one has no indeterminate
+/// byte anywhere. `record` is borrowed for the copy and nothing is read back through a pointer.
 pub fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
     // SAFETY: `record` is a live `T` borrowed for the length of this function and is at least
     // `size_of::<T>()` bytes of readable memory, so the slice stays inside it and outlives nothing;
-    // `T: Copy` means the value owns nothing the bytes could outlive.
+    // `T: Copy` means the value owns nothing the bytes could outlive; and every byte of a `T` is an
+    // initialised field — the records' alignment holes are named `padding_*` fields, which
+    // `#[derive(Default)]` zeroes — so the `&[u8]` never covers uninitialised memory.
     unsafe { std::slice::from_raw_parts(std::ptr::from_ref(record).cast::<u8>(), size_of::<T>()) }.to_vec()
 }
 
@@ -1183,6 +1216,7 @@ mod tests {
         assert_eq!(offset_of!(VaPictureParameterBufferH264, picture_height_in_mbs_minus1), 614);
         assert_eq!(offset_of!(VaPictureParameterBufferH264, bit_depth_luma_minus8), 616);
         assert_eq!(offset_of!(VaPictureParameterBufferH264, num_ref_frames), 618);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, padding_after_num_ref_frames), 619, "the C layout's hole before seq_fields");
         assert_eq!(offset_of!(VaPictureParameterBufferH264, seq_fields), 620);
         assert_eq!(offset_of!(VaPictureParameterBufferH264, num_slice_groups_minus1), 624);
         assert_eq!(offset_of!(VaPictureParameterBufferH264, slice_group_change_rate_minus1), 626);
@@ -1190,20 +1224,26 @@ mod tests {
         assert_eq!(offset_of!(VaPictureParameterBufferH264, second_chroma_qp_index_offset), 631);
         assert_eq!(offset_of!(VaPictureParameterBufferH264, pic_fields), 632);
         assert_eq!(offset_of!(VaPictureParameterBufferH264, frame_num), 636);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, padding_after_frame_num), 638, "the C layout's hole before va_reserved");
         assert_eq!(offset_of!(VaPictureParameterBufferH264, va_reserved), 640);
         assert_eq!(size_of::<VaSliceParameterBufferH264>(), 3128, "VASliceParameterBufferH264 (va.h:3664)");
         assert_eq!(offset_of!(VaSliceParameterBufferH264, slice_data_bit_offset), 12);
         assert_eq!(offset_of!(VaSliceParameterBufferH264, first_mb_in_slice), 14);
         assert_eq!(offset_of!(VaSliceParameterBufferH264, slice_type), 16);
         assert_eq!(offset_of!(VaSliceParameterBufferH264, slice_beta_offset_div2), 24);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, padding_before_ref_pic_list0), 25, "the C layout's hole before RefPicList0[]");
         assert_eq!(offset_of!(VaSliceParameterBufferH264, ref_pic_list0), 28);
         assert_eq!(offset_of!(VaSliceParameterBufferH264, ref_pic_list1), 1180);
         assert_eq!(offset_of!(VaSliceParameterBufferH264, luma_log2_weight_denom), 2332);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, padding_before_luma_weight_l0), 2335, "the hole before luma_weight_l0[]");
         assert_eq!(offset_of!(VaSliceParameterBufferH264, luma_offset_l0), 2400);
         assert_eq!(offset_of!(VaSliceParameterBufferH264, chroma_weight_l0_flag), 2464);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, padding_before_chroma_weight_l0), 2465, "the hole before chroma_weight_l0[][]");
         assert_eq!(offset_of!(VaSliceParameterBufferH264, chroma_offset_l0), 2594);
         assert_eq!(offset_of!(VaSliceParameterBufferH264, luma_weight_l1_flag), 2722);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, padding_before_luma_weight_l1), 2723, "the hole before luma_weight_l1[]");
         assert_eq!(offset_of!(VaSliceParameterBufferH264, chroma_offset_l1), 2982);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, padding_before_va_reserved), 3110, "the hole before va_reserved");
         assert_eq!(offset_of!(VaSliceParameterBufferH264, va_reserved), 3112);
         // HEVC (va.h:5292, va_dec_hevc.h:57-479)
         assert_eq!(size_of::<VaPictureHevc>(), 28, "VAPictureHEVC (va.h:5292)");
@@ -1230,6 +1270,7 @@ mod tests {
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_data_byte_offset), 12);
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_segment_address), 16);
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, ref_pic_list), 20);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, padding_before_long_slice_flags), 50, "the C layout's hole before LongSliceFlags");
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, long_slice_flags), 52);
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, collocated_ref_idx), 56);
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_qp_delta), 59);
@@ -1237,8 +1278,35 @@ mod tests {
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, luma_log2_weight_denom), 64);
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, chroma_offset_l1), 216);
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, five_minus_max_num_merge_cand), 246);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, padding_before_num_entry_point_offsets), 247, "the hole before num_entry_point_offsets");
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_data_num_emu_prevn_bytes), 252);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, padding_before_va_reserved), 254, "the hole before va_reserved");
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, va_reserved), 256);
+    }
+
+    /// Every byte of a record is a named field, so no byte of a default record is indeterminate —
+    /// which is what lets `record_bytes` hand them to a driver as a `&[u8]`. The C layout's
+    /// alignment holes are declared as `padding_*` fields; this checks that every default record is
+    /// all zeroes, so a field added without a value, or a padding field that stopped being one,
+    /// shows up here.
+    #[test]
+    fn a_default_record_is_every_byte_zero() {
+        for bytes in [
+            record_bytes(&VaPictureH264::default()),
+            record_bytes(&VaPictureParameterBufferH264::default()),
+            record_bytes(&VaSliceParameterBufferH264::default()),
+            record_bytes(&VaPictureHevc::default()),
+            record_bytes(&VaPictureParameterBufferHevc::default()),
+            record_bytes(&VaSliceParameterBufferHevc::default()),
+        ] {
+            assert!(!bytes.is_empty());
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "a default record has a non-zero byte: {} of {}",
+                bytes.iter().position(|&b| b != 0).unwrap_or(0),
+                bytes.len()
+            );
+        }
     }
 
     /// A record read back out of the bytes `picture.rs` built is the same record it built, and a
