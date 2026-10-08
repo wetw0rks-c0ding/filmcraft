@@ -59,7 +59,9 @@ impl From<FrameStreamInfo> for Stream {
 }
 
 /// What the driver needs for an `avcC` / `hvcC` stream, or why it is declined: 4:2:0 progressive,
-/// 8-bit H.264 in one of the profiles a VA-API decoder is configured for, or 10-bit HEVC Main 10.
+/// 8 or 10 bits — H.264 at 8 bits in `profile_idc` 66 (Baseline), 77 (Main) or 100 (High), and HEVC
+/// at 8 bits in 1 (Main) or 3 (Main Still Picture), or at 10 bits in 2 (Main 10). Nothing else, and
+/// the profile arms below are what say why: 10-bit H.264 included.
 pub fn plan_nal(info: &NalStreamInfo) -> Result<Plan, String> {
     if info.interlaced {
         return Err("field-coded video".into());
@@ -345,8 +347,10 @@ mod tests {
         assert_eq!(plan_nal(&big).unwrap().size, (MAX_SIDE, MAX_SIDE), "a coded picture of exactly MAX_SIDE is taken");
     }
 
-    /// Every profile the mapping accepts, and the depth it takes it at: libva names one profile
-    /// per codec profile, so this is the table a driver is asked against.
+    /// The whole table, not only what it accepts: every profile the mapping takes and the depth it
+    /// takes it at, and the depth each one is refused at. libva names more profiles than a codec has
+    /// `profile_idc` values (`VAProfileH264High10` is one we do not carry), so this table is what
+    /// this backend asks a driver about, not what libva has.
     #[test]
     fn the_nal_profiles_map_to_the_ones_a_vaapi_driver_lists() {
         for (p, profile) in [(66u8, Profile::H264ConstrainedBaseline), (77, Profile::H264Main), (100, Profile::H264High)] {
