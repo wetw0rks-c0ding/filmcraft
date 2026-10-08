@@ -201,7 +201,7 @@ playback with no dropped frames at Full, 1/2 and 1/4. Details in
 
 Zero-copy upload of decoded pictures into wgpu textures (`CVPixelBuffer`s on macOS, Direct3D 11
 textures on Windows, libva surfaces on Linux); B-frames and 10-bit / HDR HEVC (Main 10) in hardware
-encoding; VP9 and AV1 decoding on Linux (their picture-parameter records are not built yet, so
-`vaapi/stream.rs` declines every frame-coded stream); field-coded H.264; HEVC, 10-bit and HDR
-encoding with NVENC, and encoders from other vendors on Windows (through Media Foundation);
+encoding; VP9 and AV1 decoding on Linux (neither codec exposes the per-frame header libva wants as a
+record, so `vaapi/stream.rs` declines every frame-coded stream); field-coded H.264; HEVC, 10-bit and
+HDR encoding with NVENC, and encoders from other vendors on Windows (through Media Foundation);
 VP9 / AV1 4:4:4 and 12-bit on Windows.

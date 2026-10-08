@@ -76,11 +76,17 @@ fn auto_uses_the_vaapi_decoder() {
     let s = read_stream(&path);
     filmcraft_platform::register();
     filmcraft_codecs::hw::set_hardware_decoding(true);
-    let Some(Ok(d)) = filmcraft_platform::vaapi_factory(&s.entry) else {
-        eprintln!("SKIPPED: no VA-API decoder for {}", s.entry.codec.name());
-        return;
+    let d = match filmcraft_platform::vaapi_factory(&s.entry) {
+        Some(Ok(d)) => d,
+        None => {
+            eprintln!("SKIPPED: no VA-API decoder for {}", s.entry.codec.name());
+            return;
+        }
+        // A factory that hands back a decoder it could not build is a failure, not a machine without
+        // one, and must not pass as the skip above.
+        Some(Err(e)) => panic!("the VA-API factory failed for {} video: {e}", s.entry.codec.name()),
     };
-    assert!(d.name().starts_with("VA-API"), "{}", d.name());
+    assert_eq!(d.name(), "VA-API H.264", "the H.264 fixture is decoded as H.264");
 
     // and Off still gives FilmCraft's own decoder
     filmcraft_codecs::hw::set_hardware_decoding(false);

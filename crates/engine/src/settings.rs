@@ -955,7 +955,7 @@ static CATEGORIES: &[Category] = &[
             b("playback.draftDecode", "Draft decoding at reduced playback resolution (H.264: faster, some frames less filtered)", true),
             f("playback.hardwareDecoding", "Hardware decoding", Kind::Choice(HW_DECODE), true),
             Row::Note(
-                "Hardware decoding: Auto uses the system's video decoder (VideoToolbox on macOS) for the H.264 and HEVC streams it supports, and FilmCraft's own decoder for everything else or if the hardware fails. Media that is already open keeps its decoder until it is reopened.",
+                "Hardware decoding: Auto uses the system's video decoder (VideoToolbox on macOS, Media Foundation on Windows, VA-API on Linux) for the H.264 and HEVC streams it supports, and FilmCraft's own decoder for everything else or if the hardware fails. Media that is already open keeps its decoder until it is reopened.",
             ),
         ],
     },

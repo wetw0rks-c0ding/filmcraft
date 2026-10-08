@@ -63,7 +63,7 @@ impl From<FrameStreamInfo> for Stream {
 ///
 /// The same helper the Windows backend has, for the same two callers (the factory in front of our
 /// decoders, and the diagnostics that ask what this machine can decode): a frame-coded entry is
-/// recognised here even though [`plan_frame`] declines every one of them, so that the recognition
+/// recognised here even though `plan_frame` declines every one of them, so that the recognition
 /// and the decline cannot drift apart.
 pub fn stream_info(entry: &filmcraft_isobmff::SampleEntry) -> Option<StreamInfo> {
     match NalStreamInfo::from_entry(entry) {

@@ -33,11 +33,13 @@ mod picture;
 mod decoder;
 
 pub use decoder::{Timings, VaDecoder};
-// What a caller outside this module needs to build a decoder and to ask what this machine has:
-// the display (the initialised libva connection), the stream description (which converts straight
-// into [`VaDecoder::new`]), the two diagnostics functions, and the record builder for a frame-coded
-// sample — which every frame codec is declined before it can reach, and which is public so that the
-// decline and the builder cannot drift apart (see `picture::build_frame`).
+// What a caller outside this module needs to build a decoder: [`Display`] is the initialised libva
+// connection a session is created on; [`stream_info`] reads a sample entry into the codec-agnostic
+// `StreamInfo` the rest of the workspace speaks, and [`Stream`] is this backend's own view of a
+// stream — a `StreamInfo` converts into it (`impl From<StreamInfo> for Stream`), so [`VaDecoder::new`]
+// takes either; and [`build_frame`] builds the picture-parameter record for a frame-coded sample,
+// which every frame codec is declined before it can reach, and which is public so that the decline
+// and the builder cannot drift apart (see `picture::build_frame`).
 pub use ffi::Display;
 pub use ffi::status;
 pub use picture::build_frame;
