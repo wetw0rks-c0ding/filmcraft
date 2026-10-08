@@ -899,9 +899,10 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         // the sample entry's sets, and this backend does not fold a sample's own in — so a stream
         // that changes its sequence parameter set mid-stream would be decoded with the quantizer,
         // the geometry and the whole reference-list layout of the *sample entry's* set, and nothing
-        // would say so: the pictures would simply come out wrong. `H264ParameterSets` is the fix, and
-        // until it lands a decline is the answer. (An MP4 sample entry carries its parameter sets in
-        // `avcC` and repeats them in-band only at a keyframe, so this is rare rather than usual.)
+        // would say so: the pictures would simply come out wrong. Folding a sample's own sets into
+        // `H264Sets` is the fix, and until that lands a decline is the answer. (An MP4 sample entry
+        // carries its parameter sets in `avcC` and repeats them in-band only at a keyframe, so this
+        // is rare rather than usual.)
         if matches!(hdr.nal_unit_type, 7 | 8) {
             return Err(format!("in-band parameter set (NAL type {}) in an access unit", hdr.nal_unit_type));
         }

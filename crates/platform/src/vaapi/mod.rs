@@ -59,8 +59,8 @@ pub fn available() -> bool {
 /// the declaration, because the declaration is not a bound the buffer respects — HEVC decides what
 /// stays a reference from each picture's own set, and consecutive sets can name more pictures between
 /// them than `sps_max_dec_pic_buffering_minus1` counts. A decoder's pool is therefore normally
-/// larger than what this reports, and `examples/vaprobe.rs` prints this number under "surfaces
-/// needed", which is about the stream and not about the decoder.
+/// larger than what this reports, and `examples/vaprobe.rs` prints this number under "decoded picture
+/// buffer declares", which is about the stream and not about the decoder.
 ///
 /// It is exposed on its own because it is answerable from a stream description alone, before any
 /// display is opened, so a caller can ask on a machine with no GPU at all.
