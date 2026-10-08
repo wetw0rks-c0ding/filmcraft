@@ -1392,20 +1392,36 @@ mod tests {
         i8::try_from(value).unwrap_or_else(|_| panic!("{value} does not fit the record's i8"))
     }
 
+    /// [`i8_of`], for the `i16` a prediction weight or offset is carried in.
+    fn i16_of(value: i32) -> i16 {
+        i16::try_from(value).unwrap_or_else(|_| panic!("{value} does not fit the record's i16"))
+    }
+
     /// The H.264 slice record's prediction weight tables come from the slice header's own
-    /// `pred_weight_table()`, entry by entry, rather than staying zeroed. A record that advertised
+    /// `pred_weight_table`, entry by entry, rather than staying zeroed. A record that advertised
     /// weighted prediction with an empty table would decode a different picture from the stream's,
-    /// so this fixture exists to carry real weights: `weightp=1` makes the encoder use weighted
-    /// prediction in its P slices, which are exactly the slices where the table is mandatory.
+    /// silently, which is the one answer this module never gives.
+    ///
+    /// The fixture matters as much as the fill — see [`h264_weighted`]. Both `*_flag` fields, both
+    /// denominators and every luma and chroma weight and offset are compared against the parsed
+    /// table, and the two floor assertions at the end are what stop the fixture going quietly
+    /// vacuous, which is the failure mode an encoder-side fixture really has.
+    ///
+    /// **What this does not cover: the L1 family.** `filmcraft_h264` parses a B slice's table only
+    /// for `weighted_bipred_idc == 1`, and no x264 option set produces that (it writes 2, explicit,
+    /// for `weightb=1`), so this fixture has no B slices and `luma_weight_l1` and its chroma family
+    /// are only checked for carrying nothing rather than carrying the right thing. The L1 fill is the
+    /// same loop over the other list; the HEVC fixture does exercise both of its lists, and this
+    /// task's report records the gap.
     #[test]
     fn the_h264_slice_record_carries_the_prediction_weights() {
         let Some((info, sets, samples)) = h264_weighted() else { return };
         let pps = sets.ppss.iter().flatten().next().unwrap_or_else(|| panic!("no PPS")).clone();
         assert!(pps.weighted_pred, "the fixture's PPS allows weighted prediction");
         let mut weighted = 0usize;
-        let mut checked = 0usize;
+        let mut explicit = 0usize;
         let mut poc = super::NalPoc::default();
-        for sample in samples.iter().take(6) {
+        for sample in &samples {
             let Ok(picture) = super::build_nal(&info, sample, &mut poc, 7, 40, 23) else { continue };
             let nals = info.nals(sample);
             for (slice, &at) in picture.slices.iter().zip(&picture.slice_offsets) {
@@ -1426,32 +1442,45 @@ mod tests {
                     continue;
                 };
                 weighted += 1;
-                checked += 1;
                 assert_eq!(u32::from(r.luma_log2_weight_denom), table.luma_log2_denom, "luma_log2_weight_denom");
                 assert_eq!(u32::from(r.chroma_log2_weight_denom), table.chroma_log2_denom, "chroma_log2_weight_denom");
-                assert_eq!(r.luma_weight_l0_flag, u8::from(table.l0.iter().any(|e| e.luma_flag)), "luma_weight_l0_flag");
-                assert_eq!(r.chroma_weight_l0_flag, u8::from(table.l0.iter().any(|e| e.chroma_flag)), "chroma_weight_l0_flag");
-                assert_eq!(r.luma_weight_l1_flag, u8::from(table.l1.iter().any(|e| e.luma_flag)), "luma_weight_l1_flag");
-                assert_eq!(r.chroma_weight_l1_flag, u8::from(table.l1.iter().any(|e| e.chroma_flag)), "chroma_weight_l1_flag");
-                for (i, e) in table.l0.iter().enumerate() {
-                    assert_eq!(r.luma_weight_l0[i], e.luma_weight as i16, "luma_weight_l0[{i}]");
-                    assert_eq!(r.luma_offset_l0[i], e.luma_offset as i16, "luma_offset_l0[{i}]");
-                    for c in 0..2 {
-                        assert_eq!(r.chroma_weight_l0[i][c], e.chroma_weight[c] as i16, "chroma_weight_l0[{i}][{c}]");
-                        assert_eq!(r.chroma_offset_l0[i][c], e.chroma_offset[c] as i16, "chroma_offset_l0[{i}][{c}]");
+                for (list, entries, (lw, lo, cw, co, luma_flag, chroma_flag)) in [
+                    (
+                        0,
+                        &table.l0,
+                        (&r.luma_weight_l0, &r.luma_offset_l0, &r.chroma_weight_l0, &r.chroma_offset_l0, r.luma_weight_l0_flag, r.chroma_weight_l0_flag),
+                    ),
+                    (
+                        1,
+                        &table.l1,
+                        (&r.luma_weight_l1, &r.luma_offset_l1, &r.chroma_weight_l1, &r.chroma_offset_l1, r.luma_weight_l1_flag, r.chroma_weight_l1_flag),
+                    ),
+                ] {
+                    // The `*_flag` fields say the list carries luma weights at all (7.4.3.2); with no
+                    // flag the default weight of `1 << denom` applies, which the entries hold anyway.
+                    assert_eq!(luma_flag, u8::from(entries.iter().any(|e| e.luma_flag)), "luma_weight_l{list}_flag");
+                    assert_eq!(chroma_flag, u8::from(entries.iter().any(|e| e.chroma_flag)), "chroma_weight_l{list}_flag");
+                    for (i, e) in entries.iter().enumerate() {
+                        if e.luma_flag || e.chroma_flag {
+                            explicit += 1;
+                        }
+                        assert_eq!(lw[i], i16_of(e.luma_weight), "luma_weight_l{list}[{i}]");
+                        assert_eq!(lo[i], i16_of(e.luma_offset), "luma_offset_l{list}[{i}]");
+                        for c in 0..2 {
+                            assert_eq!(cw[i][c], i16_of(e.chroma_weight[c]), "chroma_weight_l{list}[{i}][{c}]");
+                            assert_eq!(co[i][c], i16_of(e.chroma_offset[c]), "chroma_offset_l{list}[{i}][{c}]");
+                        }
                     }
+                    // nothing is written past the slice's own references
+                    assert!(lw[entries.len()..].iter().all(|&w| w == 0), "luma_weight_l{list} past the slice's references");
+                    assert!(lo[entries.len()..].iter().all(|&w| w == 0), "luma_offset_l{list} past the slice's references");
+                    assert!(cw[entries.len()..].iter().flatten().all(|&w| w == 0), "chroma_weight_l{list} past the slice's references");
+                    assert!(co[entries.len()..].iter().flatten().all(|&w| w == 0), "chroma_offset_l{list} past the slice's references");
                 }
-                for (i, e) in table.l1.iter().enumerate() {
-                    assert_eq!(r.luma_weight_l1[i], e.luma_weight as i16, "luma_weight_l1[{i}]");
-                    assert_eq!(r.luma_offset_l1[i], e.luma_offset as i16, "luma_offset_l1[{i}]");
-                }
-                // nothing is written past the slice's own references
-                assert!(r.luma_weight_l0[table.l0.len()..].iter().all(|&w| w == 0), "entries past the slice's references stay zero");
-                assert!(r.luma_weight_l1[table.l1.len()..].iter().all(|&w| w == 0), "entries past the slice's references stay zero");
             }
         }
-        assert!(weighted >= 2, "the fixture has weighted slices ({weighted})");
-        assert!(checked == weighted, "every weighted slice was checked");
+        assert!(weighted >= 15, "the fixture's P slices code a table ({weighted})");
+        assert!(explicit >= 15, "and at least {explicit} of their entries set a weight flag rather than taking the default");
     }
 
     /// The one thing this backend cannot do with H.264 explicit weighted bipred is discovered at
@@ -1530,10 +1559,16 @@ mod tests {
         }
     }
 
-    /// An H.264 stream whose encoder actually uses weighted prediction (`weightp=1`), so the slice
-    /// records carry real weights: the plain fixture's picture parameter set allows weighted
-    /// prediction but its P slices do not use it, which would leave the tables empty and the test
-    /// above vacuous.
+    /// An H.264 stream whose encoder actually *uses* weighted prediction, so the slice records carry
+    /// weights worth checking.
+    ///
+    /// Two things are needed for that, and both are easy to get wrong: `weightp=1` alone leaves every
+    /// entry of the table at its default (`luma_weight 1`, no flags set), so the per-entry arithmetic
+    /// never runs; and a plain `testsrc2` has too little of a brightness trend for x264 to derive a
+    /// weight from. A `fade=t=in` source over `weightp=1:weightb=1` is what produces real weights —
+    /// luma 9 to 93, chroma 43 to 120, non-zero offsets, and a `luma_log2_denom` that differs from
+    /// slice to slice. `bframes=0` keeps this fixture to P slices, so it does not also feed the
+    /// explicit-weighted-bipred path that `h264()` covers.
     fn h264_weighted() -> Option<(NalStreamInfo, super::H264Sets, Vec<Vec<u8>>)> {
         let ff = filmcraft_testkit::require_ffmpeg!(None);
         let path = filmcraft_testkit::fixtures::generate(&fixture("h264_weighted.mp4"), |tmp| {
@@ -1541,7 +1576,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc2=s=640x360:r=24:d=1",
+                "testsrc2=s=640x360:r=24:d=1,fade=t=in:st=0:d=1",
                 "-c:v",
                 "libx264",
                 "-profile:v",
@@ -1549,7 +1584,7 @@ mod tests {
                 "-preset",
                 "fast",
                 "-x264-params",
-                "bframes=0:weightp=1:weightb=0:keyint=24:min-keyint=24:scenecut=0",
+                "bframes=0:weightp=1:weightb=1:keyint=24:min-keyint=24:scenecut=0",
                 "-pix_fmt",
                 "yuv420p",
             ];
@@ -1991,8 +2026,6 @@ mod tests {
         Some(read(&path))
     }
 
-    /// An ffmpeg-made HEVC stream and its samples: an `hvcC`-derived description and the length-
-    /// prefixed temporal units it holds, the first of which is an IDR.
     /// The HEVC slice record's prediction weight tables come from the slice segment header's own
     /// `pwt`, entry by entry. A record that said `weighted_pred_flag` and `weighted_bipred_flag`
     /// were in use and then handed a driver zeroes would decode to a different picture from the
@@ -2064,6 +2097,8 @@ mod tests {
         assert!(explicit >= 20, "and at least {explicit} of its entries set a weight flag rather than taking the default");
     }
 
+    /// An ffmpeg-made HEVC stream and its samples: an `hvcC`-derived description and the length-
+    /// prefixed temporal units it holds, the first of which is an IDR.
     fn hevc_stream() -> Option<(Result<NalStreamInfo, String>, Vec<Vec<u8>>)> {
         let ff = filmcraft_testkit::require_ffmpeg!(None);
         let path = filmcraft_testkit::fixtures::generate(&fixture("hevc_main.mp4"), |tmp| {
