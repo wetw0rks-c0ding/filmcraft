@@ -22,10 +22,11 @@
 //! The structures and constants are hand-declared from `/usr/include/va/` (libva 2.x) rather than
 //! generated, so the tests at the bottom of this file check them twice over: the constants and the
 //! layout are pinned against the header, and the layout is compared with the library that is
-//! actually installed ([`Display::probe_image_layout`]).
+//! actually installed ([`Display::probe_image_layout`]) — libva has no `sizeof` / `offsetof` of its
+//! own to ask, so a behavioural check is the only way to hold the declaration to the driver.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::mem::{offset_of, size_of};
+use std::mem::size_of;
 use std::sync::{Arc, MutexGuard, OnceLock};
 
 // ---------------------------------------------------------------------------------------------
@@ -321,6 +322,17 @@ pub enum RtFormat {
     Other(u32),
 }
 
+impl RtFormat {
+    /// The format as the `VA_RT_FORMAT_*` libva takes, which is what a surface is created in.
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::Nv12 => YUV420,
+            Self::Yuv420_10 => YUV420_10,
+            Self::Other(bits) => bits,
+        }
+    }
+}
+
 impl From<u32> for RtFormat {
     fn from(bits: u32) -> Self {
         match bits {
@@ -333,6 +345,10 @@ impl From<u32> for RtFormat {
 
 /// libva's own words for a status code, or the number when libva is not loaded or does not know the
 /// code: error messages name the status, and this is where the text comes from.
+///
+/// This opens libva if it is not open yet. Code that already has an [`Api`] in hand — everything on
+/// a [`Display`] error path — uses [`Api::status_text`] instead, so that decorating an error can
+/// never be the thing that loads a library (and so can never re-enter the one-time load).
 pub fn status(s: i32) -> String {
     match load() {
         Ok(api) => api.status_text(s),
@@ -519,7 +535,10 @@ fn string_from(p: *const c_char) -> String {
 
 impl Api {
     /// libva's words for a status code, or the number when it has none for it.
-    fn status_text(&self, s: i32) -> String {
+    ///
+    /// This is the [`status`] work with the library already in hand, which is what a caller that
+    /// has an `Api` should use: it cannot load anything, so it cannot re-enter the one-time load.
+    pub(crate) fn status_text(&self, s: i32) -> String {
         let Some(error_str) = self.error_str else { return format!("VA-API status {s}") };
         // SAFETY: `error_str` is `vaErrorStr` (`va.h:403`), which takes a status and returns a
         // NUL-terminated string (or null for a code it does not know) and does nothing else.
@@ -581,7 +600,7 @@ impl Display {
         if st != OK {
             // Nothing to terminate: the display was never initialised.
             close_fd(fd);
-            let why = format!("vaInitialize failed: {}", status(st));
+            let why = format!("vaInitialize failed: {}", api.status_text(st));
             log::info!("VA-API: {why}");
             return Err(why);
         }
@@ -632,7 +651,7 @@ impl Display {
         // SAFETY: as above, plus the count out-pointer, which is a live local.
         let st = unsafe { (self.api.query_profiles)(self.dpy, profiles.as_mut_ptr(), &mut reported) };
         if st != OK {
-            return Err(format!("vaQueryConfigProfiles failed: {}", status(st)));
+            return Err(format!("vaQueryConfigProfiles failed: {}", self.api.status_text(st)));
         }
         // The count is the driver's to write, so it is bounded by what was allocated before it is
         // used as a length.
@@ -651,30 +670,10 @@ impl Display {
         // SAFETY: as above, plus the profile, which is a plain integer libva compares.
         let st = unsafe { (self.api.query_entrypoints)(self.dpy, p.bits(), entrypoints.as_mut_ptr(), &mut reported) };
         if st != OK {
-            return Err(format!("vaQueryConfigEntrypoints failed: {}", status(st)));
+            return Err(format!("vaQueryConfigEntrypoints failed: {}", self.api.status_text(st)));
         }
         let count = usize::try_from(reported).unwrap_or(0).min(entrypoints.len());
         Ok(entrypoints.into_iter().take(count).map(Entrypoint::from_bits).collect())
-    }
-
-    /// The size of the `VAImage` this module declares, in bytes.
-    pub fn size_of_va_image(&self) -> usize {
-        size_of::<VaImage>()
-    }
-
-    /// The byte offset of `VAImage.pitches` in the layout this module declares.
-    pub fn offset_of_va_image_pitches(&self) -> usize {
-        offset_of!(VaImage, pitches)
-    }
-
-    /// The byte offset of `VAImage.offsets` in the layout this module declares.
-    pub fn offset_of_va_image_offsets(&self) -> usize {
-        offset_of!(VaImage, offsets)
-    }
-
-    /// The byte offset of `VAImage.num_planes` in the layout this module declares.
-    pub fn offset_of_va_image_num_planes(&self) -> usize {
-        offset_of!(VaImage, num_planes)
     }
 
     /// Whether the installed driver fills a `VAImage` the way this module declares it: libva has
@@ -695,7 +694,7 @@ impl Display {
         // are the ones libva is asked to allocate for.
         let st = unsafe { create_image(self.dpy, &mut format, width, height, &mut image) };
         if st != OK {
-            return Err(format!("vaCreateImage failed for the ABI probe: {}", status(st)));
+            return Err(format!("vaCreateImage failed for the ABI probe: {}", self.api.status_text(st)));
         }
         // SAFETY: `image` is the image libva just created, and this is its matching destroy; the
         // id is the one the driver wrote above.
@@ -785,7 +784,7 @@ mod tests {
     use std::mem::{offset_of, size_of};
 
     #[test]
-    fn va_image_layout_matches_the_library() {
+    fn the_libraries_load_and_the_display_initializes() {
         let Ok(api) = load() else {
             eprintln!("SKIPPED: no libva");
             return;
@@ -794,21 +793,37 @@ mod tests {
             eprintln!("SKIPPED: no VA display");
             return;
         };
-        // VAImage is the struct every readback path copies out of; a wrong layout reads garbage.
-        assert_eq!(size_of::<VaImage>(), d.size_of_va_image(), "VAImage size");
-        assert_eq!(offset_of!(VaImage, pitches), d.offset_of_va_image_pitches(), "VAImage.pitches offset");
-        assert_eq!(offset_of!(VaImage, offsets), d.offset_of_va_image_offsets(), "VAImage.offsets offset");
-        assert_eq!(offset_of!(VaImage, num_planes), d.offset_of_va_image_num_planes(), "VAImage.num_planes offset");
+        // What the decoder needs off a display, other than the plane geometry the ABI probe checks:
+        // libva reports a version, a profile list, and a video-decoder entry point for at least one
+        // profile. A driver answering none of that is not a display this backend can decode with.
+        let (major, minor) = d.va_version();
+        assert!(major >= 1 || minor >= 1, "vaInitialize reported no libva version");
+        let profiles = d.profiles().expect("vaQueryConfigProfiles");
+        assert!(!profiles.is_empty(), "the driver supports no profile at all");
+        assert!(profiles.iter().any(|p| d.entrypoints(*p).is_ok_and(|e| e.contains(&Entrypoint::Vld))), "no profile offers VAEntrypointVLD");
     }
 
+    /// `OK` is success, libva has words for it, and the load-free path a [`Display`] error uses
+    /// says the same thing as the public `status` — otherwise decorating an error there would
+    /// quietly produce a different message than everything else.
     #[test]
     fn va_status_zero_is_success() {
         assert_eq!(OK, 0);
         assert!(!status(OK).is_empty());
+        let Ok(api) = load() else {
+            eprintln!("SKIPPED: no libva");
+            return;
+        };
+        assert_eq!(api.status_text(OK), status(OK), "status() and Api::status_text disagree");
+        assert!(!api.status_text(OK).is_empty());
+        // A code libva does not know still names itself rather than coming back empty.
+        assert!(!api.status_text(-999).is_empty(), "an unknown status is not described");
     }
 
-    /// The constants libva 2.24 uses, pinned so a wrong one fails on every machine rather than only
-    /// where a driver happens to be installed.
+    /// Every libva 2.24 constant this module carries, pinned so a wrong one fails on every machine
+    /// rather than only where a driver happens to be installed. The profile numbers are the ones
+    /// that matter most: a wrong one does not fail a call, it configures the wrong codec, and the
+    /// symptom is "this stream decodes in software" rather than a test failure.
     #[test]
     fn the_format_constants_are_the_ones_libva_uses() {
         assert_eq!(YUV420, 0x0000_0001);
@@ -820,6 +835,17 @@ mod tests {
         assert_eq!(SLICE_DATA_BUFFER, 5);
         assert_eq!(IMAGE_BUFFER, 9);
         assert_eq!(VLD, 1);
+        assert_eq!(ENC_SLICE, 6, "VAEntrypointEncSlice");
+        assert_eq!(H264_MAIN, 6, "VAProfileH264Main");
+        assert_eq!(H264_HIGH, 7, "VAProfileH264High");
+        assert_eq!(H264_CONSTRAINED_BASELINE, 13, "VAProfileH264ConstrainedBaseline");
+        assert_eq!(HEVC_MAIN, 17, "VAProfileHEVCMain");
+        assert_eq!(HEVC_MAIN_10, 18, "VAProfileHEVCMain10");
+        assert_eq!(VP9_PROFILE_0, 19, "VAProfileVP9Profile0");
+        assert_eq!(VP9_PROFILE_1, 20, "VAProfileVP9Profile1");
+        assert_eq!(VP9_PROFILE_2, 21, "VAProfileVP9Profile2");
+        assert_eq!(VP9_PROFILE_3, 22, "VAProfileVP9Profile3");
+        assert_eq!(AV1_MAIN, 32, "VAProfileAV1Profile0");
     }
 
     /// The layout as `/usr/include/va/va.h` has it, so a field added or moved here is a deliberate,
@@ -882,9 +908,11 @@ mod tests {
         for e in [Entrypoint::Vld, Entrypoint::EncSlice, Entrypoint::Other(9)] {
             assert_eq!(Entrypoint::from_bits(e.bits()), e, "{e:?}");
         }
-        assert_eq!(RtFormat::from(YUV420), RtFormat::Nv12);
-        assert_eq!(RtFormat::from(YUV420_10), RtFormat::Yuv420_10);
-        assert_eq!(RtFormat::from(0x1234), RtFormat::Other(0x1234));
+        for f in [RtFormat::Nv12, RtFormat::Yuv420_10, RtFormat::Other(0x1234)] {
+            assert_eq!(RtFormat::from(f.bits()), f, "{f:?}");
+        }
+        assert_eq!(RtFormat::Nv12.bits(), YUV420);
+        assert_eq!(RtFormat::Yuv420_10.bits(), YUV420_10);
     }
 
     /// A driver count is what sizes the array handed to it, so both ends are bounded.

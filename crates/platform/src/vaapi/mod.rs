@@ -19,8 +19,11 @@
 mod ffi;
 
 // What the rest of the backend needs; no libva type crosses this line. `OK` and the buffer-type
-// constants are part of it too — the decode loop submits those buffers — as are the render-format
-// constants a config is created in.
+// constants are part of it too — the decode loop submits those buffers and compares statuses — as
+// are the render formats a surface is created in. The padding widths stay for the same reason:
+// they decide the size of every `VA*` structure, and the next milestone's picture-parameter
+// structures are sized with them. The raw profile and entry point numbers do not: those are what
+// `Profile`, `Entrypoint` and `RtFormat` are compared as.
 pub use ffi::{
     Api, Display, Entrypoint, IMAGE_BUFFER, OK, PICTURE_PARAMETER_BUFFER, Profile, RtFormat, SLICE_DATA_BUFFER, SLICE_PARAMETER_BUFFER, VA_PADDING_LOW,
     VA_PADDING_MEDIUM, YUV420, YUV420_10, status,
