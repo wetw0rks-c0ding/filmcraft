@@ -100,6 +100,17 @@ impl NalPoc {
         );
         true
     }
+
+    /// The surfaces the decoded picture buffer still refers to — the ones a new picture may **not**
+    /// be decoded into, because the driver would read the new picture as that reference.
+    ///
+    /// This is the buffer's own knowledge of where its pictures live, which is the only place in the
+    /// backend that knows: the decode loop's surface ring is a pool and cannot tell a live reference
+    /// from a free surface. The decode loop asks this before it builds a picture's records, because
+    /// building them is what adds the picture to the buffer.
+    pub fn live_surfaces(&self) -> Vec<u32> {
+        self.dpb.iter().filter(|e| e.mark != Mark::Unused).map(|e| e.surface).collect()
+    }
 }
 
 /// One slice's submission: where its bytes sit in the picture's slice data buffer, how long they
@@ -237,6 +248,29 @@ pub fn reference_pictures(info: &NalStreamInfo) -> Result<usize, String> {
     // At least one, since every picture that is not a reference still has to be decoded somewhere,
     // and at most what the H.264 record can name.
     Ok(parsed.clamp(1, MAX_REF_FRAMES))
+}
+
+/// How many surfaces the decode loop must have, for a stream this backend decodes: the most the
+/// decoded picture buffer can hold at once, **plus the one the next picture is decoded into**.
+///
+/// This is deliberately *not* [`reference_pictures`]. That is what the stream's sequence parameter
+/// set declares, and it is what a diagnostics report should show, but it is not a bound the buffer
+/// respects: HEVC decides what stays a reference from each picture's own reference picture set
+/// (8.3.2), and consecutive sets can name more pictures between them than
+/// `sps_max_dec_pic_buffering_minus1` counts — on a 640x360 fixture declaring five, the buffer
+/// reached six and the decode ran out of surfaces. Sizing the pool from the declaration is what let
+/// a picture be decoded into a surface the driver was reading as a reference.
+///
+/// The bound that does hold is the record's own: a picture record cannot name more references than
+/// it has slots, and the marking functions refuse to keep more than that in the buffer (a reference
+/// with no slot would be dropped from the driver's copy of the buffer without anything saying so).
+/// So the buffer holds at most the record's slot count, and the pool needs one more surface than
+/// that — the one being written, which must not be a surface the buffer still refers to.
+pub fn surface_pool(info: &NalStreamInfo) -> usize {
+    match info.codec {
+        NalCodec::H264 => MAX_REF_FRAMES + 1,
+        NalCodec::Hevc => MAX_HEVC_REF_PICS + 1,
+    }
 }
 
 impl Picture {
@@ -659,6 +693,12 @@ fn hevc_ref_lists(dpb: &mut Vec<DpbEntry>, sh: &filmcraft_hevc::slice::SliceHead
         }
         let (first, second) = if list == 0 { (&before, &after) } else { (&after, &before) };
         let mut temp: Vec<usize> = Vec::with_capacity(want);
+        // 8.3.4 cycles the set until the list is long enough, which is a loop over nothing when the
+        // set is empty. `filmcraft_hevc` refuses an empty set (`StRps::total > 0`), but this loop
+        // must not depend on another crate's guarantee to terminate, so the empty case is the error.
+        if before.is_empty() && after.is_empty() && lt_curr.is_empty() {
+            return Err(format!("list {list} of a picture whose reference set names no picture"));
+        }
         while temp.len() < want {
             for entry in first.iter().chain(second.iter()).chain(lt_curr.iter()) {
                 if temp.len() < want {
@@ -731,6 +771,14 @@ fn hevc_mark(dpb: &mut Vec<DpbEntry>, sh: &filmcraft_hevc::slice::SliceHeader, s
     }
     dpb.retain(|e| e.mark != Mark::Unused);
     dpb.push(DpbEntry { surface, frame_num: u32::try_from(cur_poc).unwrap_or(u32::MAX), poc: cur_poc, mark: Mark::Short });
+    // The buffer cannot hold more pictures than a picture record can name. `hevc_ref_lists` has
+    // already refused a set larger than that (which is why this is rarely reached), but what it
+    // compacts to is the set the *previous* picture named, and this picture adds one more — so the
+    // trim is what makes [`surface_pool`]'s bound true rather than hopeful. Keeping the most recent
+    // is the least surprising trim: those are the ones a reference can still reach.
+    if dpb.len() > MAX_HEVC_REF_PICS {
+        dpb.drain(..dpb.len() - MAX_HEVC_REF_PICS);
+    }
 }
 
 /// The picture- and slice-parameter records for one H.264 / HEVC access unit, or why it has none.
@@ -1297,6 +1345,15 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         if sps.chroma_array_type() == 0 {
             return Err("monochrome (4:0:0)".into());
         }
+        // A stream with quantizer scaling lists needs `VAIQMatrixBufferHEVC`, which this backend does
+        // not build. See `hevc_scaling_lists_declined` for why the answer is a decline and not a
+        // default: `va_dec_hevc.h` says the buffer "is sent once per frame, and only when
+        // scaling_list_enabled_flag = 1", and a driver that falls back to the flat default would
+        // decode a picture the stream does not contain — silently, which is the one outcome worse
+        // than declining.
+        if sps.scaling_list_enabled {
+            return Err(hevc_scaling_lists_declined().into());
+        }
 
         if first.is_none() {
             let (p, built) = fill_hevc_picture(&mut params, poc, &sh, &pps, &sps, surface, width, height)?;
@@ -1330,11 +1387,6 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         poc.hevc.update(&first, p);
         // 8.3.5: the picture just decoded joins the buffer the next picture's set is derived from.
         hevc_mark(&mut poc.dpb, &first, surface, p);
-        // More pictures than the record can name is a buffer this backend cannot describe; keeping
-        // the most recent ones is the least surprising trim of a stream no encoder produces.
-        if poc.dpb.len() > MAX_HEVC_REF_PICS {
-            poc.dpb.drain(..poc.dpb.len() - MAX_HEVC_REF_PICS);
-        }
     }
     let last = segments.len().saturating_sub(1);
     for (i, (nal, offset, sh, pps, at, length)) in segments.iter().enumerate() {
@@ -1342,10 +1394,25 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         slice_offsets.push(*offset);
     }
     // No IQ matrix: HEVC carries its scaling lists in `sps_scaling_list_data_present_flag`'s tables
-    // inside the picture parameter record itself (`va_dec_hevc.h`: `ScalingListData` is a field of
-    // `VAPictureParameterBufferHEVC`), so there is no separate buffer to submit. An empty
-    // `iq_matrix` is what says so, and the decode loop reads that as "no such buffer".
+    // `VAIQMatrixBufferHEVC`, and only that — **not** part of the picture parameter record. My earlier
+    // comment here said it was, citing `va_dec_hevc.h`; that was wrong, and the test beside it
+    // asserted the wrong fact. The header is explicit: `VAPictureParameterBufferHEVC` has no
+    // scaling-list field, and `VAIQMatrixBufferHEVC` "is sent once per frame, and only when
+    // scaling_list_enabled_flag = 1". The `iHD` driver happened to tolerate omitting it for a stream
+    // with the flag clear, because the flat default is what it would decode with anyway — but a
+    // driver that does not default is exactly the plausible-wrong-picture case this backend exists to
+    // avoid, so the flag is checked rather than assumed.
+    //
+    // `sps_scaling_list_enabled_flag == 1` is declined above, so an empty `iq_matrix` here means the
+    // flag was clear and no record is needed. See `hevc_scaling_lists_declined`.
     Ok(Picture { params: record_bytes(&params), iq_matrix: Vec::new(), slices, slice_offsets })
+}
+
+/// Why an HEVC stream with `sps_scaling_list_enabled_flag` is declined, and the one-line version of it
+/// the diagnostics use.
+fn hevc_scaling_lists_declined() -> &'static str {
+    "HEVC scaling lists (sps_scaling_list_enabled_flag = 1): VAIQMatrixBufferHEVC is not built, \
+     and a driver that defaults the quantizer would produce a picture that is not the stream's"
 }
 
 /// Whether a slice segment belongs to the picture `first` opened: the same picture parameter set and
@@ -1491,12 +1558,19 @@ fn hevc_reference_frames(
             }
         }
     }
-    // Every buffer entry is a reference picture, so every one of them gets a `ReferenceFrames` slot;
-    // the ones the current picture names are flagged, and the rest carry the long-term bit or
-    // nothing. libva reads the count of flagged entries as `NumPocTotalCurr`.
+    // Only the entries the current picture's reference picture set names are live, and only they get a
+    // `ReferenceFrames` slot: `va.h:5322-5331` says the three `VA_PICTURE_HEVC_RPS_*` bits are how a
+    // driver learns *which* entries this picture refers to and that `NumPocTotalCurr` is their count —
+    // and the HEVC record has no separate count field, so an entry with a valid `picture_id` and no
+    // `RPS_*` bit is a state the header does not define. iHD tolerates it (which is why I and P
+    // pictures decode here), but a driver that counts every non-`INVALID` entry as live would read a
+    // reference this picture does not have. So: named entries carry their bit, everything else is
+    // `VA_PICTURE_HEVC_INVALID`.
     for (i, entry) in dpb.iter().enumerate().take(MAX_HEVC_REF_PICS) {
-        let bit = used.iter().find(|(at, _)| *at == i).map_or(0, |(_, bit)| *bit);
-        frames[i] = entry.mark.hevc_picture(entry, (bit != 0).then_some(bit));
+        match used.iter().find(|(at, _)| *at == i) {
+            Some((_, bit)) => frames[i] = entry.mark.hevc_picture(entry, Some(*bit)),
+            None => frames[i] = invalid_hevc_picture(),
+        }
     }
     Ok(frames)
 }
@@ -1914,15 +1988,109 @@ mod tests {
         assert_eq!(r.scaling_list8x8.len(), 2, "and the two the record has slots for");
     }
 
-    /// HEVC needs no IQ matrix buffer: its scaling lists are part of the picture parameter record,
-    /// so submitting one would be submitting a record the driver does not read.
+    /// A HEVC stream with `sps_scaling_list_enabled_flag = 1` is declined rather than submitted without
+    /// its `VAIQMatrixBufferHEVC`. The header is explicit that the buffer exists and is "sent once
+    /// per frame" when the flag is set, and this backend does not build it — so the alternatives are
+    /// a decline or a plausible picture that is not the stream's, and the decline is the one the
+    /// never-crash rule asks for.
     #[test]
-    fn hevc_submits_no_iq_matrix() {
+    fn an_hevc_stream_with_scaling_lists_is_declined_rather_than_guessed() {
+        let ff = filmcraft_testkit::require_ffmpeg!();
+        let Some(path) = filmcraft_testkit::fixtures::generate(&fixture("hevc_scaling.mp4"), |tmp| {
+            // x265 writes scaling lists when the rate control asks for custom quantizers.
+            let args = [
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:r=24:d=1",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "veryslow",
+                "-x265-params",
+                "log-level=error:rd=6:keyint=24:min-keyint=24:scenecut=0",
+                "-pix_fmt",
+                "yuv420p",
+            ];
+            run(&ff, &args, tmp)
+        }) else {
+            return;
+        };
+        let (info, samples) = read(&path);
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        // Whatever the encoder actually emitted, the answer is the same: either the flag is clear and
+        // the picture builds with no matrix buffer, or it is set and the picture is declined. What
+        // must never happen is a third answer.
+        let mut poc = super::NalPoc::default();
+        match super::super::picture::build_nal(&info, &samples[0], &mut poc, 2, 320, 240) {
+            Ok(p) => assert!(p.iq_matrix.is_empty(), "a stream that built did not have the flag set"),
+            Err(why) => assert!(why.contains("VAIQMatrixBufferHEVC") || why.contains("scaling"), "the decline says what is missing, not something else: {why}"),
+        }
+    }
+
+    /// HEVC submits no IQ matrix buffer **because the flag is clear**, not because its scaling lists are
+    /// in the picture parameter record. `va_dec_hevc.h` puts them in `VAIQMatrixBufferHEVC`, sent
+    /// "once per frame, and only when scaling_list_enabled_flag = 1" — the picture parameter record
+    /// has no scaling-list field at all. An earlier version of this test asserted the wrong fact,
+    /// which would have hidden a stream that needs a record this backend does not build.
+    ///
+    /// The fixture is encoded with x265's default, which leaves the flag clear, so this is the case
+    /// that must work; the decline for the other case is `the_hevc_record_for_a_stream_with_scaling_lists`.
+    /// Every `ReferenceFrames` entry the current picture's set does not name is
+    /// `VA_PICTURE_HEVC_INVALID`.
+    ///
+    /// The HEVC record has no count field: `va.h:5322-5331` says the three `RPS_*` bits are how a
+    /// driver learns which entries the picture refers to and that `NumPocTotalCurr` is their count.
+    /// An entry with a valid `picture_id` and no bit is therefore a state the header does not define.
+    /// iHD tolerates it, which is why I and P pictures decode here — a driver that counted every
+    /// non-`INVALID` entry as live would read a reference the picture does not have.
+    #[test]
+    fn hevc_marks_every_reference_frame_the_picture_does_not_name() {
+        let Some((info, samples)) = hevc_stream() else { return };
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let mut poc = super::NalPoc::default();
+        let mut named_somewhere = false;
+        // A run of pictures, so that some refer to something and some do not.
+        for (n, sample) in samples.iter().enumerate().take(12) {
+            let surface = u32::try_from(n).unwrap_or(0);
+            let Ok(p) = super::build_nal(&info, sample, &mut poc, surface, 640, 360) else { continue };
+            let pp = crate::vaapi::ffi::picture_params_hevc(&p.params).unwrap_or_else(|| panic!("not a picture parameter record"));
+            const FLAGS: u32 = crate::vaapi::ffi::PICTURE_HEVC_RPS_ST_CURR_BEFORE
+                | crate::vaapi::ffi::PICTURE_HEVC_RPS_ST_CURR_AFTER
+                | crate::vaapi::ffi::PICTURE_HEVC_RPS_LT_CURR;
+            for (i, r) in pp.reference_frames.iter().enumerate() {
+                if r.flags & FLAGS != 0 {
+                    named_somewhere = true;
+                    assert_ne!(r.picture_id, crate::vaapi::ffi::INVALID_SURFACE, "sample {n} slot {i}: a named entry names a surface");
+                    assert_eq!(r.flags & crate::vaapi::ffi::PICTURE_HEVC_INVALID, 0, "sample {n} slot {i}: a referred-to entry is not also invalid");
+                } else {
+                    // Unnamed entries say they name nothing: no surface id, and the invalid bit.
+                    assert_eq!(r.picture_id, crate::vaapi::ffi::INVALID_SURFACE, "sample {n} slot {i}: an unnamed entry names no surface");
+                    assert_ne!(r.flags & crate::vaapi::ffi::PICTURE_HEVC_INVALID, 0, "sample {n} slot {i}: and says it is invalid");
+                }
+            }
+        }
+        assert!(named_somewhere, "the run refers to pictures, so some entry was flagged");
+    }
+
+    /// HEVC submits no IQ matrix buffer **because the flag is clear**, not because its scaling lists
+    /// are in the picture parameter record — which the test above is the companion to: the record has
+    /// no slot for them, and one does exist in libva that a stream with the flag set needs.
+    #[test]
+    fn hevc_without_scaling_lists_submits_no_iq_matrix() {
         let Some((info, samples)) = hevc_stream() else { return };
         let info = info.unwrap_or_else(|e| panic!("{e}"));
         let mut poc = super::NalPoc::default();
         let p = super::build_nal(&info, &samples[0], &mut poc, 4, 640, 360).unwrap_or_else(|e| panic!("{e}"));
-        assert!(p.iq_matrix.is_empty(), "HEVC carries its scaling lists in the picture record");
+        assert!(p.iq_matrix.is_empty(), "scaling_list_enabled_flag is clear, so no buffer is needed");
+        // And the picture parameter record is exactly the structure `va_dec_hevc.h` declares — which
+        // is what makes omitting the buffer right rather than a default: there is nowhere in it for
+        // a scaling list to go.
+        assert_eq!(
+            p.params.len(),
+            std::mem::size_of::<crate::vaapi::ffi::VaPictureParameterBufferHevc>(),
+            "the picture record is the declared structure, scaling lists and all (there are none)"
+        );
     }
 
     /// The two records an ffmpeg-made H.264 fixture's first picture is submitted as: one picture

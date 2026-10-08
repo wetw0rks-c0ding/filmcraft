@@ -67,7 +67,7 @@ fn probe(path: &str, time: bool, pixels: bool) {
     };
     println!("  decoder: {}", d.name());
     let (mut n, t0, mut shown) = (0usize, std::time::Instant::now(), 0usize);
-    let mut first: Option<(i64, filmcraft_frame::PixelData)> = None;
+    let mut first: Option<(i64, filmcraft_frame::VideoFrame)> = None;
     for i in 0..file.tracks[t].samples.len() {
         let Ok(s) = file.read_sample(&bytes, t, i) else { break };
         let pts = file.tracks[t].samples[i].pts;
@@ -76,11 +76,11 @@ fn probe(path: &str, time: bool, pixels: bool) {
                 for f in frames {
                     n += 1;
                     if pixels && first.is_none() {
-                        first = Some((f.pts, f.frame.data.clone()));
+                        first = Some((f.pts, f.frame.clone()));
                     }
                     if pixels && (shown < 3 || i + 1 == file.tracks[t].samples.len()) {
                         shown += 1;
-                        println!("  sample {i} pts {}: {}", f.pts, describe(&f.frame.data));
+                        println!("  sample {i} pts {}: {}", f.pts, describe(&f.frame));
                     }
                 }
             }
@@ -111,41 +111,56 @@ fn probe(path: &str, time: bool, pixels: bool) {
     }
 }
 
-/// A frame as its corner samples and a checksum: enough to see that it is the stream's picture and
-/// not a black surface, without dumping a whole frame.
+/// A frame as a row of samples and a checksum: enough to see that it is the stream's picture and
+/// not a blank surface, without dumping a whole frame.
+///
+/// The checksum is FNV-1a/64 over **the luma plane's bytes** — one byte per 8-bit sample, two per
+/// 10-bit one — so it can be compared against any other byte-level hash of the same picture (a
+/// software decode, ffmpeg's VA-API decode, a reference yuv). An earlier version folded each sample
+/// into four little-endian bytes whatever its depth, which made the number match nothing and sent
+/// me looking for a parity that was never there.
 #[cfg(target_os = "linux")]
-fn describe(data: &filmcraft_frame::PixelData) -> String {
-    let bits: u32 = match data {
+fn describe(frame: &filmcraft_frame::VideoFrame) -> String {
+    let bits: u32 = match &frame.data {
         filmcraft_frame::PixelData::Yuv8 { .. } => 8,
         filmcraft_frame::PixelData::Yuv16 { bits, .. } => *bits,
         _ => return "a format this backend does not produce".to_string(),
     };
-    let luma: Vec<u32> = match data {
-        filmcraft_frame::PixelData::Yuv8 { planes, .. } => planes[0].iter().map(|&b| u32::from(b)).collect(),
-        filmcraft_frame::PixelData::Yuv16 { planes, .. } => planes[0].iter().map(|&v| u32::from(v)).collect(),
+    // The luma plane as the bytes it is on the wire, so the hash is over the same bytes a reference
+    // decode of the same picture would produce.
+    let bytes: Vec<u8> = match &frame.data {
+        filmcraft_frame::PixelData::Yuv8 { planes, .. } => planes[0].as_ref().clone(),
+        filmcraft_frame::PixelData::Yuv16 { planes, .. } => planes[0].iter().flat_map(|v| v.to_le_bytes()).collect(),
         _ => Vec::new(),
     };
-    if luma.is_empty() {
+    if bytes.is_empty() {
         return "an empty plane".to_string();
     }
-    // FNV-1a over the luma plane: a hash, so "the whole picture" is one number rather than a page.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &v in &luma {
-        for b in v.to_le_bytes() {
-            hash = (hash ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
-        }
+    for &b in &bytes {
+        hash = (hash ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
     }
-    let corner = |at: usize| luma[at.min(luma.len() - 1)];
-    // Twelve samples spread across the first row: enough to see the picture's own structure rather
-    // than a uniform surface, which is what a decode that never rendered looks like (a driver that
-    // accepts the records and renders nothing leaves every sample at NV12's neutral 128).
-    let row: Vec<u32> = (0..12).map(|k| corner(k * (luma.len() / 640))).collect();
+    // A real row of the real picture, sampled across its actual width. The stride is the frame's own
+    // width, not the sample count divided by a constant: the first version of this divided the plane
+    // length by a hard-coded 640, which for a 640-wide frame stepped a whole row per tap and so
+    // printed one sample per *column* under a `row0` label.
+    let width = usize::try_from(frame.width).unwrap_or(bytes.len()).max(1);
+    let sample_bytes = (bits as usize / 8).max(1);
+    let samples = bytes.len() / sample_bytes;
+    let at = |i: usize| -> u32 {
+        let start = i.min(samples.saturating_sub(1)) * sample_bytes;
+        let lo = bytes.get(start).copied().unwrap_or(0);
+        if bits > 8 { u32::from(u16::from_le_bytes([lo, bytes.get(start + 1).copied().unwrap_or(0)])) } else { u32::from(lo) }
+    };
+    let row: Vec<u32> = (0..12).map(|k| at(k * width / 12)).collect();
+    let sum: u64 = (0..samples).map(|i| u64::from(at(i))).sum();
     format!(
-        "{bits} bits, {} luma samples, row0 {row:?}, luma[centre]={} luma[last]={} mean={:.1} fnv1a={hash:016x}",
-        luma.len(),
-        corner(luma.len() / 2),
-        corner(luma.len() - 1),
-        luma.iter().map(|&v| f64::from(v)).sum::<f64>() / luma.len() as f64,
+        "{bits} bits, {}x{}, {samples} luma samples, row0 {row:?}, luma[centre]={} luma[last]={} mean={:.1} fnv1a={hash:016x}",
+        frame.width,
+        frame.height,
+        at(samples / 2),
+        at(samples.saturating_sub(1)),
+        sum as f64 / samples as f64,
     )
 }
 #[cfg(not(target_os = "linux"))]

@@ -7,7 +7,7 @@ use filmcraft_codecs::hw::{NalCodec, StreamInfo};
 use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
 
 use super::ffi::{self, Display, Session};
-use super::picture::{NalPoc, Picture, reference_pictures};
+use super::picture::{NalPoc, Picture, surface_pool};
 use super::stream::{Stream, plan_frame, supports};
 use super::{Ring, validate_image};
 use crate::biplanar::{self, Geometry};
@@ -19,12 +19,6 @@ use ffi::{IQ_MATRIX_BUFFER, PICTURE_PARAMETER_BUFFER, SLICE_DATA_BUFFER, SLICE_P
 /// here for the same reason `MfDecoder` has it, as a backstop against a driver-reported count that
 /// would otherwise grow without limit.
 const MAX_IN_FLIGHT: usize = 64;
-
-/// Surfaces the ring holds beyond what the stream's decoded picture buffer needs. A picture is read
-/// back out of its surface before the next one is decoded, so the ring has to hold the whole buffer
-/// plus the picture being decoded into — a surface that is the current picture and a reference at the
-/// same time would be read as a reference while it is being written.
-const SURFACE_MARGIN: usize = 1;
 
 /// Where a decoder's time went (wall clock), for diagnostics. The three costs are the ones a user
 /// would notice: the driver's decode, the GPU-to-CPU copy of the picture, and the conversion of that
@@ -75,6 +69,9 @@ pub struct VaDecoder {
     /// Whether the next picture is the first of a run, which is what decides whether RASL pictures are
     /// skipped and what a seek resets.
     first: bool,
+    /// The next sample must be preceded by the parameter sets: the first of a run, after a seek or a
+    /// flush. Set from the start and by `reset` / `flush`, cleared by the first `decode`.
+    need_headers: bool,
     /// [`VideoDecoder::flush`] drained the driver, which then behaves as at the end of a stream: it
     /// only restarts at an IDR picture, and the references of the run are gone.
     drained: bool,
@@ -100,12 +97,13 @@ impl VaDecoder {
         let api = ffi::load()?;
         let display = Display::new(&api)?;
         supports(&display, &plan)?;
-        // The ring is sized from the stream's own decoded picture buffer, not from a constant: the
-        // references have to survive in their surfaces until the pictures that use them are decoded,
-        // so a stream that needs more surfaces gets them. `Session::new` clamps the count, so a
-        // stream description claiming an absurd buffer costs a clamp and not an allocation.
+        // The ring is sized from the record's own reference-slot count, not from the number the
+        // sequence parameter set declares — see `picture::surface_pool` for why the declaration is not
+        // a bound the buffer respects. The references have to survive in their surfaces until the
+        // pictures that use them are decoded, and one more surface is the one being written into.
+        // `Session::new` clamps the count, so this costs a clamp rather than an allocation.
         let count = match &stream {
-            Stream::Nal(info) => reference_pictures(info).map_err(|e| format!("decoded picture buffer: {e}"))?,
+            Stream::Nal(info) => surface_pool(info),
             // Every frame-coded stream is declined by `plan` above, so this arm is unreachable today; it
             // is written rather than unreachable so that adding a frame codec is not a compile error. An
             // `Ok` here would mean a frame codec had been planned without the records to decode it, and
@@ -117,15 +115,18 @@ impl VaDecoder {
                 return Err(why);
             }
         };
-        let session = Session::new(&display, plan.profile, plan.entrypoint, plan.format, plan.size, count + SURFACE_MARGIN)?;
+        let session = Session::new(&display, plan.profile, plan.entrypoint, plan.format, plan.size, count)?;
         let name = stream.name();
         // Safe to read `info.crop` / `info.size` unbounded here *because* `stream.plan()` above ran
         // first and bounded both, along with the coded size the crop has to fit inside
         // (`stream::plan_nal`, `plan_frame`). `first_geometry` is the one reader of those fields
         // that trusts them, and this is its only caller in this backend — so the order of the two
         // lines is load-bearing, not incidental.
-        let geometry = stream.first_geometry(plan_bits(plan.format));
-        let first = session.surfaces().first().copied().unwrap_or(0);
+        let geometry = stream.first_geometry(plan_bits(plan.format)?);
+        // The ring holds the ids the driver filled in, in the order it gave them: libva does not
+        // promise surface ids are contiguous, so an id this code worked out rather than read would
+        // name a surface that does not exist.
+        let ring = Ring::from_surfaces(session.surfaces());
         log::info!(
             "hardware decoding: {name} on {}{}",
             display.vendor().unwrap_or("a VA-API driver"),
@@ -136,11 +137,12 @@ impl VaDecoder {
             geometry,
             stream,
             session,
-            ring: Ring::new(count + SURFACE_MARGIN, first),
+            ring,
             poc: NalPoc::default(),
             in_flight: Vec::new(),
             skip_rasl: false,
             first: true,
+            need_headers: true,
             drained: false,
             fail_after: None,
             fed: 0,
@@ -240,8 +242,9 @@ impl VaDecoder {
     /// on, and a missing entry is a failing test rather than a grey timeline.
     ///
     /// `data` is the assembled slice data buffer ([`VaDecoder::slice_data`]), and an empty
-    /// `picture.iq_matrix` contributes no buffer: that is how an HEVC picture, whose scaling lists are
-    /// inside its picture parameter record, says there is nothing to submit.
+    /// `picture.iq_matrix` contributes no buffer — which for H.264 never happens (every picture
+    /// carries its scaling lists) and for HEVC means the sequence parameter set's
+    /// `sps_scaling_list_enabled_flag` was clear, so `VAIQMatrixBufferHEVC` is not sent.
     fn submission<'p>(picture: &'p Picture, data: &'p [u8]) -> Vec<(i32, &'p [u8])> {
         let mut out = Vec::with_capacity(picture.slices.len() + 3);
         out.push((PICTURE_PARAMETER_BUFFER, picture.params.as_slice()));
@@ -257,10 +260,16 @@ impl VaDecoder {
 }
 
 /// `RTFormat` as the significant bits per sample its pictures hold: 8 for NV12, 10 for P010.
-fn plan_bits(format: ffi::RtFormat) -> u32 {
+///
+/// Only `plan_nal`'s two formats can reach here, and `RtFormat::Other` is refused in `Session::new`
+/// before that. The third arm is an `Err` rather than a silent 8-bit depth: a default there would
+/// hand a decoder a picture geometry that does not match the surface it was created at, which is a
+/// plausible-looking wrong picture rather than a refusal.
+fn plan_bits(format: ffi::RtFormat) -> std::result::Result<u32, String> {
     match format {
-        ffi::RtFormat::Yuv420_10 => 10,
-        _ => 8,
+        ffi::RtFormat::Nv12 => Ok(8),
+        ffi::RtFormat::Yuv420_10 => Ok(10),
+        ffi::RtFormat::Other(bits) => Err(format!("render format {bits:#x} has no bit depth this backend knows")),
     }
 }
 
@@ -293,6 +302,13 @@ impl VideoDecoder for VaDecoder {
             } else if self.skip_rasl && types.iter().any(|t| matches!(t, 8 | 9)) {
                 self.first = false;
                 return Ok(Vec::new());
+            } else if self.skip_rasl {
+                // The skipped run is over. Without this the flag stays set for the rest of the
+                // stream, and a later RASL picture — which in an open GOP is decodable, because it
+                // refers only to pictures after the CRA — is dropped too. The symptom is an empty
+                // frame list after pictures had already come out, which is the blank-timeline
+                // outcome: a caller cannot tell it from a picture the stream has not produced yet.
+                self.skip_rasl = false;
             }
         }
         self.first = false;
@@ -302,30 +318,37 @@ impl VideoDecoder for VaDecoder {
         if let Some(g) = self.stream.declared_picture(sample) {
             self.geometry = g;
         }
+        // The sample as the decoder's input: Annex B with the parameter sets in front when the
+        // decoder has just started (the first sample, after a seek or a flush). A sample whose NAL
+        // units do not add up is refused here rather than parsed into a picture record.
+        let annex_b = self.stream.input(sample, self.need_headers).map_err(CodecError::Decode)?;
+        debug_assert!(!annex_b.is_empty(), "a sample that converts to nothing is refused by input()");
+        self.need_headers = false;
         self.in_flight.push(pts);
         if self.in_flight.len() > MAX_IN_FLIGHT {
-            return Err(CodecError::Decode(format!("the decoder holds {} pictures back", self.in_flight.len())));
+            let held = self.in_flight.len();
+            self.in_flight.clear();
+            return Err(CodecError::Decode(format!("the decoder holds {held} pictures back")));
         }
-        let r = self.picture(sample);
-        let mut out = Vec::new();
-        match r {
-            // A picture that decoded is returned as it is, with the presentation time it was
-            // submitted under. A decode that produced nothing is an error rather than an empty
-            // frame: an empty frame list for a sample the caller fed is indistinguishable from a
-            // picture the stream has not produced yet, and a blank timeline is the worst answer
-            // available — an error hands the stream to the software decoder instead.
-            Ok(Some(decoded)) => {
-                let stamp = self.take_pts(pts);
-                self.timings.frames += 1;
-                self.timings.decode += decoded.decode;
-                self.timings.readback += decoded.readback;
-                self.timings.convert += decoded.convert;
-                out.push(DecodedFrame { pts: stamp, frame: decoded.frame, draft: false });
-                Ok(out)
+        // One access unit in, one picture out. A decode that produced nothing is an error rather than
+        // an empty frame list: an empty list for a sample the caller fed is indistinguishable from a
+        // picture the stream has not produced yet, and a blank timeline is the worst answer available
+        // — an error hands the stream to the software decoder instead.
+        let decoded = match self.picture(sample) {
+            Ok(d) => d,
+            // The submission is gone: nothing will come out of it, so it is not in flight any more.
+            // Leaving it would make every later decode report a decoder full of pictures back.
+            Err(e) => {
+                self.in_flight.pop();
+                return Err(CodecError::Decode(e));
             }
-            Ok(None) => Ok(out),
-            Err(e) => Err(CodecError::Decode(e)),
-        }
+        };
+        let stamp = self.take_pts(pts);
+        self.timings.frames += 1;
+        self.timings.decode += decoded.decode;
+        self.timings.readback += decoded.readback;
+        self.timings.convert += decoded.convert;
+        Ok(vec![DecodedFrame { pts: stamp, frame: decoded.frame, draft: false }])
     }
 
     fn flush(&mut self) -> Vec<DecodedFrame> {
@@ -336,6 +359,7 @@ impl VideoDecoder for VaDecoder {
         self.poc.reset();
         self.first = true;
         self.skip_rasl = false;
+        self.need_headers = true;
         self.drained = true;
         Vec::new()
     }
@@ -348,6 +372,7 @@ impl VideoDecoder for VaDecoder {
         self.poc.reset();
         self.in_flight.clear();
         self.skip_rasl = false;
+        self.need_headers = true;
         self.first = true;
         self.drained = false;
     }
@@ -367,19 +392,27 @@ impl VideoDecoder for VaDecoder {
 
 impl VaDecoder {
     /// Decode one access unit and read its picture back: the driver records built from the sample,
-    /// submitted to the surface at the front of the ring, then copied out. Returns `None` when the
-    /// access unit holds no picture (an HEVC RASL picture the run left out), which is not an error.
+    /// submitted to a surface no live reference is in, then copied out.
+    ///
+    /// **The surface is chosen from the decoded picture buffer, not by rotating.** A surface a later
+    /// picture still refers to may not be decoded into: the driver would read the new picture as that
+    /// reference, and what comes out is a picture the stream never contained — the plausible-looking
+    /// wrong answer this backend must not produce. The buffer is only known here, in the one place
+    /// that owns it, so this is where the choice is made; `Ring` hands out a surface that is not in
+    /// it, and a stream whose references fill every surface is an error rather than an overwrite.
     ///
     /// The timing is kept in two parts because they are what a user would notice separately: the
     /// driver's own decode (`vaEndPicture` plus the sync that waits for it), and the copy of the
     /// finished picture back to the CPU — of which the conversion into FilmCraft's planes is
     /// measured separately, so the reported readback is the copy and not the copy plus the
     /// conversion.
-    fn picture(&mut self, sample: &[u8]) -> std::result::Result<Option<Decoded>, String> {
-        if self.skip_rasl {
-            return Ok(None);
-        }
-        let surface = self.ring.take().ok_or("the surface ring is empty")?;
+    fn picture(&mut self, sample: &[u8]) -> std::result::Result<Decoded, String> {
+        // Before `build_nal`, which adds this picture to the buffer: the surfaces that must not be
+        // decoded into are the ones the *previous* pictures left referenced.
+        let surface = self
+            .ring
+            .take_unreferenced(&self.poc.live_surfaces())
+            .ok_or_else(|| format!("every one of the {} surfaces is still a reference; the stream needs more", self.ring.len()))?;
         let info = match &self.stream {
             Stream::Nal(info) => info,
             // Declined while it was still a description, so a caller that skipped planning is told
@@ -421,7 +454,7 @@ impl VaDecoder {
             return Err(format!("surface {surface} is still being rendered into after vaSyncSurface"));
         }
         let (convert, frame) = self.readback(surface)?;
-        Ok(Some(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame }))
+        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame })
     }
 }
 
@@ -446,6 +479,30 @@ mod tests {
     use super::super::picture::SliceParam;
     use super::*;
     use ffi::{SLICE_DATA_BUFFER, SLICE_PARAMETER_BUFFER};
+
+    /// The pool is sized so that a picture always has a surface that is not a live reference, which is
+    /// the defect a bare rotation invites: on a 6-surface ring with 5 live references it eventually
+    /// hands back a surface the driver is reading as a reference, and the picture is decoded into
+    /// the reference it is supposed to be predicted from.
+    ///
+    /// The invariant is what makes it safe rather than a number that happens to fit today's fixtures:
+    /// the decoded picture buffer can never hold more entries than the record has slots for them (the
+    /// marking functions trim to it), so a pool one larger than that always has one free surface.
+    #[test]
+    fn the_surface_pool_is_always_larger_than_the_picture_buffer() {
+        // Both codecs' bounds are the record's own slot count, and the pool is that plus one.
+        for (codec, slots, pool) in [(NalCodec::H264, 16usize, 17usize), (NalCodec::Hevc, 15usize, 16usize)] {
+            assert!(pool > slots, "{codec:?}: a pool of {pool} does not exceed a buffer of {slots} plus one");
+            // And a ring of that size, filled to the brim, still has a free surface to decode into.
+            let ids: Vec<u32> = (0..pool as u32).collect();
+            let mut ring = Ring::from_surfaces(&ids);
+            let live: Vec<u32> = ids[..slots].to_vec();
+            assert!(ring.take_unreferenced(&live).is_some(), "{codec:?}: a full buffer still leaves a surface");
+            // With the pool entirely live there is nothing, and that is an error rather than a
+            // reference being overwritten.
+            assert_eq!(ring.take_unreferenced(&ids), None, "{codec:?}: nothing free means an error");
+        }
+    }
 
     /// A `Picture` whose records are recognisable lengths, for checking the submission list without a
     /// driver: a two-slice H.264 picture carries five buffers, an HEVC one carries four.
@@ -487,6 +544,115 @@ mod tests {
 
     /// HEVC submits no IQ matrix buffer: its scaling lists are inside the picture parameter record,
     /// so a buffer of that kind would be a record the driver does not read.
+    /// A run that starts at a CRA skips its RASL pictures — they refer to pictures that were never
+    /// decoded. **Only those.** An earlier version of this decoder also tested `skip_rasl` inside the
+    /// picture builder, so the flag stayed set for the rest of the run and every picture after the
+    /// RASL ones came back as an empty list: indistinguishable from a picture the stream had not
+    /// produced, which is the blank-timeline outcome this backend exists to prevent.
+    ///
+    /// Needs a driver, and skips without one — the flag is decode-loop state, so there is nothing
+    /// to check on a machine with no GPU. What it asserts is that a picture well after the run's
+    /// first one comes back, which is the whole content of the bug.
+    #[test]
+    fn a_run_that_starts_at_a_cra_still_decodes_its_later_pictures() {
+        use filmcraft_codecs::VideoDecoder as _;
+        let Some(path) = open_gop_hevc() else { return };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let Ok(file) = filmcraft_isobmff::open(bytes.clone()) else { return };
+        let Some(t) = file.track_of_kind(filmcraft_isobmff::TrackKind::Video) else { return };
+        let Some(entry) = file.tracks[t].entries.first() else { return };
+        let Some(Ok(info)) = filmcraft_codecs::hw::NalStreamInfo::from_entry(entry) else {
+            eprintln!("SKIPPED: not an hvcC stream");
+            return;
+        };
+        let Ok(mut d) = VaDecoder::new(info) else {
+            eprintln!("SKIPPED: this driver does not take this stream");
+            return;
+        };
+        let count = file.tracks[t].samples.len();
+        // The stream description, for the NAL types that say which picture is a CRA.
+        let described: Option<filmcraft_codecs::hw::NalStreamInfo> = filmcraft_codecs::hw::NalStreamInfo::from_entry(entry).and_then(|r| r.ok());
+        let Some(nal_info) = described else {
+            eprintln!("SKIPPED: not an hvcC stream");
+            return;
+        };
+        // Start at a CRA rather than at the file's beginning: `skip_rasl` is only set when the run
+        // *begins* at a CRA / BLA, which is what a seek onto a key frame does. The file's own first
+        // picture is an IDR and would never set it.
+        // The same predicate `decode` uses to set the flag: a BLA / CRA at the start of a run, so
+        // types 16..=21 except the two IDR ones (19, 20). An IDR has no RASL after it, and matching
+        // one would silently never set the flag.
+        let starts_run = |types: &[u8]| types.iter().any(|&n| (16..=21).contains(&n) && !(19..=20).contains(&n));
+        let cra = (0..count).find(|&i| file.read_sample(&bytes, t, i).is_ok_and(|s| starts_run(&nal_info.nal_types(&s))));
+        let Some(cra) = cra else {
+            eprintln!("SKIPPED: the fixture has no CRA to start a run at");
+            return;
+        };
+        d.reset();
+        let (mut decoded, mut skipped_leading) = (0usize, 0usize);
+        let (mut after_skipping_ended, mut dropped_after_skipping) = (false, false);
+        for i in cra..count {
+            let Ok(s) = file.read_sample(&bytes, t, i) else { break };
+            let pts = file.tracks[t].samples[i].pts;
+            match d.decode(&s, pts) {
+                Ok(frames) if frames.is_empty() => {
+                    // Acceptable only for the run's leading RASL pictures, which are contiguous: the
+                    // CRA itself decodes, and the pictures that cannot be decoded come straight after
+                    // it. Once pictures have started coming out *again*, no later picture may be
+                    // dropped — that is the sticky flag, and its symptom is a hole in the stream.
+                    if after_skipping_ended {
+                        // A picture dropped *after* the run's leading RASL ones: the sticky flag.
+                        dropped_after_skipping = true;
+                        decoded += 1;
+                    } else {
+                        skipped_leading += 1;
+                    }
+                }
+                Ok(frames) => {
+                    decoded += frames.len();
+                    if skipped_leading > 0 {
+                        after_skipping_ended = true;
+                    }
+                }
+                Err(e) => panic!("sample {i} of an open-GOP HEVC run failed to decode: {e}"),
+            }
+        }
+        assert!(skipped_leading > 0, "the run starts at a CRA, so some leading RASL pictures are skipped");
+        assert!(decoded > 1, "the run decoded {decoded} pictures around {skipped_leading} RASL skips");
+        assert!(!dropped_after_skipping, "the flag stayed set after the leading RASL pictures ended, so pictures were dropped later in the run");
+        eprintln!("open-GOP run from sample {cra}: {decoded} pictures decoded, {skipped_leading} leading RASL pictures skipped");
+    }
+
+    /// An open-GOP HEVC fixture: `open-gop=1` makes the keyint boundary a CRA with RASL pictures
+    /// after it, which is what sets `skip_rasl`. Skips without ffmpeg.
+    fn open_gop_hevc() -> Option<std::path::PathBuf> {
+        use filmcraft_testkit::fixtures;
+        let ff = filmcraft_testkit::require_ffmpeg!(None);
+        fixtures::generate(&fixtures::fixtures_root().join("platform/vaapi").join("hevc_open_gop.mp4"), |tmp| {
+            let args = [
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:r=24:d=1",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "fast",
+                "-tag:v",
+                "hvc1",
+                "-x265-params",
+                "log-level=error:bframes=3:keyint=6:min-keyint=6:scenecut=0:open-gop=1",
+                "-pix_fmt",
+                "yuv420p",
+            ];
+            let st = std::process::Command::new(&ff).args(["-y", "-v", "error"]).args(args).arg(tmp).status();
+            matches!(st, Ok(s) if s.success())
+        })
+    }
+
     #[test]
     fn an_hevc_picture_submits_no_scaling_list_buffer() {
         let p = picture(1, false);

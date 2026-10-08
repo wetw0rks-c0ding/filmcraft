@@ -1666,7 +1666,22 @@ impl Session {
             return Err(format!("vaPutImage failed on surface {surface}: {}", api.status_text(st)));
         }
         let display = Arc::clone(&self.display);
-        Readback::map(display, image, false)
+        // `vaCreateImage` made this image, so this function owns it until a `Readback` does — and
+        // `Readback::map` only takes ownership on success. A map that fails therefore has to destroy
+        // it here, which is what `derived == false` says: `Readback::map` destroys a *derived* image
+        // itself (nothing else can tell libva the id is unwanted) but leaves a created one to the
+        // caller, because a created image's id is the caller's to release.
+        let image_id = image.image_id;
+        match Readback::map(display, image, false) {
+            Ok(read) => Ok(read),
+            Err(why) => {
+                let _gate = self.display.gate();
+                // SAFETY: `image_id` is the image `vaCreateImage` filled in above, it was never mapped
+                // (so never unmapped), and nothing else holds it — this is its one destroy.
+                unsafe { destroy_image(self.display.dpy, image_id) };
+                Err(why)
+            }
+        }
     }
 }
 
@@ -1790,12 +1805,23 @@ impl Readback {
         // below is `data_size` readable bytes; both slices handed to `f` are subranges of it, which is
         // what the `get` calls check, and neither outlives the borrow of `self`.
         let bytes = unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.image.data_size as usize) };
-        let (Some(&pitch), Some(&luma_at), Some(&chroma_at)) = (self.image.pitches.first(), self.image.offsets.first(), self.image.offsets.get(1)) else {
+        let (Some(&luma_pitch), Some(&chroma_pitch), Some(&luma_at), Some(&chroma_at)) =
+            (self.image.pitches.first(), self.image.pitches.get(1), self.image.offsets.first(), self.image.offsets.get(1))
+        else {
             return f(&[], &[], 0, 0);
         };
-        let (stride, rows) = (pitch as usize, self.image.height as usize);
+        let (stride, chroma_stride, rows) = (luma_pitch as usize, chroma_pitch as usize, self.image.height as usize);
         let chroma_rows = rows.div_ceil(2);
-        let (Some(luma_len), Some(chroma_len)) = (stride.checked_mul(rows), stride.checked_mul(chroma_rows)) else {
+        // Each plane's own pitch, not the luma's: reading the chroma plane at the luma pitch would
+        // walk off it. But `biplanar::Biplanar` has a *single* stride for both planes, so a driver
+        // that pitches them differently cannot be read through it at all — `validate_image` refuses
+        // that image before this is reached, and this second check is what makes the refusal hold even
+        // if a caller skipped it (an empty pair makes `to_frame` fail, which is an error rather than
+        // a picture read at the wrong stride).
+        if chroma_stride != stride {
+            return f(&[], &[], 0, 0);
+        }
+        let (Some(luma_len), Some(chroma_len)) = (stride.checked_mul(rows), chroma_stride.checked_mul(chroma_rows)) else {
             return f(&[], &[], 0, 0);
         };
         let (Some(luma), Some(chroma)) =
@@ -1826,12 +1852,13 @@ impl Drop for Readback {
     }
 }
 
-/// Destroy an image that was created but never read: the two paths out of [`Readback::map`] where the
-/// map failed, so that a failed readback leaks neither the image nor its buffer.
+/// Destroy an image that was created but never read: the paths out of [`Readback::map`] where the map
+/// failed, so that a failed readback leaks neither the image nor its buffer.
 ///
 /// Only for a *derived* image. An image from `vaCreateImage` whose map failed is the caller's to
-/// destroy — [`Session::read_indirect`] does — because libva has no way to tell a caller that its own
-/// `vaCreateImage` id is no longer wanted, and destroying it here would be a double destroy.
+/// destroy — [`Session::read_indirect`] does, on its own error path — because libva has no way to
+/// tell a caller that its own `vaCreateImage` id is no longer wanted, and destroying it here would be
+/// a double destroy.
 fn destroy_unread_image(display: &Arc<Display>, image: &VaImage, derived: bool) {
     if !derived {
         return;

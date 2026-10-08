@@ -93,37 +93,47 @@ pub fn capabilities() -> String {
     out
 }
 
-/// The surface ring: the surfaces a decoder decodes into, handed out one at a time.
+/// The surfaces a decoder decodes into, handed out one at a time.
 ///
 /// A picture is decoded into a surface and read back out of it before the next picture is decoded,
-/// so a decoder needs at least two; it needs more than two when the stream reorders, because a
-/// picture that precedes another in presentation order stays in the decoded picture buffer until the
-/// pictures before it have gone out. [`Dpb`] is that buffer, which is the decoder's own state;
-/// [`Ring`] is only where the surfaces come from.
+/// but a surface a later picture still refers to may not be decoded into: the driver would read the
+/// new picture as that reference. So the ring does not hand surfaces out on a bare rotation — it
+/// hands out one that is not in the decoded picture buffer, and the caller passes that buffer in
+/// because only the picture-record builder knows what it holds.
 ///
-/// Nothing here trusts the count or the first id it is handed: both come from a stream description,
-/// so the count is at least one (a ring with no surface could not decode anything) and the ids
-/// saturate, which is the only thing an overflowing count can honestly be said to be rather than a
-/// different number.
+/// The rotation is still what decides *which* of the free surfaces: starting from where the last one
+/// left off means consecutive pictures land in different surfaces, and it means the search is bounded
+/// by the number of surfaces rather than by anything the stream says.
 struct Ring {
     surfaces: Vec<u32>,
     next: usize,
 }
 
 impl Ring {
-    /// A ring of `count` surfaces whose ids are `first_id`, `first_id + 1`, … — in that order, so
-    /// that the first picture decodes into the first surface the driver gave us.
-    fn new(count: usize, first_id: u32) -> Self {
-        let surfaces = (0..count.max(1)).map(|i| first_id.saturating_add(u32::try_from(i).unwrap_or(u32::MAX))).collect();
-        Self { surfaces, next: 0 }
+    /// A ring over the ids `vaCreateSurfaces` filled in — which is the only source of surface ids
+    /// that is guaranteed right. libva does not promise they are contiguous, and a surface id this
+    /// code invented rather than read would name a surface the driver never created.
+    fn from_surfaces(surfaces: &[u32]) -> Self {
+        Self { surfaces: surfaces.to_vec(), next: 0 }
     }
 
-    /// The next surface, wrapping round to the first one once every surface has been handed out.
-    /// `None` only for a ring with no surfaces at all, which [`Ring::new`] does not produce.
-    fn take(&mut self) -> Option<u32> {
-        let surface = self.surfaces.get(self.next).copied()?;
-        self.next = (self.next + 1) % self.surfaces.len();
-        Some(surface)
+    /// The next surface that is not one of `live` — the surfaces the decoded picture buffer still
+    /// refers to. `None` when every surface is referenced, which is the one thing that cannot be
+    /// decoded into anything: the caller turns it into an error rather than overwriting a reference.
+    ///
+    /// The search starts at the cursor and wraps, so it visits each surface once and gives up after
+    /// `len()` steps whatever the stream says.
+    fn take_unreferenced(&mut self, live: &[u32]) -> Option<u32> {
+        let count = self.surfaces.len();
+        for step in 0..count {
+            let at = (self.next + step) % count;
+            let surface = self.surfaces.get(at).copied()?;
+            if !live.contains(&surface) {
+                self.next = (at + 1) % count;
+                return Some(surface);
+            }
+        }
+        None
     }
 
     /// How many surfaces the ring holds.
@@ -179,11 +189,18 @@ fn validate_image(img: &VaImage) -> Result<(), String> {
     if img.offsets[0] != 0 {
         return Err(format!("the luma plane starts at offset {} of the buffer", img.offsets[0]));
     }
+    // The two planes are pitched the same. libva does not promise it, but `biplanar::Biplanar` — which
+    // is what the copy is made through — carries a single stride for both planes, so an image whose
+    // planes are pitched differently cannot be read at all rather than read wrongly. `with_mapped`
+    // checks this again where it indexes, so the refusal holds even if a caller skips this gate.
+    if img.pitches[0] != img.pitches[1] {
+        return Err(format!("luma pitch {} and chroma pitch {} differ", img.pitches[0], img.pitches[1]));
+    }
     for plane in 0..2usize {
-        let (rows, cols) = if plane == 0 { (height, width) } else { (height.div_ceil(2), width.div_ceil(2)) };
         let (Some(&pitch), Some(&offset)) = (img.pitches.get(plane), img.offsets.get(plane)) else {
             return Err(format!("plane {plane} has no pitch or offset"));
         };
+        let (rows, cols) = if plane == 0 { (height, width) } else { (height.div_ceil(2), width.div_ceil(2)) };
         let row_bytes = cols.checked_mul(sample_bytes).ok_or_else(|| format!("plane {plane} row width overflows"))?;
         if (pitch as usize) < row_bytes {
             return Err(format!("plane {plane} pitch {pitch} is under the {row_bytes} bytes a row of {cols} samples needs"));
@@ -236,11 +253,42 @@ mod tests {
     }
 
     #[test]
-    fn the_surface_ring_hands_out_every_surface_once_before_reusing_one() {
-        let mut ring = Ring::new(4, 4);
-        let first: Vec<u32> = (0..4).map(|_| ring.take().expect("a surface")).collect();
-        assert_eq!(first, vec![4, 5, 6, 7]);
-        assert_eq!(ring.take(), Some(4), "the first surface comes round again");
+    fn the_surface_ring_skips_the_surfaces_the_picture_buffer_still_holds() {
+        // The round-robin is what picks among the free ones; what it must never do is hand back a
+        // surface the driver is going to read as a reference. This is the defect the ring existed to
+        // invite: a bare rotation on a 6-surface ring with 5 live references eventually lands on a
+        // live one, and the driver decodes the picture into the surface it is reading as a reference.
+        let mut ring = Ring::from_surfaces(&[10, 11, 12, 13]);
+        assert_eq!(ring.take_unreferenced(&[]), Some(10));
+        assert_eq!(ring.take_unreferenced(&[]), Some(11));
+        // 12 and 13 are free, so the rotation reaches them...
+        assert_eq!(ring.take_unreferenced(&[]), Some(12));
+        assert_eq!(ring.take_unreferenced(&[]), Some(13));
+        // ...and comes round to 10, which is still free.
+        assert_eq!(ring.take_unreferenced(&[]), Some(10));
+        // But with 10 and 11 live, neither is handed out again.
+        assert_eq!(ring.take_unreferenced(&[10, 11]), Some(12));
+        assert_eq!(ring.take_unreferenced(&[10, 11]), Some(13));
+        // And with every surface live there is nothing to decode into, which is an error at the
+        // call site rather than a reference being overwritten.
+        assert_eq!(ring.take_unreferenced(&[10, 11, 12, 13]), None);
+    }
+
+    /// The ring is built from the ids the driver filled in, not from an arithmetic guess: libva does
+    /// not promise surface ids are contiguous, and an invented id names a surface that does not
+    /// exist.
+    #[test]
+    fn the_ring_holds_exactly_the_ids_the_driver_returned() {
+        let mut ring = Ring::from_surfaces(&[7, 900, 3, 41]);
+        let mut got = Vec::new();
+        // Exactly `len()` hand-outs: with nothing live every surface is free, so a `while let` here
+        // would never end.
+        for _ in 0..ring.len() {
+            got.push(ring.take_unreferenced(&[]).unwrap_or(0));
+        }
+        assert_eq!(got, vec![7, 900, 3, 41], "the driver's own ids, in the order it gave them");
+        assert_eq!(ring.len(), 4);
+        assert_eq!(Ring::from_surfaces(&[]).take_unreferenced(&[]), None, "an empty ring has nothing");
     }
 
     #[test]
@@ -284,5 +332,18 @@ mod tests {
         assert!(validate_image(&img).is_err(), "a 10-bit image in a surface the picture fills 8-bit rows of");
         assert!(validate_image(&image(0, 360, 640)).is_err(), "zero width");
         assert!(validate_image(&image(640, 0, 640)).is_err(), "zero height");
+        // The two planes are read through one stride (`biplanar::Biplanar` has a single `stride`),
+        // so an image whose planes are pitched differently cannot be read at all rather than read at
+        // the wrong stride. `with_mapped` re-checks this where it indexes.
+        let mut img = image(640, 360, 640);
+        img.pitches[1] = 1280;
+        img.data_size = 640 * 360 + 1280 * 180;
+        assert!(validate_image(&img).is_err(), "a chroma pitch the copy cannot express");
+        // The other way round is refused too: it is the pair that has to agree, not one order.
+        let mut img = image(640, 360, 640);
+        img.pitches[0] = 1280;
+        img.pitches[1] = 640;
+        img.data_size = 1280 * 360 + 640 * 180;
+        assert!(validate_image(&img).is_err(), "and a luma pitch the chroma does not share");
     }
 }
