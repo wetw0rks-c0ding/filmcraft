@@ -51,6 +51,10 @@ const HEVC_NAL_HEADER: [u8; 2] = [0; 2];
 pub struct NalPoc {
     h264: filmcraft_h264::slice::PocState,
     hevc: filmcraft_hevc::PocState,
+    /// Whether this decoder has already said once that it cannot apply explicit weighted bipred
+    /// weights. A stream's B run is hundreds of slices and the point is the same every time, so the
+    /// warning is made once per decoder rather than once per slice.
+    warned_explicit_bipred: bool,
 }
 
 impl NalPoc {
@@ -59,6 +63,23 @@ impl NalPoc {
     pub fn reset(&mut self) {
         self.h264 = filmcraft_h264::slice::PocState::default();
         self.hevc = filmcraft_hevc::PocState::default();
+    }
+
+    /// Say once per decoder that explicit weighted bipred weights are being dropped, so the
+    /// limitation this backend has is in the log rather than only in a doc comment.
+    ///
+    /// Returns whether this call was the one that logged, which a test asserts rather than trusting:
+    /// a stream's B run is hundreds of slices, and the point is the same every time.
+    pub fn warn_explicit_bipred_once(&mut self) -> bool {
+        if self.warned_explicit_bipred {
+            return false;
+        }
+        self.warned_explicit_bipred = true;
+        log::warn!(
+            "VA-API: this H.264 stream signals explicit weighted bipred (weighted_bipred_idc 2) and filmcraft-h264 does not expose the per-slice weighted_bipred_flag, \
+             so its slice records carry no weights. A slice that really uses them will decode to the wrong picture. This is said once per decoder."
+        );
+        true
     }
 }
 
@@ -240,6 +261,11 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         if pps.num_slice_groups > 1 {
             return Err("slice groups (FMO)".into());
         }
+        // Said once per decoder rather than per slice: a B run is hundreds of slices and the point
+        // is the same every time. See `h264_weights` for what this costs the picture.
+        if explicit_bipred_without_weights(&sh, pps) {
+            poc.warn_explicit_bipred_once();
+        }
 
         match first.as_ref() {
             None => {
@@ -414,6 +440,15 @@ fn h264_slice_record(nal: &[u8], sh: &filmcraft_h264::slice::SliceHeader, pps: &
     Ok(record_bytes(&record))
 }
 
+/// Whether this slice is in H.264's *explicit* weighted bipred mode with no weight table: the picture
+/// parameter set allows it (`weighted_bipred_idc == 2`) and the slice opts in through a
+/// `weighted_bipred_flag` that `filmcraft_h264` does not expose, so whether this slice uses weights
+/// cannot be derived. The warning that says so is [`NalPoc::warn_explicit_bipred_once`]; what the record
+/// carries is [`h264_weights`]'s business.
+fn explicit_bipred_without_weights(sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::params::Pps) -> bool {
+    pps.weighted_bipred_idc == 2 && sh.slice_type.is_b() && sh.pred_weight_table.is_none()
+}
+
 /// The prediction weight tables, from the slice header's own `pred_weight_table()`.
 ///
 /// A slice whose weight table is mandatory and missing is declined rather than submitted with
@@ -427,7 +462,8 @@ fn h264_slice_record(nal: &[u8], sh: &filmcraft_h264::slice::SliceHeader, pps: &
 /// weight flags clear, which is libva's own encoding of "explicit mode, not weighted here" and is
 /// what FilmCraft's own decoder does with those slices — its conformance suite is bit-exact against
 /// ffmpeg on a stream whose picture parameter set says `weighted_bipred_idc == 2`. This task's
-/// report carries the evidence and the one-clause alternative.
+/// report carries the evidence and the one-clause alternative, and
+/// [`NalPoc::warn_explicit_bipred_once`] puts the limitation in the log once per decoder.
 fn h264_weights(sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::params::Pps) -> Result<VaSliceParameterBufferH264, String> {
     let mandatory = (pps.weighted_pred && sh.slice_type.is_p()) || (pps.weighted_bipred_idc == 1 && sh.slice_type.is_b());
     let Some(table) = sh.pred_weight_table.as_ref() else {
@@ -569,8 +605,10 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
     let mut params = VaPictureParameterBufferHevc::default();
     let mut slices: Vec<SliceParam> = Vec::new();
     let mut slice_offsets: Vec<usize> = Vec::new();
-    // Every segment of the picture, with where its bytes are, until the last of them is known.
-    let mut segments: Vec<(&[u8], usize, filmcraft_hevc::slice::SliceHeader, u32, u32)> = Vec::new();
+    // Every segment of the picture, with where its bytes are, until the last of them is known. The
+    // second pass needs each segment's own PPS as well as its header: whether its weight table was
+    // mandatory is a flag of that parameter set.
+    let mut segments: Vec<(&[u8], usize, filmcraft_hevc::slice::SliceHeader, Arc<filmcraft_hevc::params::Pps>, u32, u32)> = Vec::new();
     // The last *independent* segment header, which a dependent segment inherits from; a dependent
     // segment carries almost none of its own, so the parser needs the one it follows.
     let mut previous: Option<filmcraft_hevc::slice::SliceHeader> = None;
@@ -605,6 +643,12 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         if sps.separate_colour_plane {
             return Err("separate_colour_plane_flag".into());
         }
+        // Monochrome codes no chroma at all, so the slice header's prediction weight table carries
+        // no chroma weights for `hevc_weights` to send; the record would have to invent them. (Both
+        // RT formats a `Plan` can name are 4:2:0, so `plan_nal` declines these streams too.)
+        if sps.chroma_array_type() == 0 {
+            return Err("monochrome (4:0:0)".into());
+        }
 
         if first.is_none() {
             picture_poc = Some(fill_hevc_picture(&mut params, poc, &sh, &pps, &sps, surface, width, height)?);
@@ -622,7 +666,7 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         // The record is built once every segment is known, because `LastSliceOfPic` belongs to the
         // last of them and libva's driver waits for it: a picture whose last segment does not say
         // the picture ended leaves the driver looking for more.
-        segments.push((nal, *offset, sh.clone(), data_offset, length));
+        segments.push((nal, *offset, sh.clone(), pps.clone(), data_offset, length));
         data_offset = data_offset.checked_add(length).ok_or("slice data buffer size overflows")?;
         // A dependent segment repeats almost nothing, so the segment that follows an independent
         // one inherits it and a dependent one does not become the new base.
@@ -636,8 +680,8 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         poc.hevc.update(&first, p);
     }
     let last = segments.len().saturating_sub(1);
-    for (i, (nal, offset, sh, at, length)) in segments.iter().enumerate() {
-        slices.push(SliceParam { offset: *at, length: *length, params: hevc_slice_record(nal, sh, *at, i == last)? });
+    for (i, (nal, offset, sh, pps, at, length)) in segments.iter().enumerate() {
+        slices.push(SliceParam { offset: *at, length: *length, params: hevc_slice_record(nal, sh, pps, *at, i == last)? });
         slice_offsets.push(*offset);
     }
     Ok(Picture { params: record_bytes(&params), slices, slice_offsets })
@@ -796,10 +840,18 @@ fn pack_hevc_slice_parsing(sps: &filmcraft_hevc::params::Sps, pps: &filmcraft_he
 /// One slice segment's `VASliceParameterBufferHEVC`.
 ///
 /// The reference lists are indices into the picture's `ReferenceFrames` and stay `0xFF`, the
-/// record's "this entry is not used"; the prediction weights are left zero for the same reason
-/// `fill_h264_picture` leaves its own: the surfaces are the decode loop's to fill in, and a zeroed
-/// weight table would decode a picture as if weighted prediction were off.
-fn hevc_slice_record(nal: &[u8], sh: &filmcraft_hevc::slice::SliceHeader, data_offset: u32, last_of_picture: bool) -> Result<Vec<u8>, String> {
+/// record's "this entry is not used": they name surfaces, and which surfaces the DPB holds is the
+/// decode loop's to decide since it owns the ring. The prediction weights are a different thing
+/// entirely — pure arithmetic the slice header already carries — and are filled in from it by
+/// [`hevc_weights`], like the H.264 side's.
+fn hevc_slice_record(
+    nal: &[u8],
+    sh: &filmcraft_hevc::slice::SliceHeader,
+    pps: &filmcraft_hevc::params::Pps,
+    data_offset: u32,
+    last_of_picture: bool,
+) -> Result<Vec<u8>, String> {
+    let weights = hevc_weights(sh, pps)?;
     let record = VaSliceParameterBufferHevc {
         slice_data_size: u32::try_from(nal.len()).map_err(|_| "slice segment length does not fit the record".to_string())?,
         slice_data_offset: data_offset,
@@ -827,9 +879,88 @@ fn hevc_slice_record(nal: &[u8], sh: &filmcraft_hevc::slice::SliceHeader, data_o
         // find where `slice_segment_data()` starts. Counting the whole NAL unit would over-count
         // every `00 00 03` in the residual data and mis-place every subset header after the first.
         slice_data_num_emu_prevn_bytes: field_u16(header_emu_prevention_bytes(nal, sh.data_offset)?, "slice_data_num_emu_prevn_bytes")?,
-        ..Default::default()
+        ..weights
     };
     Ok(record_bytes(&record))
+}
+
+/// The HEVC prediction weight tables (`va_dec_hevc.h:448-466`), from the slice segment header's own
+/// `pwt`.
+///
+/// HEVC has no per-list weight flag in the record and no "explicit" mode to be unsure about: the
+/// table is coded exactly when `weighted_pred_flag && slice_type == P` or `weighted_bipred_flag &&
+/// slice_type == B`, both of them flags of the *picture parameter set* rather than of the slice
+/// (`crates/hevc/src/slice.rs:334`). So the table is either there and this fills it exactly, or it
+/// is mandatory and missing — which is an `Err`, never a zeroed table next to a `pic_fields` that
+/// says weighting is in use.
+///
+/// `filmcraft_hevc`'s `WpEntry` already holds the *derived* weights in 8-bit units, so nothing is
+/// re-derived here and no spec formula is needed: `ChromaOffsetL0` / `ChromaOffsetL1` are the
+/// record's `ChromaOffsetLX` verbatim (the offset the parser computed from the coded
+/// `delta_chroma_offset_lX`), and the two `delta_*_weight` families are the weight the parser built
+/// minus the `1 << denom` it added to build it — the same subtraction in reverse, which is
+/// `crates/hevc/src/slice.rs:411-427`.
+fn hevc_weights(sh: &filmcraft_hevc::slice::SliceHeader, pps: &filmcraft_hevc::params::Pps) -> Result<VaSliceParameterBufferHevc, String> {
+    let mandatory = (pps.weighted_pred && sh.slice_type == filmcraft_hevc::slice::SliceType::P) || (pps.weighted_bipred && sh.is_b());
+    let Some(table) = sh.pwt.as_ref() else {
+        return if mandatory {
+            Err(format!("weighted {} prediction in a slice that carries no prediction weight table", if sh.is_b() { "bipred" } else { "pred" }))
+        } else {
+            Ok(VaSliceParameterBufferHevc::default())
+        };
+    };
+    // `pwt` only produces entries for the references the slice actually lists, so it is at most
+    // `num_ref_idx` long; the record's arrays are 15.
+    if table.l[0].len() > 15 || table.l[1].len() > 15 {
+        return Err(format!("prediction weight table of {} references does not fit the record", table.l[0].len().max(table.l[1].len())));
+    }
+    let luma_log2 = table.luma_log2_denom;
+    let chroma_log2 = table.chroma_log2_denom;
+    // Signed, because `delta_chroma_log2_weight_denom` is a signed syntax element (a stream may lower
+    // ChromaLog2WeightDenom below LumaLog2WeightDenom) and `1 << denom` is what the parser added to
+    // each coded weight, so subtracting it recovers the `delta_*_weight` the record carries. The
+    // parser bounds both denominators to 0..=7; the conversions refuse anything else rather than
+    // truncate it.
+    let luma_log2_i = i32::try_from(luma_log2).map_err(|_| format!("luma_log2_weight_denom {luma_log2} is out of range"))?;
+    let chroma_log2_i = i32::try_from(chroma_log2).map_err(|_| format!("ChromaLog2WeightDenom {chroma_log2} is out of range"))?;
+    let luma_one = 1i32.checked_shl(luma_log2_i.unsigned_abs()).ok_or("luma_log2_weight_denom out of range")?;
+    let chroma_one = 1i32.checked_shl(chroma_log2_i.unsigned_abs()).ok_or("ChromaLog2WeightDenom out of range")?;
+    let mut record = VaSliceParameterBufferHevc {
+        luma_log2_weight_denom: field_u8(luma_log2, "luma_log2_weight_denom")?,
+        delta_chroma_log2_weight_denom: field_i8(chroma_log2_i - luma_log2_i, "delta_chroma_log2_weight_denom")?,
+        ..Default::default()
+    };
+    for (list, entries) in [(0, &table.l[0]), (1, &table.l[1])] {
+        let mut delta_luma_weight = [0i8; 15];
+        let mut luma_offset = [0i8; 15];
+        let mut delta_chroma_weight = [[0i8; 2]; 15];
+        let mut chroma_offset = [[0i8; 2]; 15];
+        for (i, e) in entries.iter().enumerate() {
+            delta_luma_weight[i] = field_i8(e.luma.0.checked_sub(luma_one).ok_or("luma weight out of range")?, "delta_luma_weight")?;
+            luma_offset[i] = field_i8(e.luma.1, "luma_offset")?;
+            for c in 0..2 {
+                delta_chroma_weight[i][c] = field_i8(e.chroma[c].0.checked_sub(chroma_one).ok_or("chroma weight out of range")?, "delta_chroma_weight")?;
+                // The record's `ChromaOffsetLX` is the derived 8-bit offset, which is what the
+                // parser computed from the coded `delta_chroma_offset_lX` and left in `WpEntry`.
+                chroma_offset[i][c] = field_i8(e.chroma[c].1, "ChromaOffsetLX")?;
+            }
+        }
+        match list {
+            0 => {
+                record.delta_luma_weight_l0 = delta_luma_weight;
+                record.luma_offset_l0 = luma_offset;
+                record.delta_chroma_weight_l0 = delta_chroma_weight;
+                record.chroma_offset_l0 = chroma_offset;
+            }
+            _ => {
+                record.delta_luma_weight_l1 = delta_luma_weight;
+                record.luma_offset_l1 = luma_offset;
+                record.delta_chroma_weight_l1 = delta_chroma_weight;
+                record.chroma_offset_l1 = chroma_offset;
+            }
+        }
+    }
+    Ok(record)
 }
 
 /// The `LongSliceFlags` word (`va_dec_hevc.h:392`), packed from bit 0 up as the C bitfield declares
@@ -1255,6 +1386,12 @@ mod tests {
         bytes.windows(3).filter(|w| *w == [0, 0, 3]).count()
     }
 
+    /// A parser value as the `i8` a record field holds, refusing to truncate: `as i8` in an assertion
+    /// would let a value that does not fit compare equal to a truncated record field.
+    fn i8_of(value: i32) -> i8 {
+        i8::try_from(value).unwrap_or_else(|_| panic!("{value} does not fit the record's i8"))
+    }
+
     /// The H.264 slice record's prediction weight tables come from the slice header's own
     /// `pred_weight_table()`, entry by entry, rather than staying zeroed. A record that advertised
     /// weighted prediction with an empty table would decode a different picture from the stream's,
@@ -1315,6 +1452,50 @@ mod tests {
         }
         assert!(weighted >= 2, "the fixture has weighted slices ({weighted})");
         assert!(checked == weighted, "every weighted slice was checked");
+    }
+
+    /// The one thing this backend cannot do with H.264 explicit weighted bipred is discovered at
+    /// runtime: the slice record carries no weights, and the decoder says so in the log once rather
+    /// than once per slice. Both halves are checked — which slices the warning is for (the fixture's
+    /// B slices, not the P slices that do carry a table), and that it fires exactly once per decoder
+    /// across the fixture's whole B run.
+    #[test]
+    fn explicit_bipred_says_once_per_decoder_which_pictures_it_cannot_weight() {
+        let Some((info, sets, samples)) = h264() else { return };
+        let pps = sets.ppss.iter().flatten().next().unwrap_or_else(|| panic!("no PPS")).clone();
+        assert_eq!(pps.weighted_bipred_idc, 2, "the fixture is in explicit mode, which is what this is about");
+        let header_of = |sample: &[u8]| -> filmcraft_h264::slice::SliceHeader {
+            let nal = info.nals(sample).first().copied().expect("a NAL unit");
+            let hdr = filmcraft_h264::slice::NalHeader::parse(nal[0]).unwrap_or_else(|e| panic!("{e}"));
+            let rbsp = filmcraft_bitstream::unescape_rbsp(&nal[1..]);
+            filmcraft_h264::slice::SliceHeader::parse(&rbsp, hdr, |id| {
+                let p = sets.ppss.get(id as usize).and_then(|p| p.as_ref()).unwrap_or_else(|| panic!("PPS {id}"));
+                let s = sets.spss.get(p.sps_id as usize).and_then(|s| s.as_ref()).unwrap_or_else(|| panic!("SPS"));
+                Ok((p, s))
+            })
+            .unwrap_or_else(|e| panic!("{e}"))
+            .0
+        };
+        let headers: Vec<_> = samples.iter().map(|s| header_of(s)).collect();
+        let b = headers.iter().filter(|sh| sh.slice_type.is_b()).count();
+        assert!(b > 10, "the fixture has a B run to be quiet about ({b} B pictures)");
+        assert!(
+            headers.iter().filter(|sh| sh.slice_type.is_b()).all(|sh| super::explicit_bipred_without_weights(sh, &pps)),
+            "every B slice of an explicit-mode stream is one this backend cannot weight"
+        );
+        assert!(
+            headers.iter().filter(|sh| sh.slice_type.is_p()).all(|sh| !super::explicit_bipred_without_weights(sh, &pps)),
+            "and a P slice is not: it carries a table, so it is described exactly"
+        );
+        // the warning itself: once for the whole run, not once per B picture
+        let mut poc = super::NalPoc::default();
+        assert!(poc.warn_explicit_bipred_once(), "the first call is the one that logs");
+        for _ in 0..b {
+            assert!(!poc.warn_explicit_bipred_once(), "and no later call is");
+        }
+        // a decoder's warning survives a seek, which is the same stream and the same limitation
+        poc.reset();
+        assert!(!poc.warn_explicit_bipred_once(), "a reset forgets the pictures, not the limitation");
     }
 
     /// A slice segment that does not belong to the picture the record was filled in from is an
@@ -1384,6 +1565,39 @@ mod tests {
     /// samples in decoding order.
     fn hevc() -> Option<(NalStreamInfo, super::HevcSets, Vec<Vec<u8>>)> {
         let (info, samples) = hevc_stream()?;
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let sets = super::HevcSets::parse(&info).unwrap_or_else(|e| panic!("{e}"));
+        Some((info, sets, samples))
+    }
+
+    /// [`hevc_weighted`]: an HEVC stream whose encoder uses explicit weighted prediction.
+    fn hevc_weighted() -> Option<(NalStreamInfo, super::HevcSets, Vec<Vec<u8>>)> {
+        let ff = filmcraft_testkit::require_ffmpeg!(None);
+        let path = filmcraft_testkit::fixtures::generate(&fixture("hevc_weighted.mp4"), |tmp| {
+            // `weightp` and `weightb` are x265's weighted-prediction switches: the first puts
+            // `weighted_pred_flag` in the picture parameter set, the second `weighted_bipred_flag`,
+            // and each of those makes the slice header code a `pred_weight_table`. The plain
+            // fixture's parameter sets allow neither, so its segments carry no table at all and
+            // would leave the weight test vacuous.
+            let args = [
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=640x360:r=24:d=1,fade=t=in:st=0:d=1",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "fast",
+                "-tag:v",
+                "hvc1",
+                "-x265-params",
+                "log-level=error:bframes=3:keyint=24:min-keyint=24:scenecut=0:weightp=1:weightb=1",
+                "-pix_fmt",
+                "yuv420p",
+            ];
+            run(&ff, &args, tmp)
+        })?;
+        let (info, samples) = read(&path);
         let info = info.unwrap_or_else(|e| panic!("{e}"));
         let sets = super::HevcSets::parse(&info).unwrap_or_else(|e| panic!("{e}"));
         Some((info, sets, samples))
@@ -1779,6 +1993,77 @@ mod tests {
 
     /// An ffmpeg-made HEVC stream and its samples: an `hvcC`-derived description and the length-
     /// prefixed temporal units it holds, the first of which is an IDR.
+    /// The HEVC slice record's prediction weight tables come from the slice segment header's own
+    /// `pwt`, entry by entry. A record that said `weighted_pred_flag` and `weighted_bipred_flag`
+    /// were in use and then handed a driver zeroes would decode to a different picture from the
+    /// source, silently, which is the one answer this module never gives.
+    ///
+    /// The mapping the record wants is the syntax element of the same name, except that the two
+    /// `delta_*_weight` fields hold the *coded* weight minus the `1 << denom` the parser added to
+    /// build it, and `ChromaOffsetLX` is the derived 8-bit offset `filmcraft_hevc` already computed.
+    #[test]
+    fn the_hevc_slice_record_carries_the_prediction_weights() {
+        let Some((info, sets, samples)) = hevc_weighted() else { return };
+        let pps = sets.ppss.iter().flatten().next().unwrap_or_else(|| panic!("no PPS")).clone();
+        assert!(pps.weighted_pred, "the fixture's PPS allows weighted prediction in P slices");
+        assert!(pps.weighted_bipred, "and weighted bipred in B slices");
+        let mut weighted = 0usize;
+        let mut explicit = 0usize;
+        let mut poc = super::NalPoc::default();
+        for sample in &samples {
+            let Ok(picture) = super::build_nal(&info, sample, &mut poc, 9, 640, 360) else { continue };
+            let nals = info.nals(sample);
+            for (slice, &at) in picture.slices.iter().zip(&picture.slice_offsets) {
+                let nal = nals.iter().find(|n| sample.get(at..at + n.len()) == Some(*n)).unwrap_or_else(|| panic!("no NAL unit at {at}"));
+                let hdr = filmcraft_hevc::slice::NalHeader::parse(nal).unwrap_or_else(|e| panic!("{e}"));
+                let rbsp = filmcraft_bitstream::unescape_rbsp(&nal[2..]);
+                let (sh, _, _) = filmcraft_hevc::slice::SliceHeader::parse(&rbsp, hdr, |id| sets.lookup(id), None).unwrap_or_else(|e| panic!("{e}"));
+                let r = crate::vaapi::ffi::slice_params_hevc(&slice.params).unwrap_or_else(|| panic!("not a slice record"));
+                let Some(table) = sh.pwt.as_ref() else {
+                    // An I slice codes no table and needs none, and says so with zeroes.
+                    assert_eq!(r.luma_log2_weight_denom, 0, "no table means no weighting");
+                    assert!(r.delta_luma_weight_l0 == [0; 15] && r.delta_luma_weight_l1 == [0; 15], "and none are invented");
+                    continue;
+                };
+                weighted += 1;
+                let luma_one = 1i32 << table.luma_log2_denom;
+                let chroma_one = 1i32 << table.chroma_log2_denom;
+                assert_eq!(u32::from(r.luma_log2_weight_denom), table.luma_log2_denom, "luma_log2_weight_denom");
+                assert_eq!(
+                    r.delta_chroma_log2_weight_denom,
+                    i8_of(table.chroma_log2_denom as i32 - table.luma_log2_denom as i32),
+                    "delta_chroma_log2_weight_denom is ChromaLog2WeightDenom minus LumaLog2WeightDenom"
+                );
+                for (list, entries, (dl, lo, dc, co)) in [
+                    (0, &table.l[0], (&r.delta_luma_weight_l0, &r.luma_offset_l0, &r.delta_chroma_weight_l0, &r.chroma_offset_l0)),
+                    (1, &table.l[1], (&r.delta_luma_weight_l1, &r.luma_offset_l1, &r.delta_chroma_weight_l1, &r.chroma_offset_l1)),
+                ] {
+                    // A B slice has both lists; a P slice's second list is empty and the record's
+                    // L1 family stays zero, which is what an empty list means.
+                    if !sh.is_b() {
+                        assert!(entries.is_empty() || list == 0, "a P slice codes no second prediction weight list");
+                    }
+                    for (i, e) in entries.iter().enumerate() {
+                        if e.luma_flag || e.chroma_flag {
+                            explicit += 1;
+                        }
+                        assert_eq!(dl[i], i8_of(e.luma.0 - luma_one), "delta_luma_weight_l{list}[{i}]");
+                        assert_eq!(lo[i], i8_of(e.luma.1), "luma_offset_l{list}[{i}]");
+                        for c in 0..2 {
+                            assert_eq!(dc[i][c], i8_of(e.chroma[c].0 - chroma_one), "delta_chroma_weight_l{list}[{i}][{c}]");
+                            assert_eq!(co[i][c], i8_of(e.chroma[c].1), "ChromaOffsetL{list}[{i}][{c}]");
+                        }
+                    }
+                    // nothing is written past the slice segment's own references
+                    assert!(dl[entries.len()..].iter().all(|&w| w == 0), "delta_luma_weight_l{list} past the slice's references");
+                    assert!(lo[entries.len()..].iter().all(|&w| w == 0), "luma_offset_l{list} past the slice's references");
+                }
+            }
+        }
+        assert!(weighted >= 20, "the fixture's segments code a table ({weighted})");
+        assert!(explicit >= 20, "and at least {explicit} of its entries set a weight flag rather than taking the default");
+    }
+
     fn hevc_stream() -> Option<(Result<NalStreamInfo, String>, Vec<Vec<u8>>)> {
         let ff = filmcraft_testkit::require_ffmpeg!(None);
         let path = filmcraft_testkit::fixtures::generate(&fixture("hevc_main.mp4"), |tmp| {
