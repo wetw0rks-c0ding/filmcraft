@@ -192,7 +192,7 @@ pub struct VaImageFormat {
 /// many planes it has, and where each plane starts and how it is pitched. Every readback path
 /// copies out of this, so a field declared at the wrong offset or width reads its neighbour's
 /// value instead of its own; [`Display::probe_image_layout`] is the check against the library that
-/// is installed, and `va_image_layout_matches_the_library` pins the offsets against the header.
+/// is installed, and `va_image_layout_matches_the_header` pins the offsets against the header.
 /// 120 bytes.
 ///
 /// The fields are private to this file: they are libva's memory layout rather than FilmCraft's
@@ -783,6 +783,9 @@ mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
 
+    /// The loader and the mandatory `vaInitialize` work on a machine that has them: both libraries
+    /// open, every required symbol resolves, and the display reports a version and a profile list.
+    /// What a profile then supports is a separate question, answered by the decoder's own tests.
     #[test]
     fn the_libraries_load_and_the_display_initializes() {
         let Ok(api) = load() else {
@@ -793,14 +796,15 @@ mod tests {
             eprintln!("SKIPPED: no VA display");
             return;
         };
-        // What the decoder needs off a display, other than the plane geometry the ABI probe checks:
-        // libva reports a version, a profile list, and a video-decoder entry point for at least one
-        // profile. A driver answering none of that is not a display this backend can decode with.
-        let (major, minor) = d.va_version();
-        assert!(major >= 1 || minor >= 1, "vaInitialize reported no libva version");
-        let profiles = d.profiles().expect("vaQueryConfigProfiles");
-        assert!(!profiles.is_empty(), "the driver supports no profile at all");
-        assert!(profiles.iter().any(|p| d.entrypoints(*p).is_ok_and(|e| e.contains(&Entrypoint::Vld))), "no profile offers VAEntrypointVLD");
+        // The loader opened both libraries, found every required symbol and initialised the
+        // display, which is what this test is for. Beyond that, only what this backend promises:
+        // a display reports its version and answers a profile query. Whether any profile offers a
+        // video decoder is a capability question, not a load question — a driver that offers only
+        // encode entry points is a machine with no hardware decoder, which is a legitimate answer
+        // (see the module doc), not a failure.
+        let (major, _) = d.va_version();
+        assert!(major >= 1, "vaInitialize reported no libva version");
+        assert!(!d.profiles().expect("vaQueryConfigProfiles").is_empty(), "the driver supports no profile at all");
     }
 
     /// `OK` is success, libva has words for it, and the load-free path a [`Display`] error uses
