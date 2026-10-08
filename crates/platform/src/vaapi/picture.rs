@@ -24,8 +24,9 @@ use filmcraft_bitstream::unescape_rbsp;
 use filmcraft_codecs::hw::{FrameCodec, FrameStreamInfo, NalCodec, NalStreamInfo};
 
 use super::ffi::{
-    INVALID_SURFACE, PICTURE_H264_INVALID, PICTURE_H264_LONG_TERM_REFERENCE, PICTURE_H264_SHORT_TERM_REFERENCE, PICTURE_HEVC_INVALID, SLICE_DATA_FLAG_ALL,
-    VA_PADDING_LOW, VaPictureH264, VaPictureHevc, VaPictureParameterBufferH264, VaPictureParameterBufferHevc, VaSliceParameterBufferH264,
+    INVALID_SURFACE, PICTURE_H264_INVALID, PICTURE_H264_LONG_TERM_REFERENCE, PICTURE_H264_SHORT_TERM_REFERENCE, PICTURE_HEVC_INVALID,
+    PICTURE_HEVC_LONG_TERM_REFERENCE, PICTURE_HEVC_RPS_LT_CURR, PICTURE_HEVC_RPS_ST_CURR_AFTER, PICTURE_HEVC_RPS_ST_CURR_BEFORE, SLICE_DATA_FLAG_ALL,
+    VA_PADDING_LOW, VaIqMatrixBufferH264, VaPictureH264, VaPictureHevc, VaPictureParameterBufferH264, VaPictureParameterBufferHevc, VaSliceParameterBufferH264,
     VaSliceParameterBufferHevc, record_bytes,
 };
 
@@ -39,6 +40,10 @@ const MAX_REF_FRAMES: usize = 16;
 /// bounds what a corrupt sample can make this module allocate rather than describing a real limit.
 const MAX_SLICES: usize = 256;
 
+/// The most reference frames a `VAPictureParameterBufferHEVC` holds (`ReferenceFrames[15]`,
+/// `va_dec_hevc.h:64`), which is also the most a `VASliceParameterBufferHEVC`'s `RefPicList` names.
+const MAX_HEVC_REF_PICS: usize = 15;
+
 /// The bytes of an HEVC NAL unit header (`nuh_layer_id` and `nuh_temporal_id_plus1`), which the
 /// slice segment header's byte offsets in a record are counted from.
 const HEVC_NAL_HEADER: [u8; 2] = [0; 2];
@@ -47,10 +52,22 @@ const HEVC_NAL_HEADER: [u8; 2] = [0; 2];
 /// FilmCraft's own decoder would compute for it. One per decoder: a seek or a flush that starts
 /// again mid-stream calls [`NalPoc::reset`], and so does a caller whose first picture is not an IDR
 /// — an IDR's POC follows from being an IDR rather than from what came before.
+///
+/// It also carries the decoded picture buffer: which surfaces hold a picture that later pictures may
+/// refer to, and the marks 8.2.5 / 8.3.2 put on them. A VA-API driver keeps its own picture buffer,
+/// but the records name its contents — [`VaPictureParameterBufferH264::reference_frames`] and
+/// [`VaSliceParameterBufferH264::ref_pic_list0`] are the only place the driver is told what is in it
+/// — so the list lives here, beside the parser state the pictures' identities come from. The decode
+/// loop's surface ring is where the surfaces come from; it does not need to know which of them hold
+/// a reference.
 #[derive(Clone, Default)]
 pub struct NalPoc {
     h264: filmcraft_h264::slice::PocState,
     hevc: filmcraft_hevc::PocState,
+    dpb: Vec<DpbEntry>,
+    /// `MaxFrameNum` (H.264 7.4.2.1.1): the modulus `frame_num` wraps at, which 8.2.4.1's `pic_num`
+    /// needs to order two frames that straddle the wrap. Zero until the first picture is parsed.
+    max_frame_num: u32,
     /// Whether this decoder has already said once that it cannot apply explicit weighted bipred
     /// weights. A stream's B run is hundreds of slices and the point is the same every time, so the
     /// warning is made once per decoder rather than once per slice.
@@ -59,10 +76,12 @@ pub struct NalPoc {
 
 impl NalPoc {
     /// Forget every picture decoded so far, as after a seek or a flush: the next picture's POC is
-    /// computed as though nothing came before it.
+    /// computed as though nothing came before it, and the decoded picture buffer is empty.
     pub fn reset(&mut self) {
         self.h264 = filmcraft_h264::slice::PocState::default();
         self.hevc = filmcraft_hevc::PocState::default();
+        self.dpb.clear();
+        self.max_frame_num = 0;
     }
 
     /// Say once per decoder that explicit weighted bipred weights are being dropped, so the
@@ -104,10 +123,120 @@ pub struct SliceParam {
 pub struct Picture {
     /// The picture parameter buffer record.
     pub params: Vec<u8>,
+    /// The IQ matrix (scaling list) record — H.264 only; empty for HEVC, whose scaling lists are
+    /// part of its picture parameter record. See [`h264_iq_matrix`] for why a decode cannot be
+    /// without it.
+    pub iq_matrix: Vec<u8>,
     /// One entry per slice, in decoding order.
     pub slices: Vec<SliceParam>,
     /// Byte offset of each slice's NAL unit within the sample it came from, parallel to `slices`.
     pub slice_offsets: Vec<usize>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// The decoded picture buffer, and the reference lists a slice's record names.
+//
+// The driver's own picture buffer is not something this backend can see; the records are how it is
+// told what is in it. So the pictures the decoder has decoded are listed here, each with the surface
+// it is in and the mark reference marking (8.2.5 for H.264, 8.3.2 for HEVC) gives it, and each
+// record is filled in from that list.
+//
+// Every reference a slice names has to be a surface holding *that* picture. A reference the buffer
+// does not hold is therefore an `Err`, never a filler: a filler is a real surface id holding a
+// different picture, and a driver reads it as the reference without complaint, so the mistake shows
+// up as corruption on screen rather than as an error. Handing the stream to the software decoder
+// instead is the visible, correct outcome.
+// ---------------------------------------------------------------------------------------------
+
+/// One picture in the decoded picture buffer: which surface it is in, and the numbers a later
+/// picture refers to it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DpbEntry {
+    /// The surface the picture was decoded into.
+    surface: u32,
+    /// `frame_num` (H.264) or `pic_order_cnt` (HEVC).
+    frame_num: u32,
+    poc: i32,
+    mark: Mark,
+}
+
+/// How a picture in the decoded picture buffer is marked. The variants are 8.2.5.1's three states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mark {
+    /// Not a reference: the surface may be decoded into again.
+    Unused,
+    /// A short-term reference, named by its `frame_num` (H.264) or POC (HEVC).
+    Short,
+    /// A long-term reference with the index its marking gave it (`long_term_frame_idx` in H.264's
+    /// MMCO 3 / 6, the position in `lt_ref_pic_poc_lsb_sps` in HEVC).
+    Long(u32),
+}
+
+impl Mark {
+    /// The entry as a `ReferenceFrames` slot: an unused one names no surface and says so, and a
+    /// used one carries the surface, the number it is named by and the `VA_PICTURE_*` bit its mark
+    /// is.
+    fn h264_picture(self, entry: &DpbEntry) -> VaPictureH264 {
+        if self == Mark::Unused {
+            return invalid_h264_picture();
+        }
+        let long = matches!(self, Mark::Long(_));
+        VaPictureH264 {
+            picture_id: entry.surface,
+            frame_idx: entry.frame_num,
+            flags: if long { PICTURE_H264_LONG_TERM_REFERENCE } else { PICTURE_H264_SHORT_TERM_REFERENCE },
+            top_field_order_cnt: entry.poc,
+            bottom_field_order_cnt: 0,
+            va_reserved: [0; VA_PADDING_LOW],
+        }
+    }
+
+    /// [`Mark::h264_picture`] for the HEVC record: the same entry with the POC in the field HEVC
+    /// names pictures by.
+    fn hevc_picture(self, entry: &DpbEntry, used: Option<u32>) -> VaPictureHevc {
+        if self == Mark::Unused {
+            return invalid_hevc_picture();
+        }
+        // `used` is the `VA_PICTURE_HEVC_RPS_*` bit saying the current picture refers to this one,
+        // which is exclusive of the long-term bit (va.h:5325).
+        let flags = match (used, self) {
+            (Some(bit), _) => bit,
+            (None, Mark::Long(_)) => PICTURE_HEVC_LONG_TERM_REFERENCE,
+            _ => 0,
+        };
+        VaPictureHevc { picture_id: entry.surface, pic_order_cnt: entry.poc, flags, va_reserved: [0; VA_PADDING_LOW] }
+    }
+}
+
+/// How many surfaces a stream's decoded picture buffer needs, so the decode loop knows how many to
+/// create: the number of pictures its sequence parameter set allows in the buffer at once
+/// (`max_num_ref_frames` for H.264, `sps_max_dec_pic_buffering_minus1` for HEVC).
+///
+/// This is the *reference* count, not the presentation-reordering count: a picture is read back out
+/// of its surface and handed on as host memory before the next picture is decoded, so the only
+/// pictures that have to stay in a surface are the ones later pictures refer to. A parameter set
+/// that will not parse is an `Err` — the surfaces are allocated for the sizes it describes, so a
+/// stream whose parameter sets do not parse is not one this backend hands to a driver.
+pub fn reference_pictures(info: &NalStreamInfo) -> Result<usize, String> {
+    let parsed = match info.codec {
+        NalCodec::H264 => H264Sets::parse(info)?
+            .spss
+            .iter()
+            .flatten()
+            .map(|sps| sps.max_num_ref_frames as usize)
+            .max()
+            .ok_or("no sequence parameter set to size the decoded picture buffer from")?,
+        NalCodec::Hevc => HevcSets::parse(info)?
+            .spss
+            .iter()
+            .flatten()
+            .map(|sps| sps.max_dec_pic_buffering as usize)
+            .max()
+            .ok_or("no sequence parameter set to size the decoded picture buffer from")?,
+    };
+    // At least one, since every picture that is not a reference still has to be decoded somewhere,
+    // and at most what the H.264 record can name.
+    Ok(parsed.clamp(1, MAX_REF_FRAMES))
 }
 
 impl Picture {
@@ -117,6 +246,491 @@ impl Picture {
     pub fn slice_data_size(&self) -> u32 {
         self.slices.last().map_or(0, |s| s.offset.saturating_add(s.length))
     }
+}
+
+/// The H.264 IQ matrix record for a picture decoded with `sps`: that sequence parameter set's own
+/// scaling lists, or the flat 16s of 7.4.2.1.1's default when it declares none.
+///
+/// **A decode that does not submit this record does not decode.** That is not an inference from the
+/// specification, which never mentions it: it is what the iHD driver on an Intel Arc does. Given
+/// the picture, slice and slice-data records with no IQ matrix among them, it takes the whole
+/// submission, `vaBeginPicture`, `vaRenderPicture`, `vaEndPicture` and `vaSyncSurface` all report
+/// `VA_STATUS_SUCCESS`, `vaQuerySurfaceStatus` reports the surface ready — and the surface holds a
+/// uniform mid-grey, because nothing was ever rendered into it. An indirect readback (`vaPutImage`)
+/// of the same surface is uniformly *zero* instead. A driver that fails loudly is easy to fall back
+/// from; this one succeeds at every step and returns a plausible picture that is not the stream's,
+/// which is the outcome this backend is not allowed to ship (see `docs/adr/0001-platform-ffi.md`
+/// and the never-crash rule's "never lost work").
+///
+/// So the record is submitted for every H.264 picture, flat lists and all. It costs 240 bytes and
+/// one buffer per picture.
+fn h264_iq_matrix(sps: &filmcraft_h264::params::Sps) -> Vec<u8> {
+    // A copy and nothing more: `Sps::scaling` already holds the lists in raster scan order and in
+    // the record's own order — `[Intra Y, Intra Cb, Intra Cr, Inter Y, Inter Cb, Inter Cr]` for
+    // the 4x4 (7.3.2.1.1.1's list order) — so nothing is transposed or re-scanned here, and a
+    // stream with custom quantizers gets exactly the lists it carries.
+    //
+    // Only the two luma 8x8 lists go in: `VAIQMatrixBufferH264`'s 8x8 array is `[2][64]`, holding
+    // `[Intra Y, Inter Y]` and nothing for chroma, because an 8x8 chroma scaling list only exists
+    // at `chroma_format_idc == 3` (4:4:4), which `plan_nal` declines. `ScalingMatrices` keeps all
+    // six because the software decoder applies chroma 8x8 lists at that depth; this path does not
+    // get there, and putting a chroma list where the record has no slot for it would silently
+    // submit the wrong quantizer.
+    let m = &sps.scaling;
+    let record = VaIqMatrixBufferH264 { scaling_list4x4: m.m4, scaling_list8x8: [m.m8[0], m.m8[3]], ..Default::default() };
+    record_bytes(&record)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reference marking and reference list construction, for both codecs. The two are the same shape
+// (H.264 8.2.4 / 8.2.5 and HEVC 8.3.2 / 8.3.4) and they are separate from the parsing above because
+// they are about *surfaces* rather than about bitstream: which surface a later picture is looking for,
+// and whether it is still there.
+// ---------------------------------------------------------------------------------------------
+
+/// `pic_num` (H.264 8.2.4.1): `entry`'s `frame_num` as a number relative to the current picture's,
+/// so that two frames that straddle the `frame_num` wrap compare the right way round. A stream's
+/// `MaxFrameNum` is at most 65536 and its `frame_num` is below it, so neither can overflow an `i32`.
+fn h264_pic_num(entry: &DpbEntry, cur_frame_num: u32, max_frame_num: u32) -> i32 {
+    let n = entry.frame_num as i32;
+    if n > cur_frame_num as i32 { n - max_frame_num as i32 } else { n }
+}
+
+/// 8.2.4.2 (initial list construction) and 8.2.4.3 (list modification), as indices into `dpb`.
+///
+/// This is `filmcraft_h264`'s own `Dpb::build_ref_lists` with one difference, forced by the surface:
+/// it returns `Err` where that function substitutes a fallback entry for a reference the buffer does
+/// not hold, and it works in indices rather than `FrameRef`s. A slice record's `RefPicList` names
+/// surfaces, so there is no such thing as a filler here — an entry that is not the picture the slice
+/// refers to is a *different* picture, which the driver reads without complaint, so the mistake shows
+/// up as corruption on screen rather than as an error. Handing the stream to the software decoder is
+/// the visible, correct outcome.
+fn h264_ref_lists(dpb: &[DpbEntry], sh: &filmcraft_h264::slice::SliceHeader, cur_poc: i32, max_frame_num: u32) -> Result<[Vec<usize>; 2], String> {
+    let mut lists: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    if sh.slice_type.is_intra() {
+        return Ok(lists);
+    }
+    if max_frame_num == 0 {
+        return Err("no sequence parameter set to order reference pictures by".into());
+    }
+    let cur = sh.frame_num as i32;
+    let modulus = max_frame_num as i32;
+    let pic_num = |i: usize| h264_pic_num(&dpb[i], sh.frame_num, max_frame_num);
+    let short: Vec<usize> = (0..dpb.len()).filter(|&i| dpb[i].mark == Mark::Short).collect();
+    let mut long: Vec<usize> = (0..dpb.len()).filter(|&i| matches!(dpb[i].mark, Mark::Long(_))).collect();
+    long.sort_by_key(|&i| match dpb[i].mark {
+        Mark::Long(n) => n,
+        Mark::Short | Mark::Unused => 0,
+    });
+    let mut entries: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    if sh.slice_type != filmcraft_h264::slice::SliceType::B {
+        let mut s = short.clone();
+        s.sort_by_key(|&i| std::cmp::Reverse(pic_num(i)));
+        entries[0] = s.into_iter().chain(long.iter().copied()).collect();
+    } else {
+        let mut before: Vec<usize> = short.iter().copied().filter(|&i| dpb[i].poc < cur_poc).collect();
+        let mut after: Vec<usize> = short.iter().copied().filter(|&i| dpb[i].poc > cur_poc).collect();
+        before.sort_by_key(|&i| std::cmp::Reverse(dpb[i].poc));
+        after.sort_by_key(|&i| dpb[i].poc);
+        entries[0] = before.iter().chain(&after).chain(&long).copied().collect();
+        entries[1] = after.iter().chain(&before).chain(&long).copied().collect();
+        // 8.2.4.2.3: when the two lists came out identical, swap the first two of the second, so the
+        // two pictures of a B pair are not each other's first reference.
+        if entries[1].len() > 1 && entries[0] == entries[1] {
+            entries[1].swap(0, 1);
+        }
+    }
+    for (list, out) in lists.iter_mut().enumerate().take(if sh.slice_type.is_b() { 2 } else { 1 }) {
+        let n = usize::try_from(sh.num_ref_idx_active[list]).map_err(|_| "num_ref_idx_active does not fit a list".to_string())?;
+        // 8.2.4.3.1 rewrites the initial list in place; an entry the modification leaves unplaced
+        // stays `None` and is the missing-reference error below rather than a filler.
+        let mut built: Vec<Option<usize>> = entries[list].iter().copied().take(n).map(Some).collect();
+        built.resize(n, None);
+        let mut pred = cur;
+        for (index, m) in sh.ref_pic_list_mod[list].iter().enumerate() {
+            if index >= n {
+                return Err("more reference list modifications than references".into());
+            }
+            // idc 3 ends the loop and 4, 5 and 6 change the list's length; only 0..=2 name a
+            // picture, and this module does not implement the length changes.
+            let (target, is_long) = match m.idc {
+                3 => break,
+                4..=6 => return Err(format!("modification_of_pic_nums_idc {}", m.idc)),
+                0 | 1 => {
+                    let d = i32::try_from(m.value).map_err(|_| "abs_diff_pic_num_minus1 does not fit".to_string())?.saturating_add(1);
+                    let no_wrap = if m.idc == 0 {
+                        if pred - d < 0 { pred - d + modulus } else { pred - d }
+                    } else if pred + d >= modulus {
+                        pred + d - modulus
+                    } else {
+                        pred + d
+                    };
+                    pred = no_wrap;
+                    let wanted = if no_wrap > cur { no_wrap - modulus } else { no_wrap };
+                    (short.iter().copied().find(|&i| pic_num(i) == wanted), false)
+                }
+                2 => (long.iter().copied().find(|&i| matches!(dpb[i].mark, Mark::Long(k) if k == m.value)), true),
+                other => return Err(format!("modification_of_pic_nums_idc {other}")),
+            };
+            let target = target.ok_or_else(|| {
+                if is_long {
+                    format!("long-term reference {} is not in the decoded picture buffer", m.value)
+                } else {
+                    format!("short-term reference at pic_num {pred} is not in the decoded picture buffer")
+                }
+            })?;
+            // 8.2.4.3.1: the named picture goes at `index`, what was there shifts right, and the
+            // picture that was displaced is dropped from later in the list.
+            for c in (index + 1..n).rev() {
+                built[c] = built[c - 1];
+            }
+            built[index] = Some(target);
+            let mut write = index + 1;
+            for c in index + 1..n {
+                let keeps = match built[c] {
+                    None => true,
+                    Some(e) if is_long => !matches!(dpb[e].mark, Mark::Long(k) if k == m.value),
+                    Some(e) => e != target,
+                };
+                if keeps {
+                    built[write] = built[c];
+                    write += 1;
+                }
+            }
+        }
+        let mut built_list: Vec<usize> = Vec::with_capacity(n);
+        for (i, entry) in built.iter().enumerate() {
+            built_list.push(entry.ok_or_else(|| format!("reference {i} of list {list} is not in the decoded picture buffer"))?);
+        }
+        *out = built_list;
+    }
+    Ok(lists)
+}
+
+/// 8.2.5: reference marking for the picture that has just been decoded, and its insertion into the
+/// decoded picture buffer. This is `filmcraft_h264`'s own `Dpb::store_picture` marking half without
+/// the output bumping: the only output order this backend has to keep is the one it reads back in,
+/// and a picture's surface is only needed until the next picture that refers to it is decoded.
+///
+/// It runs when the *records are built*, which is before the picture is rendered rather than after.
+/// That is safe because a decode that fails after this point takes the whole decoder with it (the
+/// hybrid decoder drops the hardware one and replays the run in software), and because what follows a
+/// flush or a seek is a fresh run whose first picture is a restart point, which clears the buffer.
+fn h264_mark(poc: &mut NalPoc, sh: &filmcraft_h264::slice::SliceHeader, sps: &filmcraft_h264::params::Sps, surface: u32, cur_poc: i32) {
+    // `MaxFrameNum = 1 << log2_max_frame_num` (7.4.2.1.1), which is what `frame_num` wraps at and so
+    // what `pic_num` is relative to. `log2_max_frame_num` is bounded to 4..=16 by the parser and
+    // re-bounded here, because a `shl` that overflowed would make every comparison wrong.
+    let max_frame_num = 1u32.checked_shl(sps.log2_max_frame_num).unwrap_or(0).max(1);
+    poc.max_frame_num = max_frame_num;
+    if sh.idr {
+        // 8.2.5.1: an IDR empties the buffer; there is no reference across it.
+        poc.dpb.clear();
+    }
+    let mut mark = Mark::Unused;
+    if sh.nal_ref_idc != 0 {
+        if sh.idr {
+            mark = if sh.long_term_reference { Mark::Long(0) } else { Mark::Short };
+        } else {
+            let mut current_long = None;
+            if sh.adaptive_ref_pic_marking {
+                current_long = h264_mmcos(poc, &sh.mmcos, sh.frame_num, max_frame_num);
+            } else {
+                h264_sliding_window(poc, sh.frame_num, max_frame_num, sps.max_num_ref_frames.max(1) as usize);
+            }
+            mark = match current_long {
+                Some(index) => Mark::Long(index),
+                None => {
+                    // A stream whose MMCOs left the buffer over-full is not conforming, and a
+                    // buffer over-full is a surface that is about to be reused under a reference.
+                    if poc.dpb.iter().filter(|e| e.mark != Mark::Unused).count() >= sps.max_num_ref_frames.max(1) as usize {
+                        h264_sliding_window(poc, sh.frame_num, max_frame_num, sps.max_num_ref_frames.max(1) as usize);
+                    }
+                    Mark::Short
+                }
+            };
+        }
+    }
+    poc.dpb.retain(|e| e.mark != Mark::Unused);
+    poc.dpb.push(DpbEntry { surface, frame_num: sh.frame_num, poc: cur_poc, mark });
+    // More pictures than the record can name is a picture buffer this backend cannot describe: a
+    // reference that no slot fits would be silently dropped from the driver's copy of the buffer.
+    // Keeping the most recent ones (the ones a reference can reach) is the least surprising trim,
+    // and a stream that gets here is one no conforming encoder produces.
+    if poc.dpb.len() > MAX_REF_FRAMES {
+        poc.dpb.drain(..poc.dpb.len() - MAX_REF_FRAMES);
+    }
+}
+
+/// 8.2.5.3 sliding window: make room by unmarking the oldest short-term reference.
+fn h264_sliding_window(poc: &mut NalPoc, cur_frame_num: u32, max_frame_num: u32, limit: usize) {
+    while poc.dpb.iter().filter(|e| e.mark != Mark::Unused).count() >= limit.max(1) {
+        let victim = poc
+            .dpb
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.mark == Mark::Short)
+            .min_by_key(|(_, e)| h264_pic_num(e, cur_frame_num, max_frame_num))
+            .map(|(i, _)| i);
+        // Nothing short-term left to make room with: the buffer holds long-term references only, and
+        // removing one of those would be a decision 8.2.5 does not offer. Leaving it is the
+        // conservative choice, and `h264_mark` trims the buffer to what the record can name.
+        let Some(i) = victim else { break };
+        poc.dpb[i].mark = Mark::Unused;
+    }
+    poc.dpb.retain(|e| e.mark != Mark::Unused);
+}
+
+/// 8.2.5.4 memory management control: the MMCOs 1 to 6, returning MMCO 6's long-term index for the
+/// current picture. This is `filmcraft_h264`'s `Dpb::apply_mmcos` marking marks on the buffer rather
+/// than on pictures.
+fn h264_mmcos(poc: &mut NalPoc, mmcos: &[filmcraft_h264::slice::Mmco], cur_frame_num: u32, max_frame_num: u32) -> Option<u32> {
+    let cur = cur_frame_num as i32;
+    let mut current_long = None;
+    for m in mmcos {
+        match m.op {
+            1 => {
+                let pn = cur - (m.difference_of_pic_nums_minus1 as i32 + 1);
+                for e in poc.dpb.iter_mut() {
+                    if e.mark == Mark::Short && h264_pic_num(e, cur_frame_num, max_frame_num) == pn {
+                        e.mark = Mark::Unused;
+                    }
+                }
+            }
+            2 => {
+                for e in poc.dpb.iter_mut() {
+                    if matches!(e.mark, Mark::Long(k) if k == m.long_term_pic_num) {
+                        e.mark = Mark::Unused;
+                    }
+                }
+            }
+            3 => {
+                let pn = cur - (m.difference_of_pic_nums_minus1 as i32 + 1);
+                for e in poc.dpb.iter_mut() {
+                    if matches!(e.mark, Mark::Long(k) if k == m.long_term_pic_num) {
+                        e.mark = Mark::Unused;
+                    }
+                }
+                for e in poc.dpb.iter_mut() {
+                    if e.mark == Mark::Short && h264_pic_num(e, cur_frame_num, max_frame_num) == pn {
+                        e.mark = Mark::Long(m.long_term_frame_idx);
+                    }
+                }
+            }
+            4 => {
+                let max = m.max_long_term_frame_idx_plus1;
+                for e in poc.dpb.iter_mut() {
+                    if matches!(e.mark, Mark::Long(k) if max == 0 || k > max - 1) {
+                        e.mark = Mark::Unused;
+                    }
+                }
+            }
+            5 => {
+                poc.dpb.clear();
+                current_long = None;
+            }
+            6 => current_long = Some(m.long_term_frame_idx),
+            _ => {}
+        }
+    }
+    poc.dpb.retain(|e| e.mark != Mark::Unused);
+    current_long
+}
+
+/// The `ReferenceFrames` a picture's record carries: the decoded picture buffer as it is for this
+/// picture, and how many entries of it were filled in.
+///
+/// The count is what was filled, never the DPB size the sequence parameter set declares: a driver
+/// reads `num_ref_frames` as the number of entries it may look at, so a count larger than the number
+/// of entries that name a surface is a record telling the driver to read invalid slots as pictures.
+/// An IDR starts from nothing, so it carries zero.
+fn h264_reference_frames(dpb: &[DpbEntry]) -> ([VaPictureH264; MAX_REF_FRAMES], u8, Vec<Option<usize>>) {
+    let mut frames = [invalid_h264_picture(); MAX_REF_FRAMES];
+    let mut slots = vec![None; dpb.len()];
+    let mut n = 0usize;
+    // Only the entries that are a reference get a slot, and only those are counted. An entry marked
+    // unused is a picture that is not a reference — one with `nal_ref_idc == 0`, kept so its surface
+    // is not reused while a later picture may still name its `frame_num` — and a slot that named it
+    // would be a counted slot holding no picture.
+    for (index, entry) in dpb.iter().enumerate().filter(|(_, e)| e.mark != Mark::Unused) {
+        if n == MAX_REF_FRAMES {
+            break;
+        }
+        frames[n] = entry.mark.h264_picture(entry);
+        slots[index] = Some(n);
+        n += 1;
+    }
+    (frames, u8::try_from(n).unwrap_or(u8::MAX), slots)
+}
+
+/// The two `RefPicList`s of a slice record, as the pictures they name, with everything past each
+/// list's length left invalid. `slots` maps a decoded-picture-buffer index to its `ReferenceFrames`
+/// slot ([`h264_reference_frames`]), which is how a list entry finds the picture the driver will read.
+fn h264_ref_pic_lists(dpb: &[DpbEntry], lists: &[Vec<usize>; 2], slots: &[Option<usize>]) -> Result<([VaPictureH264; 32], [VaPictureH264; 32]), String> {
+    let mut l0 = [invalid_h264_picture(); 32];
+    let mut l1 = [invalid_h264_picture(); 32];
+    for (list, built) in lists.iter().enumerate() {
+        if built.len() > 32 {
+            return Err(format!("reference list {list} of {} entries does not fit the record", built.len()));
+        }
+        let out: &mut [VaPictureH264; 32] = match list {
+            0 => &mut l0,
+            _ => &mut l1,
+        };
+        for (at, &index) in built.iter().enumerate() {
+            let entry = dpb.get(index).ok_or_else(|| format!("reference list {list} entry {at} names entry {index} of a {}-entry buffer", dpb.len()))?;
+            // Every entry of a built list is a reference, so it has a slot in the picture record's
+            // `ReferenceFrames`; a `None` here means the list and that record disagree, which is a bug
+            // here rather than a fault in the stream. The entry itself is the picture: a list position
+            // holds a whole `VAPictureH264`, whose `frame_idx` is how the driver finds it again.
+            if slots.get(index).copied().flatten().is_none() {
+                return Err(format!("reference list {list} entry {at} has no slot in the picture record"));
+            }
+            out[at] = entry.mark.h264_picture(entry);
+        }
+    }
+    Ok((l0, l1))
+}
+
+/// 8.3.2 (the reference picture set) and 8.3.4 (the reference lists), for HEVC.
+///
+/// `dpb` comes in holding every picture the previous pictures marked as a reference and comes out
+/// holding the ones this picture's set keeps — that is 8.3.2's own rule, that a picture the set does
+/// not name is no longer a reference. The lists come back as indices into what is left, in the order
+/// 8.3.4 builds them, which is also the order the picture record's `ReferenceFrames` is filled in.
+fn hevc_ref_lists(dpb: &mut Vec<DpbEntry>, sh: &filmcraft_hevc::slice::SliceHeader, cur_poc: i32, max_poc_lsb: i32) -> Result<[Vec<usize>; 2], String> {
+    let mut lists: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    if sh.is_intra() {
+        return Ok(lists);
+    }
+    if max_poc_lsb <= 0 {
+        return Err("log2_max_pic_order_cnt_lsb is out of range".into());
+    }
+    // Long-term entries first, as 8.3.2 does: a long-term reference is named by its POC LSB rather
+    // than by a delta from this picture, so it can refer to a picture in either direction.
+    let mut long: Vec<(Option<usize>, bool, u32)> = Vec::new();
+    for (index, &(lsb, used, msb_present, cycle)) in sh.lt.iter().enumerate() {
+        let mut p = i32::try_from(lsb).map_err(|_| "PocLsbLt does not fit".to_string())?;
+        if msb_present {
+            let cycle = i32::try_from(cycle).map_err(|_| "DeltaPocMsbCycleLt does not fit".to_string())?;
+            p = p.wrapping_add(cur_poc.wrapping_sub(cycle.wrapping_mul(max_poc_lsb)).wrapping_sub(cur_poc & (max_poc_lsb - 1)));
+        }
+        let found = dpb.iter().position(|e| e.mark != Mark::Unused && if msb_present { e.poc == p } else { (e.poc & (max_poc_lsb - 1)) == p });
+        long.push((found, used, u32::try_from(index).unwrap_or(u32::MAX)));
+    }
+    // `st_rps.s0` carries negative deltas (the pictures before this one) and `s1` positive ones.
+    let mut short: Vec<(Option<usize>, bool, bool)> = Vec::new();
+    for before in [true, false] {
+        for &(d, used) in if before { &sh.st_rps.s0 } else { &sh.st_rps.s1 } {
+            let p = cur_poc.wrapping_add(d);
+            let found = dpb.iter().position(|e| e.mark == Mark::Short && e.poc == p);
+            short.push((found, used, before));
+        }
+    }
+    // The set, in the order the record's flags and lists need it, against the buffer as it is now.
+    // Every reference the set names has to be in it: 8.3.3's "unavailable reference picture" is a
+    // picture generated here rather than decoded, and a VA-API record has nowhere to say so — handing
+    // the driver another surface for it would read a different picture without complaint.
+    let mut before: Vec<usize> = Vec::new();
+    let mut after: Vec<usize> = Vec::new();
+    for &(found, used, is_before) in &short {
+        if !used {
+            continue;
+        }
+        let entry = found.ok_or("a short-term reference the picture set names is not in the decoded picture buffer")?;
+        (if is_before { &mut before } else { &mut after }).push(entry);
+    }
+    let mut lt_curr: Vec<usize> = Vec::new();
+    for &(found, used, _) in &long {
+        if !used {
+            continue;
+        }
+        lt_curr.push(found.ok_or("a long-term reference the picture set names is not in the decoded picture buffer")?);
+    }
+    let total = before.len() + after.len() + lt_curr.len();
+    if total > MAX_HEVC_REF_PICS {
+        return Err(format!("{total} reference pictures, more than the record names ({MAX_HEVC_REF_PICS})"));
+    }
+    // 8.3.4: each list is the set's before / after / long-term pictures, cycled up to `num_ref_idx`
+    // entries, with the slice's own list entry reordering which one goes where.
+    for (list, out) in lists.iter_mut().enumerate().take(if sh.is_b() { 2 } else { 1 }) {
+        let want = usize::try_from(sh.num_ref_idx[list]).map_err(|_| "num_ref_idx does not fit the record".to_string())?;
+        if want > MAX_HEVC_REF_PICS {
+            return Err(format!("num_ref_idx_l{list}_active of {want} does not fit the record ({MAX_HEVC_REF_PICS})"));
+        }
+        let (first, second) = if list == 0 { (&before, &after) } else { (&after, &before) };
+        let mut temp: Vec<usize> = Vec::with_capacity(want);
+        while temp.len() < want {
+            for entry in first.iter().chain(second.iter()).chain(lt_curr.iter()) {
+                if temp.len() < want {
+                    temp.push(*entry);
+                }
+            }
+        }
+        for i in 0..want {
+            let at = match sh.list_entry[list].as_ref() {
+                Some(entry) => *entry.get(i).ok_or("a reference list modification runs past the list")? as usize,
+                None => i,
+            };
+            out.push(*temp.get(at).ok_or("a reference list modification names a picture the list does not hold")?);
+        }
+    }
+    // 8.3.2's other half: a picture the set does not name stops being a reference, and the ones it
+    // does are re-marked — a picture that becomes long-term was short-term until now.
+    let mut keep = vec![false; dpb.len()];
+    for &(found, _, _) in &long {
+        if let Some(i) = found {
+            keep[i] = true;
+        }
+    }
+    for &(found, _, _) in &short {
+        if let Some(i) = found {
+            keep[i] = true;
+        }
+    }
+    for (i, entry) in dpb.iter_mut().enumerate() {
+        if !keep[i] {
+            entry.mark = Mark::Unused;
+        }
+    }
+    for &(found, _, index) in &long {
+        if let Some(i) = found {
+            dpb[i].mark = Mark::Long(index);
+        }
+    }
+    // The lists above name positions in the buffer as it was; the entries that were dropped close
+    // up behind them, so every index moves. `moved` is the old position to the new one.
+    let mut moved = vec![None; dpb.len()];
+    let mut next = 0usize;
+    for (i, entry) in dpb.iter().enumerate() {
+        if entry.mark != Mark::Unused {
+            moved[i] = Some(next);
+            next += 1;
+        }
+    }
+    dpb.retain(|e| e.mark != Mark::Unused);
+    for list in lists.iter_mut() {
+        for entry in list.iter_mut() {
+            let at = *entry;
+            *entry = moved.get(at).copied().flatten().ok_or("a reference list entry is not in the decoded picture buffer")?;
+        }
+    }
+    Ok(lists)
+}
+
+/// 8.3.5: the picture just decoded joins the decoded picture buffer, and an IDR or BLA empties it
+/// first (nothing references across one).
+///
+/// Every picture goes in as a short-term reference, because HEVC has no `nal_ref_idc` — unlike H.264,
+/// whether a picture is a reference is decided by the *next* picture's reference picture set, and
+/// [`hevc_ref_lists`] is what marks everything that set does not name as unused. A picture marked
+/// unused here would be invisible to the next picture's set, which is the same as never having
+/// decoded it.
+fn hevc_mark(dpb: &mut Vec<DpbEntry>, sh: &filmcraft_hevc::slice::SliceHeader, surface: u32, cur_poc: i32) {
+    if sh.nal.is_idr() || sh.nal.is_bla() {
+        dpb.clear();
+    }
+    dpb.retain(|e| e.mark != Mark::Unused);
+    dpb.push(DpbEntry { surface, frame_num: u32::try_from(cur_poc).unwrap_or(u32::MAX), poc: cur_poc, mark: Mark::Short });
 }
 
 /// The picture- and slice-parameter records for one H.264 / HEVC access unit, or why it has none.
@@ -223,6 +837,12 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
     let mut slice_offsets: Vec<usize> = Vec::new();
     let mut first: Option<filmcraft_h264::slice::SliceHeader> = None;
     let mut picture_poc: Option<filmcraft_h264::slice::Poc> = None;
+    // The sequence parameter set the picture's first slice named, kept for the reference marking
+    // after the last slice: `MaxFrameNum` and `max_num_ref_frames` come from it.
+    let mut picture_sps: Option<&filmcraft_h264::params::Sps> = None;
+    // The picture record's `ReferenceFrames` slots, as a map from decoded-picture-buffer index to the
+    // slot it got: every slice record's `RefPicList` entry is a slot in the picture's own record.
+    let mut slots: Option<Vec<Option<usize>>> = None;
     let mut data_offset = 0u32;
 
     for (nal, offset) in &nals {
@@ -270,8 +890,12 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         match first.as_ref() {
             None => {
                 let p = poc.h264.compute(&sh, sps);
-                fill_h264_picture(&mut params, &sh, pps, sps, &p, info, surface, width_mbs, height_mbs)?;
+                slots = Some(fill_h264_picture(&mut params, &sh, pps, sps, &p, info, surface, width_mbs, height_mbs, &poc.dpb)?);
+                // `MaxFrameNum` before any reference list is built: it is what `pic_num` is relative
+                // to, and a decoder that has not parsed a picture yet does not have one.
+                poc.max_frame_num = 1u32.checked_shl(sps.log2_max_frame_num).unwrap_or(0).max(1);
                 first = Some(sh.clone());
+                picture_sps = Some(sps);
                 picture_poc = Some(p);
             }
             // A later slice of the same picture: it has to agree about which picture that is, since
@@ -284,18 +908,33 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         }
 
         let length = u32::try_from(nal.len()).map_err(|_| "slice length does not fit the record".to_string())?;
-        slices.push(SliceParam { offset: data_offset, length, params: h264_slice_record(nal, &sh, pps, data_offset)? });
+        // Each slice names its own references: `ref_pic_list_modification` is a syntax element of
+        // the slice header, so two slices of one picture may list them differently even though they
+        // share a frame_num.
+        let lists = h264_ref_lists(&poc.dpb, &sh, picture_poc.as_ref().map_or(0, |p| p.top), poc.max_frame_num)?;
+        slices.push(SliceParam {
+            offset: data_offset,
+            length,
+            params: h264_slice_record(nal, &sh, pps, data_offset, &poc.dpb, slots.as_deref().unwrap_or_default(), &lists)?,
+        });
         slice_offsets.push(*offset);
         data_offset = data_offset.checked_add(length).ok_or("slice data buffer size overflows")?;
     }
 
     let first = first.ok_or("no slice in the access unit")?;
+    let Some(sps) = picture_sps else { return Err("no slice in the access unit".into()) };
     // The POC state advances once per picture, not once per slice: every slice of a picture shares
     // its frame_num and POC, and advancing per slice would leave the next picture's count wrong.
-    if let Some(p) = picture_poc.as_ref() {
-        poc.h264.update(&first, p);
+    if let Some(p) = picture_poc {
+        poc.h264.update(&first, &p);
+        // Reference marking for the picture just decoded, and its entry in the buffer the next
+        // picture's lists are built from. See `h264_mark` for why this happens before the render.
+        h264_mark(poc, &first, sps, surface, p.top);
     }
-    Ok(Picture { params: record_bytes(&params), slices, slice_offsets })
+    // The scaling lists come from the picture's own sequence parameter set, so this is submitted
+    // per picture rather than per stream — a stream whose sets differ between pictures (an
+    // in-band parameter set) changes its quantizer without changing its sample entry.
+    Ok(Picture { params: record_bytes(&params), iq_matrix: h264_iq_matrix(sps), slices, slice_offsets })
 }
 
 /// Fill the picture-level record from the picture's first slice, whose parsed header is where every
@@ -310,7 +949,8 @@ fn fill_h264_picture(
     surface: u32,
     width_mbs: u32,
     height_mbs: u32,
-) -> Result<(), String> {
+    dpb: &[DpbEntry],
+) -> Result<Vec<Option<usize>>, String> {
     let (width, height) = h264_macroblocks(info, width_mbs, height_mbs)?;
     params.picture_width_in_mbs_minus1 = width;
     params.picture_height_in_mbs_minus1 = height;
@@ -328,7 +968,6 @@ fn fill_h264_picture(
     params.seq_fields = pack_h264_seq_fields(sps);
     params.pic_fields = pack_h264_pic_fields(pps, sh);
     params.frame_num = field_u16(sh.frame_num, "frame_num")?;
-    params.num_ref_frames = field_u8(h264_dpb(sps), "num_ref_frames")?;
     params.curr_pic = VaPictureH264 {
         picture_id: surface,
         frame_idx: sh.frame_num,
@@ -337,12 +976,14 @@ fn fill_h264_picture(
         bottom_field_order_cnt: p.bottom,
         va_reserved: [0; VA_PADDING_LOW],
     };
-    // Every `ReferenceFrames` slot says "not a picture" rather than naming a surface id that could
-    // belong to a real but wrong surface. Which surfaces the DPB holds is the decode loop's to
-    // decide, since it owns the surface ring; until it fills them in, a driver reads an inter
-    // picture as having no references and reports it, which is the failure worth surfacing.
-    params.reference_frames = [invalid_h264_picture(); MAX_REF_FRAMES];
-    Ok(())
+    // The decoded picture buffer, as the driver is told to see it: one slot per surface that holds a
+    // reference picture, and a count of exactly those. `num_ref_frames` was previously the DPB size
+    // the sequence parameter set declares, which claimed more valid slots than the record filled — a
+    // count a driver reads as "these many slots name pictures" over entries that say they name none.
+    let (frames, n, slots) = h264_reference_frames(dpb);
+    params.reference_frames = frames;
+    params.num_ref_frames = n;
+    Ok(slots)
 }
 
 /// A `ReferenceFrames` slot that names no surface and says so.
@@ -401,20 +1042,23 @@ fn h264_curr_pic_flags(sh: &filmcraft_h264::slice::SliceHeader) -> u32 {
     }
 }
 
-/// How many `ReferenceFrames` slots this picture's DPB uses: the stream's own parsed DPB size,
-/// bounded by what the record holds.
-fn h264_dpb(sps: &filmcraft_h264::params::Sps) -> u32 {
-    u32::try_from(sps.max_dpb_frames()).unwrap_or(u32::MAX).clamp(1, MAX_REF_FRAMES as u32)
-}
-
 /// One slice's `VASliceParameterBufferH264`.
 ///
-/// The two reference lists stay filled with invalid entries rather than with surfaces: they name
-/// entries of the picture's `ReferenceFrames`, and which surfaces the DPB holds is the decode loop's
-/// to decide, since it owns the ring. A driver reading this finds no valid reference and reports it,
-/// which beats being handed a surface that decodes as a different picture.
-fn h264_slice_record(nal: &[u8], sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::params::Pps, data_offset: u32) -> Result<Vec<u8>, String> {
+/// The two reference lists name the pictures the slice predicts from, as surfaces: each entry is the
+/// `VAPictureH264` of a picture in `dpb` ([`h264_ref_pic_lists`]), and each entry's `frame_idx` is
+/// how the driver finds it again in the picture record's `ReferenceFrames`. Past a list's own length
+/// the entries stay invalid, which is what an unused `RefPicList` slot means.
+fn h264_slice_record(
+    nal: &[u8],
+    sh: &filmcraft_h264::slice::SliceHeader,
+    pps: &filmcraft_h264::params::Pps,
+    data_offset: u32,
+    dpb: &[DpbEntry],
+    slots: &[Option<usize>],
+    lists: &[Vec<usize>; 2],
+) -> Result<Vec<u8>, String> {
     let weights = h264_weights(sh, pps)?;
+    let (ref_pic_list0, ref_pic_list1) = h264_ref_pic_lists(dpb, lists, slots)?;
     let record = VaSliceParameterBufferH264 {
         slice_data_size: u32::try_from(nal.len()).map_err(|_| "slice length does not fit the record".to_string())?,
         slice_data_offset: data_offset,
@@ -433,8 +1077,8 @@ fn h264_slice_record(nal: &[u8], sh: &filmcraft_h264::slice::SliceHeader, pps: &
         disable_deblocking_filter_idc: field_u8(sh.disable_deblocking_filter_idc, "disable_deblocking_filter_idc")?,
         slice_alpha_c0_offset_div2: field_i8(sh.slice_alpha_c0_offset_div2, "slice_alpha_c0_offset_div2")?,
         slice_beta_offset_div2: field_i8(sh.slice_beta_offset_div2, "slice_beta_offset_div2")?,
-        ref_pic_list0: [invalid_h264_picture(); 32],
-        ref_pic_list1: [invalid_h264_picture(); 32],
+        ref_pic_list0,
+        ref_pic_list1,
         ..weights
     };
     Ok(record_bytes(&record))
@@ -614,6 +1258,10 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
     let mut previous: Option<filmcraft_hevc::slice::SliceHeader> = None;
     let mut first: Option<filmcraft_hevc::slice::SliceHeader> = None;
     let mut picture_poc: Option<i32> = None;
+    // The picture's reference lists, filled from the picture record and passed to every segment's
+    // record. They are the picture's, not a segment's: every segment of one picture refers to the
+    // same pictures, and the record that names them is the picture's.
+    let mut lists: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
     let mut data_offset = 0u32;
 
     for (nal, offset) in &nals {
@@ -651,7 +1299,9 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         }
 
         if first.is_none() {
-            picture_poc = Some(fill_hevc_picture(&mut params, poc, &sh, &pps, &sps, surface, width, height)?);
+            let (p, built) = fill_hevc_picture(&mut params, poc, &sh, &pps, &sps, surface, width, height)?;
+            picture_poc = Some(p);
+            lists = built;
             first = Some(sh.clone());
         } else {
             // Every segment of a picture shares the picture's parameter sets: the record was filled
@@ -678,13 +1328,24 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
     let first = first.ok_or("no slice segment in the access unit")?;
     if let Some(p) = picture_poc {
         poc.hevc.update(&first, p);
+        // 8.3.5: the picture just decoded joins the buffer the next picture's set is derived from.
+        hevc_mark(&mut poc.dpb, &first, surface, p);
+        // More pictures than the record can name is a buffer this backend cannot describe; keeping
+        // the most recent ones is the least surprising trim of a stream no encoder produces.
+        if poc.dpb.len() > MAX_HEVC_REF_PICS {
+            poc.dpb.drain(..poc.dpb.len() - MAX_HEVC_REF_PICS);
+        }
     }
     let last = segments.len().saturating_sub(1);
     for (i, (nal, offset, sh, pps, at, length)) in segments.iter().enumerate() {
-        slices.push(SliceParam { offset: *at, length: *length, params: hevc_slice_record(nal, sh, pps, *at, i == last)? });
+        slices.push(SliceParam { offset: *at, length: *length, params: hevc_slice_record(nal, sh, pps, *at, i == last, &lists)? });
         slice_offsets.push(*offset);
     }
-    Ok(Picture { params: record_bytes(&params), slices, slice_offsets })
+    // No IQ matrix: HEVC carries its scaling lists in `sps_scaling_list_data_present_flag`'s tables
+    // inside the picture parameter record itself (`va_dec_hevc.h`: `ScalingListData` is a field of
+    // `VAPictureParameterBufferHEVC`), so there is no separate buffer to submit. An empty
+    // `iq_matrix` is what says so, and the decode loop reads that as "no such buffer".
+    Ok(Picture { params: record_bytes(&params), iq_matrix: Vec::new(), slices, slice_offsets })
 }
 
 /// Whether a slice segment belongs to the picture `first` opened: the same picture parameter set and
@@ -694,21 +1355,27 @@ fn hevc_same_picture(first: &filmcraft_hevc::slice::SliceHeader, sh: &filmcraft_
     sh.pps_id == first.pps_id && sh.nal.nal_type == first.nal.nal_type && sh.nal.temporal_id == first.nal.temporal_id && sh.nal.layer_id == first.nal.layer_id
 }
 
-/// Fill the picture-level record from the picture's first segment, and return its POC.
+/// Fill the picture-level record from the picture's first segment, and return its POC and its
+/// reference lists.
 ///
 /// The HEVC record carries far more of the parameter sets than the H.264 one does — the coding
 /// block and transform block geometry, the tile grid, the loop filter and chroma QP offsets — and
 /// each is the parsed value of the set the segment named.
+///
+/// `ReferenceFrames` is the decoded picture buffer after this picture's reference picture set has
+/// been applied to it, with each entry flagged as one of the picture set's `RPS_ST_CURR_*` groups
+/// or as a long-term reference (`va_dec_hevc.h:5319-5337`). The slice record's `RefPicList` entries
+/// are indices into that array, which is why both come from the same call.
 fn fill_hevc_picture(
     params: &mut VaPictureParameterBufferHevc,
-    poc: &NalPoc,
+    poc: &mut NalPoc,
     sh: &filmcraft_hevc::slice::SliceHeader,
     pps: &filmcraft_hevc::params::Pps,
     sps: &filmcraft_hevc::params::Sps,
     surface: u32,
     width: u32,
     height: u32,
-) -> Result<i32, String> {
+) -> Result<(i32, [Vec<usize>; 2]), String> {
     if sps.width != width || sps.height != height {
         return Err(format!("coded picture size {}x{} is not {width}x{height}", sps.width, sps.height));
     }
@@ -719,8 +1386,11 @@ fn fill_hevc_picture(
     // an open-GOP CRA does not, which is the whole difference between the two cases.
     let p = poc.hevc.compute(sh, max_lsb, sh.nal.is_irap() && !sh.nal.is_rasl());
     params.curr_pic = VaPictureHevc { picture_id: surface, pic_order_cnt: p, flags: 0, va_reserved: [0; VA_PADDING_LOW] };
-    // `ReferenceFrames[15]` (`va_dec_hevc.h:64`), the HEVC record's DPB.
-    params.reference_frames = [invalid_hevc_picture(); 15];
+    // `ReferenceFrames[15]` (`va_dec_hevc.h:64`), the HEVC record's DPB. The set is applied to the
+    // decoder's own buffer first, so what is filled in below is exactly what the driver's picture
+    // buffer should hold when this picture is decoded.
+    let lists = hevc_ref_lists(&mut poc.dpb, sh, p, max_lsb)?;
+    params.reference_frames = hevc_reference_frames(&poc.dpb, sh, p, max_lsb)?;
     params.pic_width_in_luma_samples = field_u16(sps.width, "pic_width_in_luma_samples")?;
     params.pic_height_in_luma_samples = field_u16(sps.height, "pic_height_in_luma_samples")?;
     params.pic_fields = pack_hevc_pic_fields(sps, pps, sh);
@@ -755,7 +1425,95 @@ fn fill_hevc_picture(
     params.num_extra_slice_header_bits = field_u8(pps.num_extra_slice_header_bits, "num_extra_slice_header_bits")?;
     // The bits `short_term_ref_pic_set()` takes in this header, which is what lets a driver skip it.
     params.st_rps_bits = u32::try_from(sh.st_rps_bits).map_err(|_| "short-term reference picture set is longer than the record".to_string())?;
-    Ok(p)
+    Ok((p, lists))
+}
+
+/// The `ReferenceFrames` a picture's record carries, each entry flagged as one of the picture set's
+/// three groups (`va_dec_hevc.h:5320-5337`) or as a long-term reference.
+///
+/// The groups are derived here rather than in [`hevc_ref_lists`] because that function has already
+/// applied the set to the buffer by the time it returns: what is left in `dpb` *is* the set, and an
+/// entry's group is its picture order count's position relative to the current picture's.
+fn hevc_reference_frames(
+    dpb: &[DpbEntry],
+    sh: &filmcraft_hevc::slice::SliceHeader,
+    cur_poc: i32,
+    max_poc_lsb: i32,
+) -> Result<[VaPictureHevc; MAX_HEVC_REF_PICS], String> {
+    let mut frames = [invalid_hevc_picture(); MAX_HEVC_REF_PICS];
+    if sh.is_intra() {
+        // An I picture's set is empty, so the buffer is whatever an IDR left (nothing, since
+        // `hevc_mark` cleared it) and nothing here refers to anything.
+        return Ok(frames);
+    }
+    if max_poc_lsb <= 0 {
+        return Err("log2_max_pic_order_cnt_lsb is out of range".into());
+    }
+    // The set, once more: which buffer entry is in which group. `hevc_ref_lists` has already checked
+    // that every reference the set names is present, so a `None` here cannot happen — but the buffer
+    // it was checked against has since been trimmed, so an entry the lists no longer reach is
+    // simply not filled in.
+    let mut used: Vec<(usize, u32)> = Vec::new();
+    for (i, entry) in dpb.iter().enumerate() {
+        if entry.poc != cur_poc {
+            used.push((i, 0));
+        }
+    }
+    let deltas = sh.st_rps.s0.iter().map(|&(d, u)| (d, u, true)).chain(sh.st_rps.s1.iter().map(|&(d, u)| (d, u, false)));
+    for (delta, used_by_curr, before) in deltas {
+        if !used_by_curr {
+            continue;
+        }
+        let wanted = cur_poc.wrapping_add(delta);
+        if let Some(at) = dpb.iter().position(|e| e.poc == wanted) {
+            let bit = if before { PICTURE_HEVC_RPS_ST_CURR_BEFORE } else { PICTURE_HEVC_RPS_ST_CURR_AFTER };
+            match used.iter_mut().find(|(entry, _)| *entry == at) {
+                Some(entry) => entry.1 = bit,
+                None => used.push((at, bit)),
+            }
+        }
+    }
+    for (i, &(lsb, used_by_curr, msb_present, cycle)) in sh.lt.iter().enumerate() {
+        if !used_by_curr {
+            continue;
+        }
+        let mut p = i32::try_from(lsb).map_err(|_| "PocLsbLt does not fit".to_string())?;
+        if msb_present {
+            let cycle = i32::try_from(cycle).map_err(|_| "DeltaPocMsbCycleLt does not fit".to_string())?;
+            p = p.wrapping_add(cur_poc.wrapping_sub(cycle.wrapping_mul(max_poc_lsb)).wrapping_sub(cur_poc & (max_poc_lsb - 1)));
+        }
+        if let Some(at) = dpb.iter().position(|e| {
+            if e.poc == p { true } else { !msb_present && (e.poc & (max_poc_lsb - 1)) == p && matches!(e.mark, Mark::Long(k) if k as usize == i) }
+        }) {
+            match used.iter_mut().find(|(entry, _)| *entry == at) {
+                Some(entry) => entry.1 = PICTURE_HEVC_RPS_LT_CURR,
+                None => used.push((at, PICTURE_HEVC_RPS_LT_CURR)),
+            }
+        }
+    }
+    // Every buffer entry is a reference picture, so every one of them gets a `ReferenceFrames` slot;
+    // the ones the current picture names are flagged, and the rest carry the long-term bit or
+    // nothing. libva reads the count of flagged entries as `NumPocTotalCurr`.
+    for (i, entry) in dpb.iter().enumerate().take(MAX_HEVC_REF_PICS) {
+        let bit = used.iter().find(|(at, _)| *at == i).map_or(0, |(_, bit)| *bit);
+        frames[i] = entry.mark.hevc_picture(entry, (bit != 0).then_some(bit));
+    }
+    Ok(frames)
+}
+
+/// The two `RefPicList`s of a slice record: indices into the picture record's `ReferenceFrames`, with
+/// `0xFF` — the record's "this entry is not used" — everywhere past each list's own length.
+fn hevc_ref_pic_lists(lists: &[Vec<usize>; 2]) -> Result<[[u8; MAX_HEVC_REF_PICS]; 2], String> {
+    let mut out = [[0xFF; MAX_HEVC_REF_PICS]; 2];
+    for (list, built) in lists.iter().enumerate() {
+        if built.len() > MAX_HEVC_REF_PICS {
+            return Err(format!("reference list {list} of {} entries does not fit the record", built.len()));
+        }
+        for (slot, &index) in out[list].iter_mut().zip(built) {
+            *slot = u8::try_from(index).map_err(|_| format!("reference list {list} entry {index} does not fit the record"))?;
+        }
+    }
+    Ok(out)
 }
 
 /// A `ReferenceFrames` slot that names no surface and says so; see [`invalid_h264_picture`].
@@ -839,19 +1597,21 @@ fn pack_hevc_slice_parsing(sps: &filmcraft_hevc::params::Sps, pps: &filmcraft_he
 
 /// One slice segment's `VASliceParameterBufferHEVC`.
 ///
-/// The reference lists are indices into the picture's `ReferenceFrames` and stay `0xFF`, the
-/// record's "this entry is not used": they name surfaces, and which surfaces the DPB holds is the
-/// decode loop's to decide since it owns the ring. The prediction weights are a different thing
-/// entirely — pure arithmetic the slice header already carries — and are filled in from it by
-/// [`hevc_weights`], like the H.264 side's.
+/// The two `RefPicList`s are indices into the picture record's `ReferenceFrames`, which is where the
+/// surfaces are named: entry `i` of a list is buffer entry `i` of that array ([`hevc_ref_pic_lists`]),
+/// and `0xFF` — the record's "this entry is not used" — is everywhere past each list's own length.
+/// The prediction weights are a different thing entirely — pure arithmetic the slice header already
+/// carries — and are filled in from it by [`hevc_weights`], like the H.264 side's.
 fn hevc_slice_record(
     nal: &[u8],
     sh: &filmcraft_hevc::slice::SliceHeader,
     pps: &filmcraft_hevc::params::Pps,
     data_offset: u32,
     last_of_picture: bool,
+    lists: &[Vec<usize>; 2],
 ) -> Result<Vec<u8>, String> {
     let weights = hevc_weights(sh, pps)?;
+    let ref_pic_list = hevc_ref_pic_lists(lists)?;
     let record = VaSliceParameterBufferHevc {
         slice_data_size: u32::try_from(nal.len()).map_err(|_| "slice segment length does not fit the record".to_string())?,
         slice_data_offset: data_offset,
@@ -860,7 +1620,7 @@ fn hevc_slice_record(
         // parser's `data_offset` is a position in the RBSP, which starts after the two-byte header.
         slice_data_byte_offset: u32::try_from(sh.data_offset + 2).map_err(|_| "slice segment header runs past the record".to_string())?,
         slice_segment_address: sh.segment_address,
-        ref_pic_list: [[0xFF; 15]; 2],
+        ref_pic_list,
         long_slice_flags: pack_hevc_long_slice_flags(sh, last_of_picture),
         // 0xFF is the record's "no collocated picture", which is what temporal MVP off means.
         collocated_ref_idx: if sh.temporal_mvp { field_u8(sh.collocated_ref_idx, "collocated_ref_idx")? } else { 0xFF },
@@ -1091,6 +1851,80 @@ mod tests {
 
     use filmcraft_codecs::hw::{FrameCodec, FrameStreamInfo, NalCodec, NalStreamInfo};
 
+    /// The IQ matrix record carries the sequence parameter set's own scaling lists, in the raster
+    /// order the record wants, and flat 16s when the set declares none.
+    ///
+    /// This is the record whose absence is invisible until a real driver is asked to decode: the
+    /// iHD driver accepts a submission without it, reports success at every call, and leaves the
+    /// render target holding the cleared surface. See [`super::h264_iq_matrix`].
+    #[test]
+    fn the_iq_matrix_carries_the_sequence_parameters_scaling_lists() {
+        let Some((info, samples)) = h264_stream() else { return };
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let mut poc = super::NalPoc::default();
+        let p = super::build_nal(&info, &samples[0], &mut poc, 3, 40, 23).unwrap_or_else(|e| panic!("{e}"));
+        let r = crate::vaapi::ffi::iq_matrix_h264(&p.iq_matrix).unwrap_or_else(|| panic!("not an IQ matrix record"));
+        assert_eq!(p.iq_matrix.len(), std::mem::size_of_val(&r), "240 bytes, the size libva declares");
+        // The fixture is encoded without quantizer matrices, so every list is the flat 16 of
+        // 7.4.2.1.1's default — what the record has to say, and what the driver reads as "no
+        // custom quantizer", which is the truth about this stream.
+        assert!(r.scaling_list4x4.iter().all(|l| l.iter().all(|&v| v == 16)), "flat 4x4 lists");
+        assert!(r.scaling_list8x8.iter().all(|l| l.iter().all(|&v| v == 16)), "flat 8x8 luma lists");
+        assert_eq!(r.scaling_list8x8.len(), 2, "the record's 8x8 array is [Intra Y, Inter Y] only");
+        assert_eq!(r.va_reserved, [0; crate::vaapi::ffi::VA_PADDING_LOW], "the reserved tail is zero");
+    }
+
+    /// A stream that does send scaling lists gets *its* lists, not flat ones: a record of flat 16s
+    /// for a stream with custom quantizers decodes a different picture than the stream's.
+    #[test]
+    fn a_stream_with_scaling_lists_gets_its_own() {
+        let ff = filmcraft_testkit::require_ffmpeg!();
+        let Some(path) = filmcraft_testkit::fixtures::generate(&fixture("h264_scaling.mp4"), |tmp| {
+            // `cqmfile` is empty, so x264 writes flat lists — but `--cqm` with a flat file and
+            // `flat` is what makes `seq_scaling_matrix_present_flag` 1, which is the branch under
+            // test. What matters is only that the flag is set and the lists reach the record.
+            let args = [
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:r=24:d=1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryslow",
+                "-x264-params",
+                "cqm=flat:keyint=24:min-keyint=24:scenecut=0",
+                "-pix_fmt",
+                "yuv420p",
+            ];
+            run(&ff, &args, tmp)
+        }) else {
+            return;
+        };
+        let (info, samples) = read(&path);
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let mut poc = super::NalPoc::default();
+        let p = super::build_nal(&info, &samples[0], &mut poc, 5, 20, 15).unwrap_or_else(|e| panic!("{e}"));
+        let r = crate::vaapi::ffi::iq_matrix_h264(&p.iq_matrix).unwrap_or_else(|| panic!("not an IQ matrix record"));
+        // Flat lists, sent explicitly: the record must still carry six 4x4 and six 8x8 lists of
+        // sixteen 16s, which is what makes "the set declared them" and "the set declared none"
+        // indistinguishable in the record — correctly, because they decode the same picture.
+        assert!(r.scaling_list4x4.iter().all(|l| l.iter().all(|&v| v == 16)));
+        assert!(r.scaling_list8x8.iter().all(|l| l.iter().all(|&v| v == 16)));
+        assert_eq!(r.scaling_list8x8.len(), 2, "and the two the record has slots for");
+    }
+
+    /// HEVC needs no IQ matrix buffer: its scaling lists are part of the picture parameter record,
+    /// so submitting one would be submitting a record the driver does not read.
+    #[test]
+    fn hevc_submits_no_iq_matrix() {
+        let Some((info, samples)) = hevc_stream() else { return };
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let mut poc = super::NalPoc::default();
+        let p = super::build_nal(&info, &samples[0], &mut poc, 4, 640, 360).unwrap_or_else(|e| panic!("{e}"));
+        assert!(p.iq_matrix.is_empty(), "HEVC carries its scaling lists in the picture record");
+    }
+
     /// The two records an ffmpeg-made H.264 fixture's first picture is submitted as: one picture
     /// parameter buffer, and one slice parameter buffer per slice — not one per NAL unit, since the
     /// fixture's IDR is preceded by the SEI that names the encoder.
@@ -1108,7 +1942,12 @@ mod tests {
 
     /// The record a driver reads carries what FilmCraft's own parser found, read back through the
     /// `ffi` struct: the size in macroblocks, the surface it is told to decode into, the POC its
-    /// decoder would compute and the reference frames it must not be told exist.
+    /// decoder would compute, and the decoded picture buffer as the decoder has it.
+    ///
+    /// The fixture's first picture is an IDR, so the buffer is empty for it: `num_ref_frames` is zero
+    /// and every slot says it names nothing. That is the whole point of the count being what was
+    /// filled rather than the DPB size the sequence parameter set declares — a count of 4 over four
+    /// slots that all say "no picture" is a record telling the driver to read four invalid slots.
     #[test]
     fn picture_parameters_carry_the_parsed_slice_header() {
         let Some((info, samples)) = h264_stream() else { return };
@@ -1124,11 +1963,103 @@ mod tests {
         // An IDR's POC follows from being an IDR, with nothing before it.
         assert_eq!((pp.curr_pic.top_field_order_cnt, pp.curr_pic.bottom_field_order_cnt), (0, 0));
         assert_eq!(pp.bit_depth_luma_minus8, 0);
-        assert!(pp.num_ref_frames >= 1, "the stream's DPB has room for at least one picture");
+        assert_eq!(pp.num_ref_frames, 0, "an IDR refers to nothing, and the count is what was filled");
         assert!(
             pp.reference_frames.iter().all(|r| r.flags & crate::vaapi::ffi::PICTURE_H264_INVALID != 0 && r.picture_id == crate::vaapi::ffi::INVALID_SURFACE),
-            "no reference frame is claimed before the decode loop fills them in"
+            "and so every slot says it names no picture"
         );
+    }
+
+    /// The other half of the count: once there *is* a decoded picture buffer, the record names it, and
+    /// the count is exactly how many slots were filled. This is the deferred finding from Task 3 — a
+    /// `num_ref_frames` claiming N valid DPB slots while every `ReferenceFrames` entry was invalid —
+    /// checked on a real stream rather than by construction.
+    #[test]
+    fn the_reference_frames_are_the_surfaces_the_buffer_holds() {
+        let Some((info, samples)) = h264_stream() else { return };
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let mut poc = super::NalPoc::default();
+        // One distinct surface per picture, as the decode loop's ring hands them out.
+        let mut filled = 0u32;
+        for (i, sample) in samples.iter().enumerate() {
+            let surface = u32::try_from(i).unwrap_or(u32::MAX);
+            let Ok(p) = super::build_nal(&info, sample, &mut poc, surface, 40, 23) else {
+                panic!("sample {i} does not decode");
+            };
+            let pp = crate::vaapi::ffi::picture_params_h264(&p.params).unwrap_or_else(|| panic!("not a picture parameter record"));
+            // The count is the number of slots that name a surface, and those are the first `count`
+            // of them: a driver reads the first `num_ref_frames` entries and nothing else.
+            let named: Vec<&crate::vaapi::ffi::VaPictureH264> =
+                pp.reference_frames.iter().filter(|r| r.picture_id != crate::vaapi::ffi::INVALID_SURFACE).collect();
+            assert_eq!(usize::from(pp.num_ref_frames), named.len(), "sample {i}: the count is what was filled");
+            assert!(
+                pp.reference_frames.iter().take(usize::from(pp.num_ref_frames)).all(|r| r.picture_id != crate::vaapi::ffi::INVALID_SURFACE),
+                "sample {i}: every counted slot names a surface"
+            );
+            assert!(
+                pp.reference_frames.iter().skip(usize::from(pp.num_ref_frames)).all(|r| r.picture_id == crate::vaapi::ffi::INVALID_SURFACE),
+                "sample {i}: and nothing past the count claims to"
+            );
+            // Every entry names a surface this decoder has decoded into, and no surface twice.
+            let mut seen = std::collections::HashSet::new();
+            for r in &named {
+                assert!(r.picture_id <= surface, "sample {i}: entry names surface {} of a ring at {surface}", r.picture_id);
+                assert!(seen.insert(r.picture_id), "sample {i}: surface {} is in the buffer twice", r.picture_id);
+                assert!(r.flags & crate::vaapi::ffi::PICTURE_H264_INVALID == 0, "sample {i}: a named slot does not say it is invalid");
+            }
+            // Each slice's list entries are all pictures the buffer holds, and its `num_ref_idx` counts
+            // them: an entry that is not one the slice refers to is a different picture, silently.
+            // An I slice refers to nothing, and the record's `num_ref_idx` fields say nothing about
+            // them (the slice header does not code them), so it is exempt from the count check.
+            for slice in &p.slices {
+                let sp = crate::vaapi::ffi::slice_params_h264(&slice.params).unwrap_or_else(|| panic!("not a slice record"));
+                let intra = sp.slice_type == 2;
+                // Only a B slice has a second list: `num_ref_idx_active[1]` is 0 for an I or a P, so
+                // the record's `minus1` field cannot distinguish "none" from "one" and the list is
+                // empty for both.
+                for (l, count) in
+                    [(0, Some(sp.num_ref_idx_l0_active_minus1)), (1, if sp.slice_type == 1 { Some(sp.num_ref_idx_l1_active_minus1) } else { None })]
+                {
+                    let list = if l == 0 { &sp.ref_pic_list0 } else { &sp.ref_pic_list1 };
+                    let wanted = match (intra, count) {
+                        (true, _) | (_, None) => 0,
+                        (_, Some(count)) => usize::from(count) + 1,
+                    };
+                    for (at, entry) in list.iter().take(wanted).enumerate() {
+                        assert!(entry.picture_id != crate::vaapi::ffi::INVALID_SURFACE, "sample {i}: list {l} entry {at} names no picture");
+                        assert!(
+                            seen.contains(&entry.picture_id),
+                            "sample {i}: list {l} entry {at} names surface {}, which is not in the buffer",
+                            entry.picture_id
+                        );
+                    }
+                    for entry in list.iter().skip(wanted) {
+                        assert_eq!(entry.picture_id, crate::vaapi::ffi::INVALID_SURFACE, "sample {i}: list {l} past its length");
+                    }
+                }
+            }
+            filled = filled.max(u32::from(pp.num_ref_frames));
+        }
+        assert!(filled >= 2, "the fixture's later pictures do refer to more than one picture ({filled})");
+    }
+
+    /// How many surfaces a stream's decoded picture buffer needs, read from its own parameter sets:
+    /// what the decode loop allocates, bounded by what a record can name.
+    #[test]
+    fn the_surface_count_is_the_streams_own_picture_buffer() {
+        let Some((info, _)) = h264_stream() else { return };
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let n = super::reference_pictures(&info).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(n, 4, "the fixture's sequence parameter set allows four reference pictures");
+        // A parameter set that will not parse is an error, not a zero: the surfaces are allocated for
+        // the sizes it describes, so a stream whose sets do not parse is not one this backend takes.
+        let mut broken = info.clone();
+        broken.parameter_sets = vec![vec![0x67, 0xff, 0xff, 0xff]];
+        assert!(super::reference_pictures(&broken).is_err(), "an unparsable sequence parameter set");
+        // A stream with no parameter sets at all cannot be sized either.
+        let mut none = info.clone();
+        none.parameter_sets.clear();
+        assert!(super::reference_pictures(&none).is_err(), "no sequence parameter set");
     }
 
     /// What a bitstream says and a record can hold are not the same question: a coded size that is
@@ -1219,7 +2150,13 @@ mod tests {
         assert_eq!(pp.pic_height_in_luma_samples, 360);
         assert_eq!(pp.curr_pic.picture_id, 9);
         assert_eq!(pp.curr_pic.pic_order_cnt, 0, "an IDR's POC follows from being an IDR");
-        assert!(pp.reference_frames.iter().all(|r| r.flags & crate::vaapi::ffi::PICTURE_HEVC_INVALID != 0), "no reference frame is claimed");
+        // An IRAP picture's set is empty, so its record names no reference picture: every
+        // `ReferenceFrames` slot says it holds nothing, which is what the count of them that name a
+        // surface (none) says too.
+        assert!(
+            pp.reference_frames.iter().all(|r| r.flags & crate::vaapi::ffi::PICTURE_HEVC_INVALID != 0 && r.picture_id == crate::vaapi::ffi::INVALID_SURFACE),
+            "no reference frame is claimed"
+        );
         // each slice record says where its own bytes are, back to back in one buffer
         let mut end = 0u32;
         for slice in &p.slices {
@@ -1349,8 +2286,12 @@ mod tests {
         let Some((info, sets, samples)) = hevc() else { return };
         let mut checked = 0usize;
         let mut header_only = 0usize;
-        for sample in &samples {
-            let Ok(p) = super::build_nal(&info, sample, &mut super::NalPoc::default(), 9, 640, 360) else { continue };
+        // One picture-order-count state for the whole loop, as a decoder has: an inter picture's
+        // records cannot be built without the pictures it refers to, so a fresh state per sample
+        // would decline every picture after the first.
+        let mut poc = super::NalPoc::default();
+        for (i, sample) in samples.iter().enumerate() {
+            let Ok(p) = super::build_nal(&info, sample, &mut poc, i as u32, 640, 360) else { continue };
             let nals = info.nals(sample);
             for (slice, &at) in p.slices.iter().zip(&p.slice_offsets) {
                 let nal = nals.iter().find(|n| sample.get(at..at + n.len()) == Some(*n)).unwrap_or_else(|| panic!("no NAL unit at {at}"));
@@ -1698,6 +2639,10 @@ mod tests {
     fn the_h264_slice_record_carries_the_parsed_slice_header() {
         let Some((info, sets, samples)) = h264() else { return };
         let mut poc = super::NalPoc::default();
+        // From the fixture's first picture: the second is an inter picture, and an inter picture's
+        // records cannot be built without the pictures it refers to — which is the point of the
+        // decoded picture buffer, and why this starts at sample 0 rather than at the one it reads.
+        super::build_nal(&info, &samples[0], &mut poc, 6, 40, 23).unwrap_or_else(|e| panic!("{e}"));
         let p = super::build_nal(&info, &samples[1], &mut poc, 7, 40, 23).unwrap_or_else(|e| panic!("{e}"));
         assert!(!p.slices.is_empty(), "the fixture's second picture has slices");
         let mut seen_types = Vec::new();
@@ -1728,8 +2673,20 @@ mod tests {
             assert_eq!(r.direct_spatial_mv_pred_flag, u8::from(sh.direct_spatial_mv_pred), "direct_spatial_mv_pred_flag");
             // the record counts from the NAL header byte, our parser from after it
             assert_eq!(usize::from(r.slice_data_bit_offset), sh.header_bits + 8, "slice_data_bit_offset");
-            assert_eq!(r.ref_pic_list0, [super::invalid_h264_picture(); 32], "no reference is claimed before the decode loop fills them in");
-            assert_eq!(r.ref_pic_list1, [super::invalid_h264_picture(); 32]);
+            // The reference lists name pictures the decoded picture buffer holds, and nothing past the
+            // slice's own `num_ref_idx` claims to: the IDR before this picture is the one they name.
+            for (list, active) in [(0, sh.num_ref_idx_active[0]), (1, sh.num_ref_idx_active[1])] {
+                let entries = if list == 0 { &r.ref_pic_list0 } else { &r.ref_pic_list1 };
+                let wanted = usize::try_from(active).unwrap_or(0);
+                for (at, entry) in entries.iter().take(wanted).enumerate() {
+                    assert_eq!(entry.frame_idx, 0, "list {list} entry {at}: the IDR is the fixture's frame_num 0");
+                    assert_ne!(entry.picture_id, crate::vaapi::ffi::INVALID_SURFACE, "list {list} entry {at} names a picture");
+                }
+                assert!(
+                    entries.iter().skip(wanted).all(|e| e.picture_id == crate::vaapi::ffi::INVALID_SURFACE),
+                    "list {list}: nothing past its {wanted} entries claims to name a picture"
+                );
+            }
             // and the picture record agrees with the same picture
             let pp = crate::vaapi::ffi::picture_params_h264(&p.params).unwrap_or_else(|| panic!("not a picture record"));
             assert_eq!(pp.frame_num, sh.frame_num as u16, "the picture's frame_num is its first slice's");
@@ -1749,7 +2706,7 @@ mod tests {
         let Some((sps, pps)) = h264_set() else { return };
         let Some((info, samples)) = h264_stream() else { return };
         let info = info.unwrap_or_else(|e| panic!("{e}"));
-        assert!(super::super::plan_nal(&info).is_ok(), "the fixture is a stream this backend takes");
+        assert!(super::super::stream::plan_nal(&info).is_ok(), "the fixture is a stream this backend takes");
         assert_eq!(sps.chroma_array_type(), 1, "4:2:0");
         assert_eq!((sps.bit_depth_luma, sps.bit_depth_chroma), (8, 8));
         let mut poc = super::NalPoc::default();

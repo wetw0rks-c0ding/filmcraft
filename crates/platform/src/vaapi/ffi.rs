@@ -25,7 +25,7 @@
 //! actually installed ([`Display::probe_image_layout`]) — libva has no `sizeof` / `offsetof` of its
 //! own to ask, so a behavioural check is the only way to hold the declaration to the driver.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::mem::size_of;
 use std::sync::{Arc, MutexGuard, OnceLock};
 
@@ -55,6 +55,49 @@ type VAStatus = c_int;
 type VAProfile = c_int;
 type VAEntrypoint = c_int;
 
+/// `VAConfigAttrib` (`va.h:1072`): one configuration attribute — a type and its value. Eight bytes.
+/// This backend passes none: `vaCreateConfig` takes a null list with a zero count for the defaults,
+/// which is what a decoder wants (the profile, the entry point and the render format are the three
+/// things it does choose, and those are arguments rather than attributes).
+#[repr(C)]
+#[derive(Default)]
+pub struct VaConfigAttrib {
+    type_: VAStatus,
+    value: c_uint,
+}
+
+/// `VASurfaceAttrib` (`va.h:1742`): one surface attribute — a type, the flags saying whether it can
+/// be read or written, and a value whose meaning the type decides. 16 bytes, laid out as the union
+/// `VAGenericValue` the header ends the struct with.
+///
+/// This backend passes none, either: `vaCreateSurfaces` takes a null list with a zero count, and the
+/// driver allocates surfaces in the default (`VA_SURFACE_ATTRIB_MEM_TYPE_VA`) memory type, which is
+/// the only type a mapped readback path can rely on. It is declared because
+/// `vaCreateSurfaces` takes the array's type, so a caller that passes nothing still has to hand the
+/// library a pointer to *something*.
+#[repr(C)]
+#[derive(Default)]
+pub struct VaSurfaceAttrib {
+    type_: VAStatus,
+    flags: c_uint,
+    value: VaGenericValue,
+}
+
+/// `VAGenericValue` (`va.h:245`): the eight-byte value a `VASurfaceAttrib` carries, as the union
+/// the header declares it (a 64-bit integer, or a pointer of the same width). Only its size is ever
+/// used here, and only as the tail of a `VASurfaceAttrib` a null list points past.
+#[repr(C)]
+union VaGenericValue {
+    integer: u64,
+    pointer: *mut c_void,
+}
+
+impl Default for VaGenericValue {
+    fn default() -> Self {
+        Self { integer: 0 }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Constants, all read out of `/usr/include/va/` on the target machine (libva 2.24).
 // ---------------------------------------------------------------------------------------------
@@ -80,15 +123,60 @@ pub const YUV420_10: u32 = 0x0000_0100;
 const FOURCC_NV12: u32 = 0x3231_564e;
 const BYTE_ORDER_LSB_FIRST: u32 = 1;
 
+/// `VA_FOURCC_NV12` (`va.h:4425`): the four-character code of an 8-bit biplanar 4:2:0 image. The
+/// readback path asks for this by name (and for [`FOURCC_P010`] at 10 bits) so a driver that
+/// derives something else — NV21, say, which is the same picture with U and V swapped — is
+/// refused rather than read as if the components were in the order FilmCraft expects.
+pub const NV12_FOURCC: u32 = FOURCC_NV12;
+/// `VA_FOURCC_P010` (`va.h:4478`): the 10-bit biplanar 4:2:0 image, each sample a 16-bit word with
+/// the 10 significant bits in the high half.
+pub const P010_FOURCC: u32 = 0x3031_3050;
+
+/// `VAImageFormat.bits_per_pixel` as libva reports it for a 4:2:0 image: **12** for NV12 and
+/// **24** for P010.
+///
+/// Not "8" and "10": the field counts the bits a *luma and chroma sample together* take across the
+/// two planes, which for 4:2:0 is twice the sample depth (8 + 4 + 4, or 16 + 4 + 4). Every driver
+/// agrees on this — an Intel iHD driver at libva 1.24 reports exactly these two for NV12 and P010
+/// — so they are the two values [`crate::vaapi::validate_image`] takes, and anything else is a
+/// picture this backend does not know how to read.
+pub const NV12_BPP: u32 = 12;
+/// See [`NV12_BPP`].
+pub const P010_BPP: u32 = 24;
+
+/// `VA_STATUS_ERROR_OPERATION_FAILED` (`va.h:266`): the status `vaDeriveImage` is documented to
+/// return when a surface cannot be represented as a `VAImage`, which is the signal to read the
+/// picture the indirect way instead (`vaCreateImage` + `vaPutImage`). See [`Session::read`].
+pub const OPERATION_FAILED: i32 = 0x1;
+/// `VA_STATUS_ERROR_HW_BUSY` (`va.h:291`): the video engine was resetting. `vaSyncSurface` reports
+/// it while the reset runs and succeeds on a later call, so [`Session::sync`] asks again rather
+/// than reporting a decode failure the stream may not have had.
+pub const HW_BUSY: i32 = 0x22;
+
+/// `VASurfaceRendering` / `VASurfaceDisplaying` / `VASurfaceReady` (`va.h:4296-4299`): what
+/// `vaQuerySurfaceStatus` says about a surface. `READY` is the state a surface has to be in before
+/// its pixels can be read.
+pub const SURFACE_READY: u32 = 0x4;
+
+/// `VA_PROGRESSIVE` (`va.h:1920`): the only frame-pictures flag a decoder passes to
+/// `vaCreateContext`. Every stream this backend takes is progressive (`plan_nal` declines the rest),
+/// so this is the whole flag word.
+pub const PROGRESSIVE: c_int = 0x1;
+
 /// `VABufferType` (`va.h:2042`): the buffer kinds a decode loop submits, in the order libva
 /// numbers them.
 pub const PICTURE_PARAMETER_BUFFER: VAStatus = 0;
+/// `VAIQMatrixBufferType` (`va.h:2043`): the H.264 scaling lists (`VAIQMatrixBufferH264`, `va.h`).
+/// **A decode that does not submit one of these does not decode.** The iHD driver takes a
+/// submission without it, reports success at every call, and leaves the render target holding the
+/// cleared surface — a uniform mid-grey picture, which is the plausible-looking wrong answer this
+/// backend must never hand back. See [`crate::vaapi::picture`]'s `h264_iq_matrix`, which builds it
+/// from the sequence parameter set's own lists.
+pub const IQ_MATRIX_BUFFER: VAStatus = 1;
 /// See [`PICTURE_PARAMETER_BUFFER`].
 pub const SLICE_PARAMETER_BUFFER: VAStatus = 4;
 /// See [`PICTURE_PARAMETER_BUFFER`].
 pub const SLICE_DATA_BUFFER: VAStatus = 5;
-/// See [`PICTURE_PARAMETER_BUFFER`].
-pub const IMAGE_BUFFER: VAStatus = 9;
 
 /// `VA_SLICE_DATA_FLAG_ALL` (`va.h:3080`): the whole slice is in the buffer. Every slice record
 /// this backend builds carries its slice whole, so this is the flag they all get; the other
@@ -107,6 +195,19 @@ pub const PICTURE_H264_INVALID: u32 = 0x0000_0001;
 
 /// `VA_PICTURE_HEVC_INVALID` (`va.h:5310`): see [`PICTURE_H264_INVALID`].
 pub const PICTURE_HEVC_INVALID: u32 = 0x0000_0001;
+/// `VA_PICTURE_HEVC_LONG_TERM_REFERENCE` (`va.h:5316`): the `ReferenceFrames` entry is a long-term
+/// reference of the stream (`va.h:5319`).
+pub const PICTURE_HEVC_LONG_TERM_REFERENCE: u32 = 0x0000_0008;
+/// `VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` (`va.h:5325`): the entry is one of the
+/// `NumPocStCurrBefore` pictures the current picture's short-term reference picture set refers to.
+pub const PICTURE_HEVC_RPS_ST_CURR_BEFORE: u32 = 0x0000_0010;
+/// `VA_PICTURE_HEVC_RPS_ST_CURR_AFTER` (`va.h:5331`): see
+/// [`PICTURE_HEVC_RPS_ST_CURR_BEFORE`], for `NumPocStCurrAfter`.
+pub const PICTURE_HEVC_RPS_ST_CURR_AFTER: u32 = 0x0000_0020;
+/// `VA_PICTURE_HEVC_RPS_LT_CURR` (`va.h:5337`): see [`PICTURE_HEVC_RPS_ST_CURR_BEFORE`], for
+/// `NumPocLtCurr`. The three are exclusive of one another and of
+/// [`PICTURE_HEVC_LONG_TERM_REFERENCE`] (`va.h:5326`), so one entry carries one of the four.
+pub const PICTURE_HEVC_RPS_LT_CURR: u32 = 0x0000_0040;
 
 /// `VA_INVALID_SURFACE` (`va.h:1648`), which is `VA_INVALID_ID`: the picture id an invalid entry
 /// carries.
@@ -167,6 +268,17 @@ const DRM_NODE_ENV: &str = "FILMCRAFT_VAAPI_DRM_NODE";
 /// profiles or entry points, and the answer is what sizes the array we hand it.
 const MAX_DRIVER_ENTRIES: usize = 4096;
 
+/// The most surfaces one decode session allocates. A decoded picture buffer holds at most 16
+/// pictures (15 for HEVC) and the decoder reads each picture back before decoding the next, so this
+/// is far more than any conforming stream needs; it is here so that a stream description claiming an
+/// absurd decoded picture buffer size costs a clamp rather than an allocation.
+pub const MAX_SURFACES: usize = 32;
+
+/// How many times `vaSyncSurface` is asked again while it reports the video engine busy. The engine
+/// resets in a fraction of a frame; a driver still answering after this many is one that has stopped
+/// answering, and the decode is reported as failed so the stream goes to the software decoder.
+const MAX_SYNC_ATTEMPTS: u32 = 64;
+
 /// The longest driver string copied out of libva (a vendor name is a few dozen bytes), so a
 /// driver that hands back a huge or unterminated string cannot drive a large allocation.
 const MAX_DRIVER_STRING: usize = 256;
@@ -197,17 +309,17 @@ unsafe extern "C" {
 #[repr(C)]
 #[derive(Default)]
 pub struct VaImageFormat {
-    fourcc: u32,
+    pub fourcc: u32,
     /// `VA_LSB_FIRST` or `VA_MSB_FIRST` (`va.h:4714-4715`).
-    byte_order: u32,
-    bits_per_pixel: u32,
+    pub byte_order: u32,
+    pub bits_per_pixel: u32,
     /// Significant bits per pixel.
-    depth: u32,
-    red_mask: u32,
-    green_mask: u32,
-    blue_mask: u32,
-    alpha_mask: u32,
-    va_reserved: [u32; VA_PADDING_LOW],
+    pub depth: u32,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+    pub alpha_mask: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
 /// `VAImage` (`va.h:4734`): the description libva hands back for a decoded picture — its size, how
@@ -217,30 +329,32 @@ pub struct VaImageFormat {
 /// is installed, and `va_image_layout_matches_the_header` pins the offsets against the header.
 /// 120 bytes.
 ///
-/// The fields are private to this file: they are libva's memory layout rather than FilmCraft's
-/// data, so a decoder asks this module for plane geometry instead of reading them itself.
+/// The fields are `pub(crate)` rather than public: they are libva's memory layout rather than
+/// FilmCraft's data, but [`crate::vaapi::validate_image`] is the single gate every readback goes
+/// through and has to read the plane geometry the driver wrote — which is exactly what is unsafe to
+/// read from anywhere else. Nothing outside this backend's one module tree reads them.
 #[repr(C)]
 #[derive(Default)]
 pub struct VaImage {
-    image_id: VAImageID,
-    format: VaImageFormat,
+    pub image_id: VAImageID,
+    pub format: VaImageFormat,
     /// The buffer (`VAImageBufferType`) the image data lives in, to be mapped and unmapped.
-    buf: VABufferID,
-    width: u16,
-    height: u16,
+    pub buf: VABufferID,
+    pub width: u16,
+    pub height: u16,
     /// Bytes the driver allocated for all planes together.
-    data_size: u32,
+    pub data_size: u32,
     /// 1..=3 for the planar formats; whatever else a driver reports is not read.
-    num_planes: u32,
+    pub num_planes: u32,
     /// Bytes per row of each plane.
-    pitches: [u32; 3],
+    pub pitches: [u32; 3],
     /// Byte offset of each plane within the mapped buffer.
-    offsets: [u32; 3],
+    pub offsets: [u32; 3],
     /// Palette bookkeeping; zero for the YUV formats this backend takes.
-    num_palette_entries: i32,
-    entry_bytes: i32,
-    component_order: [i8; 4],
-    va_reserved: [u32; VA_PADDING_LOW],
+    pub num_palette_entries: i32,
+    pub entry_bytes: i32,
+    pub component_order: [i8; 4],
+    pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -381,6 +495,38 @@ pub struct VaSliceParameterBufferH264 {
     /// The C layout's hole at offsets 3110-3111, before `va_reserved`.
     pub padding_before_va_reserved: [u8; 2],
     pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAIQMatrixBufferH264` (`va.h`): the quantizer and inverse-quantizer scaling lists a picture is
+/// decoded with. 240 bytes — six 4x4 lists, six 8x8 lists, then the reserved tail.
+///
+/// Both arrays are in **raster scan order**, which is the order FilmCraft's own parser keeps its
+/// `ScalingMatrices` in (`params.rs`: `zz4_to_raster`), so filling this record from the sequence
+/// parameter set is a copy rather than a re-scan. A stream whose sequence parameter set says
+/// `seq_scaling_matrix_present_flag == 0` gets flat lists of 16 (`ScalingMatrices::flat`), which
+/// is what 7.4.2.1.1 specifies as the default and what every encoder uses when it has no
+/// quantizer matrices to send.
+///
+/// This is a buffer a decode cannot be without: see [`IQ_MATRIX_BUFFER`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaIqMatrixBufferH264 {
+    /// `[Intra Y, Intra Cb, Intra Cr, Inter Y, Inter Cb, Inter Cr]`, raster order.
+    pub scaling_list4x4: [[u8; 16]; 6],
+    /// `[Intra Y, Inter Y]`, raster order — the 8x8 arrays are `[2][64]`, so the record holds the
+    /// luma pair and nothing for chroma: 8x8 chroma lists only exist at `chroma_format_idc == 3`
+    /// (4:4:4), which [`super::plan_nal`] declines.
+    pub scaling_list8x8: [[u8; 64]; 2],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+impl Default for VaIqMatrixBufferH264 {
+    /// Flat lists of 16 — the quantizer every stream without custom matrices decodes with
+    /// (7.4.2.1.1's default), so the empty record is the right one to hand a driver rather than
+    /// zeroes, which would name a quantizer nothing in H.264 allows.
+    fn default() -> Self {
+        Self { scaling_list4x4: [[16; 16]; 6], scaling_list8x8: [[16; 64]; 2], va_reserved: [0; VA_PADDING_LOW] }
+    }
 }
 
 /// `VAPictureHEVC` (`va.h:5292`): the HEVC counterpart of [`VaPictureH264`]. 28 bytes.
@@ -548,6 +694,13 @@ pub fn picture_params_h264(bytes: &[u8]) -> Option<VaPictureParameterBufferH264>
 pub fn slice_params_h264(bytes: &[u8]) -> Option<VaSliceParameterBufferH264> {
     // SAFETY: `VaSliceParameterBufferH264` is a `#[repr(C)]` struct declared above.
     unsafe { record_of::<VaSliceParameterBufferH264>(bytes) }
+}
+
+/// The H.264 IQ matrix record `bytes` carries, or `None` if it is not one long enough.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn iq_matrix_h264(bytes: &[u8]) -> Option<VaIqMatrixBufferH264> {
+    // SAFETY: `VaIqMatrixBufferH264` is a `#[repr(C)]` struct declared above.
+    unsafe { record_of::<VaIqMatrixBufferH264>(bytes) }
 }
 
 /// The HEVC picture parameter record `bytes` carries, or `None` if it is not one long enough.
@@ -745,9 +898,28 @@ pub struct Api {
     query_entrypoints: QueryEntrypointsFn,
     /// Optional: `vaErrorStr` is libva 1.0-era and only decorates error messages.
     error_str: Option<ErrorStrFn>,
-    /// Optional: the image calls are only the ABI layout probe (and, later, readback).
+    /// Optional: the image calls are the ABI layout probe and the indirect readback path (see
+    /// [`Session::read`]). Both are needed together, so a libva with neither is still a working
+    /// decoder on any driver whose surfaces can be derived.
     create_image: Option<CreateImageFn>,
     destroy_image: Option<DestroyImageFn>,
+    put_image: Option<PutImageFn>,
+    create_config: CreateConfigFn,
+    destroy_config: DestroyConfigFn,
+    create_surfaces: CreateSurfacesFn,
+    destroy_surfaces: DestroySurfacesFn,
+    create_context: CreateContextFn,
+    destroy_context: DestroyContextFn,
+    create_buffer: CreateBufferFn,
+    destroy_buffer: DestroyBufferFn,
+    derive_image: DeriveImageFn,
+    begin_picture: BeginPictureFn,
+    render_picture: RenderPictureFn,
+    end_picture: EndPictureFn,
+    sync_surface: SyncSurfaceFn,
+    query_surface_status: QuerySurfaceStatusFn,
+    map_buffer: MapBufferFn,
+    unmap_buffer: UnmapBufferFn,
 }
 
 // SAFETY: the function pointers are resolved once and are not mutated afterwards, and the
@@ -814,6 +986,23 @@ fn resolve(va: *mut c_void, va_drm: *mut c_void, libraries: Arc<Libraries>) -> R
             error_str: optional_symbol(va, c"vaErrorStr"),
             create_image: optional_symbol(va, c"vaCreateImage"),
             destroy_image: optional_symbol(va, c"vaDestroyImage"),
+            put_image: optional_symbol(va, c"vaPutImage"),
+            create_config: symbol(va, c"vaCreateConfig")?,
+            destroy_config: symbol(va, c"vaDestroyConfig")?,
+            create_surfaces: symbol(va, c"vaCreateSurfaces")?,
+            destroy_surfaces: symbol(va, c"vaDestroySurfaces")?,
+            create_context: symbol(va, c"vaCreateContext")?,
+            destroy_context: symbol(va, c"vaDestroyContext")?,
+            create_buffer: symbol(va, c"vaCreateBuffer")?,
+            destroy_buffer: symbol(va, c"vaDestroyBuffer")?,
+            derive_image: symbol(va, c"vaDeriveImage")?,
+            begin_picture: symbol(va, c"vaBeginPicture")?,
+            render_picture: symbol(va, c"vaRenderPicture")?,
+            end_picture: symbol(va, c"vaEndPicture")?,
+            sync_surface: symbol(va, c"vaSyncSurface")?,
+            query_surface_status: symbol(va, c"vaQuerySurfaceStatus")?,
+            map_buffer: symbol(va, c"vaMapBuffer")?,
+            unmap_buffer: symbol(va, c"vaUnmapBuffer")?,
         })
     }
 }
@@ -829,6 +1018,23 @@ type QueryEntrypointsFn = unsafe extern "C" fn(VADisplay, VAProfile, *mut VAEntr
 type ErrorStrFn = unsafe extern "C" fn(VAStatus) -> *const c_char;
 type CreateImageFn = unsafe extern "C" fn(VADisplay, *mut VaImageFormat, c_int, c_int, *mut VaImage) -> VAStatus;
 type DestroyImageFn = unsafe extern "C" fn(VADisplay, VAImageID) -> VAStatus;
+type PutImageFn = unsafe extern "C" fn(VADisplay, VASurfaceID, VAImageID, c_int, c_int, c_uint, c_uint, c_int, c_int, c_uint, c_uint) -> VAStatus;
+type CreateConfigFn = unsafe extern "C" fn(VADisplay, VAProfile, VAEntrypoint, *mut VaConfigAttrib, c_int, *mut VAConfigID) -> VAStatus;
+type DestroyConfigFn = unsafe extern "C" fn(VADisplay, VAConfigID) -> VAStatus;
+type CreateSurfacesFn = unsafe extern "C" fn(VADisplay, c_uint, c_uint, c_uint, *mut VASurfaceID, c_uint, *mut VaSurfaceAttrib, c_uint) -> VAStatus;
+type DestroySurfacesFn = unsafe extern "C" fn(VADisplay, *mut VASurfaceID, c_int) -> VAStatus;
+type CreateContextFn = unsafe extern "C" fn(VADisplay, VAConfigID, c_int, c_int, c_int, *mut VASurfaceID, c_int, *mut VAContextID) -> VAStatus;
+type DestroyContextFn = unsafe extern "C" fn(VADisplay, VAContextID) -> VAStatus;
+type CreateBufferFn = unsafe extern "C" fn(VADisplay, VAContextID, VAStatus, c_uint, c_uint, *mut c_void, *mut VABufferID) -> VAStatus;
+type DestroyBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
+type DeriveImageFn = unsafe extern "C" fn(VADisplay, VASurfaceID, *mut VaImage) -> VAStatus;
+type BeginPictureFn = unsafe extern "C" fn(VADisplay, VAContextID, VASurfaceID) -> VAStatus;
+type RenderPictureFn = unsafe extern "C" fn(VADisplay, VAContextID, *mut VABufferID, c_int) -> VAStatus;
+type EndPictureFn = unsafe extern "C" fn(VADisplay, VAContextID) -> VAStatus;
+type SyncSurfaceFn = unsafe extern "C" fn(VADisplay, VASurfaceID) -> VAStatus;
+type QuerySurfaceStatusFn = unsafe extern "C" fn(VADisplay, VASurfaceID, *mut c_uint) -> VAStatus;
+type MapBufferFn = unsafe extern "C" fn(VADisplay, VABufferID, *mut *mut c_void) -> VAStatus;
+type UnmapBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
 
 /// The exported symbol `name` of the open library `handle` as a function pointer of type `F`.
 ///
@@ -1116,6 +1322,529 @@ fn close_fd(fd: c_int) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The decode session: a config, a ring of surfaces, a decode context, and the picture readback
+// that gets pixels back out of a surface. Everything that needs a libva handle lives behind these
+// six types, so the decoder itself never names one and every pairing that has to happen on every
+// path — buffer and image destroyed, buffer unmapped — is a `Drop`, not a line someone has to
+// remember on the error return.
+// ---------------------------------------------------------------------------------------------
+
+/// A configured decode session: what [`crate::vaapi::VaDecoder`] decodes one stream with.
+///
+/// It owns the three libva objects a decoder needs, in the order libva requires them to be torn
+/// down: the config, the surfaces (which cannot be destroyed while a context uses them) and the
+/// context. Dropping it releases all three, so a decode that fails half-way cannot leave a context
+/// or a surface behind.
+///
+/// `vaSyncSurface` is mandatory before a surface's pixels are read, and [`Session::sync`] is it:
+/// rendering is asynchronous, and a readback that does not sync reads whatever the driver had
+/// finished writing — which is a plausible-looking black picture rather than an error.
+pub struct Session {
+    display: Arc<Display>,
+    config: VAConfigID,
+    surfaces: Vec<u32>,
+    /// `None` after [`Session::clear_context`], which is what a seek does: no reference picture
+    /// survives it, so the next picture makes a fresh context.
+    context: Option<VAContextID>,
+    /// The four-character code and bit depth a decoded picture is read back as.
+    fourcc: u32,
+    bpp: u32,
+    size: (u32, u32),
+    /// Whether this session's surfaces are always read back the indirect way, remembered so that a
+    /// driver that cannot derive reports it once rather than on every picture.
+    indirect: bool,
+}
+
+impl Session {
+    /// Configure `display` for `profile` at `entrypoint`, create `count` surfaces of `format` at
+    /// `size`, and make a decode context for them.
+    ///
+    /// Every failure names the step and the driver's own status text, because "hardware decoding
+    /// declined" is only actionable if it says which of the three steps the driver refused. `size`
+    /// is the *coded* picture size (the surfaces hold the padding too) and `count` is the number of
+    /// surfaces the stream's decoded picture buffer needs; both come from the plan and the stream
+    /// description, which bound them.
+    pub fn new(display: &Arc<Display>, profile: Profile, entrypoint: Entrypoint, format: RtFormat, size: (u32, u32), count: usize) -> Result<Self, String> {
+        let count = count.clamp(1, MAX_SURFACES);
+        let count_u = c_uint::try_from(count).map_err(|_| format!("{count} surfaces"))?;
+        let width = c_uint::try_from(size.0).map_err(|_| format!("surface width {}", size.0))?;
+        let height = c_uint::try_from(size.1).map_err(|_| format!("surface height {}", size.1))?;
+        let context_width = c_int::try_from(size.0).map_err(|_| format!("picture width {}", size.0))?;
+        let context_height = c_int::try_from(size.1).map_err(|_| format!("picture height {}", size.1))?;
+        let (fourcc, bpp) = match format {
+            RtFormat::Nv12 => (NV12_FOURCC, NV12_BPP),
+            RtFormat::Yuv420_10 => (P010_FOURCC, P010_BPP),
+            RtFormat::Other(bits) => return Err(format!("render format {bits:#x} is not 4:2:0 8- or 10-bit")),
+        };
+        let api = Arc::clone(&display.api);
+        let mut session = Self { display: Arc::clone(display), config: 0, surfaces: Vec::new(), context: None, fourcc, bpp, size, indirect: false };
+
+        let mut surfaces = vec![0 as VASurfaceID; count];
+        {
+            let _gate = display.gate();
+            let mut config: VAConfigID = 0;
+            // SAFETY: the display is initialised; no attributes are passed (null, zero), which
+            // libva reads as "every attribute at its default"; and `config` is a live local the
+            // call writes the config id into.
+            let st = unsafe { (api.create_config)(display.dpy, profile.bits(), entrypoint.bits(), std::ptr::null_mut(), 0, &mut config) };
+            if st != OK {
+                return Err(format!("vaCreateConfig failed for {:?}/{:?}: {}", profile, entrypoint, api.status_text(st)));
+            }
+            session.config = config;
+            // SAFETY: as above for the surfaces: `surfaces` is a live array `count_u` long, which is
+            // what the driver is told to fill, and no attribute list is passed. A `Session` that is
+            // dropped from here on destroys the config it holds, so this needs no manual unwind.
+            let st = unsafe { (api.create_surfaces)(display.dpy, format.bits(), width, height, surfaces.as_mut_ptr(), count_u, std::ptr::null_mut(), 0) };
+            if st != OK {
+                return Err(format!("vaCreateSurfaces failed for {} surfaces at {}x{}: {}", count, size.0, size.1, api.status_text(st)));
+            }
+            session.surfaces = std::mem::take(&mut surfaces);
+            let Ok(contexts) = c_int::try_from(session.surfaces.len()) else {
+                return Err(format!("{count} surfaces does not fit a context's render target list"));
+            };
+            let mut context: VAContextID = 0;
+            // SAFETY: `config` is the config created above, `surfaces` the array just filled and
+            // `contexts` its length, and `context` is a live local for the id to be written into.
+            let st = unsafe {
+                (api.create_context)(display.dpy, config, context_width, context_height, PROGRESSIVE, session.surfaces.as_mut_ptr(), contexts, &mut context)
+            };
+            if st != OK {
+                return Err(format!("vaCreateContext failed at {}x{}: {}", size.0, size.1, api.status_text(st)));
+            }
+            session.context = Some(context);
+        }
+        Ok(session)
+    }
+
+    /// The surfaces pictures are decoded into, in the order the driver gave them.
+    pub fn surfaces(&self) -> &[u32] {
+        &self.surfaces
+    }
+
+    /// The coded picture size the surfaces and the context were created at.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// Whether this session's pictures have to be read back the indirect way.
+    pub fn reads_indirectly(&self) -> bool {
+        self.indirect
+    }
+
+    /// Drop the decode context, so that the next picture makes a new one. A seek does this: no
+    /// reference picture survives it, and a context that still held the previous run's references
+    /// would decode the new run against surfaces that hold something else.
+    pub fn clear_context(&mut self) {
+        if let Some(context) = self.context.take() {
+            let api = &self.display.api;
+            // SAFETY: `context` is this session's own context, taken out of the option so no other
+            // reference to it exists, and this is its matching destroy.
+            unsafe { (api.destroy_context)(self.display.dpy, context) };
+        }
+    }
+
+    /// Make a decode context again, for the surfaces this session already owns.
+    fn make_context(&mut self) -> Result<VAContextID, String> {
+        let api = &self.display.api;
+        let width = c_int::try_from(self.size.0).map_err(|_| format!("picture width {}", self.size.0))?;
+        let height = c_int::try_from(self.size.1).map_err(|_| format!("picture height {}", self.size.1))?;
+        let Ok(count) = c_int::try_from(self.surfaces.len()) else { return Err(format!("{} surfaces", self.surfaces.len())) };
+        let mut context: VAContextID = 0;
+        // SAFETY: `config` is this session's own config, `surfaces` the array this session owns and
+        // `count` its length, and `context` is a live local for the id to be written into.
+        let st = unsafe { (api.create_context)(self.display.dpy, self.config, width, height, PROGRESSIVE, self.surfaces.as_mut_ptr(), count, &mut context) };
+        if st != OK {
+            return Err(format!("vaCreateContext failed at {}x{}: {}", self.size.0, self.size.1, api.status_text(st)));
+        }
+        Ok(context)
+    }
+
+    /// A buffer holding `data` of kind `kind` (a [`PICTURE_PARAMETER_BUFFER`],
+    /// [`SLICE_PARAMETER_BUFFER`] or [`SLICE_DATA_BUFFER`]), destroyed when it is dropped.
+    ///
+    /// `size` is the byte length and `num_elements` is 1. That is what libva's own decode examples
+    /// pass for all three kinds (`va.h:3838`: "size" and "num_elements", which for a decoder's
+    /// parameter buffers is a single record rather than an array of them), and it is what the
+    /// drivers read back with `vaBufferGetNumElements` — a driver asked for one element per byte
+    /// refuses the buffer with `VA_STATUS_ERROR_INVALID_PARAMETER`, which is what an Intel iHD driver
+    /// does for a 672-byte picture parameter buffer.
+    ///
+    /// libva copies the data in (`va.h:3826`), so the buffer owns its own copy of the record and the
+    /// caller's bytes do not have to outlive the call.
+    pub fn buffer(&mut self, kind: VAStatus, data: &[u8]) -> Result<Buffer, String> {
+        let Ok(size) = c_uint::try_from(data.len()) else { return Err(format!("{} byte buffer", data.len())) };
+        let mut id: VABufferID = 0;
+        // SAFETY: the context exists (a buffer is only made for a decode in flight) and `data` is
+        // `size` bytes of readable memory, which is the count passed below, so libva copies exactly
+        // that many bytes from it. `id` is a live local for the buffer id.
+        let st = unsafe { (self.display.api.create_buffer)(self.display.dpy, self.context_id()?, kind, size, 1, data.as_ptr().cast_mut().cast(), &mut id) };
+        if st != OK {
+            return Err(format!("vaCreateBuffer failed for {size} bytes of type {kind}: {}", self.display.api.status_text(st)));
+        }
+        Ok(Buffer { display: Arc::clone(&self.display), id })
+    }
+
+    /// The id of the decode context, making one if a seek dropped it.
+    fn context_id(&mut self) -> Result<VAContextID, String> {
+        if let Some(context) = self.context {
+            return Ok(context);
+        }
+        let context = self.make_context()?;
+        self.context = Some(context);
+        Ok(context)
+    }
+
+    /// Decode into `surface`: begin the picture, submit `buffers`, end it.
+    ///
+    /// `vaEndPicture` is called on every path that got as far as `vaBeginPicture`, so a
+    /// `vaRenderPicture` that fails cannot leave the context mid-picture — which libva would refuse
+    /// every later call on.
+    pub fn render(&mut self, surface: u32, buffers: &[u32]) -> Result<(), String> {
+        let api = Arc::clone(&self.display.api);
+        let context = self.context_id()?;
+        if buffers.is_empty() {
+            return Err("a picture with no buffers to render".into());
+        }
+        let Ok(count) = c_int::try_from(buffers.len()) else { return Err(format!("{} buffers", buffers.len())) };
+        let _gate = self.display.gate();
+        // SAFETY: `context` is this session's own context and `surface` one of its own surfaces;
+        // both were created together and neither has been destroyed.
+        let begun = unsafe { (api.begin_picture)(self.display.dpy, context, surface) };
+        if begun != OK {
+            return Err(format!("vaBeginPicture failed on surface {surface}: {}", api.status_text(begun)));
+        }
+        // SAFETY: as above, plus `buffers` is a live slice of `count` ids, all of them buffers this
+        // session created and not yet destroyed.
+        let st = unsafe { (api.render_picture)(self.display.dpy, context, buffers.as_ptr().cast_mut(), count) };
+        // SAFETY: as above. `vaEndPicture` is the matching call for the `vaBeginPicture` above, and
+        // is made whether or not `vaRenderPicture` succeeded: libva requires the pair.
+        let ended = unsafe { (api.end_picture)(self.display.dpy, context) };
+        if st != OK {
+            return Err(format!("vaRenderPicture failed for {} buffers: {}", buffers.len(), api.status_text(st)));
+        }
+        if ended != OK {
+            return Err(format!("vaEndPicture failed: {}", api.status_text(ended)));
+        }
+        Ok(())
+    }
+
+    /// Wait for the rendering on `surface` to finish. **Required before its pixels are read.**
+    ///
+    /// `VA_STATUS_ERROR_HW_BUSY` means the video engine was resetting; libva documents that the
+    /// call succeeds on a later one, so this asks again rather than reporting a decode failure the
+    /// stream may not have had. The retry count is bounded because a driver that keeps answering
+    /// `HW_BUSY` is a driver that is not going to answer at all.
+    pub fn sync(&self, surface: u32) -> Result<(), String> {
+        let api = &self.display.api;
+        let _gate = self.display.gate();
+        for _ in 0..MAX_SYNC_ATTEMPTS {
+            // SAFETY: `surface` is one of this session's own surfaces.
+            let st = unsafe { (api.sync_surface)(self.display.dpy, surface) };
+            match st {
+                OK => return Ok(()),
+                HW_BUSY => continue,
+                // `VA_STATUS_ERROR_DECODING_ERROR` (`va.h:283`) is the important one: the driver ran
+                // the decode and the picture in the surface is not decodable. It is reported like any
+                // other failure, and `status_text` says which it was.
+                other => return Err(format!("vaSyncSurface failed on surface {surface}: {}", api.status_text(other))),
+            }
+        }
+        Err(format!("vaSyncSurface on surface {surface} still reports the engine busy"))
+    }
+
+    /// Whether the driver says `surface` is ready to be read — that is, still being rendered into,
+    /// or being displayed. `Err` if the query itself failed.
+    pub fn surface_ready(&self, surface: u32) -> Result<bool, String> {
+        let api = &self.display.api;
+        let _gate = self.display.gate();
+        let mut status: c_uint = 0;
+        // SAFETY: `surface` is one of this session's own surfaces and `status` is a live local for
+        // the flag word libva writes.
+        let st = unsafe { (api.query_surface_status)(self.display.dpy, surface, &mut status) };
+        if st != OK {
+            return Err(format!("vaQuerySurfaceStatus failed on surface {surface}: {}", api.status_text(st)));
+        }
+        Ok(status & SURFACE_READY != 0)
+    }
+
+    /// The pixels of `surface`, mapped and ready to read.
+    ///
+    /// Two paths, in the order libva documents. `vaDeriveImage` is the direct one: the surface's
+    /// own memory is handed back as a `VAImage`, and reading it is one copy. When it returns
+    /// `VA_STATUS_ERROR_OPERATION_FAILED` — the documented answer for a surface that cannot be
+    /// represented as an image, which is most often a driver whose surfaces are tiled — the picture
+    /// is read the indirect way instead: an image of its own is created and the surface copied into
+    /// it. That is a real copy through the driver and it is slower, which is why whether a session
+    /// needs it is remembered and reported rather than discovered once per picture.
+    ///
+    /// The caller checks [`VaImage`] against its own gate ([`crate::vaapi::validate_image`]) before
+    /// reading a byte, and borrows the mapped bytes through [`Readback::with_bytes`]; the map is
+    /// paired with its unmap and the image with its destroy in [`Readback`]'s `Drop`, so a failure
+    /// between here and the read cannot leak either.
+    pub fn read(&mut self, surface: u32) -> Result<Readback, String> {
+        if self.indirect {
+            return self.read_indirect(surface);
+        }
+        let mut image = VaImage::default();
+        let status = {
+            let _gate = self.display.gate();
+            // SAFETY: `surface` is one of this session's own surfaces and `image` is a live local
+            // libva fills in with the image's own description.
+            unsafe { (self.display.api.derive_image)(self.display.dpy, surface, &mut image) }
+        };
+        if status == OPERATION_FAILED {
+            self.indirect = true;
+            log::info!("VA-API: this driver's surfaces cannot be derived into an image; reading pictures back through a copy");
+            return self.read_indirect(surface);
+        }
+        if status != OK {
+            return Err(format!("vaDeriveImage failed on surface {surface}: {}", self.display.api.status_text(status)));
+        }
+        let display = Arc::clone(&self.display);
+        let read = Readback::map(display, image, true)?;
+        if read.image().format.fourcc != self.fourcc {
+            return Err(format!(
+                "the driver derived surface {surface} as fourcc {:#x}, not the {:#x} this session decodes into",
+                read.image().format.fourcc,
+                self.fourcc
+            ));
+        }
+        Ok(read)
+    }
+
+    /// The indirect readback: `vaCreateImage` + `vaPutImage` (`va.h:4892`), the fallback `vaDeriveImage`
+    /// documents. An error on either step destroys the image, so a failure here leaves nothing
+    /// behind.
+    fn read_indirect(&self, surface: u32) -> Result<Readback, String> {
+        let (Some(create_image), Some(destroy_image), Some(put_image)) =
+            (self.display.api.create_image, self.display.api.destroy_image, self.display.api.put_image)
+        else {
+            return Err("this libva has no vaCreateImage / vaPutImage, so a surface that cannot be derived cannot be read".into());
+        };
+        let api = &self.display.api;
+        let mut format = VaImageFormat { fourcc: self.fourcc, byte_order: BYTE_ORDER_LSB_FIRST, bits_per_pixel: self.bpp, ..Default::default() };
+        let mut image = VaImage::default();
+        let (width, height) = (
+            c_int::try_from(self.size.0).map_err(|_| format!("picture width {}", self.size.0))?,
+            c_int::try_from(self.size.1).map_err(|_| format!("picture height {}", self.size.1))?,
+        );
+        let st = {
+            let _gate = self.display.gate();
+            // SAFETY: the display is initialised, `format` and `image` are live locals, and the sizes
+            // are the ones the image is allocated at.
+            unsafe { create_image(self.display.dpy, &mut format, width, height, &mut image) }
+        };
+        if st != OK {
+            return Err(format!("vaCreateImage failed for the indirect readback: {}", api.status_text(st)));
+        }
+        // From here the image exists, so every exit has to destroy it. `Readback::map` takes that
+        // over as soon as the image is mapped; before that the two calls below do it themselves.
+        let extent = |s: u32| c_uint::try_from(s).unwrap_or(0);
+        let st = {
+            let _gate = self.display.gate();
+            // SAFETY: `image` is the image just created, and `surface` is one of this session's own
+            // surfaces; the rectangle is the whole of both.
+            unsafe {
+                put_image(
+                    self.display.dpy,
+                    surface,
+                    image.image_id,
+                    0,
+                    0,
+                    extent(self.size.0),
+                    extent(self.size.1),
+                    0,
+                    0,
+                    extent(self.size.0),
+                    extent(self.size.1),
+                )
+            }
+        };
+        if st != OK {
+            // SAFETY: the image this function created, destroyed once, on its way out.
+            unsafe { destroy_image(self.display.dpy, image.image_id) };
+            return Err(format!("vaPutImage failed on surface {surface}: {}", api.status_text(st)));
+        }
+        let display = Arc::clone(&self.display);
+        Readback::map(display, image, false)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let api = Arc::clone(&self.display.api);
+        let _gate = self.display.gate();
+        // libva's own order: surfaces may only be destroyed after the contexts that use them.
+        if let Some(context) = self.context.take() {
+            // SAFETY: `context` is this session's own context, taken out of the option so no other
+            // reference to it exists, and this is its matching destroy.
+            unsafe { (api.destroy_context)(self.display.dpy, context) };
+        }
+        if !self.surfaces.is_empty() {
+            let count = c_int::try_from(self.surfaces.len()).unwrap_or(0);
+            // SAFETY: `self.surfaces` is the array of surface ids this session created, `count` is its
+            // length (zero on the conversion that cannot represent it, which destroys none), and this
+            // is their one destroy.
+            unsafe { (api.destroy_surfaces)(self.display.dpy, self.surfaces.as_mut_ptr(), count) };
+        }
+        if self.config != 0 {
+            // SAFETY: `config` is this session's own config id, created in `Session::new` and not
+            // destroyed on any earlier path, and this is its one destroy.
+            unsafe { (api.destroy_config)(self.display.dpy, self.config) };
+        }
+    }
+}
+
+/// A buffer submitted to a decode, destroyed when it is dropped.
+///
+/// Destroying a buffer is how libva is told a decode is finished with it, and a buffer that outlives
+/// its decode holds driver memory. `Drop` rather than a call the decode loop has to remember, so
+/// that an error between `vaCreateBuffer` and `vaRenderPicture` cannot leak one.
+pub struct Buffer {
+    display: Arc<Display>,
+    id: VABufferID,
+}
+
+impl Buffer {
+    /// The buffer id `vaRenderPicture` takes.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        let _gate = self.display.gate();
+        // SAFETY: `id` is the buffer this value owns and was created by the same display, which it
+        // holds a reference to; this is its one destroy.
+        unsafe { (self.display.api.destroy_buffer)(self.display.dpy, self.id) };
+    }
+}
+
+/// A decoded picture's pixels, mapped and readable — what a readback returns.
+///
+/// The mapped region belongs to the driver and is only valid until this is dropped, which is why it
+/// is lent rather than handed out: [`Readback::with_bytes`] borrows it for the duration of a
+/// closure, so nothing can hold a slice past the unmap. Dropping unmaps the buffer and destroys the
+/// image, on every path: a decode that fails between mapping and reading leaks neither.
+pub struct Readback {
+    /// Kept alive so the display — and through it the libva handle the mapping belongs to — outlives
+    /// the unmap in `Drop`.
+    display: Arc<Display>,
+    /// The driver's own description of the image, which the readback gate reads.
+    image: VaImage,
+    /// The mapped buffer, or null when `vaMapBuffer` has not been called (it cannot have, or `map`
+    /// would have failed).
+    data: *mut c_void,
+    mapped: bool,
+}
+
+impl Readback {
+    /// Map `image`'s buffer. `derived` says whether the image came from `vaDeriveImage` or from
+    /// `vaCreateImage`, which is what [`destroy_unread_image`] and `Drop` have to match.
+    fn map(display: Arc<Display>, image: VaImage, derived: bool) -> Result<Self, String> {
+        let mut data: *mut c_void = std::ptr::null_mut();
+        let status = {
+            let _gate = display.gate();
+            // SAFETY: `image.buf` is the buffer of an image libva created on this display, and
+            // `data` is a live local for the address libva writes into it.
+            unsafe { (display.api.map_buffer)(display.dpy, image.buf, &mut data) }
+        };
+        if status != OK {
+            let api = &display.api;
+            destroy_unread_image(&display, &image, derived);
+            return Err(format!("vaMapBuffer failed: {}", api.status_text(status)));
+        }
+        if data.is_null() {
+            // A successful map with no address is a driver that did not do what it said. There is
+            // nothing to unmap, but the image still has to be destroyed — see `destroy_unread_image`
+            // for why that is only for a derived one.
+            destroy_unread_image(&display, &image, derived);
+            return Err("vaMapBuffer succeeded but returned no address".into());
+        }
+        Ok(Self { display, image, data, mapped: true })
+    }
+
+    /// The image as the driver described it: its size, planes, pitches and offsets. This is what the
+    /// readback gate reads before a byte is read out of the mapped buffer.
+    pub fn image(&self) -> &VaImage {
+        &self.image
+    }
+
+    /// Borrow the mapped buffer's two planes for the duration of `f`, as
+    /// `(luma, chroma, stride, rows)`: a luma plane of `rows` rows of `stride` bytes, and a chroma
+    /// plane of `rows / 2` rows of the same stride, which is what a biplanar 4:2:0 image is.
+    ///
+    /// This is the one place a driver-reported offset becomes an address a pixel read happens at, so
+    /// every number in it is bounded against `data_size` — the only length libva reports for a mapped
+    /// buffer — and both planes are required to be inside it. The closure cannot keep either slice: it
+    /// returns nothing, so the borrow ends when it does and the unmap in `Drop` cannot pull the
+    /// ground out from under a caller.
+    ///
+    /// `data_size` is what the caller checked against the picture geometry (see
+    /// [`crate::vaapi::validate_image`]); this is the second gate, and it does not rely on that check
+    /// having been made, because this is the one that indexes.
+    pub fn with_mapped(&self, f: impl FnOnce(&[u8], &[u8], usize, usize)) {
+        // SAFETY: `data` is what `vaMapBuffer` returned for this image's buffer and is still mapped
+        // (only `Drop` unmaps it, and only once, with this value borrowed throughout), so the slice
+        // below is `data_size` readable bytes; both slices handed to `f` are subranges of it, which is
+        // what the `get` calls check, and neither outlives the borrow of `self`.
+        let bytes = unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.image.data_size as usize) };
+        let (Some(&pitch), Some(&luma_at), Some(&chroma_at)) = (self.image.pitches.first(), self.image.offsets.first(), self.image.offsets.get(1)) else {
+            return f(&[], &[], 0, 0);
+        };
+        let (stride, rows) = (pitch as usize, self.image.height as usize);
+        let chroma_rows = rows.div_ceil(2);
+        let (Some(luma_len), Some(chroma_len)) = (stride.checked_mul(rows), stride.checked_mul(chroma_rows)) else {
+            return f(&[], &[], 0, 0);
+        };
+        let (Some(luma), Some(chroma)) =
+            (bytes.get(luma_at as usize..).and_then(|b| b.get(..luma_len)), bytes.get(chroma_at as usize..).and_then(|b| b.get(..chroma_len)))
+        else {
+            return f(&[], &[], 0, 0);
+        };
+        f(luma, chroma, stride, rows)
+    }
+}
+
+impl Drop for Readback {
+    fn drop(&mut self) {
+        let _gate = self.display.gate();
+        if self.mapped {
+            // SAFETY: `image.buf` is the buffer mapped by `Readback::map` and has not been unmapped
+            // since (only this `Drop` unmaps it, and only once, with the value borrowed throughout), so
+            // this is its one unmap.
+            unsafe { (self.display.api.unmap_buffer)(self.display.dpy, self.image.buf) };
+            self.mapped = false;
+        }
+        if let Some(destroy) = self.display.api.destroy_image {
+            // SAFETY: `image.image_id` is the id libva wrote for this image, which this value owns:
+            // either `vaDeriveImage` filled it in or `vaCreateImage` created it, and nothing else holds
+            // it. This is its one destroy.
+            unsafe { destroy(self.display.dpy, self.image.image_id) };
+        }
+    }
+}
+
+/// Destroy an image that was created but never read: the two paths out of [`Readback::map`] where the
+/// map failed, so that a failed readback leaks neither the image nor its buffer.
+///
+/// Only for a *derived* image. An image from `vaCreateImage` whose map failed is the caller's to
+/// destroy — [`Session::read_indirect`] does — because libva has no way to tell a caller that its own
+/// `vaCreateImage` id is no longer wanted, and destroying it here would be a double destroy.
+fn destroy_unread_image(display: &Arc<Display>, image: &VaImage, derived: bool) {
+    if !derived {
+        return;
+    }
+    let _gate = display.gate();
+    if let Some(destroy) = display.api.destroy_image {
+        // SAFETY: `image.image_id` is the id `vaDeriveImage` wrote into `image`, the image was never
+        // mapped and so never unmapped, and nothing else holds the id, so this is its one destroy.
+        unsafe { destroy(display.dpy, image.image_id) };
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Tests: the hand-declared ABI against `/usr/include/va/`, and against the library that is
 // installed. Mirrors `nvenc/abi_tests.rs`, except that the header is present on the machine that
 // runs this, so the layout can be compared with libva itself.
@@ -1178,9 +1907,9 @@ mod tests {
         assert_eq!(VA_PADDING_LOW, 4);
         assert_eq!(VA_PADDING_MEDIUM, 8);
         assert_eq!(PICTURE_PARAMETER_BUFFER, 0);
+        assert_eq!(IQ_MATRIX_BUFFER, 1, "VAIQMatrixBufferType");
         assert_eq!(SLICE_PARAMETER_BUFFER, 4);
         assert_eq!(SLICE_DATA_BUFFER, 5);
-        assert_eq!(IMAGE_BUFFER, 9);
         assert_eq!(VLD, 1);
         assert_eq!(ENC_SLICE, 6, "VAEntrypointEncSlice");
         assert_eq!(H264_MAIN, 6, "VAProfileH264Main");
@@ -1193,6 +1922,50 @@ mod tests {
         assert_eq!(VP9_PROFILE_2, 21, "VAProfileVP9Profile2");
         assert_eq!(VP9_PROFILE_3, 22, "VAProfileVP9Profile3");
         assert_eq!(AV1_MAIN, 32, "VAProfileAV1Profile0");
+        assert_eq!(OPERATION_FAILED, 0x1, "VA_STATUS_ERROR_OPERATION_FAILED");
+        assert_eq!(HW_BUSY, 0x22, "VA_STATUS_ERROR_HW_BUSY");
+        assert_eq!(SURFACE_READY, 0x4, "VASurfaceReady");
+        assert_eq!(PROGRESSIVE, 0x1, "VA_PROGRESSIVE");
+        // The IQ matrix record's shape, which is what `h264_iq_matrix` fills: 96 bytes of 4x4
+        // lists, 128 of 8x8, then the reserved tail — 240 in total, and the driver reads a
+        // submission of any other length as something else entirely.
+        assert_eq!(size_of::<VaIqMatrixBufferH264>(), 240, "VAIQMatrixBufferH264 is 240 bytes");
+        assert_eq!(offset_of!(VaIqMatrixBufferH264, scaling_list4x4), 0);
+        assert_eq!(offset_of!(VaIqMatrixBufferH264, scaling_list8x8), 96, "after the six 4x4 lists");
+        assert_eq!(offset_of!(VaIqMatrixBufferH264, va_reserved), 224, "and the two 8x8 luma lists are 128 bytes");
+        assert_eq!(NV12_BPP, 12, "libva reports 12 bits per pixel for NV12, not 8");
+        assert_eq!(P010_BPP, 24, "and 24 for P010, not 10");
+        assert_eq!(NV12_FOURCC, 0x3231_564e, "VA_FOURCC_NV12");
+        assert_eq!(P010_FOURCC, 0x3031_3050, "VA_FOURCC_P010");
+        assert_eq!(PICTURE_HEVC_LONG_TERM_REFERENCE, 0x8, "VA_PICTURE_HEVC_LONG_TERM_REFERENCE");
+        assert_eq!(PICTURE_HEVC_RPS_ST_CURR_BEFORE, 0x10);
+        assert_eq!(PICTURE_HEVC_RPS_ST_CURR_AFTER, 0x20);
+        assert_eq!(PICTURE_HEVC_RPS_LT_CURR, 0x40);
+    }
+
+    /// The layouts of the two attribute structures a decoder passes a null array of: libva takes
+    /// `(attrib_list, num_attribs)` and the array's type is in the signature, so a caller that passes
+    /// nothing still needs the struct to exist and be the right size.
+    #[test]
+    fn the_attribute_records_match_the_header() {
+        assert_eq!(size_of::<VaConfigAttrib>(), 8, "VAConfigAttrib (va.h:1072)");
+        assert_eq!(offset_of!(VaConfigAttrib, value), 4);
+        assert_eq!(size_of::<VaSurfaceAttrib>(), 16, "VASurfaceAttrib (va.h:1742)");
+        assert_eq!(offset_of!(VaSurfaceAttrib, flags), 4);
+        assert_eq!(offset_of!(VaSurfaceAttrib, value), 8, "the VAGenericValue tail");
+        assert_eq!(size_of::<VaGenericValue>(), 8, "VAGenericValue (va.h:245)");
+    }
+
+    /// A driver that will not decode into a derived image says so with
+    /// `VA_STATUS_ERROR_OPERATION_FAILED`, and that is the only status this backend reads a surface
+    /// back the indirect way for. A driver that fails for any other reason is an error, not a reason
+    /// to copy the picture a second way: the distinction is what keeps a broken driver from being
+    /// quietly worked around.
+    #[test]
+    fn only_operation_failed_is_treated_as_a_derive_failure() {
+        assert_eq!(OPERATION_FAILED, 1);
+        assert_ne!(OPERATION_FAILED, OK);
+        assert_ne!(OPERATION_FAILED, HW_BUSY);
     }
 
     /// The picture- and slice-parameter records, as libva 2.24's headers declare them, so a field
