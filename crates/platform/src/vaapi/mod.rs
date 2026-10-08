@@ -23,17 +23,21 @@ mod ffi;
 // from needing changes in this file when the gate moves.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod stream;
+// What a picture is submitted as, read out of FilmCraft's own parsers. Safe code with nothing
+// OS-specific in it either, for the same reason as `stream` above.
+mod picture;
 
 // What the rest of the backend needs; no libva type crosses this line. `OK` and the buffer-type
 // constants are part of it too — the decode loop submits those buffers and compares statuses — as
 // are the render formats a surface is created in. The padding widths stay for the same reason:
-// they decide the size of every `VA*` structure, and the next milestone's picture-parameter
-// structures are sized with them. The raw profile and entry point numbers do not: those are what
-// `Profile`, `Entrypoint` and `RtFormat` are compared as.
+// they decide the size of every `VA*` structure, the picture-parameter records among them. The raw
+// profile and entry point numbers do not: those are what `Profile`, `Entrypoint` and `RtFormat` are
+// compared as.
 pub use ffi::{
     Api, Display, Entrypoint, IMAGE_BUFFER, OK, PICTURE_PARAMETER_BUFFER, Profile, RtFormat, SLICE_DATA_BUFFER, SLICE_PARAMETER_BUFFER, VA_PADDING_LOW,
     VA_PADDING_MEDIUM, YUV420, YUV420_10, status,
 };
-// What the decoder itself drives: the stream it takes, what the driver would decode it with, and
-// the check that the driver really offers that.
+// What the decoder itself drives: the stream it takes, what the driver would decode it with, the
+// check that the driver really offers that, and the records one access unit is submitted as.
+pub use picture::{NalPoc, Picture, SliceParam, build_frame, build_nal};
 pub use stream::{MAX_SIDE, Plan, Stream, plan_frame, plan_nal, supports};

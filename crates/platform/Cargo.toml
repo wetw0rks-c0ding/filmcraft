@@ -21,12 +21,19 @@ type_complexity = "allow"
 undocumented_unsafe_blocks = "deny"
 
 [dependencies]
+filmcraft-bitstream = { workspace = true }
 filmcraft-codecs = { workspace = true }
 filmcraft-color = { workspace = true }
 filmcraft-export = { workspace = true }
 filmcraft-frame = { workspace = true }
 filmcraft-isobmff = { workspace = true }
+# Our own parsers: the VA-API picture-parameter records are built from the slice headers and
+# parameter sets these decode, so both backends read one description of a stream.
+filmcraft-av1 = { workspace = true }
+filmcraft-h264 = { workspace = true }
+filmcraft-hevc = { workspace = true }
 filmcraft-time = { workspace = true }
+filmcraft-vp9 = { workspace = true }
 log = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

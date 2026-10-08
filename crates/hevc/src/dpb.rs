@@ -259,7 +259,7 @@ pub fn build_ref_lists(sh: &SliceHeader, rps: &RefPicSet) -> Result<[Vec<RefPic>
 }
 
 /// POC state (8.3.1).
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct PocState {
     pub prev_tid0_poc: i32,
 }

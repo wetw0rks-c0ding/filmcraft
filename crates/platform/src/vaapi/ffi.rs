@@ -90,6 +90,28 @@ pub const SLICE_DATA_BUFFER: VAStatus = 5;
 /// See [`PICTURE_PARAMETER_BUFFER`].
 pub const IMAGE_BUFFER: VAStatus = 9;
 
+/// `VA_SLICE_DATA_FLAG_ALL` (`va.h:3080`): the whole slice is in the buffer. Every slice record
+/// this backend builds carries its slice whole, so this is the flag they all get; the other
+/// `VA_SLICE_DATA_FLAG_*` values (`BEGIN`, `MIDDLE`, `END`) describe a slice submitted in
+/// pieces, which a single-frame-at-a-time decoder never does.
+pub const SLICE_DATA_FLAG_ALL: u32 = 0x0;
+
+/// `VAPictureH264::flags` bits (`va.h:3583-3592`).
+pub const PICTURE_H264_SHORT_TERM_REFERENCE: u32 = 0x0000_0008;
+/// See [`PICTURE_H264_SHORT_TERM_REFERENCE`].
+pub const PICTURE_H264_LONG_TERM_REFERENCE: u32 = 0x0000_0010;
+/// `VA_PICTURE_H264_INVALID` (`va.h:3583`): the entry is not a picture the driver may read. It is
+/// what an unused `ReferenceFrames` slot or reference list entry carries, which is a defined value
+/// rather than a surface id that might name a real but wrong surface.
+pub const PICTURE_H264_INVALID: u32 = 0x0000_0001;
+
+/// `VA_PICTURE_HEVC_INVALID` (`va.h:5310`): see [`PICTURE_H264_INVALID`].
+pub const PICTURE_HEVC_INVALID: u32 = 0x0000_0001;
+
+/// `VA_INVALID_SURFACE` (`va.h:1648`), which is `VA_INVALID_ID`: the picture id an invalid entry
+/// carries.
+pub const INVALID_SURFACE: u32 = 0xffff_ffff;
+
 /// `VAEntrypoint` (`va.h:553`): `VAEntrypointVLD` is the hardware video decoder, the entry point
 /// every decode goes through.
 pub const VLD: VAEntrypoint = 1;
@@ -219,6 +241,294 @@ pub struct VaImage {
     entry_bytes: i32,
     component_order: [i8; 4],
     va_reserved: [u32; VA_PADDING_LOW],
+}
+
+// ---------------------------------------------------------------------------------------------
+// The picture- and slice-parameter records: what a decode submits per access unit. Unlike the
+// image above, these are built by [`crate::vaapi::picture`] and read back by its tests, so their
+// fields are `pub`; the records themselves stay in this module's hands (`Picture` carries opaque
+// owned bytes) and nothing here is handed to libva until the decode loop copies it into a buffer.
+//
+// The C declarations carry bitfields (`seq_fields`, `pic_fields`, `slice_parsing_fields`,
+// `LongSliceFlags`), which Rust has no syntax for. Each is declared here as the union's `u32`
+// `value` member, and `picture.rs` packs the syntax elements into it with the bit order
+// `/usr/include/va/` writes them in — the same order a C compiler would, from bit 0 up. Reading a
+// packed word back is the same operation the other way, which is what the record readers below
+// and `picture.rs`'s tests do; each bit position is pinned there against the parsed value.
+//
+// Every field keeps the C name, including the deprecated ones the headers still declare
+// (`num_slice_groups_minus1`, `tg_start`, …), because a renamed field is one the next reader has
+// to look up and one a declaration fix has to match against the header.
+//
+// Sizes and offsets are libva 2.24's own (`va.h:3572` and `va_dec_hevc.h:57`), pinned by
+// `the_picture_parameter_records_match_the_header`.
+// ---------------------------------------------------------------------------------------------
+
+/// `VAPictureH264` (`va.h:3572`): one picture's identity — which surface it decodes into, which
+/// slot it keeps in the DPB and its picture order counts. 36 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaPictureH264 {
+    /// The surface the picture is decoded into (the render target).
+    pub picture_id: VABufferID,
+    /// `frame_num` of the slice header, which is how the DPB slot is referred to.
+    pub frame_idx: u32,
+    /// `VA_PICTURE_H264_*` bits ([`PICTURE_H264_SHORT_TERM_REFERENCE`] and
+    /// [`PICTURE_H264_LONG_TERM_REFERENCE`]).
+    pub flags: u32,
+    pub top_field_order_cnt: i32,
+    pub bottom_field_order_cnt: i32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAPictureParameterBufferH264` (`va.h:3599`): the picture-level record, one per access unit,
+/// submitted before its slices. 672 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaPictureParameterBufferH264 {
+    /// The picture this record describes.
+    pub curr_pic: VaPictureH264,
+    /// The DPB, as surfaces. This backend leaves them to the decode loop, which owns the surface
+    /// ring; see `crate::vaapi::picture`.
+    pub reference_frames: [VaPictureH264; 16],
+    pub picture_width_in_mbs_minus1: u16,
+    pub picture_height_in_mbs_minus1: u16,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    /// How many entries of `reference_frames` are valid.
+    pub num_ref_frames: u8,
+    /// `seq_fields`: the sequence parameter set's flags, packed into the union's `value` member.
+    pub seq_fields: u32,
+    /// FMO is not supported, so these stay at what the picture parameter set says and the
+    /// decode is declined if it asks for more than one slice group.
+    pub num_slice_groups_minus1: u8,
+    pub slice_group_map_type: u8,
+    pub slice_group_change_rate_minus1: u16,
+    pub pic_init_qp_minus26: i8,
+    pub pic_init_qs_minus26: i8,
+    pub chroma_qp_index_offset: i8,
+    pub second_chroma_qp_index_offset: i8,
+    /// `pic_fields`: the picture parameter set's flags plus what this slice says, packed into the
+    /// union's `value` member.
+    pub pic_fields: u32,
+    /// `frame_num` of the first slice of the picture.
+    pub frame_num: u16,
+    pub va_reserved: [u32; VA_PADDING_MEDIUM],
+}
+
+/// `VASliceParameterBufferH264` (`va.h:3664`): one slice's record, submitted per slice. 3128
+/// bytes, most of it the two reference picture lists and the prediction weights.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaSliceParameterBufferH264 {
+    /// Bytes of this slice in the slice data buffer.
+    pub slice_data_size: u32,
+    /// Byte offset of this slice's NAL unit in the slice data buffer.
+    pub slice_data_offset: u32,
+    /// `VA_SLICE_DATA_FLAG_*` ([`SLICE_DATA_FLAG_ALL`] for a whole slice).
+    pub slice_data_flag: u32,
+    /// Bits from the NAL header to the start of `slice_data()`, emulation prevention bytes
+    /// removed — which is where FilmCraft's own parser leaves the bit position.
+    pub slice_data_bit_offset: u16,
+    pub first_mb_in_slice: u16,
+    pub slice_type: u8,
+    pub direct_spatial_mv_pred_flag: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub cabac_init_idc: u8,
+    pub slice_qp_delta: i8,
+    pub disable_deblocking_filter_idc: u8,
+    pub slice_alpha_c0_offset_div2: i8,
+    pub slice_beta_offset_div2: i8,
+    pub ref_pic_list0: [VaPictureH264; 32],
+    pub ref_pic_list1: [VaPictureH264; 32],
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub luma_weight_l0_flag: u8,
+    pub luma_weight_l0: [i16; 32],
+    pub luma_offset_l0: [i16; 32],
+    pub chroma_weight_l0_flag: u8,
+    pub chroma_weight_l0: [[i16; 2]; 32],
+    pub chroma_offset_l0: [[i16; 2]; 32],
+    pub luma_weight_l1_flag: u8,
+    pub luma_weight_l1: [i16; 32],
+    pub luma_offset_l1: [i16; 32],
+    pub chroma_weight_l1_flag: u8,
+    pub chroma_weight_l1: [[i16; 2]; 32],
+    pub chroma_offset_l1: [[i16; 2]; 32],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAPictureHEVC` (`va.h:5292`): the HEVC counterpart of [`VaPictureH264`]. 28 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaPictureHevc {
+    /// The surface the picture is decoded into.
+    pub picture_id: VABufferID,
+    /// Picture order count, which is how the DPB slot is referred to.
+    pub pic_order_cnt: i32,
+    /// `VA_PICTURE_HEVC_*` bits.
+    pub flags: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAPictureParameterBufferHEVC` (`va_dec_hevc.h:57`): the HEVC picture-level record. 604 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaPictureParameterBufferHevc {
+    pub curr_pic: VaPictureHevc,
+    /// The DPB, as surfaces; the decode loop's to fill, like `reference_frames` above.
+    pub reference_frames: [VaPictureHevc; 15],
+    pub pic_width_in_luma_samples: u16,
+    pub pic_height_in_luma_samples: u16,
+    /// `pic_fields`: the sequence and picture parameter sets' flags, packed into the union's
+    /// `value` member.
+    pub pic_fields: u32,
+    pub sps_max_dec_pic_buffering_minus1: u8,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub pcm_sample_bit_depth_luma_minus1: u8,
+    pub pcm_sample_bit_depth_chroma_minus1: u8,
+    pub log2_min_luma_coding_block_size_minus3: u8,
+    pub log2_diff_max_min_luma_coding_block_size: u8,
+    pub log2_min_transform_block_size_minus2: u8,
+    pub log2_diff_max_min_transform_block_size: u8,
+    pub log2_min_pcm_luma_coding_block_size_minus3: u8,
+    pub log2_diff_max_min_pcm_luma_coding_block_size: u8,
+    pub max_transform_hierarchy_depth_intra: u8,
+    pub max_transform_hierarchy_depth_inter: u8,
+    pub init_qp_minus26: i8,
+    pub diff_cu_qp_delta_depth: u8,
+    pub pps_cb_qp_offset: i8,
+    pub pps_cr_qp_offset: i8,
+    pub log2_parallel_merge_level_minus2: u8,
+    pub num_tile_columns_minus1: u8,
+    pub num_tile_rows_minus1: u8,
+    pub column_width_minus1: [u16; 19],
+    pub row_height_minus1: [u16; 21],
+    /// `slice_parsing_fields`: what a driver needs to parse this slice header, packed into the
+    /// union's `value` member.
+    pub slice_parsing_fields: u32,
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
+    pub num_short_term_ref_pic_sets: u8,
+    pub num_long_term_ref_pic_sps: u8,
+    pub num_ref_idx_l0_default_active_minus1: u8,
+    pub num_ref_idx_l1_default_active_minus1: u8,
+    pub pps_beta_offset_div2: i8,
+    pub pps_tc_offset_div2: i8,
+    pub num_extra_slice_header_bits: u8,
+    /// Bits `short_term_ref_pic_set()` takes in this slice header, so a driver can skip it.
+    pub st_rps_bits: u32,
+    pub va_reserved: [u32; VA_PADDING_MEDIUM],
+}
+
+/// `VASliceParameterBufferHEVC` (`va_dec_hevc.h:358`): one slice segment's record. 264 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaSliceParameterBufferHevc {
+    pub slice_data_size: u32,
+    pub slice_data_offset: u32,
+    /// `VA_SLICE_DATA_FLAG_*` ([`SLICE_DATA_FLAG_ALL`] for a whole segment).
+    pub slice_data_flag: u32,
+    /// Bytes from the NAL header to the start of `slice_segment_data()`.
+    pub slice_data_byte_offset: u32,
+    pub slice_segment_address: u32,
+    /// Indices into `reference_frames`; `0xFF` marks an entry the picture does not use.
+    pub ref_pic_list: [[u8; 15]; 2],
+    /// `LongSliceFlags`: the slice header's own syntax elements, packed into the union's `value`
+    /// member.
+    pub long_slice_flags: u32,
+    /// Index of the collocated picture, `0xFF` when temporal MVP is off.
+    pub collocated_ref_idx: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub slice_qp_delta: i8,
+    pub slice_cb_qp_offset: i8,
+    pub slice_cr_qp_offset: i8,
+    pub slice_beta_offset_div2: i8,
+    pub slice_tc_offset_div2: i8,
+    pub luma_log2_weight_denom: u8,
+    pub delta_chroma_log2_weight_denom: i8,
+    pub delta_luma_weight_l0: [i8; 15],
+    pub luma_offset_l0: [i8; 15],
+    pub delta_chroma_weight_l0: [[i8; 2]; 15],
+    pub chroma_offset_l0: [[i8; 2]; 15],
+    pub delta_luma_weight_l1: [i8; 15],
+    pub luma_offset_l1: [i8; 15],
+    pub delta_chroma_weight_l1: [[i8; 2]; 15],
+    pub chroma_offset_l1: [[i8; 2]; 15],
+    pub five_minus_max_num_merge_cand: u8,
+    pub num_entry_point_offsets: u16,
+    pub entry_offset_to_subset_array: u16,
+    /// Emulation prevention bytes in this slice header, which is what the entry point offsets and
+    /// `slice_data_byte_offset` are counted without.
+    pub slice_data_num_emu_prevn_bytes: u16,
+    pub va_reserved: [u32; VA_PADDING_LOW - 2],
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reading the records back out of the opaque bytes `Picture` carries. The tests of
+// `picture.rs` are what reads them today, so the `cfg_attr` keeps them out of the dead-code lint
+// without letting them go unchecked when the decode loop does read them.
+// ---------------------------------------------------------------------------------------------
+
+/// The record of type `T` in `bytes`, or `None` when the buffer is too short for one.
+///
+/// # Safety
+/// `T` must be a `#[repr(C)]` record this module declares, so that any `size_of::<T>()` bytes are a
+/// valid `T`. Every caller passes one of the structs below and nothing else; a short buffer is
+/// refused rather than read past.
+#[cfg_attr(not(test), allow(dead_code))]
+unsafe fn record_of<T: Default + Copy>(bytes: &[u8]) -> Option<T> {
+    if bytes.len() < size_of::<T>() {
+        return None;
+    }
+    let mut record = T::default();
+    // SAFETY: `bytes` is at least `size_of::<T>()` long (checked above) and `record` is a live,
+    // initialised `T`, so this copies exactly one `T`'s worth of bytes into it.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), std::ptr::from_mut(&mut record).cast::<u8>(), size_of::<T>()) };
+    Some(record)
+}
+
+/// The bytes of a record: exactly the bytes the driver reads, at the same addresses they land at
+/// when a buffer is made from them.
+///
+/// Safe because a record is a plain `#[repr(C)]` value with no padding requirements beyond what the
+/// C declaration imposes, so any `size_of::<T>()` of its bytes are a valid `[u8]` of that length.
+/// `record` is borrowed for the copy and nothing is read back through a pointer.
+pub fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
+    // SAFETY: `record` is a live `T` borrowed for the length of this function and is at least
+    // `size_of::<T>()` bytes of readable memory, so the slice stays inside it and outlives nothing;
+    // `T: Copy` means the value owns nothing the bytes could outlive.
+    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(record).cast::<u8>(), size_of::<T>()) }.to_vec()
+}
+
+/// The H.264 picture parameter record `bytes` carries, or `None` if it is not one long enough.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn picture_params_h264(bytes: &[u8]) -> Option<VaPictureParameterBufferH264> {
+    // SAFETY: `VaPictureParameterBufferH264` is a `#[repr(C)]` struct declared above.
+    unsafe { record_of::<VaPictureParameterBufferH264>(bytes) }
+}
+
+/// The H.264 slice parameter record `bytes` carries, or `None` if it is not one long enough.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn slice_params_h264(bytes: &[u8]) -> Option<VaSliceParameterBufferH264> {
+    // SAFETY: `VaSliceParameterBufferH264` is a `#[repr(C)]` struct declared above.
+    unsafe { record_of::<VaSliceParameterBufferH264>(bytes) }
+}
+
+/// The HEVC picture parameter record `bytes` carries, or `None` if it is not one long enough.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn picture_params_hevc(bytes: &[u8]) -> Option<VaPictureParameterBufferHevc> {
+    // SAFETY: `VaPictureParameterBufferHevc` is a `#[repr(C)]` struct declared above.
+    unsafe { record_of::<VaPictureParameterBufferHevc>(bytes) }
+}
+
+/// The HEVC slice parameter record `bytes` carries, or `None` if it is not one long enough.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn slice_params_hevc(bytes: &[u8]) -> Option<VaSliceParameterBufferHevc> {
+    // SAFETY: `VaSliceParameterBufferHevc` is a `#[repr(C)]` struct declared above.
+    unsafe { record_of::<VaSliceParameterBufferHevc>(bytes) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -850,6 +1160,129 @@ mod tests {
         assert_eq!(VP9_PROFILE_2, 21, "VAProfileVP9Profile2");
         assert_eq!(VP9_PROFILE_3, 22, "VAProfileVP9Profile3");
         assert_eq!(AV1_MAIN, 32, "VAProfileAV1Profile0");
+    }
+
+    /// The picture- and slice-parameter records, as libva 2.24's headers declare them, so a field
+    /// declared with the wrong type or width — which the driver would read as a neighbouring field's
+    /// value — fails here rather than as corruption on screen. The sizes come from the headers on
+    /// this machine; the offsets are the ones the C declarations imply, and every struct's trailing
+    /// reserved field is checked too, since that is what makes each record a stable size.
+    #[test]
+    fn the_picture_parameter_records_match_the_header() {
+        // H.264 (va.h:3572-3721)
+        assert_eq!(size_of::<VaPictureH264>(), 36, "VAPictureH264 (va.h:3572)");
+        assert_eq!(offset_of!(VaPictureH264, frame_idx), 4);
+        assert_eq!(offset_of!(VaPictureH264, flags), 8);
+        assert_eq!(offset_of!(VaPictureH264, top_field_order_cnt), 12);
+        assert_eq!(offset_of!(VaPictureH264, bottom_field_order_cnt), 16);
+        assert_eq!(offset_of!(VaPictureH264, va_reserved), 20);
+        assert_eq!(size_of::<VaPictureParameterBufferH264>(), 672, "VAPictureParameterBufferH264 (va.h:3599)");
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, curr_pic), 0);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, reference_frames), 36);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, picture_width_in_mbs_minus1), 612);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, picture_height_in_mbs_minus1), 614);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, bit_depth_luma_minus8), 616);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, num_ref_frames), 618);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, seq_fields), 620);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, num_slice_groups_minus1), 624);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, slice_group_change_rate_minus1), 626);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, pic_init_qp_minus26), 628);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, second_chroma_qp_index_offset), 631);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, pic_fields), 632);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, frame_num), 636);
+        assert_eq!(offset_of!(VaPictureParameterBufferH264, va_reserved), 640);
+        assert_eq!(size_of::<VaSliceParameterBufferH264>(), 3128, "VASliceParameterBufferH264 (va.h:3664)");
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, slice_data_bit_offset), 12);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, first_mb_in_slice), 14);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, slice_type), 16);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, slice_beta_offset_div2), 24);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, ref_pic_list0), 28);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, ref_pic_list1), 1180);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, luma_log2_weight_denom), 2332);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, luma_offset_l0), 2400);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, chroma_weight_l0_flag), 2464);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, chroma_offset_l0), 2594);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, luma_weight_l1_flag), 2722);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, chroma_offset_l1), 2982);
+        assert_eq!(offset_of!(VaSliceParameterBufferH264, va_reserved), 3112);
+        // HEVC (va.h:5292, va_dec_hevc.h:57-479)
+        assert_eq!(size_of::<VaPictureHevc>(), 28, "VAPictureHEVC (va.h:5292)");
+        assert_eq!(offset_of!(VaPictureHevc, pic_order_cnt), 4);
+        assert_eq!(offset_of!(VaPictureHevc, flags), 8);
+        assert_eq!(offset_of!(VaPictureHevc, va_reserved), 12);
+        assert_eq!(size_of::<VaPictureParameterBufferHevc>(), 604, "VAPictureParameterBufferHEVC (va_dec_hevc.h:57)");
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, reference_frames), 28);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, pic_width_in_luma_samples), 448);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, pic_height_in_luma_samples), 450);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, pic_fields), 452);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, sps_max_dec_pic_buffering_minus1), 456);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, log2_min_luma_coding_block_size_minus3), 461);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, init_qp_minus26), 469);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, log2_parallel_merge_level_minus2), 473);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, column_width_minus1), 476);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, row_height_minus1), 514);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, slice_parsing_fields), 556);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, log2_max_pic_order_cnt_lsb_minus4), 560);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, num_extra_slice_header_bits), 567);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, st_rps_bits), 568);
+        assert_eq!(offset_of!(VaPictureParameterBufferHevc, va_reserved), 572);
+        assert_eq!(size_of::<VaSliceParameterBufferHevc>(), 264, "VASliceParameterBufferHEVC (va_dec_hevc.h:358)");
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_data_byte_offset), 12);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_segment_address), 16);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, ref_pic_list), 20);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, long_slice_flags), 52);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, collocated_ref_idx), 56);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_qp_delta), 59);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_beta_offset_div2), 62);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, luma_log2_weight_denom), 64);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, chroma_offset_l1), 216);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, five_minus_max_num_merge_cand), 246);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_data_num_emu_prevn_bytes), 252);
+        assert_eq!(offset_of!(VaSliceParameterBufferHevc, va_reserved), 256);
+    }
+
+    /// A record read back out of the bytes `picture.rs` built is the same record it built, and a
+    /// buffer too short for one is refused rather than read past. The two sides only agree if
+    /// `record_bytes` and `record_of` describe the same layout, which is what makes them a pair.
+    #[test]
+    fn a_record_round_trips_through_its_bytes() {
+        let picture = VaPictureParameterBufferH264 {
+            curr_pic: VaPictureH264 {
+                picture_id: 7,
+                frame_idx: 3,
+                flags: PICTURE_H264_SHORT_TERM_REFERENCE,
+                top_field_order_cnt: 11,
+                bottom_field_order_cnt: 22,
+                ..Default::default()
+            },
+            picture_width_in_mbs_minus1: 39,
+            picture_height_in_mbs_minus1: 22,
+            num_ref_frames: 4,
+            seq_fields: 0x1234_5678,
+            pic_fields: 0x9abc_def0,
+            frame_num: 3,
+            ..Default::default()
+        };
+        let bytes = record_bytes(&picture);
+        assert_eq!(bytes.len(), size_of::<VaPictureParameterBufferH264>());
+        assert_eq!(picture_params_h264(&bytes), Some(picture), "the record reads back as the one built");
+
+        // A short buffer is `None`, and a longer one is still the record: a driver reads a prefix.
+        assert_eq!(picture_params_h264(&bytes[..size_of::<VaPictureParameterBufferH264>() - 1]), None, "a byte short");
+        assert_eq!(picture_params_h264(&[]), None);
+        assert_eq!(picture_params_h264(&bytes[..10]), None, "an empty slice of it");
+        assert_eq!(slice_params_h264(&bytes), None, "an H.264 picture record read as a slice record");
+
+        // The four records are four different sizes. A buffer shorter than the record is refused; a longer
+        // one still reads as the record at its front, which is why the caller has to know which
+        // record it built rather than letting a reader guess.
+        assert_eq!(record_bytes(&VaPictureParameterBufferH264::default()).len(), size_of::<VaPictureParameterBufferH264>());
+        assert_eq!(record_bytes(&VaSliceParameterBufferH264::default()).len(), size_of::<VaSliceParameterBufferH264>());
+        assert_eq!(record_bytes(&VaPictureParameterBufferHevc::default()).len(), size_of::<VaPictureParameterBufferHevc>());
+        assert_eq!(record_bytes(&VaSliceParameterBufferHevc::default()).len(), size_of::<VaSliceParameterBufferHevc>());
+        assert_eq!(slice_params_h264(&bytes), None, "an H.264 picture record is not long enough to be a slice record");
+        let extra = [bytes.as_slice(), &[0u8; 8]].concat();
+        assert_eq!(picture_params_h264(&extra).expect("a record at the front of a longer buffer"), picture, "trailing bytes are ignored");
     }
 
     /// The layout as `/usr/include/va/va.h` has it, so a field added or moved here is a deliberate,

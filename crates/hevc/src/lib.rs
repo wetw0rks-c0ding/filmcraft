@@ -43,6 +43,10 @@ mod transform;
 
 pub use decoder::{DecodeStats, Decoder};
 pub use error::{Error, Result};
+// 8.3.1, for a caller that derives a picture's POC without a decoded picture buffer behind it
+// (the VA-API backend, which supplies its own). The rest of `dpb` stays private: it hands out
+// decoded frames, which are this crate's business.
+pub use dpb::PocState;
 
 /// Colour description from the VUI (ITU-T H.273 code points).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
