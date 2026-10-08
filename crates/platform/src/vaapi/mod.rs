@@ -17,6 +17,11 @@
 
 #[allow(unsafe_code)]
 mod ffi;
+// Safe code with nothing OS-specific in it: `stream.rs` is written so that its tests run wherever
+// the backend is built, and the allow is what keeps that true once the module it lives in is no
+// longer Linux-only — which is `ffi`'s gate to open (it needs `dlopen`), not this file's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod stream;
 
 // What the rest of the backend needs; no libva type crosses this line. `OK` and the buffer-type
 // constants are part of it too — the decode loop submits those buffers and compares statuses — as
@@ -28,3 +33,6 @@ pub use ffi::{
     Api, Display, Entrypoint, IMAGE_BUFFER, OK, PICTURE_PARAMETER_BUFFER, Profile, RtFormat, SLICE_DATA_BUFFER, SLICE_PARAMETER_BUFFER, VA_PADDING_LOW,
     VA_PADDING_MEDIUM, YUV420, YUV420_10, status,
 };
+// What the decoder itself drives: the stream it takes, what the driver would decode it with, and
+// the check that the driver really offers that.
+pub use stream::{MAX_SIDE, Plan, Stream, plan_frame, plan_nal, supports};
