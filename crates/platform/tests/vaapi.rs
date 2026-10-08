@@ -1,11 +1,11 @@
-//! VA-API decoding against our software decoders (Linux): every picture of the HEVC fixtures, and of
-//! the H.264 fixture that does not code an explicit weighted bipred, must be the software
-//! decoder's — bit-exact planes, colour, pixel aspect and picture — also after `reset` + reseek and
-//! a mid-stream `flush`; a forced mid-stream failure must continue in software with the software
-//! decoder's exact output; damaged samples and parameter sets must give errors or fall back, never
-//! crash or hang; a VP9 or AV1 stream must be declined while it is still a description, with a
-//! reason. One fixture is not bit-exact, and the section below says which, why, and which way round
-//! the two decoders are wrong. Skips without ffmpeg (fixture generator) or without a VA-API driver.
+//! VA-API decoding against our software decoders (Linux): every picture of the fixtures this backend
+//! can describe must be the software decoder's — bit-exact planes, colour, pixel aspect, draft flag and
+//! picture — also after `reset` + reseek and a mid-stream `flush`; a forced mid-stream failure must
+//! continue in software with the software decoder's exact output; damaged samples and parameter sets
+//! must give errors or fall back, never crash or hang; a VP9 or AV1 stream must be declined while it is
+//! still a description, with a reason; and an H.264 stream whose B slices are implicitly weighted must
+//! be declined rather than decoded with weights that are wrong. Skips without ffmpeg (fixture
+//! generator) or without a VA-API driver.
 //!
 //! # Pictures are compared by presentation time
 //!
@@ -18,42 +18,36 @@
 //! decoders return the same *set* of pictures with the same content; only the order they arrive in
 //! differs, and [`a_picture_is_emitted_as_it_is_decoded`] pins that.
 //!
-//! # One fixture cannot be bit-exact, and it is not the software decoder that is wrong
+//! # `h264_high.mp4` is declined, and this backend is what was wrong
 //!
-//! `h264_high.mp4` is x264 High profile with B-frames, so its picture parameter set carries
-//! `weighted_bipred_idc == 2` — "explicit", in which *each B slice* codes a `weighted_bipred_flag`
-//! and, when that flag is set, a prediction weight table (H.264 7.4.3.2). `filmcraft_h264` does not
-//! read `weighted_bipred_flag` (`crates/h264/src/slice.rs:229`), so its `pred_weight_table` is
-//! always `None` in this mode; this backend needs the same flag and gets it from the same parser, so
-//! a B slice the stream really does weight is submitted with an **empty** weight table
-//! (`crates/platform/src/vaapi/picture.rs`, `h264_weights`), which libva's own encoding reads as
-//! "explicit mode, this slice not weighted".
+//! `h264_high.mp4` is x264 High profile with B frames, so its picture parameter set carries
+//! `weighted_bipred_idc == 2` — x264's default, so this is most H.264. The per-slice
+//! `weighted_bipred_flag` of 7.4.3.2 is not read by `filmcraft_h264`
+//! (`crates/h264/src/slice.rs:230`), which resolves such a slice as H.264's **implicit** weighting:
+//! a weight per (`ref0`, `ref1`) *pair*, derived from the two pictures' POC distances
+//! (`crates/h264/src/slicedec.rs:316-331`). That is what `filmcraft_h264` decodes, and it is
+//! bit-for-bit ffmpeg's own decode on all 72 pictures of the fixture.
 //!
-//! That is a guess, and it is wrong here, so the two decoders disagree: on this machine, 60 of the
-//! fixture's 72 pictures — 48 of its 51 B pictures and 12 of its 18 P pictures; all 3 of its I
-//! pictures match. ffmpeg settles which side is right: ffmpeg's own decode of the fixture is
-//! bit-for-bit `filmcraft_h264`'s on all 72 pictures and agrees with this backend on 12
-//! ([`the_weighted_bipred_divergence_is_this_backends_not_the_software_decoders`] pins that, with a
-//! negative control so "matches ffmpeg" cannot pass vacuously). **This must not be "fixed" by
-//! making the hardware path reproduce whatever the software decoder does**: that would replace 60
-//! correct pictures with 60 incorrect ones. The hardware path has to read `weighted_bipred_flag`;
-//! the fix belongs in `filmcraft-h264`, which would have to expose the flag.
+//! A `VASliceParameterBufferH264` cannot express it: `luma_weight_l0` / `luma_weight_l1` are one
+//! weight **per reference index per list** (`va_dec_h264.h:3702-3723`), and a pair-dependent function
+//! does not fit two per-index arrays. This backend used to submit an empty table there — "explicit,
+//! this slice is not weighted" — which is simply wrong, and it decoded 60 of the fixture's 72
+//! pictures differently from ffmpeg (12 of 72 agreed; [`an_h264_b_slice_this_record_cannot_weight_is_declined`]
+//! pins the numbers, with ffmpeg as the oracle).
 //!
-//! The P pictures are worth a word, because the divergence is not confined to B slices:
-//! `h264_high_unweighted.mp4` is the same source, encoder, frame rate, GOPs and B frames with
-//! `weightb=0` added, so its `weighted_bipred_idc` is 0 while its `weighted_pred_flag` is still 1 —
-//! the P weight tables are still coded and still submitted — and it comes out of this backend
-//! bit-exact on all 72 pictures. So the P weights this backend sends are right; the 12 P pictures
-//! that differ are the ones whose references reach a B picture that was decoded wrong, and a
-//! prediction cannot come out right from a reference that is wrong. One encoder parameter is what
-//! separates the two fixtures, so it is what the divergence follows.
+//! So `h264_weights` now **checks** instead of guessing: it computes every (`ref0`, `ref1`) pair the
+//! slice's own reference lists could use, and submits the default explicit table when they are all
+//! 1.0 — which is a different statement from "no weights", and is what makes the hardware decoder's
+//! output right — and declines the slice when one of them is not. On this fixture it declines at the
+//! second B picture of the first GOP (pair `(0, 1)` wants `(48, 16)`), and `HybridDecoder` finishes
+//! the run in software.
 //!
-//! So the parity assertion is two-tiered: [`Agreement::EveryPicture`] for the streams that do not
-//! hit this, which is every picture bit for bit and is what interchangeability means, and
-//! [`Agreement::StreamOnly`] for the one that does, which pins the stream (same pictures, same
-//! geometry, colour and pixel aspect) and every intra-coded picture bit for bit, and reports how
-//! many inter-coded pictures differ. There is no blanket allowance: that would absorb a real parity
-//! regression.
+//! The same encode with `weightb=0` — `weighted_bipred_idc == 0`, which codes no weight table and no
+//! implicit mode at all, and is the only difference between the two files — is bit-exact against
+//! ffmpeg on **all 72** pictures
+//! ([`an_h264_fixture_this_record_can_express_is_bit_exact_against_ffmpeg`]). So parity is no longer
+//! two-tiered with a tolerated divergence: everything this backend can describe is asserted bit for
+//! bit, and the one thing it cannot describe is asserted to be declined.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -69,15 +63,17 @@ use filmcraft_frame::PixelData;
 use filmcraft_platform::HybridDecoder;
 use filmcraft_platform::vaapi::VaDecoder;
 
-/// What the two decoders must agree on, picture for picture, for one fixture.
+/// What this backend is expected to do with one fixture, which is the only thing the fixtures differ
+/// in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Agreement {
-    /// Every picture, bit for bit. This is what "interchangeable" means.
+enum Tier {
+    /// Decoded in hardware, and every picture bit for bit what the software decoder produces. This is
+    /// what "interchangeable" means, and there is no tier below it.
     EveryPicture,
-    /// The stream, not the pixels: the same pictures with the same geometry, colour and pixel
-    /// aspect, and every intra-coded picture bit for bit. Only for the fixture whose
-    /// `weighted_bipred_flag` this backend cannot read — see the file's doc comment.
-    StreamOnly,
+    /// Refused in hardware and finished in software: this stream's B slice records cannot say what
+    /// the stream says. The finished run must still be the software decoder's own pictures, and the
+    /// refusal must name the reason. See the file's doc comment.
+    Declines,
 }
 
 /// The hardware decoder for a stream, or `None` (skip) when this machine has none for it.
@@ -98,14 +94,14 @@ fn hardware(s: &Stream) -> Option<Box<dyn VideoDecoder>> {
 /// FilmCraft's own decoder for a stream: the reference the hardware decoder has to match.
 ///
 /// H.264 is built with **one** frame thread ([`H264Decoder::with_threads`]), so the reference does
-/// not depend on how many cores the machine has. Measured on `h264_high.mp4`, ten runs each at 1, 4
-/// and 16 threads: every run — one thread or many — ended in a `flush` with all 72 pictures, one
-/// presentation-time set and one set of pixels, so this reference is deterministic and pinning is
-/// belt and braces rather than a workaround. What the thread count does change is how many pictures
-/// come out of `decode` *before* the `flush`, because the pictures still held back for reordering
-/// are the ones the frame-threaded path has not finished: 70 at one thread, 65 at four, 45–53 at
-/// sixteen. A harness that hashes what `decode` returns and never calls `flush` — as
-/// `examples/vaparity.rs` does — is what reported "63 or 65 pictures" for this fixture.
+/// not depend on how many cores the machine has. That is a repeatability measure, not a workaround:
+/// the complete run is deterministic at every thread count — measured on `h264_high.mp4`, ten runs
+/// each at 1, 4 and 16 threads, all 72 pictures, one presentation-time set, one set of pixels. What
+/// the thread count changes is how many pictures come out of `decode` *before* the `flush`, because
+/// the pictures still held back for reordering are the ones the frame-threaded path has not finished:
+/// 70 at one thread, 65 at four, 45–53 at sixteen. A harness that hashes what `decode` returned and
+/// never called `flush` — as `examples/vaparity.rs` does — is what first reported this decoder as
+/// dropping pictures nondeterministically.
 fn software(s: &Stream) -> Box<dyn VideoDecoder> {
     match &s.entry.codec {
         filmcraft_isobmff::CodecConfig::Avc(a) => Box::new(filmcraft_codecs::video::H264Decoder::with_threads(a.to_bytes(), 1).unwrap()),
@@ -113,73 +109,57 @@ fn software(s: &Stream) -> Box<dyn VideoDecoder> {
     }
 }
 
-/// The parity fixtures and what each must agree on.
+/// The parity fixtures and what each is expected to do.
 ///
-/// `h264_high_unweighted.mp4` is `h264_high.mp4` with `weightb=0`, so its picture parameter set
-/// says `weighted_bipred_idc == 0`: the same encoder, the same B-frames, the same two GOPs, the
-/// same cropped 360-line picture, without the one syntax element this backend cannot read. It is
-/// what gives an H.264 stream the full bit-exact parity assertion, so that assertion is a real
-/// H.264 assertion and not only HEVC.
-fn streams(ff: &Path) -> Vec<(String, Stream, Agreement)> {
+/// `h264_high.mp4` declines: its B slices are implicitly weighted, which a slice record cannot
+/// express. **`h264_high_unweighted.mp4` is the control that makes the parity assertion an H.264
+/// assertion** — the same source, encoder, frame rate, GOPs, B frames and cropped 360-line picture
+/// with `weightb=0` added, which is the *only* difference from `h264_high.mp4`, decoded in hardware
+/// and compared picture for picture. Losing it must not quietly remove the control, so
+/// [`streams_with_control`] insists on it whenever ffmpeg is there to generate it.
+fn streams(ff: &Path) -> Vec<(String, Stream, Tier)> {
     let mut out = Vec::new();
     for (name, _) in FIXTURES {
         if let Some(path) = named(ff, name) {
-            let agreement = if *name == "h264_high.mp4" { Agreement::StreamOnly } else { Agreement::EveryPicture };
-            out.push((name.to_string(), read_stream(&path), agreement));
+            let tier = if *name == "h264_high.mp4" { Tier::Declines } else { Tier::EveryPicture };
+            out.push((name.to_string(), read_stream(&path), tier));
         }
-    }
-    if let Some(path) = unweighted(ff) {
-        out.push(("h264_high_unweighted.mp4".to_string(), read_stream(&path), Agreement::EveryPicture));
     }
     out
 }
 
-/// The H.264 fixture that does not code an explicit `weighted_bipred_flag`: `h264_high.mp4` with
-/// `weightb=0` added.
+/// The H.264 control fixture: the fixture `h264_high.mp4` is named in [`FIXTURES`] with exactly one
+/// encoder parameter changed, `weightb=0`, so its picture parameter set says
+/// `weighted_bipred_idc == 0` — no weight table in a B slice and no implicit mode.
+///
+/// Derived from that entry rather than written out again, because the whole value of this fixture is
+/// that it differs from `h264_high.mp4` in that one parameter and in nothing else. A second copy of
+/// the argument list would drift, and a drifted control stops being a control while still looking
+/// like one.
 fn unweighted(ff: &Path) -> Option<PathBuf> {
-    let args = [
-        "-f",
-        "lavfi",
-        "-i",
-        "testsrc2=s=640x360:r=24:d=3,noise=alls=12:allf=t",
-        "-c:v",
-        "libx264",
-        "-profile:v",
-        "high",
-        "-preset",
-        "fast",
-        "-x264-params",
-        "bframes=3:b-pyramid=normal:keyint=24:min-keyint=24:scenecut=0:weightb=0",
-        "-pix_fmt",
-        "yuv420p",
-    ];
+    let (name, args) = FIXTURES.iter().find(|f| f.0 == "h264_high.mp4")?;
+    assert_eq!(*name, "h264_high.mp4");
+    let mut args: Vec<&str> = args.to_vec();
+    // `-x264-params` takes one colon-separated value, so the extra parameter joins that value rather
+    // than becoming a second occurrence of the option.
+    let p = args.iter().position(|a| *a == "-x264-params").map(|i| i + 1)?;
+    args[p] = Box::leak(format!("{}:weightb=0", args[p]).into_boxed_str());
     fixture(ff, "h264_high_unweighted.mp4", &args)
 }
 
-/// A picture's geometry, colour, pixel aspect, chroma format and depth — everything about it but
-/// its pixels.
-fn description(f: &DecodedFrame) -> String {
-    let v = &f.frame;
-    let planes = match &v.data {
-        PixelData::Yuv8 { chroma, .. } => format!("8-bit {chroma:?}"),
-        PixelData::Yuv16 { chroma, bits, .. } => format!("{bits}-bit {chroma:?}"),
-        _ => "another pixel format".to_string(),
-    };
-    format!("{}x{} {:?} {:?} {planes}", v.width, v.height, v.par, v.color)
-}
-
-/// The two outputs matched by presentation time, and the checks [`assert_same_by_pts`] makes.
-fn compare(what: &str, a: &[DecodedFrame], b: &[DecodedFrame], agreement: Agreement) {
-    if agreement == Agreement::EveryPicture {
-        assert_same_by_pts(what, a, b);
-        return;
-    }
-    let (pa, pb) = (by_pts(a), by_pts(b));
-    assert_eq!(pa.keys().collect::<Vec<_>>(), pb.keys().collect::<Vec<_>>(), "{what}: presentation times");
-    for (pts, x) in &pa {
-        assert_eq!(description(x), description(pb[pts]), "{what}: pts {pts} geometry / colour");
-        assert_eq!(x.draft, pb[pts].draft, "{what}: pts {pts} draft flag");
-    }
+/// [`streams`] plus the H.264 control fixture, whose absence is a failure rather than a smaller run.
+///
+/// This is the fixture the hardware decoder is asserted bit-exact on for H.264. A run that quietly
+/// dropped it would still be green with one H.264 fixture fewer and no hardware H.264 assertion at
+/// all, which is the coverage loss this function exists to make loud.
+fn streams_with_control(ff: &Path) -> Vec<(String, Stream, Tier)> {
+    let mut out = streams(ff);
+    let path = unweighted(ff).unwrap_or_else(|| {
+        panic!("the H.264 control fixture h264_high_unweighted.mp4 could not be generated, so the H.264 bit-exactness assertion would not be run at all")
+    });
+    assert!(!out.iter().any(|(n, _, _)| n == "h264_high_unweighted.mp4"), "the control fixture is listed twice");
+    out.push(("h264_high_unweighted.mp4".to_string(), read_stream(&path), Tier::EveryPicture));
+    out
 }
 
 /// The slice type of each picture of an H.264 stream, read from the first two syntax elements of
@@ -209,62 +189,17 @@ fn h264_slice_types(info: &NalStreamInfo, s: &Stream) -> BTreeMap<i64, u32> {
     out
 }
 
-/// Assert every intra-coded picture of the two outputs is bit for bit the same, and report how many
-/// of the inter-coded ones are not.
-///
-/// This is what the `StreamOnly` tier really asserts: an intra-coded picture depends on nothing but
-/// its own slices, so the missing `weighted_bipred_flag` cannot reach it, and it must still come out
-/// of the hardware exactly as the software decoder produced it. The count that follows is the
-/// divergence the file's doc comment describes; it is printed, not bounded.
-fn intra_coded_pictures_are_bit_exact(name: &str, info: &NalStreamInfo, s: &Stream, a: &[DecodedFrame], b: &[DecodedFrame]) {
-    let kinds = h264_slice_types(info, s);
-    let (pa, pb) = (by_pts(a), by_pts(b));
-    let mut intra = 0usize;
-    let (mut inter_same, mut inter_differ) = (0usize, 0usize);
-    for (pts, x) in &pa {
-        let raw = *kinds.get(pts).unwrap_or_else(|| panic!("{name}: no slice type read for pts {pts}"));
-        let y = pb[pts];
-        let same = match (&x.frame.data, &y.frame.data) {
-            (PixelData::Yuv8 { planes: p, chroma: c, .. }, PixelData::Yuv8 { planes: q, chroma: d, .. }) => c == d && (0..3).all(|i| p[i] == q[i]),
-            (PixelData::Yuv16 { planes: p, chroma: c, bits: bx, .. }, PixelData::Yuv16 { planes: q, chroma: d, bits: by, .. }) => {
-                (c, bx) == (d, by) && (0..3).all(|i| p[i] == q[i])
-            }
-            _ => panic!("{name}: pts {pts}: pixel formats differ"),
-        };
-        match raw {
-            2 => {
-                assert!(same, "{name}: intra-coded pts {pts} differs from the software decoder");
-                intra += 1;
-            }
-            _ if same => inter_same += 1,
-            _ => inter_differ += 1,
-        }
-    }
-    assert!(intra > 0, "{name}: no intra-coded picture in the fixture");
-    // If nothing diverges any more the `StreamOnly` tier is no longer needed for this fixture, and
-    // saying so here beats leaving a weakened assertion in place after the fix lands.
-    assert!(inter_differ > 0, "{name}: no inter-coded picture diverges, so this fixture belongs in the every-picture tier");
-    println!(
-        "{name}: {intra} intra-coded pictures bit-exact; {inter_same} of {} inter-coded pictures agree and {inter_differ} differ (see this file's doc comment)",
-        inter_same + inter_differ
-    );
-}
-
 /// Every picture of `s` from the hardware decoder is the software decoder's: whole stream, after
 /// `reset` + reseek to each later sync sample, and a full pass again after all the resets. This is
 /// Review Focus #5's test.
-fn parity(name: &str, s: &Stream, agreement: Agreement) {
+fn parity(name: &str, s: &Stream) {
     let Some(mut hw) = hardware(s) else { return };
     let mut sw = software(s);
     let a = decode_all(hw.as_mut(), &s.samples);
     let b = decode_all(sw.as_mut(), &s.samples);
     assert!(a.len() >= 40, "{name}: {} pictures", a.len());
     assert_eq!(a.len(), b.len(), "{name}: picture counts");
-    compare(name, &a, &b, agreement);
-    if agreement == Agreement::StreamOnly {
-        let info = NalStreamInfo::from_entry(&s.entry).unwrap().unwrap();
-        intra_coded_pictures_are_bit_exact(name, &info, s, &a, &b);
-    }
+    assert_same_by_pts(name, &a, &b);
     assert!(hw.name().starts_with("VA-API"), "{name}: stayed in hardware ({})", hw.name());
 
     // reset + reseek to each later sync sample, then decode a stretch of the run from there
@@ -278,7 +213,7 @@ fn parity(name: &str, s: &Stream, agreement: Agreement) {
         let a = decode_all(hw.as_mut(), &s.samples[k..end]);
         let b = decode_all(sw.as_mut(), &s.samples[k..end]);
         assert!(!a.is_empty(), "{name}: pictures after seeking to {k}");
-        compare(&format!("{name} from sample {k}"), &a, &b, agreement);
+        assert_same_by_pts(&format!("{name} from sample {k}"), &a, &b);
     }
     // back to the start after seeking around: the whole stream again
     hw.reset();
@@ -286,7 +221,7 @@ fn parity(name: &str, s: &Stream, agreement: Agreement) {
     let a = decode_all(hw.as_mut(), &s.samples);
     let b = decode_all(sw.as_mut(), &s.samples);
     assert_eq!(a.len(), b.len(), "{name} after resets: picture count");
-    compare(&format!("{name} after resets"), &a, &b, agreement);
+    assert_same_by_pts(&format!("{name} after resets"), &a, &b);
 
     // random-access / disposable answers match the software decoder's
     for (smp, _) in &s.samples {
@@ -295,14 +230,29 @@ fn parity(name: &str, s: &Stream, agreement: Agreement) {
     }
 }
 
+/// Every picture of every fixture this backend can describe, bit for bit what FilmCraft's own decoder
+/// produces: whole stream, after `reset` + reseek to each later sync sample, and a full pass again
+/// after all the resets. This is Review Focus #5's test.
 #[test]
 fn bit_exact_with_the_software_decoder() {
     let ff = filmcraft_testkit::require_ffmpeg!();
-    let streams = streams(&ff);
-    assert!(!streams.is_empty(), "no parity fixture could be generated");
-    for (name, s, agreement) in &streams {
-        parity(name, s, *agreement);
+    let streams = streams_with_control(&ff);
+    let mut compared = 0usize;
+    for (name, s, tier) in &streams {
+        if *tier != Tier::EveryPicture {
+            continue;
+        }
+        compared += 1;
+        parity(name, s);
     }
+    // The three fixtures this backend must decode: HEVC 8-bit, HEVC 10-bit and the H.264 control.
+    // Anything less and this is no longer a parity test — in particular losing the control fixture
+    // would leave the H.264 half of the claim unasserted, which is why it is counted here by name.
+    assert!(compared >= 3, "only {compared} fixtures were compared bit for bit, which is not a parity test");
+    assert!(
+        streams.iter().any(|(n, _, t)| n == "h264_high_unweighted.mp4" && *t == Tier::EveryPicture),
+        "the H.264 control fixture was not compared bit for bit"
+    );
 }
 
 /// A picture comes back from the `decode` call that produced it, so the run is in decode order
@@ -315,7 +265,10 @@ fn bit_exact_with_the_software_decoder() {
 #[test]
 fn a_picture_is_emitted_as_it_is_decoded() {
     let ff = filmcraft_testkit::require_ffmpeg!();
-    for (name, s, _) in streams(&ff) {
+    for (name, s, tier) in streams_with_control(&ff) {
+        if tier != Tier::EveryPicture {
+            continue;
+        }
         let Some(mut hw) = hardware(&s) else { continue };
         let hardware_pts: Vec<i64> = s.samples.iter().flat_map(|(b, p)| hw.decode(b, *p).unwrap()).map(|f| f.pts).collect();
         let software_pts: Vec<i64> = decode_all(software(&s).as_mut(), &s.samples).iter().map(|f| f.pts).collect();
@@ -334,16 +287,21 @@ fn a_picture_is_emitted_as_it_is_decoded() {
 #[test]
 fn a_drained_context_restarts_only_at_an_idr() {
     let ff = filmcraft_testkit::require_ffmpeg!();
-    for (name, s, agreement) in streams(&ff) {
+    for (name, s, tier) in streams_with_control(&ff) {
         let name = name.as_str();
+        if tier == Tier::Declines {
+            continue;
+        }
         let Some(info) = filmcraft_platform::vaapi::stream_info(&s.entry) else {
             eprintln!("SKIPPED: no VA-API stream description for {name}");
             continue;
         };
-        if VaDecoder::new(info.clone()).is_err() {
+        // One decoder for the two halves below: `VaDecoder::new` opens a context, and asking twice
+        // whether a context exists is a second context this test does not need.
+        let Ok(va) = VaDecoder::new(info.clone()) else {
             eprintln!("SKIPPED: no VA-API decoder for {name}");
             continue;
-        }
+        };
         let is_idr = |i: usize| match &info {
             StreamInfo::Nal(n) => n.nal_types(&s.samples[i].0).iter().any(|&t| if n.codec == NalCodec::H264 { t == 5 } else { matches!(t, 19 | 20) }),
             StreamInfo::Frame(f) => f.is_random_access(&s.samples[i].0),
@@ -357,7 +315,7 @@ fn a_drained_context_restarts_only_at_an_idr() {
         };
         assert!(!is_idr(mid), "{name}: sample {mid} is not a sync sample, so it cannot be an IDR picture");
         let mut sw = software(&s);
-        let mut va = VaDecoder::new(info.clone()).unwrap();
+        let mut va = va;
         let before: Vec<DecodedFrame> = s.samples[..mid].iter().flat_map(|(d, p)| va.decode(d, *p).unwrap()).collect();
         assert_eq!(before.len(), mid, "{name}: a VA-API decode is one picture in, one picture out");
         assert!(va.flush().is_empty(), "{name}: a VA-API decode holds nothing back, so a flush returns nothing");
@@ -382,7 +340,7 @@ fn a_drained_context_restarts_only_at_an_idr() {
                 let a = decode_all(&mut va, &s.samples[sync..]);
                 let b = decode_all(sw.as_mut(), &s.samples[sync..]);
                 assert!(!a.is_empty(), "{name}: pictures after restarting at IDR {sync}");
-                compare(&format!("{name} flush then IDR {sync}"), &a, &b, agreement);
+                assert_same_by_pts(&format!("{name} flush then IDR {sync}"), &a, &b);
             }
             None => eprintln!("SKIPPED: no restart point after sample {mid} of {name}"),
         }
@@ -390,33 +348,35 @@ fn a_drained_context_restarts_only_at_an_idr() {
         // run to the software decoder, so the finished run has to be the software decoder's own
         // pictures — the first half from the hardware, the second half replayed through software.
         let reference = decode_all(software(&s).as_mut(), &s.samples);
-        let mut d = HybridDecoder::new(Box::new(VaDecoder::new(info.clone()).unwrap()), s.entry.clone(), info.clone());
+        let mut d = HybridDecoder::new(Box::new(VaDecoder::new(info.clone()).expect("the decoder this test just used")), s.entry.clone(), info.clone());
         let mut out: Vec<DecodedFrame> = Vec::new();
         for (smp, pts) in &s.samples[..mid] {
             out.extend(d.decode(smp, *pts).unwrap());
         }
         assert!(d.is_hardware(), "{name}: still in hardware after the first half");
         assert!(d.flush().is_empty(), "{name}: the hardware holds nothing back, so the flush returns nothing");
-        let fallbacks = filmcraft_codecs::hw::hw_stats().fallbacks;
         out.extend(decode_all(&mut d, &s.samples[mid..]));
         assert!(!d.is_hardware(), "{name}: a drained context did not hand the run to the software decoder");
-        assert!(filmcraft_codecs::hw::hw_stats().fallbacks > fallbacks, "{name}: the fallback from a drained context is counted");
-        compare(&format!("{name} flushed mid-GOP at {mid}"), &out, &reference, agreement);
+        assert_same_by_pts(&format!("{name} flushed mid-GOP at {mid}"), &out, &reference);
     }
 }
 
+/// A forced mid-stream failure hands the rest of the run to the software decoder, and the finished
+/// run is the software decoder's own output.
+///
+/// The reference is the software decoder's whole output, because that — not the hardware decoder's —
+/// is what must come out: the pictures before the failure were hardware's and are dropped by the
+/// replay, and the rest is decoded twice.
 #[test]
 fn a_forced_mid_stream_failure_continues_in_software() {
     let ff = filmcraft_testkit::require_ffmpeg!();
-    for (name, s, agreement) in streams(&ff) {
+    for (name, s, tier) in streams_with_control(&ff) {
         let name = name.as_str();
         let Some(info) = filmcraft_platform::vaapi::stream_info(&s.entry) else { continue };
         if VaDecoder::new(info.clone()).is_err() {
             eprintln!("SKIPPED: no VA-API decoder for {name}");
             continue;
         }
-        // The reference is the *software* decoder's whole output: after the forced failure the run
-        // is replayed through it, so that — not the hardware decoder's — is what must come out.
         let reference = decode_all(software(&s).as_mut(), &s.samples);
         assert!(!reference.is_empty(), "{name}");
         // The first sample (so nothing at all came out of the hardware), two samples into the first
@@ -431,51 +391,93 @@ fn a_forced_mid_stream_failure_continues_in_software() {
             assert!(!d.is_hardware(), "{name}: switched to software");
             assert!(filmcraft_codecs::hw::hw_stats().fallbacks > before, "{name}: fallback counted");
             // Failing at the first sample leaves every picture of the run to the software decoder, so
-            // the output must be the software decoder's own bit for bit — including on the fixture
-            // whose pictures this backend decodes differently. Once the failure is further in, the
-            // pictures before it came out of the hardware, so that fixture can only be compared at
-            // the tier it earns; the streams this backend decodes correctly are compared in full.
-            let earned = if fail_at == 0 { Agreement::EveryPicture } else { agreement };
-            compare(&format!("{name} failing at sample {fail_at}"), &out, &reference, earned);
+            // the output must be its own bit for bit. A failure further in leaves the pictures before
+            // it to the hardware, so the run is only as good as those pictures are — which is the
+            // fixture's tier. For every fixture this backend decodes correctly that is the software
+            // decoder's own pictures as well.
+            if fail_at == 0 || tier == Tier::EveryPicture {
+                assert_same_by_pts(&format!("{name} failing at sample {fail_at}"), &out, &reference);
+            } else {
+                assert_eq!(out.len(), reference.len(), "{name} failing at sample {fail_at}: the run is complete");
+                assert_same_pts_only(&format!("{name} failing at sample {fail_at}"), &out, &reference);
+            }
             // the instance stays in software across seeks
             d.reset();
-            compare(&format!("{name} after the fallback and a reset"), &decode_all(&mut d, &s.samples), &reference, earned);
+            assert_same_by_pts(&format!("{name} after the fallback and a reset"), &decode_all(&mut d, &s.samples), &reference);
         }
     }
+}
+
+/// The presentation times two outputs have in common, and nothing else: the same set of pictures,
+/// compared by position rather than by content.
+///
+/// Only for the runs whose *pixels* cannot be compared — see the note at its one call site. It exists
+/// because "the run is complete" is a real requirement of a fallback and has to be assertable without
+/// also asserting the pixels.
+fn assert_same_pts_only(what: &str, a: &[DecodedFrame], b: &[DecodedFrame]) {
+    let pts = |out: &[DecodedFrame]| -> Vec<i64> { by_pts(out).keys().copied().collect() };
+    assert_eq!(pts(a), pts(b), "{what}: presentation times");
 }
 
 /// Run `f` on a thread; fail if it panics or takes longer than `limit`, else hand back what it
 /// returned. The value is there so a caller can assert on what the damaged runs actually did: a
 /// test that only checks "nothing blew up" also passes when the damage never reached anything.
+///
+/// The worker's thread id comes back with the value so a hang names the thread that has to be looked
+/// for: a thread stuck in a driver call cannot be killed, so a timed-out worker is still running and
+/// the only handle on it is its id. The panic payload is reported for the same reason — "it panicked"
+/// without the message loses the one thing that says what.
 fn bounded<T: Send + 'static>(what: &str, limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let worker = std::thread::current().id();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        let _ = tx.send(r.ok());
+        let _ = tx.send(r.map_err(|payload| (worker, panic_message(payload.as_ref()))));
     });
     match rx.recv_timeout(limit) {
-        Ok(Some(v)) => v,
-        Ok(None) => panic!("{what}: panicked"),
-        Err(_) => panic!("{what}: hung"),
+        Ok(Ok(v)) => v,
+        Ok(Err((worker, message))) => panic!("{what}: worker thread {worker:?} panicked: {message}"),
+        Err(_) => panic!("{what}: hung for {limit:?}; the worker thread is still running and cannot be killed"),
     }
 }
 
+/// A panic payload as text, which is `&str` or `String` in every panic the standard library and this
+/// test suite raise — anything else is described rather than dropped, so the report is never just
+/// "panicked" with nothing to go on.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<a panic payload that is neither &str nor String>".to_string())
+}
+
+/// Bit flips, truncation and corrupt length prefixes, and corrupt configuration records, must give an
+/// error, a fallback or correct pictures — never a panic and never a hang.
+///
+/// The decoder here is the factory's, which is a `HybridDecoder`: a damaged access unit it cannot
+/// decode comes back as **`Ok`**, because it replays the run in software and hands the software
+/// decoder's pictures over. Counting errors alone would therefore call a run that quietly fell back
+/// "not rejected" and report it as coverage. So the two are counted apart: `errors` is the access
+/// units the decoder refused outright, and `fallbacks` is the access units it absorbed by leaving
+/// hardware. A picture it produced itself is neither, and there is nothing to assert about one —
+/// which is why this is a "never crashed or hung" test and not a correctness one.
 #[test]
 fn damaged_samples_never_crash_or_hang() {
     let ff = filmcraft_testkit::require_ffmpeg!();
-    for (name, s, _) in streams(&ff) {
+    for (name, s, _) in streams_with_control(&ff) {
         let name = name.as_str();
         if hardware(&s).is_none() {
             continue;
         }
         // bit flips, truncation and corrupt length prefixes, through the factory's decoder
-        let mut rejected = 0usize;
+        let (mut rejected, mut absorbed) = (0usize, 0usize);
         for seed in 1..=6u64 {
             let samples = s.samples.clone();
             let entry = s.entry.clone();
-            rejected += bounded(&format!("{name} seed {seed}"), Duration::from_secs(60), move || {
+            let (e, f) = bounded(&format!("{name} seed {seed}"), Duration::from_secs(60), move || {
                 let mut seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-                let mut errors = 0usize;
+                let (mut errors, mut fallbacks, mut in_hardware) = (0usize, 0usize, true);
                 let mut d = filmcraft_platform::vaapi_factory(&entry).unwrap().unwrap();
                 for (i, (smp, pts)) in samples.iter().enumerate().take(40) {
                     let mut m = smp.clone();
@@ -493,18 +495,30 @@ fn damaged_samples_never_crash_or_hang() {
                         _ => {}
                     }
                     errors += usize::from(d.decode(&m, *pts).is_err());
+                    // The instance's own name says which decoder it is using, which is how "fell back"
+                    // is told from "absorbed" — and unlike the process-wide fallback counter it is a
+                    // fact about this run.
+                    let still = d.name().starts_with("VA-API");
+                    if in_hardware && !still {
+                        fallbacks += 1;
+                    }
+                    in_hardware = still;
                     if i % 13 == 12 {
                         d.reset();
                     }
                 }
                 let _ = d.flush();
-                errors
+                (errors, fallbacks)
             });
+            rejected += e;
+            absorbed += f;
         }
         // The damage has to reach the decoder, or "never crashed" is a statement about clean samples: on
         // every fixture these six runs are rejected well over a hundred times between them.
         assert!(rejected > 0, "{name}: none of the 240 damaged access units was rejected");
-        println!("{name}: {} of 240 damaged access units were rejected as errors, the rest decoded or were dropped", rejected);
+        println!(
+            "{name}: of 240 damaged access units, {rejected} were rejected as errors and {absorbed} more made the decoder leave hardware; the rest decoded",
+        );
         // a damaged configuration record: the factory declines, or the decoder errors / falls back
         let rec = match &s.entry.codec {
             filmcraft_isobmff::CodecConfig::Avc(a) => a.to_bytes(),
@@ -654,70 +668,164 @@ fn a_frame_codec_is_declined_before_a_context_exists() {
     assert!(checked > 0, "no VP9 or AV1 fixture could be generated");
 }
 
-/// The weighted-bipred divergence is this backend's, not the software decoder's: against ffmpeg's own
-/// decode of `h264_high.mp4` the software decoder is right on every picture and this backend on
-/// only some.
+/// How many of `out`'s pictures are ffmpeg's, and the presentation time of the first that is not.
 ///
-/// Without this, the `StreamOnly` tier above would be a gap with nothing saying which side is wrong,
-/// and the obvious "fix" would be to make the hardware path reproduce the software decoder's output
-/// — which would replace 60 correct pictures with 60 incorrect ones.
-#[test]
-fn the_weighted_bipred_divergence_is_this_backends_not_the_software_decoders() {
-    let ff = filmcraft_testkit::require_ffmpeg!();
-    let Some(path) = named(&ff, "h264_high.mp4") else {
-        eprintln!("SKIPPED: h264_high.mp4 could not be generated");
-        return;
-    };
-    let s = read_stream(&path);
-    let Some(mut hw) = hardware(&s) else { return };
-    // ffmpeg as the oracle: its own decode of the fixture, in presentation order.
-    let raw = std::process::Command::new(&ff)
+/// `out` is keyed by presentation time, so a picture returned twice would collapse into one entry and
+/// this would score the survivors instead of the run — hence the length check. Only the pictures `out`
+/// actually has are scored: a run that was refused part way through is a legitimate thing to hand this,
+/// and what matters is that everything it *did* produce is ffmpeg's.
+fn oracle(out: &[DecodedFrame], reference: &Ffmpeg) -> (usize, Option<i64>) {
+    let map: BTreeMap<i64, Vec<u8>> = out.iter().map(|f| (f.pts, pixels(f))).collect();
+    assert_eq!(map.len(), out.len(), "a presentation time was returned twice, so scoring pictures by presentation time would miss one");
+    let mut first_wrong = None;
+    for (pts, picture) in &map {
+        let want = reference.at(*pts).unwrap_or_else(|| panic!("pts {pts} is not a picture ffmpeg decoded"));
+        if picture != want {
+            first_wrong.get_or_insert(*pts);
+        }
+    }
+    (map.len() - usize::from(first_wrong.is_some()), first_wrong)
+}
+
+/// ffmpeg's own decode of a fixture, addressed by presentation time.
+struct Ffmpeg {
+    pictures: Vec<Vec<u8>>,
+    /// Presentation time of the *i*-th picture, ascending — ffmpeg emits in presentation order, so the
+    /// *i*-th frame it writes is the picture with the *i*-th smallest presentation time.
+    order: Vec<i64>,
+}
+
+impl Ffmpeg {
+    fn at(&self, pts: i64) -> Option<&Vec<u8>> {
+        self.order.iter().position(|p| *p == pts).map(|i| &self.pictures[i])
+    }
+    fn len(&self) -> usize {
+        self.pictures.len()
+    }
+}
+
+/// ffmpeg's own decode of a fixture, paired with the stream's presentation times so a picture can be
+/// looked up by the time it was decoded with rather than by its position in the output.
+fn ffmpeg_pictures(ff: &Path, path: &Path, s: &Stream) -> Ffmpeg {
+    let raw = std::process::Command::new(ff)
         .args(["-v", "error", "-i", path.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
         .output()
         .expect("ffmpeg decode");
     assert!(raw.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&raw.stderr));
     let size = 640 * 360 * 3 / 2;
     assert_eq!(raw.stdout.len() % size, 0, "ffmpeg's decode is a whole number of 640x360 4:2:0 pictures");
-
-    let software_out = decode_all(software(&s).as_mut(), &s.samples);
-    let hardware_out = decode_all(hw.as_mut(), &s.samples);
-    assert_eq!(software_out.len(), hardware_out.len(), "picture counts");
-    assert_eq!(software_out.len(), raw.stdout.len() / size, "ffmpeg decoded as many pictures as FilmCraft");
-    // ffmpeg emits in presentation order, so a picture is paired with ffmpeg's by sorted presentation
-    // time — the same matching every other comparison in this file uses.
-    let by_pts = |out: &[DecodedFrame]| out.iter().map(|f| (f.pts, pixels(f))).collect::<BTreeMap<_, _>>();
-    let (mine, theirs) = (by_pts(&hardware_out), by_pts(&software_out));
-    // Both maps are keyed by presentation time, so a picture returned twice would collapse into one
-    // entry and this comparison would score the survivors instead of the run.
-    assert_eq!(mine.len(), hardware_out.len(), "this backend returned a presentation time twice");
-    assert_eq!(theirs.len(), software_out.len(), "the software decoder returned a presentation time twice");
-    let mut order: Vec<i64> = theirs.keys().copied().collect();
+    let mut order: Vec<i64> = s.samples.iter().map(|(_, p)| *p).collect();
     order.sort_unstable();
-    let (mut software_right, mut hardware_right) = (0usize, 0usize);
-    for (i, pts) in order.iter().enumerate() {
-        let want = raw.stdout.get(i * size..(i + 1) * size).expect("a whole picture");
-        if theirs[pts] == want {
-            software_right += 1;
+    Ffmpeg { pictures: raw.stdout.chunks_exact(size).map(<[u8]>::to_vec).collect(), order }
+}
+
+/// The control fixture: with `weightb=0` this backend decodes **every** picture, and every one of them
+/// is bit-for-bit ffmpeg's.
+///
+/// This is the assertion that makes the H.264 half of the parity claim real, and it is measured
+/// against ffmpeg rather than against our own decoder, so it cannot pass because both FilmCraft
+/// decoders drifted the same way. `h264_high.mp4` is the same encode with that one parameter changed,
+/// so the two together say the weight path was the only thing wrong.
+#[test]
+fn an_h264_fixture_this_record_can_express_is_bit_exact_against_ffmpeg() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    let Some(path) = unweighted(&ff) else {
+        panic!("the H.264 control fixture h264_high_unweighted.mp4 could not be generated");
+    };
+    let s = read_stream(&path);
+    let reference = ffmpeg_pictures(&ff, &path, &s);
+    // The raw decoder, not the factory's hybrid: a decline must show up as a missing picture here, not
+    // as a software replay that quietly looks like a hardware success.
+    let info = filmcraft_platform::vaapi::stream_info(&s.entry).expect("an avcC stream");
+    let mut va = match VaDecoder::new(info) {
+        Ok(va) => va,
+        Err(e) => {
+            eprintln!("SKIPPED: no VA-API decoder for this driver: {e}");
+            return;
         }
-        if mine[pts] == want {
-            hardware_right += 1;
-        }
-        // The negative control: a picture that matched its own index must not also match its
-        // neighbour's, or "matches ffmpeg" would be measuring nothing.
-        if let Some(next) = raw.stdout.get((i + 1) * size..(i + 2) * size) {
-            assert_ne!(theirs[pts], next, "picture {i} matches ffmpeg's {i} and its successor");
+    };
+    let mut out: Vec<DecodedFrame> = Vec::new();
+    let mut declined = 0usize;
+    for (smp, pts) in &s.samples {
+        match va.decode(smp, *pts) {
+            Ok(mut frames) => out.append(&mut frames),
+            Err(_) => declined += 1,
         }
     }
-    println!(
-        "h264_high.mp4 against ffmpeg's own decode: the software decoder is right on {software_right}/{}, this backend on {hardware_right}/{}",
-        software_out.len(),
-        software_out.len()
-    );
-    assert_eq!(software_right, software_out.len(), "the software decoder agrees with ffmpeg on every picture");
-    assert!(
-        hardware_right < software_right,
-        "this backend agrees with ffmpeg on fewer pictures ({hardware_right}) than the software decoder ({software_right})"
-    );
+    out.extend(va.flush());
+    assert_eq!(declined, 0, "the control fixture must not need a single decline, and {declined} were declined");
+    let (right, first_wrong) = oracle(&out, &reference);
+    println!("h264_high_unweighted.mp4 against ffmpeg's own decode: this backend is right on {right}/{}", out.len());
+    assert_eq!(right, out.len(), "the first disagreement with ffmpeg is at pts {first_wrong:?}");
+    // and the reference the rest of this file compares against is ffmpeg's too
+    let software = decode_all(software(&s).as_mut(), &s.samples);
+    let (sw_right, _) = oracle(&software, &reference);
+    assert_eq!(sw_right, reference.len(), "the software decoder disagrees with ffmpeg, so the parity comparison would be against a wrong reference");
+}
+
+/// An H.264 B slice whose weights the record cannot express is **declined**, and the stream finishes
+/// in software.
+///
+/// `h264_high.mp4` is x264's default `weightb=1` over High profile with B frames, so its picture
+/// parameter set says `weighted_bipred_idc == 2` and `filmcraft_h264` resolves each B slice as H.264
+/// implicit weighting — a weight per (`ref0`, `ref1`) pair. `VASliceParameterBufferH264` has one
+/// weight per reference index, so this backend cannot say that, and **submitting 1.0 instead is what
+/// decoded 60 of the fixture's 72 pictures wrongly** (only 12 of 72 agreed with ffmpeg, measured
+/// before the check that now declines them). Approximating is not available; the slice is refused.
+///
+/// What is asserted here is the refusal and its consequence: the raw decoder returns an `Err` whose
+/// reason names the implicit weights, and the factory's decoder — the one a user gets — finishes the
+/// whole run in software with the software decoder's own pictures.
+#[test]
+fn an_h264_b_slice_this_record_cannot_weight_is_declined() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    let Some(path) = named(&ff, "h264_high.mp4") else {
+        eprintln!("SKIPPED: h264_high.mp4 could not be generated");
+        return;
+    };
+    let s = read_stream(&path);
+    let reference = ffmpeg_pictures(&ff, &path, &s);
+    let info = filmcraft_platform::vaapi::stream_info(&s.entry).expect("an avcC stream");
+    let mut va = match VaDecoder::new(info.clone()) {
+        Ok(va) => va,
+        Err(e) => {
+            eprintln!("SKIPPED: no VA-API decoder for this driver: {e}");
+            return;
+        }
+    };
+    // The run: the first pictures decode, and then a B slice is refused with a reason that says why.
+    let (mut out, mut declines) = (Vec::new(), Vec::new());
+    for (i, (smp, pts)) in s.samples.iter().enumerate() {
+        match va.decode(smp, *pts) {
+            Ok(mut frames) => out.append(&mut frames),
+            Err(e) => declines.push((i, e.to_string())),
+        }
+    }
+    let Some((at, why)) = declines.first().cloned() else {
+        panic!("every picture of h264_high.mp4 decoded in hardware, so the implicit weights were not exercised after all and this test is measuring nothing");
+    };
+    assert!(why.contains("implicit"), "the refusal must name the implicit weights, not the driver: {why}");
+    assert!(why.contains("per reference index"), "the refusal must say why the record cannot carry them: {why}");
+    let kinds = h264_slice_types(&filmcraft_codecs::hw::NalStreamInfo::from_entry(&s.entry).unwrap().unwrap(), &s);
+    let slice_type = kinds.get(&s.samples[at].1).copied().unwrap_or(9);
+    assert_eq!(slice_type % 5, 1, "the first refusal is at sample {at}, which is not a B picture (slice_type {slice_type})");
+    println!("h264_high.mp4: the first refusal is at sample {at}, a B picture: {why}");
+    // The pictures that were decoded before it are still ffmpeg's, so nothing wrong was handed over.
+    let (right, first_wrong) = oracle(&out, &reference);
+    assert_eq!(right, out.len(), "a picture this backend produced before refusing differs from ffmpeg at pts {first_wrong:?}");
+    println!("h264_high.mp4: the {right} pictures decoded before the refusal are all ffmpeg's");
+    // What a user gets: the whole run, in software, exactly as the software decoder produces it.
+    let mut d = filmcraft_platform::vaapi_factory(&s.entry).expect("a VA-API factory").expect("a decoder for an avcC stream");
+    assert!(d.name().starts_with("VA-API"), "the stream starts in hardware");
+    let fallbacks = filmcraft_codecs::hw::hw_stats().fallbacks;
+    let run = decode_all(d.as_mut(), &s.samples);
+    assert!(!d.name().starts_with("VA-API"), "the stream did not finish in software");
+    assert!(filmcraft_codecs::hw::hw_stats().fallbacks > fallbacks, "the refusal is counted as a fallback");
+    let software = decode_all(software(&s).as_mut(), &s.samples);
+    assert_same_by_pts("h264_high.mp4 finished in software", &run, &software);
+    let (sw_right, _) = oracle(&software, &reference);
+    assert_eq!(sw_right, reference.len(), "the software decoder disagrees with ffmpeg");
+    println!("h264_high.mp4: the run is finished by the software decoder, which is right on {sw_right}/{} pictures", reference.len());
 }
 
 /// One picture's pixels as the bytes ffmpeg's raw 4:2:0 output holds them: luma, then U, then V.

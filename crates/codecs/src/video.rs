@@ -19,6 +19,14 @@ pub struct DecodedFrame {
 pub trait VideoDecoder: Send {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>>;
     /// Drain pictures held for reordering (end of stream / before a seek).
+    ///
+    /// **Call it.** A decoder that reorders holds pictures back, so the last pictures of a run only
+    /// come out of `flush`, and how many depends on the decoder: FilmCraft's H.264 decoder returned 70
+    /// of 72 pictures from `decode` at one frame thread and 45–65 at several, with all 72 coming out
+    /// of the flush in every case. A caller that counts what `decode` returned instead of what
+    /// `decode` plus `flush` returned therefore reports a number that moves with the machine's core
+    /// count, and reads as pictures going missing. That is not a decoder bug and cannot be fixed in
+    /// the decoder — the pictures are not lost, they are not out yet.
     fn flush(&mut self) -> Vec<DecodedFrame>;
     /// Forget all state (called after seeking to a sync sample).
     fn reset(&mut self);
@@ -213,19 +221,16 @@ impl H264Decoder {
 
     /// A decoder for `avcc` using at most `threads` frame threads (1 decodes on the calling thread).
     ///
-    /// **A complete run is the same at every thread count; what the count changes is how much of it
-    /// arrives before the flush.** Measured on `h264_high.mp4` (x264 High, three B frames, 72
-    /// pictures), ten runs each at 1, 4 and 16 threads: every run returned all 72 pictures, with one
-    /// set of presentation times and one set of pixels (hashed over every plane). The pictures
-    /// `decode` returns *before* `flush` are not the whole run and depend on how far the worker pool
-    /// has got: 70 at one thread, 65 at four, 45–53 at sixteen, and the sixteen-thread figure moves
-    /// between runs. That is the reorder delay a caller has to flush for, not a lost picture — a
-    /// caller that counts what `decode` returned and never flushes is how this was first noticed
-    /// (`crates/platform/examples/vaparity.rs`).
+    /// **Pinning the count makes a measurement repeatable across machines; the count does not change
+    /// the output.** Measured on `h264_high.mp4` (x264 High, three B frames, 72 pictures), ten runs
+    /// each at 1, 4 and 16 threads: every run returned all 72 pictures, with one set of presentation
+    /// times and one set of pixels. What the thread count *does* change is how much of the run arrives
+    /// before the flush — 70 at one thread, 65 at four, 45–53 at sixteen — because the pictures held
+    /// back for reordering are the ones the frame-threaded path has not finished. So a caller that
+    /// compares this decoder's output against anything should pin the count, or it is comparing
+    /// against a machine's core count rather than against the stream.
     ///
-    /// Pinning the count is what a test comparing against a hardware decoder needs, so its reference
-    /// does not depend on the machine's core count, and [`VideoDecoder::reset`] keeps the count so a
-    /// reset does not change it either.
+    /// [`VideoDecoder::reset`] keeps the count, so a `reset` does not change it either.
     pub fn with_threads(avcc: Vec<u8>, threads: usize) -> Result<Self> {
         recycle_h264_planes();
         let mut dec = filmcraft_h264::Decoder::with_threads(threads);

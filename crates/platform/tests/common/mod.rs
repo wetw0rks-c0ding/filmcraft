@@ -161,12 +161,17 @@ pub fn assert_same(what: &str, a: &[DecodedFrame], b: &[DecodedFrame]) {
 /// pictures back for reordering emits *presentation* order (H.264 7.4.2.4.1). Comparing "the sixth
 /// picture" of each then compares two different frames. This compares the same checks
 /// picture-for-picture, keyed by pts, which is what `examples/vaparity.rs` does for the same reason.
+///
+/// The draft flag is compared too: a backend that flagged every picture `draft` — approximate
+/// samples, a decoder that skips the deblocking filter — would otherwise pass a comparison that looks
+/// only at planes, colour and size.
 pub fn assert_same_by_pts(what: &str, a: &[DecodedFrame], b: &[DecodedFrame]) {
     let (pa, pb) = (by_pts(a), by_pts(b));
     assert_eq!(pa.keys().collect::<Vec<_>>(), pb.keys().collect::<Vec<_>>(), "{what}: presentation times");
     for (pts, x) in &pa {
         let y = pb[pts];
         let (fx, fy) = (&x.frame, &y.frame);
+        assert_eq!(x.draft, y.draft, "{what}: pts {pts} draft flag ({} vs {})", x.draft, y.draft);
         assert_eq!((fx.width, fx.height, fx.par, fx.color), (fy.width, fy.height, fy.par, fy.color), "{what}: pts {pts} geometry / colour");
         match (&fx.data, &fy.data) {
             (PixelData::Yuv8 { planes: p, chroma: c, .. }, PixelData::Yuv8 { planes: q, chroma: d, .. }) => {

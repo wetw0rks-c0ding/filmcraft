@@ -68,10 +68,6 @@ pub struct NalPoc {
     /// `MaxFrameNum` (H.264 7.4.2.1.1): the modulus `frame_num` wraps at, which 8.2.4.1's `pic_num`
     /// needs to order two frames that straddle the wrap. Zero until the first picture is parsed.
     max_frame_num: u32,
-    /// Whether this decoder has already said once that it cannot apply explicit weighted bipred
-    /// weights. A stream's B run is hundreds of slices and the point is the same every time, so the
-    /// warning is made once per decoder rather than once per slice.
-    warned_explicit_bipred: bool,
 }
 
 impl NalPoc {
@@ -82,23 +78,6 @@ impl NalPoc {
         self.hevc = filmcraft_hevc::PocState::default();
         self.dpb.clear();
         self.max_frame_num = 0;
-    }
-
-    /// Say once per decoder that explicit weighted bipred weights are being dropped, so the
-    /// limitation this backend has is in the log rather than only in a doc comment.
-    ///
-    /// Returns whether this call was the one that logged, which a test asserts rather than trusting:
-    /// a stream's B run is hundreds of slices, and the point is the same every time.
-    pub fn warn_explicit_bipred_once(&mut self) -> bool {
-        if self.warned_explicit_bipred {
-            return false;
-        }
-        self.warned_explicit_bipred = true;
-        log::warn!(
-            "VA-API: this H.264 stream signals explicit weighted bipred (weighted_bipred_idc 2) and filmcraft-h264 does not expose the per-slice weighted_bipred_flag, \
-             so its slice records carry no weights. A slice that really uses them will decode to the wrong picture. This is said once per decoder."
-        );
-        true
     }
 
     /// The surfaces the decoded picture buffer still refers to — the ones a new picture may **not**
@@ -945,12 +924,6 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         if pps.num_slice_groups > 1 {
             return Err("slice groups (FMO)".into());
         }
-        // Said once per decoder rather than per slice: a B run is hundreds of slices and the point
-        // is the same every time. See `h264_weights` for what this costs the picture.
-        if explicit_bipred_without_weights(&sh, pps) {
-            poc.warn_explicit_bipred_once();
-        }
-
         match first.as_ref() {
             None => {
                 let p = poc.h264.compute(&sh, sps);
@@ -974,12 +947,15 @@ fn build_h264(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         let length = u32::try_from(nal.len()).map_err(|_| "slice length does not fit the record".to_string())?;
         // Each slice names its own references: `ref_pic_list_modification` is a syntax element of
         // the slice header, so two slices of one picture may list them differently even though they
-        // share a frame_num.
-        let lists = h264_ref_lists(&poc.dpb, &sh, picture_poc.as_ref().map_or(0, |p| p.top), poc.max_frame_num)?;
+        // share a frame_num. `cur_poc` is the same for every slice of a picture — it is the picture's
+        // — and it is what the reference lists are ordered by and what an implicit weight is measured
+        // against.
+        let cur_poc = picture_poc.as_ref().map_or(0, |p| p.top);
+        let lists = h264_ref_lists(&poc.dpb, &sh, cur_poc, poc.max_frame_num)?;
         slices.push(SliceParam {
             offset: data_offset,
             length,
-            params: h264_slice_record(nal, &sh, pps, data_offset, &poc.dpb, slots.as_deref().unwrap_or_default(), &lists)?,
+            params: h264_slice_record(nal, &sh, pps, data_offset, &poc.dpb, slots.as_deref().unwrap_or_default(), &lists, cur_poc)?,
         });
         slice_offsets.push(*offset);
         data_offset = data_offset.checked_add(length).ok_or("slice data buffer size overflows")?;
@@ -1122,8 +1098,9 @@ fn h264_slice_record(
     dpb: &[DpbEntry],
     slots: &[Option<usize>],
     lists: &[Vec<usize>; 2],
+    cur_poc: i32,
 ) -> Result<Vec<u8>, String> {
-    let weights = h264_weights(sh, pps)?;
+    let weights = h264_weights(sh, pps, cur_poc, dpb, lists)?;
     let (ref_pic_list0, ref_pic_list1) = h264_ref_pic_lists(dpb, lists, slots)?;
     let record = VaSliceParameterBufferH264 {
         slice_data_size: u32::try_from(nal.len()).map_err(|_| "slice length does not fit the record".to_string())?,
@@ -1150,43 +1127,72 @@ fn h264_slice_record(
     Ok(record_bytes(&record))
 }
 
-/// Whether this slice is in H.264's *explicit* weighted bipred mode with no weight table: the picture
-/// parameter set allows it (`weighted_bipred_idc == 2`) and the slice opts in through a
-/// `weighted_bipred_flag` that `filmcraft_h264` does not expose, so whether this slice uses weights
-/// cannot be derived. The warning that says so is [`NalPoc::warn_explicit_bipred_once`]; what the record
-/// carries is [`h264_weights`]'s business.
-fn explicit_bipred_without_weights(sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::params::Pps) -> bool {
-    pps.weighted_bipred_idc == 2 && sh.slice_type.is_b() && sh.pred_weight_table.is_none()
+/// H.264 8.4.2.3.1's implicit prediction weight for one (`ref0`, `ref1`) pair, as `(weight, offset)`
+/// on a `luma_log2_weight_denom` of 5 — which is how `filmcraft_h264` applies it
+/// (`crates/h264/src/slicedec.rs:316-331`, `Weight::Weighted { log_wd: 5, .. }`).
+///
+/// **`(32, 32)` is no weighting at all**: 32 with a denominator of 2⁵ is 1.0, and both offsets are 0.
+/// The pair is what decides that, so it is the only thing [`h264_implicit_weights`] needs to look at.
+fn h264_implicit_pair(cur_poc: i32, r0: &DpbEntry, r1: &DpbEntry) -> (i32, i32) {
+    let tb = (cur_poc - r0.poc).clamp(-128, 127);
+    let td = (r1.poc - r0.poc).clamp(-128, 127);
+    // `tb` and `td` are bounded to ±127 by the clamp above, and `tx` by `td`'s own bound, so the
+    // product is at most 127 × 16447 — no overflow to guard.
+    let is_long = |e: &DpbEntry| matches!(e.mark, Mark::Long(_));
+    if td == 0 || is_long(r0) || is_long(r1) {
+        return (32, 32);
+    }
+    let tx = (16384 + (td / 2).abs()) / td;
+    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+    if (dsf >> 2) < -64 || (dsf >> 2) > 128 { (32, 32) } else { (64 - (dsf >> 2), dsf >> 2) }
 }
 
 /// The prediction weight tables, from the slice header's own `pred_weight_table()`.
 ///
 /// A slice whose weight table is mandatory and missing is declined rather than submitted with
 /// zeros: `pic_fields` would say `weighted_pred_flag` is in use, and a zeroed table alongside that
-/// says "no weighting" — a different picture from the stream's, which is worse than an error.
+/// says "no weighting" — a different picture from the stream's, which is worse than an error. The
+/// mandatory cases are the two `filmcraft_h264` parses the table for: a P slice with
+/// `weighted_pred_flag`, and a B slice with `weighted_bipred_idc == 1` (implicit).
 ///
-/// The mandatory cases are the two `filmcraft_h264` parses the table for: a P slice with
-/// `weighted_pred_flag`, and a B slice with `weighted_bipred_idc == 1` (implicit). `weighted_bipred_idc
-/// == 2` (explicit) is not one of them: there the *slice* opts in, through a `weighted_bipred_flag`
-/// that `filmcraft_h264` does not expose.
+/// # The B slices of a `weighted_bipred_idc == 2` stream, which this record cannot express
 ///
-/// A slice with no table in that mode is submitted with the weight flags clear — which is what
-/// libva's own encoding says for "explicit mode, this slice not weighted", and is also what a
-/// `weighted_bipred_flag` of 0 means. **It is a guess, and on a stream that really does weight its
-/// bipred slices it decodes the wrong picture.** Measured on this machine: an H.264 fixture with
-/// `weighted_bipred_idc == 2` and B pictures (x264's default for High profile, so this is most
-/// H.264) comes out of this backend differing from `filmcraft_h264` on *every* B picture — 51 of 51 —
-/// while the same fixture with `weightb=0` is bit-exact. `filmcraft_h264` cannot be used as evidence
-/// here: it does not read `weighted_bipred_flag` either, so it sends the same empty table, and the
-/// two agree on what is *submitted* while disagreeing with ffmpeg on what is *decoded*. The fix
-/// belongs in `filmcraft-h264`, which would have to expose the flag; it is tracked there and is
-/// deliberately not attempted from here.
-/// [`NalPoc::warn_explicit_bipred_once`] puts the limitation in the log once per decoder.
-fn h264_weights(sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::params::Pps) -> Result<VaSliceParameterBufferH264, String> {
+/// `weighted_bipred_idc == 2` is x264's default for High profile with B frames, so it is most H.264.
+/// Its `weighted_bipred_flag` is a per-slice bit `filmcraft_h264` does not read, and `filmcraft_h264`
+/// resolves such a slice as H.264's **implicit** weighting ([`h264_implicit_pair`]) — which is what it
+/// decodes, and it is bit-exact with ffmpeg while doing so. A `VASliceParameterBufferH264` cannot say
+/// that: `luma_weight_l0` / `luma_weight_l1` are one weight **per reference index per list**
+/// (`va_dec_h264.h:3702-3723`), and an implicit weight is a function of the *pair* of indices, which
+/// changes from macroblock to macroblock inside one slice. Two per-index arrays cannot hold a
+/// pair-dependent function.
+///
+/// So the slice is checked rather than guessed. Every (`ref0`, `ref1`) pair the slice's own reference
+/// lists could use is computed; if they are all `(32, 32)` — 1.0, no offset, i.e. the stream does not
+/// actually exercise implicit weighting — the default explicit table is submitted and the picture
+/// decodes. If any pair is not, the slice is **declined**, and the error hands the stream to
+/// `HybridDecoder`, which finishes it in software. Approximating is not an option: submitting 1.0 for a
+/// pair that wants something else decodes the wrong picture, and that is a silent corruption on a
+/// timeline rather than a visible failure. Measured on this machine: x264's default `weightb=1` on
+/// `testsrc2` exercises implicit weighting, so such a stream declines, while the same encode with
+/// `weightb=0` (`weighted_bipred_idc == 0`, which codes no weight table and no implicit mode at all) is
+/// bit-exact against both ffmpeg and `filmcraft_h264` on every picture.
+fn h264_weights(
+    sh: &filmcraft_h264::slice::SliceHeader,
+    pps: &filmcraft_h264::params::Pps,
+    cur_poc: i32,
+    dpb: &[DpbEntry],
+    lists: &[Vec<usize>; 2],
+) -> Result<VaSliceParameterBufferH264, String> {
     let mandatory = (pps.weighted_pred && sh.slice_type.is_p()) || (pps.weighted_bipred_idc == 1 && sh.slice_type.is_b());
     let Some(table) = sh.pred_weight_table.as_ref() else {
-        return if mandatory {
-            Err(format!("weighted {} prediction in a slice that carries no prediction weight table", if sh.slice_type.is_b() { "bipred" } else { "pred" }))
+        if mandatory {
+            return Err(format!(
+                "weighted {} prediction in a slice that carries no prediction weight table",
+                if sh.slice_type.is_b() { "bipred" } else { "pred" }
+            ));
+        }
+        return if pps.weighted_bipred_idc == 2 && sh.slice_type.is_b() {
+            h264_implicit_weights(cur_poc, dpb, lists)
         } else {
             Ok(VaSliceParameterBufferH264::default())
         };
@@ -1235,6 +1241,56 @@ fn h264_weights(sh: &filmcraft_h264::slice::SliceHeader, pps: &filmcraft_h264::p
         }
     }
     Ok(record)
+}
+
+/// The explicit table that *is* 1.0 with no offset, for a slice whose implicit pairs are all
+/// `(32, 32)` on a denominator of 2⁵ — the weights `filmcraft_h264` applies in that case, written in
+/// the only form the record has.
+///
+/// The flags are set, because a weight of 1.0 that is *in use* is not the same statement as "this
+/// slice does not weight prediction", and this is the case where the slice does weight: every pair
+/// just happens to want 1.0. Luma and chroma alike, because the implicit weights apply to both and
+/// with the same denominator.
+fn h264_default_weights() -> VaSliceParameterBufferH264 {
+    VaSliceParameterBufferH264 {
+        luma_log2_weight_denom: 5,
+        chroma_log2_weight_denom: 5,
+        luma_weight_l0_flag: 1,
+        chroma_weight_l0_flag: 1,
+        luma_weight_l1_flag: 1,
+        chroma_weight_l1_flag: 1,
+        luma_weight_l0: [32; 32],
+        luma_weight_l1: [32; 32],
+        chroma_weight_l0: [[32; 2]; 32],
+        chroma_weight_l1: [[32; 2]; 32],
+        ..Default::default()
+    }
+}
+
+/// Every (`ref0`, `ref1`) pair this slice could use is computed; the default table goes in the record
+/// when they are all 1.0, and the slice is declined when one is not. See [`h264_weights`] for why the
+/// record cannot express the alternative.
+///
+/// A reference index the decoded picture buffer does not hold is an error rather than a skipped pair:
+/// the pair's weight cannot be derived without knowing the reference's POC, and a pair left out of the
+/// check is a pair the driver would weight wrongly.
+fn h264_implicit_weights(cur_poc: i32, dpb: &[DpbEntry], lists: &[Vec<usize>; 2]) -> Result<VaSliceParameterBufferH264, String> {
+    let entry = |at: usize, list: usize| -> Result<&DpbEntry, String> {
+        dpb.get(at).ok_or_else(|| format!("reference {at} of list {list} is not in the decoded picture buffer"))
+    };
+    for &r0 in &lists[0] {
+        for &r1 in &lists[1] {
+            let pair = h264_implicit_pair(cur_poc, entry(r0, 0)?, entry(r1, 1)?);
+            if pair != (32, 32) {
+                return Err(format!(
+                    "this H.264 stream weights its B slices with H.264 implicit weights (weighted_bipred_idc 2): the pair of references ({}, {}) wants {:?}, not 1.0, \
+                     and a VASliceParameterBufferH264 carries one weight per reference index rather than per pair",
+                    r0, r1, pair
+                ));
+            }
+        }
+    }
+    Ok(h264_default_weights())
 }
 
 /// H.264 `slice_type` as the record numbers it: the slice header's own `slice_type` modulo five.
@@ -2543,6 +2599,12 @@ mod tests {
 
     /// The fixture's own H.264 description, parameter sets as [`build_nal`] parses them, and its
     /// samples in decoding order — everything a test about the records needs, from one fixture read.
+    ///
+    /// Encoded with `weightb=0`, so every picture of it has records: x264's default `weightb=1` puts
+    /// the B slices in the mode whose weights a slice record cannot express, and they would be refused
+    /// from the second B picture on — see [`h264_implicit_bipred`] for the fixture that does exercise
+    /// that path, and [`an_implicitly_weighted_b_slice_is_refused_rather_than_guessed`] for what it
+    /// asserts.
     fn h264() -> Option<(NalStreamInfo, super::H264Sets, Vec<Vec<u8>>)> {
         let (info, samples) = h264_stream()?;
         let info = info.unwrap_or_else(|e| panic!("{e}"));
@@ -2710,16 +2772,20 @@ mod tests {
         assert!(explicit >= 15, "and at least {explicit} of their entries set a weight flag rather than taking the default");
     }
 
-    /// The one thing this backend cannot do with H.264 explicit weighted bipred is discovered at
-    /// runtime: the slice record carries no weights, and the decoder says so in the log once rather
-    /// than once per slice. Both halves are checked — which slices the warning is for (the fixture's
-    /// B slices, not the P slices that do carry a table), and that it fires exactly once per decoder
-    /// across the fixture's whole B run.
+    /// An H.264 `weighted_bipred_idc == 2` B slice is refused when the stream really does weight it,
+    /// and described with an explicit 1.0 table when it does not — which is the whole of the rule, and
+    /// it is checked here on the fixture's own parsed headers and its own reference lists.
+    ///
+    /// Both halves need the fixture, so this is one test: x264's default `weightb=1` over `testsrc2`
+    /// *does* exercise implicit weighting (a B pair wants `(48, 16)`), and the same fixture with
+    /// `weightb=0` codes no table at all and so never reaches the check. The "all pairs are 1.0"
+    /// branch is therefore covered by construction, on synthetic entries below, rather than by a
+    /// second fixture this test suite does not have.
     #[test]
-    fn explicit_bipred_says_once_per_decoder_which_pictures_it_cannot_weight() {
-        let Some((info, sets, samples)) = h264() else { return };
+    fn an_implicitly_weighted_b_slice_is_refused_rather_than_guessed() {
+        let Some((info, sets, samples)) = h264_implicit_bipred() else { return };
         let pps = sets.ppss.iter().flatten().next().unwrap_or_else(|| panic!("no PPS")).clone();
-        assert_eq!(pps.weighted_bipred_idc, 2, "the fixture is in explicit mode, which is what this is about");
+        assert_eq!(pps.weighted_bipred_idc, 2, "the fixture is in the mode whose B slices this record cannot express");
         let header_of = |sample: &[u8]| -> filmcraft_h264::slice::SliceHeader {
             let nal = info.nals(sample).first().copied().expect("a NAL unit");
             let hdr = filmcraft_h264::slice::NalHeader::parse(nal[0]).unwrap_or_else(|e| panic!("{e}"));
@@ -2734,24 +2800,58 @@ mod tests {
         };
         let headers: Vec<_> = samples.iter().map(|s| header_of(s)).collect();
         let b = headers.iter().filter(|sh| sh.slice_type.is_b()).count();
-        assert!(b > 10, "the fixture has a B run to be quiet about ({b} B pictures)");
+        assert!(b > 10, "the fixture has a B run to check ({b} B pictures)");
         assert!(
-            headers.iter().filter(|sh| sh.slice_type.is_b()).all(|sh| super::explicit_bipred_without_weights(sh, &pps)),
-            "every B slice of an explicit-mode stream is one this backend cannot weight"
+            headers.iter().filter(|sh| sh.slice_type.is_b()).all(|sh| sh.pred_weight_table.is_none()),
+            "every B slice of this fixture reaches the implicit check, because filmcraft_h264 codes no table in explicit mode"
         );
-        assert!(
-            headers.iter().filter(|sh| sh.slice_type.is_p()).all(|sh| !super::explicit_bipred_without_weights(sh, &pps)),
-            "and a P slice is not: it carries a table, so it is described exactly"
-        );
-        // the warning itself: once for the whole run, not once per B picture
+
+        // A real run of the fixture, through the decoder: the first refusal names the implicit weights. The
+        // pictures after it are refused for other reasons — the picture buffer never got the refused
+        // picture, so their references are missing — and that is a consequence, not the subject, so
+        // only the first reason is checked.
         let mut poc = super::NalPoc::default();
-        assert!(poc.warn_explicit_bipred_once(), "the first call is the one that logs");
-        for _ in 0..b {
-            assert!(!poc.warn_explicit_bipred_once(), "and no later call is");
+        let mut first_error = None;
+        for sample in &samples {
+            match super::build_nal(&info, sample, &mut poc, 0, 40, 23) {
+                Ok(_) => {}
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
         }
-        // a decoder's warning survives a seek, which is the same stream and the same limitation
-        poc.reset();
-        assert!(!poc.warn_explicit_bipred_once(), "a reset forgets the pictures, not the limitation");
+        let why = first_error
+            .unwrap_or_else(|| panic!("no picture of the fixture was refused, so the implicit weights were never exercised and this rule is untested"));
+        assert!(why.contains("implicit"), "the first refusal must name the implicit weights, not the driver: {why}");
+        assert!(why.contains("per reference index"), "the first refusal must say why the record cannot carry them: {why}");
+
+        // The all-default case, on entries whose POC distances make every pair 1.0, and the refusal on ones
+        // that do not. Both are the distances the fixture's own second B picture has, so the numbers
+        // here are the numbers above rather than invented ones: `cur_poc` 2 with references at 0 and 4
+        // is tb = 2, td = 4, which wants 1.0; the same with the second reference at 8 is td = 8, which
+        // wants (48, 16).
+        let entry = |poc: i32| super::DpbEntry { surface: 0, frame_num: 0, poc, mark: super::Mark::Short };
+        let dpb = vec![entry(0), entry(4)];
+        let lists = [vec![0], vec![1]];
+        assert_eq!(super::h264_implicit_pair(2, &dpb[0], &dpb[1]), (32, 32), "tb 2 and td 4 give 1.0");
+        let record = super::h264_implicit_weights(2, &dpb, &lists).unwrap_or_else(|e| panic!("all-default pairs must not be refused: {e}"));
+        assert_eq!(record.luma_log2_weight_denom, 5, "the denominator 1.0 is written against");
+        assert_eq!(record.luma_weight_l0_flag, 1, "the weight is in use, not absent");
+        assert_eq!(record.luma_weight_l0[0], 32, "32 on a denominator of 2^5 is 1.0");
+        assert_eq!(record.luma_weight_l1[0], 32);
+        assert_eq!(record.luma_offset_l0[0], 0, "and no offset");
+        assert_eq!(record.chroma_weight_l0[0], [32; 2], "chroma is weighted the same way, both components");
+        // A pair that wants anything else is refused, and the message carries the pair and the weight.
+        let dpb = vec![entry(0), entry(8)];
+        let e = super::h264_implicit_weights(2, &dpb, &lists).unwrap_err();
+        assert!(e.contains("implicit"), "{e}");
+        assert!(e.contains("per reference index"), "{e}");
+        assert!(e.contains("(48, 16)"), "{e}");
+        // …and a reference the buffer does not hold is an error rather than a pair left unchecked.
+        let e = super::h264_implicit_weights(2, &dpb[..1], &lists).unwrap_err();
+        assert!(e.contains("not in the decoded picture buffer"), "{e}");
     }
 
     /// A slice segment that does not belong to the picture the record was filled in from is an
@@ -2795,7 +2895,7 @@ mod tests {
     /// weight from. A `fade=t=in` source over `weightp=1:weightb=1` is what produces real weights —
     /// luma 9 to 93, chroma 43 to 120, non-zero offsets, and a `luma_log2_denom` that differs from
     /// slice to slice. `bframes=0` keeps this fixture to P slices, so it does not also feed the
-    /// explicit-weighted-bipred path that `h264()` covers.
+    /// weighted-bipred path, which is [`h264_implicit_bipred`]'s.
     fn h264_weighted() -> Option<(NalStreamInfo, super::H264Sets, Vec<Vec<u8>>)> {
         let ff = filmcraft_testkit::require_ffmpeg!(None);
         let path = filmcraft_testkit::fixtures::generate(&fixture("h264_weighted.mp4"), |tmp| {
@@ -3259,14 +3359,51 @@ mod tests {
                 "high",
                 "-preset",
                 "fast",
+                // `weightb=0` because this fixture has to be one this backend can describe end to
+                // end: with x264's default `weightb=1` the B slices are implicitly weighted, which the
+                // slice record cannot express, so every picture after the second B one is refused —
+                // and these tests are about the records of every picture, not about that refusal
+                // (`an_implicitly_weighted_b_slice_is_refused_rather_than_guessed` is, on its own
+                // fixture, which leaves `weightb` at its default).
                 "-x264-params",
-                "bframes=3:b-pyramid=normal:keyint=24:min-keyint=24:scenecut=0:slices=2",
+                "bframes=3:b-pyramid=normal:keyint=24:min-keyint=24:scenecut=0:slices=2:weightb=0",
                 "-pix_fmt",
                 "yuv420p",
             ];
             run(&ff, &args, tmp)
         })?;
         Some(read(&path))
+    }
+
+    /// An H.264 stream whose picture parameter set says `weighted_bipred_idc == 2` and whose B slices
+    /// really do exercise H.264 implicit weighting — x264's default `weightb=1` over High profile with
+    /// B frames, which is the case the slice record cannot express. The counterpart of [`h264`]'s
+    /// `weightb=0`, and what the refusal is tested on.
+    fn h264_implicit_bipred() -> Option<(NalStreamInfo, super::H264Sets, Vec<Vec<u8>>)> {
+        let ff = filmcraft_testkit::require_ffmpeg!(None);
+        let path = filmcraft_testkit::fixtures::generate(&fixture("h264_implicit_bipred.mp4"), |tmp| {
+            let args = [
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=640x360:r=24:d=1",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-preset",
+                "fast",
+                "-x264-params",
+                "bframes=3:b-pyramid=normal:keyint=24:min-keyint=24:scenecut=0",
+                "-pix_fmt",
+                "yuv420p",
+            ];
+            run(&ff, &args, tmp)
+        })?;
+        let (info, samples) = read(&path);
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let sets = super::H264Sets::parse(&info).unwrap_or_else(|e| panic!("{e}"));
+        Some((info, sets, samples))
     }
 
     /// The HEVC slice record's prediction weight tables come from the slice segment header's own

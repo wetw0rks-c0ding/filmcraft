@@ -75,6 +75,20 @@ pub struct VaDecoder {
     /// [`VideoDecoder::flush`] drained the driver, which then behaves as at the end of a stream: it
     /// only restarts at an IDR picture, and the references of the run are gone.
     drained: bool,
+    /// Why this decoder has given up on the run, once a picture could not be produced.
+    ///
+    /// A picture that could not be built or rendered is a gap in the picture buffer, and the pictures
+    /// after it are decoded against references that are not the stream's: the driver is handed a
+    /// surface holding something else and reads it as a reference, which is a plausible-looking wrong
+    /// picture rather than a failure. So the refusal is **latched**: the decoder keeps returning this
+    /// reason until [`VideoDecoder::reset`], which is what a seek does. A caller that wanted the rest
+    /// of the run in hardware has to seek somewhere the run can start again; a caller that does not —
+    /// `HybridDecoder`, which drops this decoder and replays in software — never gets here twice.
+    ///
+    /// Set from the start, and cleared by `reset` only: a `flush` does not repair the reason, which is
+    /// a property of the stream rather than of the run, so the next run at a restart point is refused
+    /// again — with the same reason, which is what a reader of the log wants to see.
+    refused: Option<String>,
     /// Test hook: fail every decode once this many samples were fed.
     fail_after: Option<u64>,
     fed: u64,
@@ -144,6 +158,7 @@ impl VaDecoder {
             first: true,
             need_headers: true,
             drained: false,
+            refused: None,
             fail_after: None,
             fed: 0,
             name,
@@ -279,6 +294,10 @@ impl VideoDecoder for VaDecoder {
         if self.fail_after.is_some_and(|n| self.fed > n) {
             return Err(CodecError::Decode("VA-API decode failed (test hook)".into()));
         }
+        // A run this decoder has already given up on stays given up on: see `refused`.
+        if let Some(why) = self.refused.clone() {
+            return Err(CodecError::Decode(format!("the hardware decoder gave up on this run: {why}")));
+        }
         if self.drained {
             // A drained decoder cannot go on from the middle of a GOP (software decoders can). The
             // GOP cache seeks (`reset`) after every flush, so this is an error only for callers that
@@ -351,6 +370,10 @@ impl VideoDecoder for VaDecoder {
             // Leaving it would make every later decode report a decoder full of pictures back.
             Err(e) => {
                 self.in_flight.pop();
+                // Every picture after this one would be decoded against a picture buffer that is
+                // missing this picture, so the run is over here rather than silently wrong later.
+                log::warn!("{} gave up on this run: {e}", self.name);
+                self.refused = Some(e.clone());
                 return Err(CodecError::Decode(e));
             }
         };
@@ -386,6 +409,10 @@ impl VideoDecoder for VaDecoder {
         self.need_headers = true;
         self.first = true;
         self.drained = false;
+        // A seek is the one thing that starts a run over: the picture buffer is empty and the next
+        // picture is decoded from scratch, so whatever ended the last run is no longer true of this
+        // one. A `flush` does not clear it — see `refused`.
+        self.refused = None;
     }
 
     fn name(&self) -> &str {
