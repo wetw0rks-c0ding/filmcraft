@@ -25,7 +25,7 @@
 //! actually installed ([`Display::probe_image_layout`]) — libva has no `sizeof` / `offsetof` of its
 //! own to ask, so a behavioural check is the only way to hold the declaration to the driver.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 
 use super::drm;
 use std::mem::size_of;
@@ -72,14 +72,17 @@ pub struct VaConfigAttrib {
 }
 
 /// `VASurfaceAttrib` (`va.h:1742`): one surface attribute — a type, the flags saying whether it can
-/// be read or written, and a value whose meaning the type decides. 16 bytes, laid out as the union
-/// `VAGenericValue` the header ends the struct with.
+/// be read or written, and a value whose meaning the type decides. **24 bytes** — 4 for the type,
+/// 4 for the flags, then a `VAGenericValue` that is 16.
 ///
 /// This backend passes none, either: `vaCreateSurfaces` takes a null list with a zero count, and the
 /// driver allocates surfaces in the default (`VA_SURFACE_ATTRIB_MEM_TYPE_VA`) memory type, which is
 /// the only type a mapped readback path can rely on. It is declared because
 /// `vaCreateSurfaces` takes the array's type, so a caller that passes nothing still has to hand the
-/// library a pointer to *something*.
+/// library a pointer to *something*. **The size still has to be the header's**, because the array's
+/// stride is what a driver walks when a caller does pass one: a record declared 8 bytes short is
+/// the same class of bug as a function declared with the wrong arity, and it produces a plausible
+/// wrong answer rather than a failure.
 #[repr(C)]
 #[derive(Default)]
 pub struct VaSurfaceAttrib {
@@ -88,18 +91,42 @@ pub struct VaSurfaceAttrib {
     value: VaGenericValue,
 }
 
-/// `VAGenericValue` (`va.h:245`): the eight-byte value a `VASurfaceAttrib` carries, as the union
-/// the header declares it (a 64-bit integer, or a pointer of the same width). Only its size is ever
-/// used here, and only as the tail of a `VASurfaceAttrib` a null list points past.
+/// `VAGenericValue` (`va.h:1662`): what a `VASurfaceAttrib` carries. **16 bytes, and a struct, not a
+/// union** — a `VAGenericValueType` discriminator followed by the value it describes:
+///
+/// ```c
+/// typedef struct _VAGenericValue {
+///     VAGenericValueType  type;
+///     union { int32_t i; float f; void *p; VAGenericFunc fn; } value;
+/// } VAGenericValue;
+/// ```
+///
+/// It was declared here as the bare eight-byte union the header's *inner* member is, which made
+/// every `VASurfaceAttrib` 8 bytes instead of 24. Nothing noticed, because the only array this
+/// backend ever passes is a null pointer — see the note on [`VaSurfaceAttrib`].
 #[repr(C)]
-union VaGenericValue {
-    integer: u64,
-    pointer: *mut c_void,
+pub struct VaGenericValue {
+    /// `VAGenericValueType` (`va.h:1648-1656`): `VAGenericValueTypeInteger`, `…Float`,
+    /// `…Pointer` or `…Func`.
+    pub type_: VAStatus,
+    pub value: VaGenericValueValue,
+}
+
+/// The union `VAGenericValue::value` holds (`va.h:1666-1675`): a 32-bit integer, a `float`, a
+/// pointer, or a function pointer. All four are 8 bytes wide on every platform this backend builds
+/// for, which is what makes the enclosing struct 16 rather than 12.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union VaGenericValueValue {
+    pub integer: i32,
+    pub float: f32,
+    pub pointer: *mut c_void,
+    pub function: Option<unsafe extern "C" fn()>,
 }
 
 impl Default for VaGenericValue {
     fn default() -> Self {
-        Self { integer: 0 }
+        Self { type_: 0, value: VaGenericValueValue { integer: 0 } }
     }
 }
 
@@ -874,6 +901,16 @@ pub struct VaCodedBufferSegment {
 ///
 /// `va.h:4086` requires the struct to be zeroed on input — `VaBufferInfo::ZEROED` is that value —
 /// because `mem_type` doubles as a hint on the way in.
+///
+/// **This one is 40 bytes, and every byte of it matters.** The four fields above are 24; the header's
+/// `va_reserved[VA_PADDING_LOW]` is the other 16 (`va.h:4048-4049`). It was declared as 24 here, and
+/// that is a live bug rather than a latent one: this is the one structure in the module that is
+/// handed to libva **by pointer to a stack local**, and libva was compiled against the 40-byte one.
+/// Measured on this stack, `vaAcquireBufferHandle` left every byte of 24..40 exactly as it found it,
+/// so the truncation costs nothing *here* — but "the driver happens not to touch the tail" is not a
+/// property the declaration may rely on, and a driver that clears its own reserved tail would be
+/// writing 16 bytes past the end of our frame. The rule the whole file follows is "matches the
+/// header", and a short struct is the size-only version of a wrong-arity call.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VaBufferInfo {
@@ -883,15 +920,20 @@ pub struct VaBufferInfo {
     /// "Buffer type (See VABufferType)." Out-parameter; unused, the buffer's type is known.
     pub buffer_type: u32,
     /// "Buffer memory type (See VASurfaceAttribMemoryType)." A hint on input, the type actually used
-    /// on output. `0x20000000` is the DRM one (`va.h:1752` reserves bits 31:28 for Linux DRM).
+    /// on output. `0x20000000` is `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME` (`va_drmcommon.h:84`; note
+    /// there is no `VA_SURFACE_ATTRIB_MEM_TYPE_DRM` in any header — `va.h:1752` only reserves bits
+    /// 31:28 for Linux DRM).
     pub mem_type: u32,
     /// "Size of the underlying buffer" (`va.h:4046`).
     pub mem_size: usize,
+    /// "Reserved bytes for future use, must be zero" (`va.h:4048-4049`). Declared so this record is
+    /// the size `vaAcquireBufferHandle` was compiled with; see the note above.
+    pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
 impl VaBufferInfo {
     /// The all-zero struct `va.h:4086` requires on input to `vaAcquireBufferHandle`.
-    pub const ZEROED: Self = Self { handle: 0, buffer_type: 0, mem_type: 0, mem_size: 0 };
+    pub const ZEROED: Self = Self { handle: 0, buffer_type: 0, mem_type: 0, mem_size: 0, va_reserved: [0; VA_PADDING_LOW] };
 }
 
 /// `VAEncSequenceParameterBufferH264` (`va_enc_h264.h:148`): what to encode — the sequence
@@ -1559,40 +1601,141 @@ fn resolve(va: *mut c_void, va_drm: *mut c_void, libraries: Arc<Libraries>) -> R
     }
 }
 
-type InitializeFn = unsafe extern "C" fn(VADisplay, *mut c_int, *mut c_int) -> VAStatus;
-type TerminateFn = unsafe extern "C" fn(VADisplay) -> VAStatus;
-type GetDisplayDrmFn = unsafe extern "C" fn(c_int) -> VADisplay;
-type QueryVendorStringFn = unsafe extern "C" fn(VADisplay) -> *const c_char;
-type MaxProfilesFn = unsafe extern "C" fn(VADisplay) -> VAStatus;
-type MaxEntrypointsFn = unsafe extern "C" fn(VADisplay) -> VAStatus;
-type QueryProfilesFn = unsafe extern "C" fn(VADisplay, *mut VAProfile, *mut c_int) -> VAStatus;
-type QueryEntrypointsFn = unsafe extern "C" fn(VADisplay, VAProfile, *mut VAEntrypoint, *mut c_int) -> VAStatus;
-type ErrorStrFn = unsafe extern "C" fn(VAStatus) -> *const c_char;
-type GetConfigAttributesFn = unsafe extern "C" fn(VADisplay, VAProfile, VAEntrypoint, *mut VaConfigAttrib, c_int) -> VAStatus;
-type CreateImageFn = unsafe extern "C" fn(VADisplay, *mut VaImageFormat, c_int, c_int, *mut VaImage) -> VAStatus;
-type DestroyImageFn = unsafe extern "C" fn(VADisplay, VAImageID) -> VAStatus;
-type PutImageFn = unsafe extern "C" fn(VADisplay, VASurfaceID, VAImageID, c_int, c_int, c_uint, c_uint, c_int, c_int, c_uint, c_uint) -> VAStatus;
-type CreateConfigFn = unsafe extern "C" fn(VADisplay, VAProfile, VAEntrypoint, *mut VaConfigAttrib, c_int, *mut VAConfigID) -> VAStatus;
-type DestroyConfigFn = unsafe extern "C" fn(VADisplay, VAConfigID) -> VAStatus;
-type CreateSurfacesFn = unsafe extern "C" fn(VADisplay, c_uint, c_uint, c_uint, *mut VASurfaceID, c_uint, *mut VaSurfaceAttrib, c_uint) -> VAStatus;
-type DestroySurfacesFn = unsafe extern "C" fn(VADisplay, *mut VASurfaceID, c_int) -> VAStatus;
-type CreateContextFn = unsafe extern "C" fn(VADisplay, VAConfigID, c_int, c_int, c_int, *mut VASurfaceID, c_int, *mut VAContextID) -> VAStatus;
-type DestroyContextFn = unsafe extern "C" fn(VADisplay, VAContextID) -> VAStatus;
-type CreateBufferFn = unsafe extern "C" fn(VADisplay, VAContextID, VAStatus, c_uint, c_uint, *mut c_void, *mut VABufferID) -> VAStatus;
-type DestroyBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
-/// `va.h:4104`: fills in a [`VaBufferInfo`] naming the buffer's underlying storage.
-type AcquireBufferHandleFn = unsafe extern "C" fn(VADisplay, VABufferID, *mut VaBufferInfo) -> VAStatus;
-/// `va.h:4117`: releases what [`AcquireBufferHandleFn`] locked.
-type ReleaseBufferHandleFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
-type DeriveImageFn = unsafe extern "C" fn(VADisplay, VASurfaceID, *mut VaImage) -> VAStatus;
-type BeginPictureFn = unsafe extern "C" fn(VADisplay, VAContextID, VASurfaceID) -> VAStatus;
-type RenderPictureFn = unsafe extern "C" fn(VADisplay, VAContextID, *mut VABufferID, c_int) -> VAStatus;
-type EndPictureFn = unsafe extern "C" fn(VADisplay, VAContextID) -> VAStatus;
-type SyncSurfaceFn = unsafe extern "C" fn(VADisplay, VASurfaceID) -> VAStatus;
-type QuerySurfaceStatusFn = unsafe extern "C" fn(VADisplay, VASurfaceID, *mut c_uint) -> VAStatus;
-type SyncBufferFn = unsafe extern "C" fn(VADisplay, VABufferID, c_ulong) -> VAStatus;
-type MapBufferFn = unsafe extern "C" fn(VADisplay, VABufferID, *mut *mut c_void) -> VAStatus;
-type UnmapBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
+/// What one libva entry point is declared as, and where that declaration came from.
+///
+/// The four fields are the guard against the bug this module had: a hand-written
+/// `unsafe extern "C" fn` whose arity does not match libva's is undefined behaviour that compiles,
+/// links, and — in an optimised build — returns plausible pictures. Nothing in the language can
+/// catch it, because the *declaration* is the thing that is wrong, so the declaration has to be
+/// written down somewhere an independent source can check: that is what `prototype` is.
+#[cfg_attr(not(test), allow(dead_code))]
+struct EntryPoint {
+    /// The symbol `dlsym` is asked for.
+    symbol: &'static str,
+    /// `va.h:2470` and so on — the header and line the declaration was read from, so a failure names
+    /// the place to go and look.
+    header: &'static str,
+    /// The declaration as the header spells it, normalised to `return(type, type, …)` with the
+    /// parameter names dropped: `"VAStatus(VADisplay, VABufferID, uint64_t)"`.
+    prototype: &'static str,
+    /// How many parameters the declaration above has, **counted from the parameter list the function
+    /// pointer type was built out of** — not written out, so it cannot disagree with the type.
+    arity: usize,
+}
+
+/// Declares every libva entry point this backend resolves, once.
+///
+/// Each line produces the `unsafe extern "C" fn` pointer type the call sites use *and* an
+/// [`EntryPoint`] whose `arity` is derived from the very parameter list that type was built from, so
+/// the two cannot drift apart. `every_entry_point_matches_the_header` then re-reads the installed
+/// headers and fails on any entry point whose `prototype` is not what the header now declares —
+/// which is what would have caught `vaSyncBuffer` being declared with two parameters when libva's
+/// third (`uint64_t timeout_ns`) was never written.
+///
+/// The C prototype is written out by hand next to the Rust type; the two are checked against the
+/// *same* header, so neither can rot quietly, but the mapping from a Rust type to its C spelling is
+/// a reviewer's job, not the compiler's.
+macro_rules! va_entry_points {
+    ($(
+        $(#[$meta:meta])*
+        $name:ident => $symbol:literal, $header:literal, $prototype:literal,
+        fn($($arg:ty),* $(,)?) -> $ret:ty;
+    )*) => {
+        $(
+            $(#[$meta])*
+            type $name = unsafe extern "C" fn($($arg),*) -> $ret;
+        )*
+        #[cfg_attr(not(test), allow(dead_code))]
+const ENTRY_POINTS: &[EntryPoint] = &[$(
+            EntryPoint {
+                symbol: $symbol,
+                header: $header,
+                prototype: $prototype,
+                arity: [$(stringify!($arg)),*].len(),
+            },
+        )*];
+    };
+}
+
+va_entry_points! {
+    InitializeFn => "vaInitialize", "va.h:181", "VAStatus(VADisplay, int *, int *)",
+        fn(VADisplay, *mut c_int, *mut c_int) -> VAStatus;
+    TerminateFn => "vaTerminate", "va.h:186", "VAStatus(VADisplay)",
+        fn(VADisplay) -> VAStatus;
+    /// `va_drm.h:52`: turns a DRM file descriptor into a display. The one symbol that is **not** in
+    /// `libva.so.2` — it is in `libva-drm.so.2`, which is why the loader opens two libraries.
+    GetDisplayDrmFn => "vaGetDisplayDRM", "va_drm.h:52", "VADisplay(int)",
+        fn(c_int) -> VADisplay;
+    QueryVendorStringFn => "vaQueryVendorString", "va.h:191", "const char *(VADisplay)",
+        fn(VADisplay) -> *const c_char;
+    /// `va.h:1524`: "Get maximum number of profiles supported by the implementation". It returns an
+    /// **`int`**, not a `VAStatus` — the two are the same width, so the ABI is the same either way,
+    /// but the declaration here says what the header says, and a count read as a status is the kind
+    /// of thing that reads as a bug in the wrong place.
+    MaxProfilesFn => "vaMaxNumProfiles", "va.h:1524", "int(VADisplay)",
+        fn(VADisplay) -> c_int;
+    MaxEntrypointsFn => "vaMaxNumEntrypoints", "va.h:1529", "int(VADisplay)",
+        fn(VADisplay) -> c_int;
+    QueryProfilesFn => "vaQueryConfigProfiles", "va.h:1538", "VAStatus(VADisplay, VAProfile *, int *)",
+        fn(VADisplay, *mut VAProfile, *mut c_int) -> VAStatus;
+    QueryEntrypointsFn => "vaQueryConfigEntrypoints", "va.h:1546", "VAStatus(VADisplay, VAProfile, VAEntrypoint *, int *)",
+        fn(VADisplay, VAProfile, *mut VAEntrypoint, *mut c_int) -> VAStatus;
+    ErrorStrFn => "vaErrorStr", "va.h:403", "const char *(VAStatus)",
+        fn(VAStatus) -> *const c_char;
+    GetConfigAttributesFn => "vaGetConfigAttributes", "va.h:1571", "VAStatus(VADisplay, VAProfile, VAEntrypoint, VAConfigAttrib *, int)",
+        fn(VADisplay, VAProfile, VAEntrypoint, *mut VaConfigAttrib, c_int) -> VAStatus;
+    CreateImageFn => "vaCreateImage", "va.h:2670", "VAStatus(VADisplay, VAImageFormat *, int, int, VAImage *)",
+        fn(VADisplay, *mut VaImageFormat, c_int, c_int, *mut VaImage) -> VAStatus;
+    DestroyImageFn => "vaDestroyImage", "va.h:2676", "VAStatus(VADisplay, VAImageID)",
+        fn(VADisplay, VAImageID) -> VAStatus;
+    PutImageFn => "vaPutImage", "va.h:2709", "VAStatus(VADisplay, VASurfaceID, VAImageID, int, int, unsigned int, unsigned int, int, int, unsigned int, unsigned int)",
+        fn(VADisplay, VASurfaceID, VAImageID, c_int, c_int, c_uint, c_uint, c_int, c_int, c_uint, c_uint) -> VAStatus;
+    CreateConfigFn => "vaCreateConfig", "va.h:1589", "VAStatus(VADisplay, VAProfile, VAEntrypoint, VAConfigAttrib *, int, VAConfigID *)",
+        fn(VADisplay, VAProfile, VAEntrypoint, *mut VaConfigAttrib, c_int, *mut VAConfigID) -> VAStatus;
+    DestroyConfigFn => "vaDestroyConfig", "va.h:1601", "VAStatus(VADisplay, VAConfigID)",
+        fn(VADisplay, VAConfigID) -> VAStatus;
+    CreateSurfacesFn => "vaCreateSurfaces", "va.h:972", "VAStatus(VADisplay, unsigned int, unsigned int, unsigned int, VASurfaceID *, unsigned int, VASurfaceAttrib *, unsigned int)",
+        fn(VADisplay, c_uint, c_uint, c_uint, *mut VASurfaceID, c_uint, *mut VaSurfaceAttrib, c_uint) -> VAStatus;
+    DestroySurfacesFn => "vaDestroySurfaces", "va.h:1914", "VAStatus(VADisplay, VASurfaceID *, int)",
+        fn(VADisplay, *mut VASurfaceID, c_int) -> VAStatus;
+    CreateContextFn => "vaCreateContext", "va.h:1933", "VAStatus(VADisplay, VAConfigID, int, int, int, VASurfaceID *, int, VAContextID *)",
+        fn(VADisplay, VAConfigID, c_int, c_int, c_int, *mut VASurfaceID, c_int, *mut VAContextID) -> VAStatus;
+    DestroyContextFn => "vaDestroyContext", "va.h:1949", "VAStatus(VADisplay, VAContextID)",
+        fn(VADisplay, VAContextID) -> VAStatus;
+    CreateBufferFn => "vaCreateBuffer", "va.h:2240", "VAStatus(VADisplay, VAContextID, VABufferType, unsigned int, unsigned int, void *, VABufferID *)",
+        fn(VADisplay, VAContextID, VaBufferType, c_uint, c_uint, *mut c_void, *mut VABufferID) -> VAStatus;
+    DestroyBufferFn => "vaDestroyBuffer", "va.h:4023", "VAStatus(VADisplay, VABufferID)",
+        fn(VADisplay, VABufferID) -> VAStatus;
+    /// `va.h:2353`: fills in a [`VaBufferInfo`] naming the buffer's underlying storage.
+    AcquireBufferHandleFn => "vaAcquireBufferHandle", "va.h:2353", "VAStatus(VADisplay, VABufferID, VABufferInfo *)",
+        fn(VADisplay, VABufferID, *mut VaBufferInfo) -> VAStatus;
+    /// `va.h:2357`: releases what [`AcquireBufferHandleFn`] locked.
+    ReleaseBufferHandleFn => "vaReleaseBufferHandle", "va.h:2357", "VAStatus(VADisplay, VABufferID)",
+        fn(VADisplay, VABufferID) -> VAStatus;
+    DeriveImageFn => "vaDeriveImage", "va.h:4893", "VAStatus(VADisplay, VASurfaceID, VAImage *)",
+        fn(VADisplay, VASurfaceID, *mut VaImage) -> VAStatus;
+    BeginPictureFn => "vaBeginPicture", "va.h:4210", "VAStatus(VADisplay, VAContextID, VASurfaceID)",
+        fn(VADisplay, VAContextID, VASurfaceID) -> VAStatus;
+    RenderPictureFn => "vaRenderPicture", "va.h:4219", "VAStatus(VADisplay, VAContextID, VABufferID *, int)",
+        fn(VADisplay, VAContextID, *mut VABufferID, c_int) -> VAStatus;
+    EndPictureFn => "vaEndPicture", "va.h:4234", "VAStatus(VADisplay, VAContextID)",
+        fn(VADisplay, VAContextID) -> VAStatus;
+    SyncSurfaceFn => "vaSyncSurface", "va.h:4276", "VAStatus(VADisplay, VASurfaceID)",
+        fn(VADisplay, VASurfaceID) -> VAStatus;
+    QuerySurfaceStatusFn => "vaQuerySurfaceStatus", "va.h:4322", "VAStatus(VADisplay, VASurfaceID, VASurfaceStatus *)",
+        fn(VADisplay, VASurfaceID, *mut c_uint) -> VAStatus;
+    /// `vaSyncBuffer`'s third parameter (`va.h:4391`) is `uint64_t timeout_ns`. It was declared here
+    /// as `c_ulong` and then **omitted from the call**, which is undefined behaviour: the driver
+    /// read an argument slot the call never wrote, the status came back `VA_STATUS_ERROR_TIMEDOUT`
+    /// in a debug build and success in a release one, and nothing else was wrong. `u64` rather than
+    /// `c_ulong` because `uint64_t` is `unsigned long long` on a 32-bit target and `c_ulong` is not.
+    SyncBufferFn => "vaSyncBuffer", "va.h:4389", "VAStatus(VADisplay, VABufferID, uint64_t)",
+        fn(VADisplay, VABufferID, u64) -> VAStatus;
+    MapBufferFn => "vaMapBuffer", "va.h:3976", "VAStatus(VADisplay, VABufferID, void **)",
+        fn(VADisplay, VABufferID, *mut *mut c_void) -> VAStatus;
+    UnmapBufferFn => "vaUnmapBuffer", "va.h:4009", "VAStatus(VADisplay, VABufferID)",
+        fn(VADisplay, VABufferID) -> VAStatus;
+}
 
 /// The exported symbol `name` of the open library `handle` as a function pointer of type `F`.
 ///
@@ -1893,7 +2036,11 @@ fn plane_geometry_is_consistent(image: &VaImage, width: usize, height: usize) ->
 /// How many entries to allocate for a driver query, from the `vaMaxNum*` answer: bounded, because
 /// a driver's answer sizes the array we hand it, and never zero, so there is always somewhere for
 /// the driver to write.
-fn capacity(reported: VAStatus) -> usize {
+///
+/// The parameter is a plain `int` because that is what `vaMaxNumProfiles` and `vaMaxNumEntrypoints`
+/// return (`va.h:1524`, `va.h:1529`) — a count, not a status. A negative one is treated as "cannot
+/// tell" rather than as an allocation of nothing.
+fn capacity(reported: c_int) -> usize {
     usize::try_from(reported).unwrap_or(MAX_DRIVER_ENTRIES).clamp(1, MAX_DRIVER_ENTRIES)
 }
 
@@ -2631,9 +2778,14 @@ impl Encoder {
         // (`va.h:4391`) is `uint64_t timeout_ns`, and omitting it leaves the driver reading
         // whatever happened to be in that argument slot: which is why this call reported
         // `VA_STATUS_ERROR_TIMEDOUT` in an unoptimised build and succeeded in an optimised one.
-        // Ten milliseconds per attempt is far longer than a 640x360 picture takes on this driver and
-        // keeps the bounded worst case at about two thirds of a second.
-        const SYNC_TIMEOUT_NS: c_ulong = 10_000_000;
+        // Ten milliseconds per attempt is far longer than a 640x360 picture takes on this driver.
+        //
+        // **The loop terminates.** `MAX_SYNC_ATTEMPTS` (`va.h:4381-4382` says a timed-out buffer is
+        // still synchronising and the call is to be made again) is the bound: at most 64 attempts
+        // of at most 10 ms each, so at worst this returns an error after about two thirds of a
+        // second. A driver that answers `HW_BUSY` or `TIMEDOUT` forever is a driver that is not
+        // going to answer at all, and an export must not hang on one.
+        const SYNC_TIMEOUT_NS: u64 = 10_000_000;
         for _ in 0..MAX_SYNC_ATTEMPTS {
             // SAFETY: `coded` is this session's own coded buffer and has not been destroyed, and
             // `SYNC_TIMEOUT_NS` is the `uint64_t` the third parameter is declared as.
@@ -3362,6 +3514,10 @@ fn destroy_unread_image(display: &Arc<Display>, image: &VaImage, derived: bool) 
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "abi_guard.rs"]
+mod abi_guard;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
@@ -3457,14 +3613,22 @@ mod tests {
     /// The layouts of the two attribute structures a decoder passes a null array of: libva takes
     /// `(attrib_list, num_attribs)` and the array's type is in the signature, so a caller that passes
     /// nothing still needs the struct to exist and be the right size.
+    ///
+    /// **`VASurfaceAttrib` is 24 bytes, not 16.** `VAGenericValue` (`va.h:1662`) is a *struct* — a
+    /// `VAGenericValueType` and then the union the header puts inside it — and it was declared here
+    /// as that inner union alone, which made every surface attribute record eight bytes short. Nothing
+    /// noticed because the only array this backend passes is a null pointer; an array's stride is
+    /// what a driver walks, so a caller that did pass one would have had every attribute after the
+    /// first read from the wrong place.
     #[test]
     fn the_attribute_records_match_the_header() {
         assert_eq!(size_of::<VaConfigAttrib>(), 8, "VAConfigAttrib (va.h:1072)");
         assert_eq!(offset_of!(VaConfigAttrib, value), 4);
-        assert_eq!(size_of::<VaSurfaceAttrib>(), 16, "VASurfaceAttrib (va.h:1742)");
+        assert_eq!(size_of::<VaSurfaceAttrib>(), 24, "VASurfaceAttrib (va.h:1742)");
         assert_eq!(offset_of!(VaSurfaceAttrib, flags), 4);
         assert_eq!(offset_of!(VaSurfaceAttrib, value), 8, "the VAGenericValue tail");
-        assert_eq!(size_of::<VaGenericValue>(), 8, "VAGenericValue (va.h:245)");
+        assert_eq!(size_of::<VaGenericValue>(), 16, "VAGenericValue (va.h:1662): a type word and a union");
+        assert_eq!(offset_of!(VaGenericValue, value), 8, "the union inside it");
     }
 
     /// A driver that will not decode into a derived image says so with

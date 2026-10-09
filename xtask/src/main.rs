@@ -444,6 +444,14 @@ fn ci() -> Result<(), String> {
     run(Command::new(cargo).args(["fmt", "--check"]))?;
     run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--release", "--", "-D", "warnings"]))?;
     run(Command::new(cargo).args(["test", "--workspace", "--release"]))?;
+    // The same tests again in the dev profile, for the one crate whose tests drive a real driver.
+    // The release run above is the fast one and the one everything else is tuned for, but a
+    // hand-written FFI layer is exactly where an optimised build hides what a debug build shows:
+    // `vaSyncBuffer` was declared with two parameters where libva has three, and the call that
+    // followed read an argument slot nobody wrote — correct pictures in release,
+    // `VA_STATUS_ERROR_TIMEDOUT` in debug. A gate that only ever runs one profile cannot see that
+    // class of bug at all.
+    run(Command::new(cargo).args(["test", "-p", "filmcraft-platform"]))?;
     layers()?;
     assets()?;
     wasm()

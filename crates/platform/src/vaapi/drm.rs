@@ -7,15 +7,24 @@
 //! through the driver's own `VACodedBufferSegment::buf` pointer, which nothing bounds.
 //!
 //! This module closes that gap from the other side. It is **libva that named the object**
-//! (`vaAcquireBufferHandle` reports its DRM handle and its size), and **DRM that maps it** — the
-//! descriptor FilmCraft already holds the display open on, asked to turn the handle into a
-//! descriptor of its own, which is then mapped here. Every byte this backend reads back comes out
-//! of a mapping this module created and sized itself, so no byte of the read depends on a pointer
-//! the driver chose, on another process's view of the address space, or on a length we had to
-//! discover.
+//! (`vaAcquireBufferHandle` reports its handle and its size), and **DRM that maps it** — either the
+//! descriptor libva itself handed back, or, on a stack that reports a bare handle, one this process
+//! asks for by `ioctl` on the descriptor FilmCraft already holds the display open on. Every byte
+//! this backend reads back comes out of a mapping this module created and sized itself, so no byte
+//! of the read depends on a pointer the driver chose, on another process's view of the address
+//! space, or on a length we had to discover.
 //!
 //! Nothing here links libva: it is plain DRM (one `ioctl`, `mmap`, `munmap`, `close`) plus the
 //! handle libva already reported.
+//!
+//! **Ownership is the subtle part, and it is why the two routes below are kept apart.** A dma-buf
+//! descriptor belongs to whoever opened it. `vaAcquireBufferHandle` opens one for a
+//! `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME` buffer and closes it again in `vaReleaseBufferHandle`
+//! (measured on this machine: the number is open before any ioctl of ours, it points at a
+//! `/dmabuf:` of the coded buffer's size, and it is closed by the release). A descriptor this
+//! process asked the kernel for in [`map`] is ours, and only that one may be closed here. Closing
+//! the other is a double close, and a double close takes whatever took the number in between — a
+//! log file, a socket, another dma-buf.
 
 use std::ffi::{c_int, c_void};
 
@@ -27,23 +36,41 @@ const PROT_READ: c_int = 1;
 /// `MAP_SHARED`: the mapping has to see the driver's writes, which is the whole point of it.
 const MAP_SHARED: c_int = 1;
 
-/// `DRM_IOCTL_PRIME_HANDLE_TO_FD` = `_IOWR('d', 0x2d, struct drm_prime_handle)`.
+/// `_IOWR('d', 0x2d, struct drm_prime_handle)`, the request number of
+/// `DRM_IOCTL_PRIME_HANDLE_TO_FD` (`drm.h:1168`).
 ///
 /// The encoding is the kernel's `_IOC` one, spelled out rather than written as the constant every
 /// DRM program copies around: `dir(2) | size(16) | type(8) | nr(8)`, with `dir = 3` for read/write.
-/// `struct drm_prime_handle` is two `__u32` and nothing else, so `size` is `size_of` below and the
-/// number cannot drift from the struct it describes.
+/// `size` is `size_of` of the struct below, so the number cannot drift from the struct it describes —
+/// and the struct is the header's, which is three words, not the two this module used to declare.
 const fn iowr(kind: u8, nr: u8, size: usize) -> std::ffi::c_ulong {
     (3 << 30) | ((size as u64) << 16) | ((kind as u64) << 8) | nr as u64
 }
 
-/// `struct drm_prime_handle`: the buffer handle in, the descriptor it exports to out.
+/// `struct drm_prime_handle`: the handle in, the export flags, and **the descriptor out**.
+///
+/// `/usr/include/drm/drm.h:926-934` declares three `__u32`-sized fields — `__u32 handle`,
+/// `__u32 flags`, `__s32 fd` — so the struct is **12 bytes** and the request number it gives is
+/// `_IOWR('d', 0x2d, 12)` = `0xc00c642d`. It was declared here with two of them, which made the
+/// struct eight bytes short and the request number `0xc008642d`.
+///
+/// That is the size-only version of the bug this audit is about, and it is not harmless. The kernel
+/// accepts either number (it dispatches on the request number, not on the encoded size — measured on
+/// this box, `_IOC_SIZE` of 4, 8, 12, 16 and 20 are all dispatched), but the descriptor it hands back
+/// goes into the **third** field, which an eight-byte struct does not have: the export succeeds, the
+/// kernel opens a descriptor, and that descriptor is never read and never closed. One per encoded
+/// picture, for the life of the process.
 #[repr(C)]
 struct DrmPrimeHandle {
+    /// `__u32 handle`: the GEM handle to export.
     handle: u32,
     /// The `open` flags to export with. Zero is `O_RDONLY`, which is all a mapping of coded output
     /// needs: the driver has already written it, and this process never writes into the buffer.
     flags: u32,
+    /// `__s32 fd`: "User-space sets `drm_prime_handle.handle` with the GEM handle to export and
+    /// `drm_prime_handle.flags`, and gets back a DMA-BUF file descriptor in `drm_prime_handle->fd`"
+    /// (`drm.h:1159-1161`). **Not** in `handle`.
+    fd: c_int,
 }
 
 const PRIME_HANDLE_TO_FD: std::ffi::c_ulong = iowr(b'd', 0x2d, size_of::<DrmPrimeHandle>());
@@ -104,23 +131,57 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
 }
 
-/// Whether `fd` names an open descriptor, asked of the kernel rather than inferred.
+/// Whether `fd` names an open descriptor of at least `mem_size` bytes.
 ///
-/// The ioctl reports failure by returning a negative `errno`, so a zero return already means the
-/// export worked — but the descriptor it leaves in `handle` is only worth `mmap`ing if it really is
-/// one. **It cannot be compared against the handle it replaced**: DRM hands the descriptor back in
-/// the same field, and on this machine both come out `4`. So it is asked about instead.
+/// Two questions, because "open" alone is not enough: a number can name *some* descriptor — the
+/// render node, a log file, a socket — and mapping one of those hands back bytes that are not the
+/// coded picture. The size is what tells a dma-buf export apart from everything else, and `mem_size`
+/// is libva's own number for the object, so an open descriptor shorter than it is not this buffer.
+fn is_the_buffer(fd: c_int, mem_size: usize) -> bool {
+    if !is_open(fd) {
+        return false;
+    }
+    // SAFETY: `BorrowedFd::borrow_raw` asserts only that `fd` is open, which the `fcntl` above has
+    // just established.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    // Duplicated rather than adopted, so asking the question does not take the descriptor away from
+    // whoever owns it — which here is libva.
+    borrowed.try_clone_to_owned().is_ok_and(|dup| std::fs::File::from(dup).metadata().is_ok_and(|m| m.len() >= mem_size as u64))
+}
+
+/// Whether `fd` names an open descriptor, asked of the kernel rather than inferred.
 fn is_open(fd: c_int) -> bool {
     // SAFETY: `fcntl(F_GETFD)` reads the descriptor table and takes no argument, so the variadic
     // call sets up the registers the SysV ABI requires and reads nothing that does not exist.
     unsafe { fcntl(fd, F_GETFD) != -1 }
 }
 
-/// Map the buffer object `handle` names, on the DRM descriptor `drm`, read-only, `mem_size` long.
+/// Map the coded buffer's storage, read-only, `mem_size` long.
 ///
-/// `handle` and `mem_size` are the two numbers `vaAcquireBufferHandle` reported for it; this
-/// function neither computes nor guesses either. A driver that exports a different number of bytes
-/// than it reported is caught by the kernel, which fails the mapping.
+/// `handle` and `mem_size` are the two numbers `vaAcquireBufferHandle` reported
+/// (`va.h:4034`, `va.h:4046`); this function neither computes nor guesses either.
+///
+/// **Which of the two it is depends on the memory type, and the code has to know which.** For
+/// `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME` — the value libva reports for a coded buffer on a DRM
+/// backend, measured — `VABufferInfo::handle` is **already an open dma-buf descriptor**: libva did
+/// the prime export itself and handed the descriptor back, and closes it again in
+/// `vaReleaseBufferHandle` (`va.h:4098-4104`). Measured on this machine: the number is open before
+/// any ioctl of ours, it points at a `/dmabuf:` whose size is the coded buffer's, and mapping it
+/// returns bytes identical to the ones `VACodedBufferSegment::buf` names.
+///
+/// So on that path there is nothing to export, and doing the ioctl anyway is actively harmful, which
+/// is what this module used to do:
+///
+/// * it fed that descriptor number to `DRM_IOCTL_PRIME_HANDLE_TO_FD` as if it were a GEM handle,
+///   which made the kernel export some *other* object (measured: 48 KiB, where the coded buffer's
+///   storage is 768 KiB) and return a descriptor nobody could use;
+/// * that descriptor was written into a field the struct did not have, so **it was leaked** — one
+///   per encoded picture, measured as the open-descriptor count rising by one per frame;
+/// * and the descriptor it mapped *was* libva's, which it then closed. libva closes it again, so
+///   the number was closed twice, and the second close took whatever had taken it since.
+///
+/// The ioctl is therefore only used for a handle that is not already a descriptor, which is what a
+/// stack that reports a GEM handle needs. That descriptor is ours, and only that one is closed here.
 pub fn map(drm: c_int, handle: u32, mem_size: usize) -> Result<Storage, String> {
     if mem_size == 0 {
         return Err("libva reported a buffer object of 0 bytes".into());
@@ -128,26 +189,43 @@ pub fn map(drm: c_int, handle: u32, mem_size: usize) -> Result<Storage, String> 
     if drm < 0 {
         return Err("no DRM descriptor is open".into());
     }
-    // DRM writes the exported descriptor back into `handle`, the field it came from.
-    let mut request = DrmPrimeHandle { handle, flags: 0 };
+    // The common case: libva already exported the object and `handle` names its descriptor.
+    let Ok(as_fd) = c_int::try_from(handle) else {
+        return Err(format!("libva reported buffer handle {handle}, which is not a descriptor number"));
+    };
+    if is_the_buffer(as_fd, mem_size) {
+        return map_it(as_fd, mem_size);
+    }
+    // Otherwise it is a handle to export, and the descriptor comes back in `fd` — the field the
+    // header names and the one this struct now has.
+    let mut request = DrmPrimeHandle { handle, flags: 0, fd: 0 };
     // SAFETY: `drm` is an open DRM render-node descriptor, `request` is a live
-    // `struct drm_prime_handle`, and the request number is the one that struct's size gives.
+    // `struct drm_prime_handle` of the size the request number encodes, and the kernel writes at
+    // most that many bytes back into it.
     let rc = unsafe { ioctl(drm, PRIME_HANDLE_TO_FD, &mut request as *mut DrmPrimeHandle) };
     if rc != 0 {
         return Err(format!("DRM_IOCTL_PRIME_HANDLE_TO_FD refused buffer handle {handle}"));
     }
     // A descriptor number that is negative, or that names nothing open, is not mappable — and
     // `mmap` on one would fail with a number nobody can act on.
-    let fd = c_int::try_from(request.handle).map_err(|_| format!("DRM_IOCTL_PRIME_HANDLE_TO_FD returned descriptor {}, which is not one", request.handle))?;
-    if !is_open(fd) {
-        return Err(format!("DRM_IOCTL_PRIME_HANDLE_TO_FD returned descriptor {fd} for buffer handle {handle}, which is not open"));
+    if request.fd < 0 {
+        return Err(format!("DRM_IOCTL_PRIME_HANDLE_TO_FD returned descriptor {}, which is not one", request.fd));
     }
-    let export = Export { fd };
-    // SAFETY: `export.fd` is the descriptor DRM just exported, `mem_size` is what libva reported
-    // for the object behind it, and the mapping is `PROT_READ` and `MAP_SHARED` with no offset.
-    let base = unsafe { mmap(std::ptr::null_mut(), mem_size, PROT_READ, MAP_SHARED, export.fd, 0) };
+    // This one is ours: the kernel opened it for this call, so it is ours to close.
+    let _export = Export { fd: request.fd };
+    if !is_open(request.fd) {
+        return Err(format!("DRM_IOCTL_PRIME_HANDLE_TO_FD returned descriptor {} for buffer handle {handle}, which is not open", request.fd));
+    }
+    map_it(request.fd, mem_size)
+}
+
+/// The mapping itself, shared by both routes above.
+fn map_it(fd: c_int, mem_size: usize) -> Result<Storage, String> {
+    // SAFETY: `fd` is an open descriptor, `mem_size` is what libva reported for the object behind
+    // it, and the mapping is `PROT_READ` and `MAP_SHARED` with no offset.
+    let base = unsafe { mmap(std::ptr::null_mut(), mem_size, PROT_READ, MAP_SHARED, fd, 0) };
     if base.is_null() || base == MAP_FAILED {
-        return Err(format!("mmap of the exported {mem_size}-byte coded buffer failed"));
+        return Err(format!("mmap of the {mem_size}-byte coded buffer failed"));
     }
     Ok(Storage { base, len: mem_size })
 }
@@ -163,12 +241,27 @@ fn close_fd(fd: c_int) {
 mod tests {
     use super::*;
 
+    /// `struct drm_prime_handle` is **twelve** bytes and the request number that follows from it is
+    /// `0xc00c642d`.
+    ///
+    /// `/usr/include/drm/drm.h:926-934` declares `__u32 handle; __u32 flags; __s32 fd;` and
+    /// `drm.h:1159-1161` says the descriptor comes back in that third field. The two-field version
+    /// this replaced gave `0xc008642d`, and the kernel — which dispatches on the request number and
+    /// not on the size encoded in it — accepted that happily while writing its answer four bytes past
+    /// the end of the struct, where nothing could read it.
     #[test]
     fn prime_handle_to_fd_is_the_ioctl_its_struct_size_gives() {
-        // `_IOWR('d', 0x2d, struct { __u32 handle; __u32 flags; })` on the SysV Linux ABI: the
-        // pinned value, written out, so a change to the struct cannot pass unnoticed.
-        assert_eq!(size_of::<DrmPrimeHandle>(), 8);
-        assert_eq!(PRIME_HANDLE_TO_FD, 0xc008_642d);
+        assert_eq!(size_of::<DrmPrimeHandle>(), 12, "struct drm_prime_handle: handle, flags, fd");
+        assert_eq!(PRIME_HANDLE_TO_FD, 0xc00c_642d, "_IOWR('d', 0x2d, struct drm_prime_handle)");
+    }
+
+    /// A handle that is not an open descriptor is not the buffer, so `map` refuses it rather than
+    /// mapping whatever else that number might name.
+    #[test]
+    fn a_handle_that_is_not_a_descriptor_is_not_mistaken_for_the_buffer() {
+        // Descriptor 0 exists and is far too small to be a coded buffer.
+        assert!(!is_the_buffer(0, 710656), "stdin's size is not the coded buffer's");
+        assert!(!is_the_buffer(-1, 710656), "a negative descriptor is not one");
     }
 
     #[test]
