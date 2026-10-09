@@ -85,12 +85,31 @@ fn assign_reassigns_conflicts_and_undoes() {
     s.execute("shortcuts.set", json!({"command": "edit.undo", "keys": "Cmd+Z", "add": true})).unwrap();
     assert_eq!(s.shortcuts.for_command("edit.undo").iter().filter(|b| b.panel.is_none()).count(), 2);
     let r = s.execute("shortcuts.set", json!({"command": "edit.redo", "keys": "M", "keepConflicts": true})).unwrap();
-    assert_eq!(r["conflicts"].as_array().unwrap().len(), 1, "{r}");
+    // The new `M` conflict has to be reported. It is deliberately *not* the only one, and the count
+    // is not asserted, because it depends on the host: off macOS `Chord::effective` folds Ctrl onto
+    // Cmd (`shortcuts.rs:300`), which collapses preset pairs that are distinct on macOS — here
+    // `Ctrl+9`/`Cmd+9` (`multicam.cutToCamera9` / `timeline.toggleAllAudioTargets`),
+    // `Ctrl+Shift+M`/`Cmd+Shift+M` and `Ctrl+T`/`Cmd+T`. `conflicts` reports every conflict for the
+    // platform it is given (`shortcuts.rs:902`) and `set` reads `Platform::current()`
+    // (`shortcuts.rs:713`), so off macOS this is 4 and on macOS it is 1. Asserting 1 would make the
+    // test pass on a Mac and fail on Linux for a reason that has nothing to do with reassignment.
+    let reported = r["conflicts"].as_array().unwrap();
+    assert!(
+        reported.iter().any(|c| {
+            c["keys"] == json!("M")
+                && c["commands"].as_array().is_some_and(|cmds| cmds.contains(&json!("markers.add")) && cmds.contains(&json!("edit.redo")))
+        }),
+        "the `M` conflict between markers.add and edit.redo is reported: {r}"
+    );
+    // On macOS the Ctrl/Cmd fold does not happen, so `M` is the only conflict there.
     let c = s.execute("shortcuts.conflicts", json!({"platform": "mac"})).unwrap();
     assert_eq!(c["conflicts"][0]["keys"], json!("M"));
     // undo / redo within the editor
     s.execute("shortcuts.undo", json!({})).unwrap();
-    assert!(s.execute("shortcuts.conflicts", json!({})).unwrap()["conflicts"].as_array().unwrap().is_empty());
+    // The `M` conflict this test created is gone. The list itself is not asserted empty, for the reason
+    // given above: off macOS the presets carry Ctrl/Cmd fold collisions that no undo of an editor
+    // action removes, so emptiness here would only ever hold on macOS.
+    assert!(!s.execute("shortcuts.conflicts", json!({})).unwrap()["conflicts"].as_array().unwrap().iter().any(|c| c["keys"] == json!("M")));
     s.execute("shortcuts.undo", json!({})).unwrap();
     s.execute("shortcuts.undo", json!({})).unwrap();
     assert_eq!(s.shortcuts.primary("edit.undo").as_deref(), Some("Cmd+Z"));
