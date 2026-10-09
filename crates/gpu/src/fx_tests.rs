@@ -4,7 +4,9 @@
 //! Tolerances:
 //! - Exact checks ([`gpu_effects_match_cpu_exactly`]): the working image read back as f32 from a
 //!   half-float-representable source (so the source draw is lossless) must match the CPU op to
-//!   [`EXACT`] per value (f32 arithmetic and the GPU's `pow` / `sqrt` differ in the last bits).
+//!   [`tolerance`] per value — [`EXACT`] for arithmetic that is exact in the same order on both
+//!   sides, [`TRANSCENDENTAL`] for the few effects whose GPU path is a power function (f32
+//!   arithmetic and the GPU's `pow` / `sqrt` differ in the last bits, and a gamma amplifies that).
 //!   Step functions (Posterize, Color Pass, Leave Color and Change to Color keys, Extract) may
 //!   flip a pixel that lands on a threshold; at most [`FLIPS`] of the values may differ by more.
 //! - Composited plans ([`gpu_effect_layers_match_cpu_plan`]): the compositor's criterion (p99 of
@@ -22,6 +24,37 @@ use filmcraft_time::Tick;
 
 const EXACT: f32 = 1e-4;
 const FLIPS: f64 = 0.01;
+
+/// Effects whose GPU path goes through a **power function** — `linear_to_srgb`, or an explicit
+/// `powf(g)` — and so cannot agree with the CPU to [`EXACT`].
+///
+/// A GPU evaluates `pow(x, g)` as `exp2(g * log2(x))` and carries its own `linear_to_srgb`
+/// approximation; the CPU uses libm's `powf` and a separate transfer function. These are different
+/// algorithms rather than different roundings of one, so the last few ULPs differ by construction —
+/// and a gamma of 5.0 *amplifies* that relative error instead of merely passing it on, because
+/// `d(x^g)/x = g * x^(g-1)` scales with `g`.
+///
+/// **Calibrated on an Intel Arc B580** (Battlemage, `iHD` 26.3.5, libva 1.24 / iHD 26.3.5), where
+/// `gamma_correction` at `gamma` 5.0 reached 3.84e-4 and `extract` 1.51e-4 against `EXACT`'s 1e-4,
+/// while every other effect in the suite — blurs, transforms, blends, transitions, keyers — held
+/// 1e-4. `1e-3` leaves about 2.6x over the worst observed and is still well under 8-bit
+/// quantisation (1/255 ≈ 3.9e-3), so the comparison still rejects a visible error; it simply stops
+/// rejecting a different transcendental implementation.
+///
+/// The exception is granted to the **class**, not to whichever effects happened to fail here:
+/// `Tint` and `Levels` reach the same two functions and would break first on a GPU whose `pow` is
+/// less accurate still. Every effect outside [`TRANSCENDENTAL_OPS`] keeps [`EXACT`] unchanged.
+const TRANSCENDENTAL: f32 = 1e-3;
+
+/// The effect ids whose GPU path is a power function — the four `FxOp` arms in
+/// `gpufx.rs` that call `linear_to_srgb` (`Tint`, `Extract`) or `powf(g)` (`Gamma`, `Levels`).
+const TRANSCENDENTAL_OPS: &[&str] = &["extract", "gamma_correction", "levels", "tint"];
+
+/// The relative difference `id` must hold to: [`TRANSCENDENTAL`] for a power-function effect,
+/// [`EXACT`] for everything else.
+fn tolerance(id: &str) -> f32 {
+    if TRANSCENDENTAL_OPS.contains(&id) { TRANSCENDENTAL } else { EXACT }
+}
 
 fn cx(t: Tick, px_scale: f32) -> FxCtx<'static> {
     FxCtx { t, px_scale, seconds: 0.0, timecode: "", clip_name: "", project: None, env: None, working: filmcraft_color::WorkingSpace::Rec709 }
@@ -212,7 +245,7 @@ fn gpu_effects_match_cpu_exactly() {
         let (_, _, gpu) = c.effect_image(&frame, &fx).expect("effect image");
         let (worst, flips) = compare(&cpu.px, &gpu);
         eprintln!("{id} {params:?}: max rel diff {worst:.2e}, {:.3}% flipped", flips * 100.0);
-        if worst > EXACT || flips > if steps { FLIPS } else { 0.0 } {
+        if worst > tolerance(id) || flips > if steps { FLIPS } else { 0.0 } {
             failures.push(format!("{id} {params:?}: {worst:.2e}, flips {flips:.4}"));
         }
     }
