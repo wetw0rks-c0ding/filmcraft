@@ -12,6 +12,16 @@ use filmcraft_isobmff::SampleEntry;
 /// The parity fixtures: (file, ffmpeg arguments). B-frames everywhere (reordering), a 360-line
 /// picture (coded 368: cropping), two GOPs or more (seeks), and an open-GOP HEVC stream (CRA with
 /// RASL pictures).
+///
+/// `hevc_weightp.mp4` and `hevc_weightp_main10.mp4` are the two **weighted-prediction** fixtures, and
+/// they are the only ones that reach `vaapi_slice_record`'s weight submission with a delta that is not
+/// zero: every other HEVC fixture here codes a `pred_weight_table` whose `luma_weight_lX_flag` and
+/// `chroma_weight_lX_flag` are all 0, so every weight is 1.0 and `delta_luma_weight_lX` is 0 by
+/// construction. Their encoder arguments are `crates/hevc`'s `weightp` / `weightp_main10` entries
+/// (`crates/hevc/tests/common/mod.rs:54-55`), the same source, size and x265 parameters, so the two
+/// crates measure the same weighting; `crates/platform/tests/vaapi.rs` names that relationship so a
+/// change to either side is visible. Only the length and GOP size are this suite's: every fixture
+/// here has to be long enough for a seek and for `parity`'s picture floor.
 pub const FIXTURES: &[(&str, &[&str])] = &[
     (
         "h264_high.mp4",
@@ -68,6 +78,52 @@ pub const FIXTURES: &[(&str, &[&str])] = &[
             "hvc1",
             "-x265-params",
             "log-level=error:bframes=4:keyint=24:min-keyint=24:scenecut=0",
+            "-pix_fmt",
+            "yuv420p10le",
+        ],
+    ),
+    // Weighted prediction, at both depths: `weightp` puts `weighted_pred_flag` in the picture
+    // parameter set and `weightb` puts `weighted_bipred_flag`, and `fade=in` is the ingredient that
+    // makes x265 derive a weight at all — `weightp=1` on a plain `testsrc2` codes a table whose
+    // every entry is at its default, which is exactly the case the other three fixtures here already
+    // reach. These are `crates/hevc`'s `weightp` / `weightp_main10` encodes, lengthened to the frame
+    // count and GOP this suite needs; see the note on `FIXTURES`.
+    (
+        "hevc_weightp.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=352x288:r=25,format=yuv420p,fade=in:0:25",
+            "-frames:v",
+            "50",
+            "-c:v",
+            "libx265",
+            "-tag:v",
+            "hvc1",
+            "-x265-params",
+            "log-level=error:weightp=1:weightb=1:bframes=3:keyint=12:min-keyint=12:scenecut=0",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    ),
+    (
+        "hevc_weightp_main10.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=352x288:r=25,format=yuv420p10le,fade=in:0:18",
+            "-frames:v",
+            "50",
+            "-c:v",
+            "libx265",
+            "-profile:v",
+            "main10",
+            "-tag:v",
+            "hvc1",
+            "-x265-params",
+            "log-level=error:weightp=1:weightb=1:keyint=12:min-keyint=12:scenecut=0",
             "-pix_fmt",
             "yuv420p10le",
         ],

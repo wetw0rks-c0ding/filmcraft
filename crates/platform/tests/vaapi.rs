@@ -751,14 +751,26 @@ impl Ffmpeg {
 
 /// ffmpeg's own decode of a fixture, paired with the stream's presentation times so a picture can be
 /// looked up by the time it was decoded with rather than by its position in the output.
+///
+/// The picture size and depth are the **stream's own**, from its configuration record, not this file's
+/// former 640x360 constant: the weighted HEVC fixtures are 352x288 and one of them is 10-bit, and an
+/// oracle that quietly read the wrong number of bytes per picture would compare a fixture's picture
+/// 3 against its picture 4 — a run that looks like a run of wrong pictures rather than a broken
+/// oracle. 10-bit samples come out of ffmpeg as two little-endian bytes each, which is what
+/// [`pixels`] writes so the two sides agree byte for byte.
 fn ffmpeg_pictures(ff: &Path, path: &Path, s: &Stream) -> Ffmpeg {
+    let info = filmcraft_codecs::hw::NalStreamInfo::from_entry(&s.entry).expect("a NAL codec").expect("a described stream");
+    let (w, h) = (info.crop.2, info.crop.3);
+    assert!(w > 0 && h > 0, "{path:?}: the stream says a picture of {w}x{h}");
+    let ten = info.bit_depth_luma == 10;
+    let sample_bytes = if ten { 2 } else { 1 };
     let raw = std::process::Command::new(ff)
-        .args(["-v", "error", "-i", path.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+        .args(["-v", "error", "-i", path.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", if ten { "yuv420p10le" } else { "yuv420p" }, "-"])
         .output()
         .expect("ffmpeg decode");
     assert!(raw.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&raw.stderr));
-    let size = 640 * 360 * 3 / 2;
-    assert_eq!(raw.stdout.len() % size, 0, "ffmpeg's decode is a whole number of 640x360 4:2:0 pictures");
+    let size = w as usize * h as usize * 3 / 2 * sample_bytes;
+    assert_eq!(raw.stdout.len() % size, 0, "ffmpeg's decode is a whole number of {w}x{h} {}-bit 4:2:0 pictures", info.bit_depth_luma);
     let mut order: Vec<i64> = s.samples.iter().map(|(_, p)| *p).collect();
     order.sort_unstable();
     Ffmpeg { pictures: raw.stdout.chunks_exact(size).map(<[u8]>::to_vec).collect(), order }
@@ -806,6 +818,234 @@ fn an_h264_fixture_this_record_can_express_is_bit_exact_against_ffmpeg() {
     let software = decode_all(software(&s).as_mut(), &s.samples);
     let (sw_right, _) = oracle(&software, &reference);
     assert_eq!(sw_right, reference.len(), "the software decoder disagrees with ffmpeg, so the parity comparison would be against a wrong reference");
+}
+
+/// The HEVC weighted-prediction fixtures, decoded in hardware, are bit for bit **ffmpeg's** decode —
+/// and the reason this is its own test is that `bit_exact_with_the_software_decoder` compares against
+/// *our* decoder, so it cannot tell a record that is right from two FilmCraft decoders that are wrong
+/// in the same way.
+///
+/// Before this, every HEVC fixture the suite used coded a `pred_weight_table` whose
+/// `luma_weight_lX_flag` and `chroma_weight_lX_flag` were **all 0** — weights of 1.0 — so
+/// `vaapi_slice_record`'s weight submission had only ever run with a delta of zero on hardware: the
+/// `coded − 1 << luma_log2_weight_denom` recovery, the signed `delta_chroma_log2_weight_denom`, and
+/// `ChromaOffsetLX` were all checked only in `picture.rs`'s unit tests, against the record's own
+/// struct. A delta that was wrong by one would have decoded a subtly different picture on a user's
+/// timeline with no error anywhere. `hevc_weightp.mp4` and `hevc_weightp_main10.mp4` are the fixtures
+/// that close that, and this is the assertion that they do.
+///
+/// The same non-vacuity argument the unit tests make applies here, so it is measured rather than
+/// assumed: [`hevc_weights_of`] counts, over the stream's own parsed slice headers, how many entries
+/// really carry a non-default weight and a non-zero offset, and how many distinct denominators the
+/// slices code between them. A fixture that stopped producing weights would fail the count rather than
+/// pass quietly on pictures the weighting never touched.
+///
+/// The raw decoder, not the factory's hybrid, for the same reason as the H.264 oracle above: a decline
+/// has to show up as a missing picture here, not as a software replay that looks like a hardware
+/// success.
+#[test]
+fn an_hevc_weighted_fixture_this_record_can_express_is_bit_exact_against_ffmpeg() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    let mut checked = 0;
+    for name in ["hevc_weightp.mp4", "hevc_weightp_main10.mp4"] {
+        let Some(path) = named(&ff, name) else {
+            eprintln!("SKIPPED: {name} could not be generated");
+            continue;
+        };
+        let s = read_stream(&path);
+        let census = hevc_weights_of(&s);
+        println!("{name}: {}", census.describe());
+        // The fixture has to be one that *can* go vacuous, so the counts that say it is not are
+        // asserted rather than printed. `crates/hevc` measures the same stream against ffmpeg and
+        // agrees with these; see its `weightp` conformance test.
+        assert!(census.tables >= 20, "{name}: {} slice segments code a prediction weight table, which is too few to be the weight path", census.tables);
+        assert!(census.non_default_luma >= 15, "{name}: only {} of {} entries ask for a luma weight other than 1.0", census.non_default_luma, census.entries);
+        assert!(census.non_zero_luma_offset >= 10, "{name}: only {} entries carry a non-zero luma offset", census.non_zero_luma_offset);
+        assert!(
+            census.denominators.len() > 1,
+            "{name}: every slice codes the same luma_log2_weight_denom ({:?}), so a recovery that read the wrong one would still agree",
+            census.denominators
+        );
+        assert!(
+            census.denominators.iter().any(|&d| d != 7),
+            "{name}: every luma_log2_weight_denom is 7, so `coded - (1 << denom)` is `coded - 128` everywhere and a wrong denominator is indistinguishable"
+        );
+        assert!(
+            census.chroma_denominators.iter().any(|&d| d != 0),
+            "{name}: no slice lowers ChromaLog2WeightDenom, so the signed delta_chroma_log2_weight_denom is only ever 0 or positive here: {:?}",
+            census.chroma_denominators
+        );
+        assert!(census.b_slices >= 10, "{name}: only {} B pictures, so the L1 weight table is barely exercised", census.b_slices);
+
+        let reference = ffmpeg_pictures(&ff, &path, &s);
+        let info = filmcraft_platform::vaapi::stream_info(&s.entry).expect("an hvcC stream");
+        let mut va = match VaDecoder::new(info) {
+            Ok(va) => va,
+            Err(e) => {
+                eprintln!("SKIPPED: no VA-API decoder for this driver: {e}");
+                continue;
+            }
+        };
+        let (mut out, mut declined) = (Vec::new(), Vec::new());
+        for (smp, pts) in &s.samples {
+            match va.decode(smp, *pts) {
+                Ok(mut frames) => out.append(&mut frames),
+                Err(e) => declined.push(e.to_string()),
+            }
+        }
+        out.extend(va.flush());
+        assert_eq!(
+            declined.len(),
+            0,
+            "{name}: a weighted HEVC slice this record can carry must not be declined, and {} were: {}",
+            declined.len(),
+            declined.first().map(String::as_str).unwrap_or("")
+        );
+        let (right, first_wrong) = oracle(&out, &reference);
+        println!("{name} against ffmpeg's own decode: this backend is right on {right}/{} pictures", out.len());
+        assert_eq!(right, out.len(), "{name}: the first disagreement with ffmpeg is at pts {first_wrong:?}");
+        // The run stayed in hardware: `hw.name()` is what this instance is using, not a counter another
+        // test could move.
+        assert!(va.name().starts_with("VA-API"), "{name}: stayed in hardware ({})", va.name());
+        // and the software decoder is ffmpeg's too, so the comparison the rest of this file makes is
+        // against a right reference
+        let software = decode_all(software(&s).as_mut(), &s.samples);
+        let (sw_right, _) = oracle(&software, &reference);
+        assert_eq!(sw_right, reference.len(), "{name}: the software decoder disagrees with ffmpeg");
+        checked += 1;
+    }
+    assert!(checked > 0, "no HEVC weighted-prediction fixture could be generated");
+}
+
+/// What an HEVC stream's own slice headers say about their prediction weights.
+///
+/// Read with `filmcraft_hevc`, the parser the record itself is built from, over the fixture's samples:
+/// this is the census that says a fixture is one the weight path is really reached on, and it is
+/// deliberately *not* read out of the record — a census of the record would agree with a record that
+/// dropped the weights. What it counts is the **coded** stream, so it is a statement about the fixture
+/// and not about this backend.
+#[derive(Default)]
+struct WeightCensus {
+    /// Slice segments that code a `pred_weight_table` at all.
+    tables: usize,
+    /// `num_ref_idx_l0/l1` entries those tables carry, over both lists.
+    entries: usize,
+    /// Entries asking for a luma weight other than `1 << luma_log2_weight_denom` — that is, entries
+    /// whose `delta_luma_weight_lX` is not 0, which is the whole point of the fixture.
+    non_default_luma: usize,
+    /// Entries carrying a non-zero `luma_offset_lX`, the field the record's `luma_offset_lX` holds.
+    non_zero_luma_offset: usize,
+    /// Entries carrying a non-zero `ChromaOffsetLX`.
+    non_zero_chroma_offset: usize,
+    /// Every `LumaLog2WeightDenom` a slice codes, deduplicated and sorted.
+    denominators: Vec<u32>,
+    /// Every `ChromaLog2WeightDenom` a slice codes, deduplicated and sorted.
+    chroma_denominators: Vec<u32>,
+    /// B pictures, whose slices carry the list-1 half of the table.
+    b_slices: usize,
+}
+
+impl WeightCensus {
+    fn describe(&self) -> String {
+        format!(
+            "{} slice segments code a pred_weight_table over {} entries; {} ask for a luma weight other than 1.0, {} carry a non-zero luma offset, {} a non-zero chroma offset; \
+             LumaLog2WeightDenom {:?}, ChromaLog2WeightDenom {:?}; {} B pictures",
+            self.tables,
+            self.entries,
+            self.non_default_luma,
+            self.non_zero_luma_offset,
+            self.non_zero_chroma_offset,
+            self.denominators,
+            self.chroma_denominators,
+            self.b_slices
+        )
+    }
+}
+
+/// [`WeightCensus`] over a stream, parsing every slice segment header with `filmcraft_hevc`.
+///
+/// The parameter sets come out of the sample entry, the same way the decoder's own
+/// `HevcSets::parse` reads them, and a segment whose header will not parse is counted as nothing
+/// rather than aborting the census: what is being asked is "how many of this stream's slices weight",
+/// and a header this test cannot read is not one whose weights were counted either way.
+fn hevc_weights_of(s: &Stream) -> WeightCensus {
+    let info = filmcraft_codecs::hw::NalStreamInfo::from_entry(&s.entry).expect("an hvcC stream").expect("a described stream");
+    let mut spss: Vec<Option<std::sync::Arc<filmcraft_hevc::params::Sps>>> = vec![None; 16];
+    let mut ppss: Vec<Option<std::sync::Arc<filmcraft_hevc::params::Pps>>> = vec![None; 64];
+    for nal in &info.parameter_sets {
+        let Some(rbsp) = nal.get(2..) else { continue };
+        let rbsp = filmcraft_bitstream::unescape_rbsp(rbsp);
+        match nal.first().map(|&h| info.nal_type(h)) {
+            Some(33) => {
+                if let Ok(sps) = filmcraft_hevc::params::Sps::parse(&rbsp)
+                    && let Some(slot) = spss.get_mut(sps.id as usize)
+                {
+                    *slot = Some(std::sync::Arc::new(sps));
+                }
+            }
+            Some(34) => {
+                if let Ok(pps) = filmcraft_hevc::params::Pps::parse(&rbsp)
+                    && let Some(slot) = ppss.get_mut(pps.id as usize)
+                {
+                    *slot = Some(std::sync::Arc::new(pps));
+                }
+            }
+            _ => {}
+        }
+    }
+    let lookup = |id: u32| -> Result<(std::sync::Arc<filmcraft_hevc::params::Pps>, std::sync::Arc<filmcraft_hevc::params::Sps>), filmcraft_hevc::Error> {
+        let pps = ppss.get(id as usize).and_then(|p| p.as_ref()).cloned().ok_or_else(|| filmcraft_hevc::Error::MissingParameterSet(format!("PPS {id}")))?;
+        let sps = spss
+            .get(pps.sps_id as usize)
+            .and_then(|s| s.as_ref())
+            .cloned()
+            .ok_or_else(|| filmcraft_hevc::Error::MissingParameterSet(format!("SPS {}", pps.sps_id)))?;
+        Ok((pps, sps))
+    };
+
+    let mut c = WeightCensus::default();
+    for (sample, _) in &s.samples {
+        for nal in info.nals(sample) {
+            if !matches!(info.nal_type(nal[0]), 0..=31) {
+                continue;
+            }
+            let Ok(hdr) = filmcraft_hevc::slice::NalHeader::parse(nal) else { continue };
+            let rbsp = filmcraft_bitstream::unescape_rbsp(nal.get(2..).unwrap_or_default());
+            let Ok((sh, _, _)) = filmcraft_hevc::slice::SliceHeader::parse(&rbsp, hdr, lookup, None) else { continue };
+            if sh.is_b() {
+                c.b_slices += 1;
+            }
+            let Some(t) = sh.pwt.as_ref() else { continue };
+            c.tables += 1;
+            push_unique(&mut c.denominators, t.luma_log2_denom);
+            push_unique(&mut c.chroma_denominators, t.chroma_log2_denom);
+            let luma_one = 1i32.checked_shl(t.luma_log2_denom).unwrap_or(0);
+            for list in 0..2 {
+                for e in t.l.get(list).map(Vec::as_slice).unwrap_or_default() {
+                    c.entries += 1;
+                    if e.luma.0 != luma_one {
+                        c.non_default_luma += 1;
+                    }
+                    if e.luma.1 != 0 {
+                        c.non_zero_luma_offset += 1;
+                    }
+                    if e.chroma.iter().any(|(_, off)| *off != 0) {
+                        c.non_zero_chroma_offset += 1;
+                    }
+                }
+            }
+        }
+    }
+    c
+}
+
+/// Add `v` to a sorted, deduplicated list. `sort_unstable` on a short list of small integers is
+/// cheaper than anything cleverer, and the list stays short (the denominators are 0..=7).
+fn push_unique(list: &mut Vec<u32>, v: u32) {
+    if list.binary_search(&v).is_err() {
+        list.push(v);
+        list.sort_unstable();
+    }
 }
 
 /// An H.264 B slice whose weights the record cannot express is **declined**, and the stream finishes
@@ -906,12 +1146,34 @@ fn an_h264_b_slice_this_record_cannot_weight_is_declined() {
 }
 
 /// One picture's pixels as the bytes ffmpeg's raw 4:2:0 output holds them: luma, then U, then V.
+///
+/// 16-bit planes go out little-endian, which is how `ffmpeg -pix_fmt yuv420p10le` writes them, so the
+/// comparison stays byte for byte at 10 bits rather than comparing a re-encoding of the samples.
 fn pixels(f: &DecodedFrame) -> Vec<u8> {
-    let PixelData::Yuv8 { planes, .. } = &f.frame.data else { panic!("expected 8-bit 4:2:0 planes") };
-    assert_eq!((f.frame.width, f.frame.height), (640, 360), "this oracle is written for the 640x360 fixtures");
-    let mut out = Vec::with_capacity(planes.iter().map(|p| p.len()).sum());
-    for p in planes {
-        out.extend(p.iter());
+    let luma = f.frame.width as usize * f.frame.height as usize;
+    // `Yuv8` and `Yuv16` carry differently typed planes, so each arm flattens its own: unifying them
+    // in one `let` would need a cast that hides which depth is being compared.
+    match &f.frame.data {
+        PixelData::Yuv8 { planes, .. } => {
+            let sizes: Vec<usize> = planes.iter().map(|p| p.len()).collect();
+            assert_eq!(sizes, vec![luma, luma / 4, luma / 4], "the planes are one 4:2:0 picture of {}x{}", f.frame.width, f.frame.height);
+            let mut out = Vec::with_capacity(sizes.iter().sum());
+            for p in planes {
+                out.extend(p.iter().copied());
+            }
+            out
+        }
+        PixelData::Yuv16 { planes, .. } => {
+            let sizes: Vec<usize> = planes.iter().map(|p| p.len()).collect();
+            assert_eq!(sizes, vec![luma, luma / 4, luma / 4], "the planes are one 4:2:0 picture of {}x{}", f.frame.width, f.frame.height);
+            let mut out = Vec::with_capacity(sizes.iter().sum::<usize>() * 2);
+            for p in planes {
+                for s in p.iter() {
+                    out.extend(s.to_le_bytes());
+                }
+            }
+            out
+        }
+        other => panic!("expected 4:2:0 planes, got {other:?}"),
     }
-    out
 }
