@@ -134,26 +134,29 @@ One caveat about this record's own claims: the safe decline tables in `vaapi::st
 Linux-gated today because `ffi` needs `dlopen`, so those tests run on Linux only. Making them
 compile on every target is tracked follow-up work, not a settled state.
 
-### Calling libva at run time — the licence position is **pending maintainer review**
+### Calling libva at run time — licence position **approved**
 
 libva is **LGPL-2.1+**, and `AGENTS.md` §2 requires permissive dependency licences (MIT /
 Apache-2.0 / BSD / ISC / Zlib / Unicode / CC0 / BSL-1.0, or MPL-2.0 used unmodified). This backend
-is the one place in the project where that rule is in tension with what is being built, and **no
-maintainer has ruled on it.** What is settled is only the mechanism: `libva.so.2` and
-`libva-drm.so.2` are opened with `dlopen` and their symbols resolved with `dlsym` at run time, never
-linked, so there is no build-time dependency on libva and the workspace gains no dependency at all.
+was the one place in the project where that rule came into tension with what was being built. **A
+maintainer ruled on it on 2026-10-08: the `dlopen` path is approved.** It is recorded here, with the
+reasoning, so the decision can be re-examined rather than rediscovered.
 
-Why that arrangement is *candidate* clean-room material under §2: nothing LGPL is vendored, copied,
-patched or shipped in the binary, and the application calls only the ABI of the system's own
-driver — the way any dynamically linked program calls `libc`. That is the reading behind the
-implementation: that §2 governs code entering this repository (vendored, linked or copied), not
-libraries a program calls through the operating system's own media stack. A stricter reading — that
-§2 covers any library the process ever calls — would rule VA-API out entirely and close the top
-hardware item in `ROADMAP.md`.
+The settled mechanism: `libva.so.2` and `libva-drm.so.2` are opened with `dlopen` and their symbols
+resolved with `dlsym` at run time, never linked, so there is no build-time dependency on libva and the
+workspace gains no dependency at all. Nothing LGPL is vendored, copied, patched or shipped in the
+binary, and the application calls only the ABI of the system's own driver — the way any dynamically
+linked program calls `libc`.
 
-That reading is a reading, not an authority. **This is not an approval, and it is not decided
-here.** `dlopen` at run time with no link-time dependency is the reason this is *candidate*
-clean-room material; whether it satisfies `AGENTS.md` §2 needs an explicit yes or no from a
-maintainer, and until that exists the backend is unratified in exactly the way this section says it
-is. It is recorded here rather than left implicit so upstream can settle — or overturn — it in one
-place.
+That is the reading §2 is being applied with: it governs code entering this repository (vendored,
+linked or copied), not libraries a program calls through the operating system's own media stack. The
+stricter alternative — that §2 covers any library the process ever calls — was considered and **not**
+adopted; it would have ruled VA-API out entirely and closed the top hardware item in `ROADMAP.md`. The
+distinguishing fact is that libva is loaded and called by *name* from the user's own system, at the
+user's choice, with nothing added to the build: the same posture as VideoToolbox and Media Foundation,
+which §0 already permits.
+
+Two consequences worth stating plainly. `libva` and `libva-drm` must stay behind `dlopen` — linking
+them would reintroduce a build-time LGPL dependency and void this ruling. And nothing here is
+libva-specific enough to be worth keeping private: the backend may be offered to the upstream project
+on request, as this one may.

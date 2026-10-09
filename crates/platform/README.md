@@ -71,8 +71,10 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
   without an NVIDIA GPU or driver, and the software encoder runs instead. A failure during an export
   ends it with an error, since a hardware stream cannot be finished in software.
 - **Linux: VA-API, H.264 (`avcC`) and HEVC (`hvcC`)**, 8-bit H.264 and 8- or 10-bit HEVC, 4:2:0
-  progressive (`vaapi/`). libva is `dlopen`ed at run time (LGPL, so never linked or shipped; the
-  licence reading is not settled yet, see [ADR 0001](../../docs/adr/0001-platform-ffi.md)), and a
+  progressive (`vaapi/`). libva is `dlopen`ed at run time and never linked or shipped, so the build
+  gains no dependency on it; its LGPL-2.1+ licence was approved against `AGENTS.md` §2 on 2026-10-08,
+  see [ADR 0001](../../docs/adr/0001-platform-ffi.md), which also records that it must stay behind
+  `dlopen`, and a
   driver that does not list the profile with a video decoder for it is declined rather than used —
   hardware is verified, not assumed. Container samples go in as Annex B and FilmCraft builds each
   picture's parameter record itself from its own parsers, because VA-API does not work picture

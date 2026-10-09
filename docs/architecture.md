@@ -264,8 +264,9 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   frame of the same source. A request that finds the shared decoder busy decodes with a private
   decoder.
   On Linux the decoder (`platform::vaapi`) drives libva 2.x, which is `dlopen`ed at run time and
-  never linked (its licence is LGPL-2.1+, and whether a run-time `dlopen` satisfies `AGENTS.md` §2
-  is still **pending maintainer review** — [ADR 0001](adr/0001-platform-ffi.md)). It takes
+  never linked, so the build gains no dependency on it; its licence is LGPL-2.1+, and a run-time
+  `dlopen` of the system's own driver was approved against `AGENTS.md` §2 on 2026-10-08
+  ([ADR 0001](adr/0001-platform-ffi.md)). It takes
   `avcC` / `hvcC` at 4:2:0 progressive — 8-bit H.264 (Baseline / Main / High) and 8- or 10-bit
   HEVC (Main, Main Still Picture, Main 10) — so `avcC` / `hvcC` samples go in as Annex B exactly
   as on Windows, and each picture's records are built by FilmCraft from its own slice-header
