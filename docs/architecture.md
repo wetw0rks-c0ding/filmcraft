@@ -72,7 +72,7 @@ and `filmcraft-cli`.
 | `engine` | L4 | `Session`, command registry, undo history, media pool, jobs, interchange glue |
 | `ui-egui` | L5 | the egui frontend: docking, panels, timeline, monitors, playback, control-channel handlers |
 | `automation` | L5 | MCP server (`rmcp`, stdio), headless or bridged to the running app |
-| `platform` | L5 | OS media FFI only: hardware video decoding (VideoToolbox H.264 / HEVC on macOS; Media Foundation / Direct3D 11 H.264 / HEVC on Windows; a no-op elsewhere) behind `codecs::VideoDecoder`, with transparent fallback to our decoders, and hardware H.264 encoding (VideoToolbox, opt-in) and H.265 encoding (VideoToolbox, the only H.265 encoder; the format exists only where a hardware encoder does) and NVIDIA NVENC H.264 encoding (Windows, opt-in) behind `export::VideoEncoder`; H.264 declines to the built-in encoder for what the hardware does not take. The one crate allowed `unsafe` ([ADR 0001](adr/0001-platform-ffi.md), [README](../crates/platform/README.md)) |
+| `platform` | L5 | OS media FFI only: hardware video decoding (VideoToolbox H.264 / HEVC on macOS; Media Foundation / Direct3D 11 H.264 / HEVC on Windows; VA-API H.264 / HEVC on Linux; a no-op elsewhere) behind `codecs::VideoDecoder`, with transparent fallback to our decoders, and hardware H.264 encoding (VideoToolbox, opt-in) and H.265 encoding (VideoToolbox, the only H.265 encoder; the format exists only where a hardware encoder does) and NVIDIA NVENC H.264 encoding (Windows, opt-in) behind `export::VideoEncoder`; H.264 declines to the built-in encoder for what the hardware does not take. The one crate allowed `unsafe` ([ADR 0001](adr/0001-platform-ffi.md), [README](../crates/platform/README.md)) |
 | `filmcraft` | L6 | desktop binary: eframe/wgpu window, cpal audio output, file dialogs, native macOS menu, TCP control server |
 | `filmcraft-cli` | L6 | headless CLI: `exec`, `run`, `inspect`, `describe`, `commands`, `import`, `export`, `render`, `probe`, `mcp`; `--bridge` targets the running app |
 | `filmcraft-web` | L6 | the browser app (wasm32): eframe web runner on WebGPU/WebGL2, Blob-backed services, OPFS recovery, WebAudio, WebCodecs, `window.filmcraft` API ([web.md](web.md)) |
@@ -231,8 +231,8 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   hardware decoder can take precedence. The GOP cache never holds its lock while decoding.
 - **Hardware decoding.** The apps (desktop, CLI / headless MCP, bench) call
   `filmcraft_platform::register()` at startup, which on macOS registers a VideoToolbox factory for
-  `avcC` / `hvcC` streams (8 / 10-bit, 4:2:0 and 4:2:2; elsewhere it does nothing), and on Windows a
-  Media Foundation one (below). The factory
+  `avcC` / `hvcC` streams (8 / 10-bit, 4:2:0 and 4:2:2), on Windows a Media Foundation one (below)
+  and on Linux a VA-API one (below); elsewhere it does nothing. The factory
   declines (our decoder is used) when Settings ▸ Playback ▸ Hardware decoding is Off
   (`codecs::hw::set_hardware_decoding`, applied by the engine whenever preferences change), for
   formats it does not take, and when the OS cannot create a *hardware* session for the stream.
@@ -263,6 +263,27 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   Decoders run slices on rayon, so an export worker waiting inside a decode can pick up another
   frame of the same source. A request that finds the shared decoder busy decodes with a private
   decoder.
+  On Linux the decoder (`platform::vaapi`) drives libva 2.x, which is `dlopen`ed at run time and
+  never linked (its licence is LGPL-2.1+, and whether a run-time `dlopen` satisfies `AGENTS.md` §2
+  is still **pending maintainer review** — [ADR 0001](adr/0001-platform-ffi.md)). It takes
+  `avcC` / `hvcC` at 4:2:0 progressive — 8-bit H.264 (Baseline / Main / High) and 8- or 10-bit
+  HEVC (Main, Main Still Picture, Main 10) — so `avcC` / `hvcC` samples go in as Annex B exactly
+  as on Windows, and each picture's records are built by FilmCraft from its own slice-header
+  parsers (`platform::vaapi::picture`), because libva does not work picture structure out for the
+  application. Pictures come back from a driver surface to the CPU through `vaDeriveImage` +
+  `vaMapBuffer` (`vaCreateImage` + `vaPutImage` when a driver cannot derive), through the same
+  `biplanar::to_frame`, so the readback is one copy and **zero-copy is not done here either**.
+  A driver that does not list the profile with a video decoder for it is declined up front. Four
+  limits are worth knowing at runtime, because each of them hands the stream to our decoder with no
+  error shown: VP9 and AV1 are declined while still a stream description (neither codec crate
+  exposes the per-frame header libva wants as a record); 10-bit H.264 is declined (libva names
+  that profile `VAProfileH264High10` and this backend does not carry it); an H.264 stream whose B
+  slices carry H.264's *implicit* weights (`weighted_bipred_idc == 2`, x264's default for High
+  profile with B frames, so most H.264) is declined at the first such slice, because
+  `VASliceParameterBufferH264` holds one weight per reference index per list and an implicit
+  weight is a function of the *pair*; and HEVC with `sps_scaling_list_enabled_flag` is declined
+  because `VAIQMatrixBufferHEVC` is not built, and a driver defaulting the quantizer would decode
+  a picture the stream does not contain.
 - **Hardware encoding.** On Windows, `platform::nvenc::export::factory` is registered with
   `filmcraft_export::register_encoder` (`register()` does this once), in front of the software H.264
   encoder. It takes an export only when Export ▸ Hardware encoding (`ExportSettings.hardwareEncoding`,

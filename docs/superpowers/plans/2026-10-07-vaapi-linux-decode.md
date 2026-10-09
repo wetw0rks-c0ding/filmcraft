@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give Linux hardware video decoding for H.264, HEVC, VP9 and AV1 at 4:2:0 8/10-bit, through the same factory, fallback and parity-test seams the macOS and Windows backends already use.
+**Goal:** Give Linux hardware video decoding for H.264, HEVC, VP9 and AV1 at 4:2:0 8/10-bit, through the same factory, fallback and parity-test seams the macOS and Windows backends already use. *(As built: H.264 and HEVC only. VP9 and AV1 are declined — see "Task 7: Documentation and the ADR" for why, and for the codec claims in this plan that were corrected with it.)*
 
 **Architecture:** A new `crates/platform/src/vaapi/` module mirroring `media_foundation/`: an `unsafe` FFI module that `dlopen`s libva at run time and exposes no raw pointers, and a safe module holding all decoder logic. Per picture, FilmCraft builds the `VAPictureParameterBuffer` itself from its own already-public slice-header parsers, decodes into a driver surface, and reads it back to CPU with `vaDeriveImage` + `vaMapBuffer`, feeding the existing `biplanar::to_frame`. `HybridDecoder` wraps it, so a mid-stream failure falls back to the software decoder transparently.
 
@@ -46,8 +46,8 @@ Inputs and conditions the spec implies but which no task's tests would otherwise
 |---|---|
 | `crates/platform/src/vaapi/mod.rs` | Safe: `VaDecoder` implementing `VideoDecoder`, surface ring, decode loop, readback, `available()`, `capabilities()` |
 | `crates/platform/src/vaapi/ffi.rs` | `unsafe`: `dlopen`/`dlsym` symbol table, the `VA*` C structs and constants we call, safe `Display`/`Session` wrappers |
-| `crates/platform/src/vaapi/stream.rs` | Safe: `Stream`, `Plan` (VA profile + entrypoint), decline tables, `input()` for all four codecs. Compiled and tested on every target. |
-| `crates/platform/src/vaapi/picture.rs` | Safe: building the per-codec picture parameter buffers (`VAPictureParameterBufferH264`, `VAPictureParameterBufferHEVC`, `VADecPictureParameterBufferVP9`, `VADecPictureParameterBufferAV1`) from parsed slice headers and `FrameStreamInfo`. Compiled and tested on every target. |
+| `crates/platform/src/vaapi/stream.rs` | Safe: `Stream`, `Plan` (VA profile + entrypoint), decline tables, `input()` for the NAL codecs (H.264 / HEVC), plus the VP9 / AV1 decline while those records do not exist. Compiled and tested on every target. |
+| `crates/platform/src/vaapi/picture.rs` | Safe: building the H.264 and HEVC picture parameter buffers (`VAPictureParameterBufferH264`, `VAPictureParameterBufferHEVC`) from parsed slice headers. Compiled and tested on every target. |
 | `crates/platform/tests/vaapi.rs` | Linux-only parity, seek, flush, forced-failure and mutation tests. |
 | `crates/platform/examples/vacaps.rs` | Diagnostics: what the local driver offers (mirrors `examples/mfcaps.rs`). |
 
@@ -813,6 +813,8 @@ The tests that prove the backend is interchangeable with the software decoder, w
 
 - [ ] **Step 1: Add the VP9 and AV1 fixtures**
 
+> **Corrected by what was built: do not add these.** `plan_frame` declines every frame-coded stream (see the note at the start of Task 7), so a parity test over these three would only ever print `SKIPPED`, and three ffmpeg encodes nothing consumes is a misleading test. Assert the **decline** instead — that a `vp9` / `av1` sample entry yields `StreamInfo::Frame`, that `VaDecoder::new` refuses it with a reason naming the missing record, that the factory returns `None`, and that FilmCraft's own decoder still plays it — and spend the fixture budget on H.264 variants that do exercise the hardware path.
+
 Append to `FIXTURES` in `crates/platform/tests/common/mod.rs`. They must match the shape of the existing ones — B-frames, a 360-line picture so the coded height is cropped, two or more GOPs, and a 10-bit case:
 
 ```rust
@@ -882,12 +884,12 @@ Then the four tests, copied in structure from `tests/media_foundation.rs`:
 - `damaged_samples_give_errors_or_fall_back` — flip bits in the slice data with `xorshift`, require only errors, fallback, or correct pictures, never a panic or hang (bound each with the same `Duration` timeout `media_foundation.rs` uses).
 - `in_band_parameter_sets_are_not_confused_with_the_config_record` — a sample carrying different SPS/PPS must fall back rather than decode with the wrong picture structure. This is Review Focus #4's test.
 
-Drive all of it from `#[test]` wrappers that iterate over the six fixture names.
+Drive all of it from `#[test]` wrappers that iterate over the fixture names this backend can describe.
 
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo test -p filmcraft-platform --test vaapi -- --nocapture`
-Expected: PASS on this machine for the fixtures its driver supports; the rest print `SKIPPED`. On this Arc B580, expect H.264, HEVC Main, HEVC Main 10, VP9 profile 0, VP9 profile 2 and AV1 profile 0 to run, since the driver advertises VLD for all of them.
+Expected: PASS on this machine for the fixtures its driver supports; the rest print `SKIPPED`. On this Arc B580, expect H.264, HEVC Main and HEVC Main 10 to run, since the driver advertises VLD for all of them. (VP9 and AV1 are asserted to be **declined** rather than decoded — see the note at the start of Task 7.)
 
 If a parity test fails with a plane mismatch, read the reported `max diff` before touching the code: a small consistent difference points at a colour-range or shift mistake in the picture record, while a large one points at the surface or pitch handling.
 
@@ -913,6 +915,10 @@ git commit -m "M-HW: VA-API parity, seek, flush, fallback and mutation tests"
 
 ### Task 7: Documentation and the ADR
 
+> **Scope as built: H.264 and HEVC only.** This task's text below said "all four codecs", and that was wrong by the time it was written. A VP9 / AV1 picture record needs the codec's per-frame uncompressed header, and neither crate exposes one: `crates/vp9/src/lib.rs:27` is `mod header;` (private) and `crates/av1/src/header.rs:478` is `pub(crate) fn parse` over private `BitReader` / `HeaderState`. Exporting those parsers is a change in two clean-room codec crates, which this plan never scoped and which needs its own review, so `plan_frame` declines both codecs while they are still a stream description.
+>
+> **Every doc this task writes says H.264 + HEVC**, and nothing says VP9 / AV1 hardware decode is available. Three more limits belong in the same breath, because they are what a user hits first: H.264 streams that weight their B slices implicitly (`weighted_bipred_idc == 2`, x264's default for High + B, so most H.264) are declined, because `VASliceParameterBufferH264` holds one weight per reference index per list and an implicit weight is a function of the *pair*; HEVC with `sps_scaling_list_enabled_flag` is declined, because `VAIQMatrixBufferHEVC` is not built and a driver default would decode a picture the stream does not contain; and 10-bit H.264 is declined too (`media_foundation/stream.rs:279` does the same, and there is no fixture that would prove a hardware path for it here). Readback is to the CPU, through `vaDeriveImage` + `vaMapBuffer`, so zero-copy is still not done on Linux. The LGPL stance in Step 1 is recorded as **pending maintainer review**, not as a decision taken.
+
 **Files:**
 - Modify: `docs/adr/0001-platform-ffi.md`, `README.md`, `ROADMAP.md`, `crates/platform/README.md`, `docs/architecture.md`
 
@@ -925,17 +931,17 @@ git commit -m "M-HW: VA-API parity, seek, flush, fallback and mutation tests"
 Two edits to `docs/adr/0001-platform-ffi.md`:
 
 - In the containment rules (`:28`), add `vaapi::ffi` to the list of modules permitted `#[allow(unsafe_code)]`: change `videotoolbox`, `media_foundation::gpu` / `media_foundation::mft`, and `nvenc::ffi` / `nvenc::session` to also include `vaapi::ffi` on Linux.
-- Add a new subsection, **"Calling libva at run time"**, recording the licence stance: `libva` is LGPL-2.1+, FilmCraft resolves its symbols with `dlopen`/`dlsym` at run time rather than linking it, no LGPL code is vendored, copied or shipped, and the application calls only the ABI of the system's own driver. State plainly that this is a reading of `AGENTS.md` section 2 — that the rule governs code entering the repository, not libraries called at run time — and that a stricter reading would rule out VA-API entirely, so the decision is recorded here for review rather than left implicit.
+- Add a new subsection, **"Calling libva at run time"**, recording the licence stance: `libva` is LGPL-2.1+, FilmCraft resolves its symbols with `dlopen`/`dlsym` at run time rather than linking it, no LGPL code is vendored, copied or shipped, and the application calls only the ABI of the system's own driver. State plainly that this is a reading of `AGENTS.md` section 2 — that the rule governs code entering the repository, not libraries called at run time — and that a stricter reading would rule out VA-API entirely. **Record it as pending maintainer review, not as a decision taken**: `dlopen` at run time with no link-time dependency is why this is *candidate* clean-room material, and whether it satisfies the rule needs an explicit yes or no from a maintainer. Nothing in that subsection may read as an approval.
 
 Also note in the same subsection that this backend targets libva **2.x only**: `vaOpenDisplay` and `vaMapSurface` were removed in libva 2.24, and systems on libva 1.x fall back to the software decoder.
 
 - [ ] **Step 2: Update `crates/platform/src/lib.rs` module doc**
 
-The crate doc says hardware decoding covers VideoToolbox and Media Foundation and that other systems register nothing. Add VA-API on Linux (libva 2.x, H.264 / HEVC / VP9 / AV1 at 4:2:0 8/10-bit) to that list.
+The crate doc says hardware decoding covers VideoToolbox and Media Foundation and that other systems register nothing. Add VA-API on Linux (libva 2.x, H.264 and HEVC at 4:2:0 — 8-bit H.264, 8- or 10-bit HEVC) to that list, with the declines above.
 
 - [ ] **Step 3: Update `crates/platform/README.md`**
 
-`:73` says other systems get `Availability::Unavailable`; change it to name Linux. Remove `VA-API (Linux) decoders` from the "Not yet" list (`:188-193`) and, while there, leave the zero-copy item in place since it is still true.
+`:73` says other systems get `Availability::Unavailable`; change it to name Linux, and state what Linux takes and declines (the scope-as-built note above). Remove `VA-API (Linux) decoders` from the "Not yet" list (`:188-193`) and, while there, leave the zero-copy item in place since it is still true; add the VP9 / AV1, implicit-weighted-H.264 and HEVC-scaling-list declines to that list.
 
 - [ ] **Step 4: Update `README.md`**
 
@@ -943,7 +949,7 @@ The crate doc says hardware decoding covers VideoToolbox and Media Foundation an
 
 - [ ] **Step 5: Update `ROADMAP.md`**
 
-`:51`: strike hardware decode on Linux (VA-API) from the gaps, leaving the zero-copy and GPU-export items. `:157`: add the landed VA-API decode milestone to the "Running now" hardware-acceleration log, and make "Next" say hardware encoding on Linux (`h264_vaapi` / `hevc_vaapi`, which the driver probe confirmed) alongside zero-copy upload and Lumetri.
+`:51`: strike hardware decode on Linux (VA-API) from the gaps, leaving the zero-copy and GPU-export items — but keep the Linux gap that is real, VP9 / AV1 hardware decode on Linux, whose reason is the missing per-frame header record. `:157`: add the landed VA-API decode milestone to the "Running now" hardware-acceleration log with its scope, and make "Next" say hardware encoding on Linux (`h264_vaapi` / `hevc_vaapi`, which the driver probe confirmed) alongside zero-copy upload and Lumetri.
 
 - [ ] **Step 6: Update `docs/architecture.md`**
 
