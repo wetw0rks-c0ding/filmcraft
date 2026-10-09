@@ -44,6 +44,11 @@ const MAX_SLICES: usize = 256;
 /// `va_dec_hevc.h:64`), which is also the most a `VASliceParameterBufferHEVC`'s `RefPicList` names.
 const MAX_HEVC_REF_PICS: usize = 15;
 
+/// A `VASliceParameterBufferHEVC`'s `RefPicList` entry that names no reference: the record's own
+/// "0xFF marks an entry the picture does not use" (`va_dec_hevc.h`), which is also what an entry past a
+/// list's own length holds.
+const INVALID_HEVC_LIST_ENTRY: u8 = 0xFF;
+
 /// The bytes of an HEVC NAL unit header (`nuh_layer_id` and `nuh_temporal_id_plus1`), which the
 /// slice segment header's byte offsets in a record are counted from.
 const HEVC_NAL_HEADER: [u8; 2] = [0; 2];
@@ -382,6 +387,14 @@ fn h264_ref_lists(dpb: &[DpbEntry], sh: &filmcraft_h264::slice::SliceHeader, cur
                     let wanted = if no_wrap > cur { no_wrap - modulus } else { no_wrap };
                     (short.iter().copied().find(|&i| pic_num(i) == wanted), false)
                 }
+                // `modification_of_pic_nums_idc == 2` names `long_term_pic_num` (7.4.3.1), which 8.2.4.3.1 resolves
+                // by `LongTermPicNum` — a different numbering from the `LongTermFrameIdx` this buffer
+                // stores, and one that is not tracked here. It is matched against the stored index
+                // anyway, because that is what `filmcraft_h264`'s own `Dpb::build_ref_lists` does
+                // (`crates/h264/src/dpb.rs:218`), so on a stream that reorders a long-term reference
+                // this way the two decoders agree — which is the only reason it is not a refusal. A
+                // stream where the two numberings differ is one neither of them is verified against;
+                // recorded here so the agreement is not mistaken for derivation.
                 2 => (long.iter().copied().find(|&i| matches!(dpb[i].mark, Mark::Long(k) if k == m.value)), true),
                 other => return Err(format!("modification_of_pic_nums_idc {other}")),
             };
@@ -510,6 +523,7 @@ fn h264_mmcos(poc: &mut NalPoc, mmcos: &[filmcraft_h264::slice::Mmco], cur_frame
                 }
             }
             2 => {
+                // 8.2.5.4.2 retires by `LongTermPicNum`, which is MMCO 2's own field.
                 for e in poc.dpb.iter_mut() {
                     if matches!(e.mark, Mark::Long(k) if k == m.long_term_pic_num) {
                         e.mark = Mark::Unused;
@@ -518,8 +532,14 @@ fn h264_mmcos(poc: &mut NalPoc, mmcos: &[filmcraft_h264::slice::Mmco], cur_frame
             }
             3 => {
                 let pn = cur - (m.difference_of_pic_nums_minus1 as i32 + 1);
+                // 8.2.5.4.3: "The long-term frame with LongTermFrameIdx equal to long_term_frame_idx
+                // is marked unused for reference" — the index this MMCO *assigns*, not MMCO 2's
+                // `LongTermPicNum`. Comparing against the wrong field retires nothing when the two
+                // happen to differ, and then two entries can hold the same `LongTermFrameIdx`, which
+                // `h264_ref_lists` picks between by index alone — so the driver would be handed the
+                // wrong long-term reference with nothing reporting a problem.
                 for e in poc.dpb.iter_mut() {
-                    if matches!(e.mark, Mark::Long(k) if k == m.long_term_pic_num) {
+                    if matches!(e.mark, Mark::Long(k) if k == m.long_term_frame_idx) {
                         e.mark = Mark::Unused;
                     }
                 }
@@ -541,7 +561,20 @@ fn h264_mmcos(poc: &mut NalPoc, mmcos: &[filmcraft_h264::slice::Mmco], cur_frame
                 poc.dpb.clear();
                 current_long = None;
             }
-            6 => current_long = Some(m.long_term_frame_idx),
+            6 => {
+                // 8.2.5.4.6: the current picture is marked long-term with `long_term_frame_idx`
+                // "and any existing long-term frame with a LongTermFrameIdx equal to
+                // long_term_frame_idx is marked unused for reference". The retirement is what keeps
+                // two entries from holding one index, which is the same hazard MMCO 3 has above; the
+                // current picture is inserted by `h264_mark` after this returns, so retiring here is
+                // retiring the *other* holder.
+                for e in poc.dpb.iter_mut() {
+                    if matches!(e.mark, Mark::Long(k) if k == m.long_term_frame_idx) {
+                        e.mark = Mark::Unused;
+                    }
+                }
+                current_long = Some(m.long_term_frame_idx);
+            }
             _ => {}
         }
     }
@@ -1176,6 +1209,13 @@ fn h264_implicit_pair(cur_poc: i32, r0: &DpbEntry, r1: &DpbEntry) -> (i32, i32) 
 /// `testsrc2` exercises implicit weighting, so such a stream declines, while the same encode with
 /// `weightb=0` (`weighted_bipred_idc == 0`, which codes no weight table and no implicit mode at all) is
 /// bit-exact against both ffmpeg and `filmcraft_h264` on every picture.
+///
+/// **The all-1.0 branch has no end-to-end test.** Every fixture with `weighted_bipred_idc == 2` this
+/// suite can produce exercises the decline, and the ones that do not (`weightb=0`) never reach this
+/// code — so [`h264_default_weights`] is checked only by
+/// `an_implicitly_weighted_b_slice_is_refused_rather_than_guessed`, which asserts the bytes it writes. A
+/// wrong weight there that still happened to be 1.0 would pass every test in the suite. That is stated
+/// here because the branch is reachable and its cost if it is wrong is a wrong picture, not an error.
 fn h264_weights(
     sh: &filmcraft_h264::slice::SliceHeader,
     pps: &filmcraft_h264::params::Pps,
@@ -1379,19 +1419,15 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
     let mut params = VaPictureParameterBufferHevc::default();
     let mut slices: Vec<SliceParam> = Vec::new();
     let mut slice_offsets: Vec<usize> = Vec::new();
-    // Every segment of the picture, with where its bytes are, until the last of them is known. The
-    // second pass needs each segment's own PPS as well as its header: whether its weight table was
-    // mandatory is a flag of that parameter set.
-    let mut segments: Vec<(&[u8], usize, filmcraft_hevc::slice::SliceHeader, Arc<filmcraft_hevc::params::Pps>, u32, u32)> = Vec::new();
+    // Every segment of the picture, with where its bytes are and **its own** reference lists, until the
+    // last of them is known. The second pass needs each segment's own PPS as well as its header:
+    // whether its weight table was mandatory is a flag of that parameter set.
+    let mut segments: Vec<(&[u8], usize, filmcraft_hevc::slice::SliceHeader, Arc<filmcraft_hevc::params::Pps>, u32, u32, [Vec<usize>; 2])> = Vec::new();
     // The last *independent* segment header, which a dependent segment inherits from; a dependent
     // segment carries almost none of its own, so the parser needs the one it follows.
     let mut previous: Option<filmcraft_hevc::slice::SliceHeader> = None;
     let mut first: Option<filmcraft_hevc::slice::SliceHeader> = None;
     let mut picture_poc: Option<i32> = None;
-    // The picture's reference lists, filled from the picture record and passed to every segment's
-    // record. They are the picture's, not a segment's: every segment of one picture refers to the
-    // same pictures, and the record that names them is the picture's.
-    let mut lists: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
     let mut data_offset = 0u32;
 
     for (nal, offset) in &nals {
@@ -1447,11 +1483,15 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
             return Err(hevc_scaling_lists_declined().into());
         }
 
-        if first.is_none() {
+        let length = u32::try_from(nal.len()).map_err(|_| "slice segment length does not fit the record".to_string())?;
+        // The record is built once every segment is known, because `LastSliceOfPic` belongs to the
+        // last of them and libva's driver waits for it: a picture whose last segment does not say
+        // the picture ended leaves the driver looking for more.
+        let lists = if first.is_none() {
             let (p, built) = fill_hevc_picture(&mut params, poc, &sh, &pps, &sps, surface, width, height)?;
             picture_poc = Some(p);
-            lists = built;
             first = Some(sh.clone());
+            built
         } else {
             // Every segment of a picture shares the picture's parameter sets: the record was filled
             // in from the first segment, so a later one naming a different picture parameter set
@@ -1460,12 +1500,39 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
             if !hevc_same_picture(first, &sh) {
                 return Err("a slice segment that does not match the first segment of its picture".into());
             }
-        }
-        let length = u32::try_from(nal.len()).map_err(|_| "slice segment length does not fit the record".to_string())?;
-        // The record is built once every segment is known, because `LastSliceOfPic` belongs to the
-        // last of them and libva's driver waits for it: a picture whose last segment does not say
-        // the picture ended leaves the driver looking for more.
-        segments.push((nal, *offset, sh.clone(), pps.clone(), data_offset, length));
+            if sh.st_rps != first.st_rps || sh.lt != first.lt {
+                return Err("a slice segment with a different reference picture set from the first segment of its picture".into());
+            }
+            // ...and its reference picture set, which the picture record was filled in from: 7.4.8.3
+            // makes one set serve every segment of a picture, and a segment carrying a different one
+            // would be described with a picture buffer that is not that segment's set.
+
+            // The lists are this segment's, not the picture's. `num_ref_idx_l0/l1_active_minus1` and
+            // `list_entry[]` are per-slice-segment syntax elements (7.4.7.1, 7.4.7.2), so two segments
+            // of one picture may name different numbers of references out of the same set — and a
+            // record that kept the first segment's lists would say `num_ref_idx_l1_active_minus1` of 3
+            // with `RefPicList[1]` still all invalid, which the driver decodes from without an error.
+            //
+            // **What is tested here, and what is not.** `every_slice_segment_record_names_as_many_references_as_its_own_header_says`
+            // runs over `hevc_multi_segment`, whose every picture has two segments, and checks each
+            // segment's record against that segment's own header; `a_segment_record_must_name_its_own_lists_not_the_first_segments`
+            // constructs a second segment asking for more references than the first's lists hold and
+            // shows the two sets of lists are not interchangeable. What neither can do is **catch this
+            // line being reverted**, because the only encoder available here (x265, `slices=2:no-tskip=1`
+            // and `slices=4`) gives both segments of a picture the same `num_ref_idx`, so the reused
+            // lists produce byte-identical records and every assertion above still passes. A stream
+            // that varied `num_ref_idx` between its segments — hardware encoders and broadcast sources
+            // do — is what would fail. That gap is stated here rather than left for the next reader to
+            // assume is covered.
+            //
+            // Deriving them again is safe: `hevc_ref_lists` applies 8.3.2's marking to the buffer as
+            // it goes, and after the first segment the buffer already holds exactly the set's
+            // entries, so every entry is kept and the index remap is the identity. The H.264 path
+            // builds its lists per slice the same way.
+            let max_lsb = i32::checked_shl(1, sps.log2_max_poc_lsb).ok_or("log2_max_pic_order_cnt_lsb is out of range")?;
+            hevc_ref_lists(&mut poc.dpb, &sh, picture_poc.ok_or("the picture's POC is not set")?, max_lsb)?
+        };
+        segments.push((nal, *offset, sh.clone(), pps.clone(), data_offset, length, lists));
         data_offset = data_offset.checked_add(length).ok_or("slice data buffer size overflows")?;
         // A dependent segment repeats almost nothing, so the segment that follows an independent
         // one inherits it and a dependent one does not become the new base.
@@ -1481,8 +1548,8 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
         hevc_mark(&mut poc.dpb, &first, surface, p);
     }
     let last = segments.len().saturating_sub(1);
-    for (i, (nal, offset, sh, pps, at, length)) in segments.iter().enumerate() {
-        slices.push(SliceParam { offset: *at, length: *length, params: hevc_slice_record(nal, sh, pps, *at, i == last, &lists)? });
+    for (i, (nal, offset, sh, pps, at, length, lists)) in segments.iter().enumerate() {
+        slices.push(SliceParam { offset: *at, length: *length, params: hevc_slice_record(nal, sh, pps, *at, i == last, lists)? });
         slice_offsets.push(*offset);
     }
     // No IQ matrix, because there is none to send. HEVC's scaling lists go in `VAIQMatrixBufferHEVC` and
@@ -1669,7 +1736,7 @@ fn hevc_reference_frames(
 /// The two `RefPicList`s of a slice record: indices into the picture record's `ReferenceFrames`, with
 /// `0xFF` — the record's "this entry is not used" — everywhere past each list's own length.
 fn hevc_ref_pic_lists(lists: &[Vec<usize>; 2]) -> Result<[[u8; MAX_HEVC_REF_PICS]; 2], String> {
-    let mut out = [[0xFF; MAX_HEVC_REF_PICS]; 2];
+    let mut out = [[INVALID_HEVC_LIST_ENTRY; MAX_HEVC_REF_PICS]; 2];
     for (list, built) in lists.iter().enumerate() {
         if built.len() > MAX_HEVC_REF_PICS {
             return Err(format!("reference list {list} of {} entries does not fit the record", built.len()));
@@ -2511,6 +2578,92 @@ mod tests {
         for (slice, &at) in p.slices.iter().zip(&p.slice_offsets) {
             assert_eq!(samples[0].get(at..at + slice.length as usize).map(<[u8]>::len), Some(slice.length as usize), "the slice at {at} is there");
         }
+    }
+
+    /// 8.2.5.4.3 (MMCO 3) and 8.2.5.4.6 (MMCO 6) both retire the long-term frame that already holds the
+    /// index the MMCO assigns, and the index is `long_term_frame_idx` — not MMCO 2's
+    /// `LongTermPicNum`, which numbers a different thing.
+    ///
+    /// The hazard is not a stale entry but a **collision**: `h264_ref_lists` finds a long-term reference
+    /// by its `Mark::Long` index and nothing else, so two entries holding one index let it hand the
+    /// driver the wrong picture without any error anywhere. Both halves are built by hand here rather
+    /// than from a fixture, because a fixture would need a stream that assigns one index twice and that
+    /// is what the test is about proving does not happen.
+    #[test]
+    fn an_mmco_that_assigns_a_held_long_term_index_retires_the_holder() {
+        let mmco = |op: u32, pic_num: u32, frame_idx: u32| filmcraft_h264::slice::Mmco {
+            op,
+            difference_of_pic_nums_minus1: 0,
+            long_term_pic_num: pic_num,
+            long_term_frame_idx: frame_idx,
+            max_long_term_frame_idx_plus1: 0,
+        };
+        let short = |frame_num: u32| super::DpbEntry { surface: frame_num, frame_num, poc: frame_num as i32, mark: super::Mark::Short };
+        let long = |frame_num: u32, index: u32| super::DpbEntry { surface: frame_num, frame_num, poc: frame_num as i32, mark: super::Mark::Long(index) };
+        let indices = |poc: &super::NalPoc| {
+            let mut v: Vec<u32> = poc
+                .dpb
+                .iter()
+                .filter_map(|e| match e.mark {
+                    super::Mark::Long(k) => Some(k),
+                    _ => None,
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let no_collisions = |poc: &super::NalPoc, what: &str| {
+            let mut seen = std::collections::BTreeSet::new();
+            for e in poc.dpb.iter() {
+                if let super::Mark::Long(k) = e.mark {
+                    assert!(
+                        seen.insert(k),
+                        "{what}: two entries hold LongTermFrameIdx {k}, in {:?}",
+                        poc.dpb.iter().map(|e| (e.frame_num, e.mark)).collect::<Vec<_>>()
+                    );
+                }
+            }
+        };
+
+        // MMCO 3: the short-term frame whose PicNum is one back becomes long-term at index 3, and
+        // frame_num 2 already holds index 3 — so frame_num 2 must be retired, not kept.
+        let mut poc = super::NalPoc::default();
+        poc.dpb.push(long(2, 3));
+        poc.dpb.push(short(4));
+        poc.dpb.push(short(8));
+        super::h264_mmcos(&mut poc, &[mmco(3, 99, 3)], 9, 16);
+        assert_eq!(indices(&poc), vec![3], "MMCO 3 keeps one entry at index 3");
+        assert!(poc.dpb.iter().any(|e| e.frame_num == 4), "and it is the frame the MMCO moved to long-term");
+        assert!(!poc.dpb.iter().any(|e| e.frame_num == 2), "the frame already holding index 3 was retired");
+        no_collisions(&poc, "after MMCO 3");
+
+        // MMCO 3 with `LongTermPicNum` set to something else must still retire by the index it assigns:
+        // with the two fields confused, `long_term_pic_num = 99` would have retired nothing.
+        let mut poc = super::NalPoc::default();
+        poc.dpb.push(long(2, 3));
+        poc.dpb.push(short(4));
+        super::h264_mmcos(&mut poc, &[mmco(3, 99, 3)], 9, 16);
+        assert!(!poc.dpb.iter().any(|e| e.frame_num == 2), "MMCO 3 retires by long_term_frame_idx, not by LongTermPicNum");
+        no_collisions(&poc, "after MMCO 3 with a differing LongTermPicNum");
+
+        // MMCO 6: the current picture is marked long-term at the index it assigns, and whatever already
+        // held that index goes. The current picture is inserted by `h264_mark`, not here, so what is
+        // asserted is the retirement and the returned index.
+        let mut poc = super::NalPoc::default();
+        poc.dpb.push(long(2, 3));
+        poc.dpb.push(short(4));
+        let cur_long = super::h264_mmcos(&mut poc, &[mmco(6, 0, 3)], 9, 16);
+        assert_eq!(cur_long, Some(3), "MMCO 6 returns the index it assigned");
+        assert!(!poc.dpb.iter().any(|e| matches!(e.mark, super::Mark::Long(3))), "MMCO 6 retired the frame already holding index 3");
+        no_collisions(&poc, "after MMCO 6");
+
+        // MMCO 2 does retire by `LongTermPicNum`, which is its own field and not a mistake: with
+        // `LongTermPicNum = 3` the holder of index 3 goes, and index 4 stays.
+        let mut poc = super::NalPoc::default();
+        poc.dpb.push(long(2, 3));
+        poc.dpb.push(long(5, 4));
+        super::h264_mmcos(&mut poc, &[mmco(2, 3, 0)], 9, 16);
+        assert_eq!(indices(&poc), vec![4], "MMCO 2 retired the entry its LongTermPicNum named");
     }
 
     /// The POC state advances once per picture, not once per slice, so the POCs of a run of pictures
@@ -3375,6 +3528,162 @@ mod tests {
         Some(read(&path))
     }
 
+    /// The slice segment headers and the VCL NAL units of one access unit, in order.
+    ///
+    /// A dependent segment inherits almost nothing from its own bytes, so the parser is given the last
+    /// independent segment — which is what `build_hevc` does too.
+    fn hevc_segments<'a>(info: &NalStreamInfo, sets: &super::HevcSets, sample: &'a [u8]) -> (Vec<filmcraft_hevc::slice::SliceHeader>, Vec<&'a [u8]>) {
+        let mut headers = Vec::new();
+        let mut nals = Vec::new();
+        let mut previous = None;
+        for nal in info.nals(sample) {
+            let Ok(hdr) = filmcraft_hevc::slice::NalHeader::parse(nal) else { continue };
+            if !hdr.is_vcl() {
+                continue;
+            }
+            let rbsp = super::unescape_rbsp(nal.get(2..).unwrap_or_default());
+            let Ok((sh, _, _)) = filmcraft_hevc::slice::SliceHeader::parse(&rbsp, hdr, |id| sets.lookup(id), previous.as_ref()) else {
+                continue;
+            };
+            if !sh.dependent {
+                previous = Some(sh.clone());
+            }
+            headers.push(sh);
+            nals.push(nal);
+        }
+        (headers, nals)
+    }
+
+    /// How many of `count` entries of a segment record's reference list name a reference, as opposed to
+    /// holding the record's "this picture does not use this" marker.
+    fn hevc_named(params: &super::VaSliceParameterBufferHevc, list: usize, count: usize) -> usize {
+        params.ref_pic_list[list][..count].iter().filter(|e| **e != super::INVALID_HEVC_LIST_ENTRY).count()
+    }
+
+    /// Every slice segment's record names as many references as **that segment's own** header says,
+    /// out of that segment's own `RefPicList`.
+    ///
+    /// The reference picture set is shared by every segment of a picture (7.4.8.3), so what may differ
+    /// between segments is `num_ref_idx_l0/l1_active_minus1` and `list_entry[]` — per-slice-segment
+    /// syntax elements (7.4.7.1, 7.4.7.2). A record built from another segment's lists while carrying
+    /// this segment's count says "three active references in list 1" over a list of invalid entries,
+    /// which a driver decodes from and reports no error for.
+    ///
+    /// `hevc_multi_segment` is what makes this worth running: every picture of it has two segments, so
+    /// second segments are really visited. `a_segment_record_must_name_its_own_lists_not_the_first_segments`
+    /// is what makes it non-vacuous, since x265 gives both segments of a picture the same
+    /// `num_ref_idx` and would make the two sets of lists produce identical bytes.
+    #[test]
+    fn every_slice_segment_record_names_as_many_references_as_its_own_header_says() {
+        let Some((info, sets, samples)) = hevc_multi_segment() else { return };
+        let mut poc = super::NalPoc::default();
+        let mut multi = 0usize;
+        let mut records = 0usize;
+        for sample in &samples {
+            let (headers, _) = hevc_segments(&info, &sets, sample);
+            if headers.len() > 1 {
+                multi += 1;
+            }
+            let picture = super::build_nal(&info, sample, &mut poc, 0, 640, 360).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(picture.slices.len(), headers.len(), "a record per slice segment, and one per header read");
+            for (i, slice) in picture.slices.iter().enumerate() {
+                let sh = &headers[i];
+                let r = crate::vaapi::ffi::slice_params_hevc(&slice.params).unwrap_or_else(|| panic!("not a slice parameter record"));
+                // A P or B picture has list 0 and a B picture list 1; an I picture has neither, and
+                // its header's `num_ref_idx` is a default the record need not have filled in.
+                if sh.is_intra() {
+                    continue;
+                }
+                for (list, claimed) in [(0usize, r.num_ref_idx_l0_active_minus1), (1usize, r.num_ref_idx_l1_active_minus1)] {
+                    if list == 1 && !sh.is_b() {
+                        continue;
+                    }
+                    let count = claimed as usize + 1;
+                    assert_eq!(count, sh.num_ref_idx[list] as usize, "segment {i}: the active count is this segment's own");
+                    assert_eq!(count, hevc_named(&r, list, count), "segment {i}: list {list} names every reference it claims");
+                }
+                records += 1;
+            }
+        }
+        assert!(multi > 10, "the fixture has {multi} multi-segment pictures, so no second segment was checked");
+        assert!(records > 40, "only {records} inter-coded segment records were read");
+    }
+
+    /// The two segments' lists are **not** interchangeable, which is why they are built per segment.
+    ///
+    /// The multi-segment fixture cannot show this on its own: x265 gives both segments of a picture the
+    /// same `num_ref_idx`, so handing the second the first's lists produces identical bytes and no test
+    /// would fail. So the differing case is constructed — the second segment's header asked for more
+    /// references than the first segment's lists hold, which is what a stream that varied
+    /// `num_ref_idx_l1_active_minus1` between its segments produces.
+    ///
+    /// The failure is then asserted literally rather than described: a record carrying the *first*
+    /// segment's lists under this segment's larger count claims three active references and names one.
+    #[test]
+    fn a_segment_record_must_name_its_own_lists_not_the_first_segments() {
+        let Some((info, sets, samples)) = hevc_multi_segment() else { return };
+        let at = samples
+            .iter()
+            .position(|s| {
+                let (h, _) = hevc_segments(&info, &sets, s);
+                h.len() > 1 && h[0].is_b() && h[0].num_ref_idx[1] < super::MAX_HEVC_REF_PICS as u32
+            })
+            .unwrap_or_else(|| panic!("no B picture with two segments and room for more references"));
+        let (headers, nals) = hevc_segments(&info, &sets, &samples[at]);
+        let first = headers[0].clone();
+        let (second, second_nal) = (headers[1].clone(), nals[1]);
+        // The state a decoder is in just before this picture: the samples before it, decoded.
+        let mut before = super::NalPoc::default();
+        for s in &samples[..at] {
+            let _ = super::build_nal(&info, s, &mut before, 0, 640, 360).unwrap_or_else(|e| panic!("{e}"));
+        }
+        // The picture itself builds, with a record per segment.
+        let mut run = super::NalPoc::default();
+        for s in &samples[..=at] {
+            let p = super::build_nal(&info, s, &mut run, 0, 640, 360).unwrap_or_else(|e| panic!("{e}"));
+            if std::ptr::eq(s, &samples[at]) {
+                assert_eq!(p.slices.len(), 2, "the fixture's picture has two segments");
+            }
+        }
+        let (pps, sps) = sets.lookup(second.pps_id).unwrap_or_else(|e| panic!("{e}"));
+        let max_lsb = i32::checked_shl(1, sps.log2_max_poc_lsb).unwrap_or_else(|| panic!("log2_max_pic_order_cnt_lsb is out of range"));
+        // Both sets of lists are derived from that same state, each in its own copy, so neither is
+        // derived from what the other marked.
+        let cur_poc = before.hevc.compute(&first, max_lsb, first.nal.is_irap() && !first.nal.is_rasl());
+        let mut first_state = before.clone();
+        let first_lists = super::hevc_ref_lists(&mut first_state.dpb, &first, cur_poc, max_lsb).unwrap_or_else(|e| panic!("{e}"));
+
+        // A second segment asking for more of the same set: its own lists can supply them from the
+        // cycled set (8.3.4), the first segment's cannot.
+        let mut asked = second.clone();
+        asked.num_ref_idx[1] = asked.num_ref_idx[1].saturating_add(2);
+        let mut second_state = before.clone();
+        let asked_lists = super::hevc_ref_lists(&mut second_state.dpb, &asked, cur_poc, max_lsb).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(asked_lists[1].len() as u32, asked.num_ref_idx[1], "the asked-for list is the length the segment asked for");
+        assert!(
+            asked_lists[1].len() > first_lists[1].len(),
+            "and it is longer than the first segment's: {} against {}",
+            asked_lists[1].len(),
+            first_lists[1].len()
+        );
+
+        // The right record: its lists were re-derived for it, so it names every reference it claims.
+        let want = asked.num_ref_idx[1] as usize;
+        let right = super::hevc_slice_record(second_nal, &asked, &pps, 0, true, &asked_lists).unwrap_or_else(|e| panic!("{e}"));
+        let right = crate::vaapi::ffi::slice_params_hevc(&right).unwrap_or_else(|| panic!("not a slice parameter record"));
+        assert_eq!(right.num_ref_idx_l1_active_minus1 as usize + 1, want, "the record claims what this segment asked for");
+        assert_eq!(hevc_named(&right, 1, want), want, "and it names all of them");
+
+        // The wrong record: the first segment's lists under this segment's larger count. The counts come
+        // from the segment's header either way, so both records claim the same number — and the
+        // difference is entirely in what the list names.
+        let wrong = super::hevc_slice_record(second_nal, &asked, &pps, 0, true, &first_lists).unwrap_or_else(|e| panic!("{e}"));
+        let wrong = crate::vaapi::ffi::slice_params_hevc(&wrong).unwrap_or_else(|| panic!("not a slice parameter record"));
+        assert_eq!(wrong.num_ref_idx_l1_active_minus1, right.num_ref_idx_l1_active_minus1, "both claim the same count, which comes from the segment's header");
+        assert_eq!(hevc_named(&wrong, 1, want), first_lists[1].len().min(want), "the first segment's lists name only what they hold");
+        assert!(hevc_named(&wrong, 1, want) < want, "which is the failure: {want} active references claimed and {} named", hevc_named(&wrong, 1, want));
+    }
+
     /// An H.264 stream whose picture parameter set says `weighted_bipred_idc == 2` and whose B slices
     /// really do exercise H.264 implicit weighting — x264's default `weightb=1` over High profile with
     /// B frames, which is the case the slice record cannot express. The counterpart of [`h264`]'s
@@ -3479,6 +3788,42 @@ mod tests {
 
     /// An ffmpeg-made HEVC stream and its samples: an `hvcC`-derived description and the length-
     /// prefixed temporal units it holds, the first of which is an IDR.
+    /// An HEVC stream whose pictures are **split into several slice segments**, which every other
+    /// fixture here is not: `num_ref_idx_l0/l1_active_minus1` and `list_entry[]` are per-segment
+    /// syntax elements (7.4.7.1, 7.4.7.2), so this is the only fixture that can show a segment
+    /// record being handed the wrong segment's reference lists.
+    ///
+    /// `slices=2` with `no-tskip=1` is what produces them on this x265 build: it splits each picture
+    /// into two rows of CTUs and disables the transform-skip heuristic that x265 otherwise uses to
+    /// decide a picture is cheap enough for one segment. (`wpp=1` does nothing here — the build
+    /// refuses it, and wavefront segments did not appear either when asked for.)
+    fn hevc_multi_segment() -> Option<(NalStreamInfo, super::HevcSets, Vec<Vec<u8>>)> {
+        let ff = filmcraft_testkit::require_ffmpeg!(None);
+        let path = filmcraft_testkit::fixtures::generate(&fixture("hevc_multi_segment.mp4"), |tmp| {
+            let args = [
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=640x360:r=24:d=1",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "fast",
+                "-tag:v",
+                "hvc1",
+                "-x265-params",
+                "log-level=error:bframes=3:keyint=24:min-keyint=24:scenecut=0:slices=2:no-tskip=1",
+                "-pix_fmt",
+                "yuv420p",
+            ];
+            run(&ff, &args, tmp)
+        })?;
+        let (info, samples) = read(&path);
+        let info = info.unwrap_or_else(|e| panic!("{e}"));
+        let sets = super::HevcSets::parse(&info).unwrap_or_else(|e| panic!("{e}"));
+        Some((info, sets, samples))
+    }
+
     fn hevc_stream() -> Option<(Result<NalStreamInfo, String>, Vec<Vec<u8>>)> {
         let ff = filmcraft_testkit::require_ffmpeg!(None);
         let path = filmcraft_testkit::fixtures::generate(&fixture("hevc_main.mp4"), |tmp| {

@@ -48,6 +48,23 @@
 //! ([`an_h264_fixture_this_record_can_express_is_bit_exact_against_ffmpeg`]). So parity is no longer
 //! two-tiered with a tolerated divergence: everything this backend can describe is asserted bit for
 //! bit, and the one thing it cannot describe is asserted to be declined.
+//!
+//! # Two branches here rest on a unit test alone, and this is where to look
+//!
+//! 1. **The all-1.0 implicit weight table.** A B slice in a `weighted_bipred_idc == 2` stream whose
+//!    reference pairs all want 1.0 is submitted a default explicit table rather than declined. No
+//!    fixture reaches it: every `idc == 2` fixture here exercises the decline, and the `weightb=0` ones
+//!    code no weight table at all, so `h264_default_weights` is exercised only by
+//!    `vaapi::picture::tests::an_implicitly_weighted_b_slice_is_refused_rather_than_guessed`, which
+//!    asserts the bytes it writes. A weight that is wrong but still near 1.0 would pass every test in
+//!    this file. The branch's own doc says so at `vaapi::picture::h264_weights`.
+//! 2. **Per-segment HEVC reference lists.** `hevc_multi_segment.mp4` has two segments in every picture
+//!    and each segment's record is checked against that segment's own header — but the only encoder
+//!    available here gives both segments of a picture the same `num_ref_idx`, so handing the second the
+//!    first's lists produces byte-identical records and no assertion here can tell the two apart. The
+//!    mechanism is proved separately, in
+//!    `vaapi::picture::tests::a_segment_record_must_name_its_own_lists_not_the_first_segments`, and the
+//!    gap is stated at `vaapi::picture::build_hevc`.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -159,7 +176,24 @@ fn streams_with_control(ff: &Path) -> Vec<(String, Stream, Tier)> {
     });
     assert!(!out.iter().any(|(n, _, _)| n == "h264_high_unweighted.mp4"), "the control fixture is listed twice");
     out.push(("h264_high_unweighted.mp4".to_string(), read_stream(&path), Tier::EveryPicture));
+    // An HEVC stream whose every picture is split into two slice segments, so the per-segment record
+    // path is decoded on the real driver rather than only built in a unit test. What that does and does
+    // not prove is said at `vaapi::picture::build_hevc`.
+    match multi_segment_hevc(ff) {
+        Some(path) => out.push(("hevc_multi_segment.mp4".to_string(), read_stream(&path), Tier::EveryPicture)),
+        None => eprintln!("SKIPPED: the multi-segment HEVC fixture could not be generated"),
+    }
     out
+}
+
+/// The multi-segment HEVC fixture: `slices=2:no-tskip=1` is what makes x265 split each picture into
+/// two, and it is the only way this suite can reach a segment record that is not the first one.
+fn multi_segment_hevc(ff: &Path) -> Option<PathBuf> {
+    let (_name, args) = FIXTURES.iter().find(|f| f.0 == "hevc_main.mp4")?;
+    let mut args: Vec<&str> = args.to_vec();
+    let p = args.iter().position(|a| *a == "-x265-params").map(|i| i + 1)?;
+    args[p] = Box::leak(format!("{}:slices=2:no-tskip=1", args[p]).into_boxed_str());
+    fixture(ff, "hevc_multi_segment.mp4", &args)
 }
 
 /// The slice type of each picture of an H.264 stream, read from the first two syntax elements of
@@ -806,6 +840,30 @@ fn an_h264_b_slice_this_record_cannot_weight_is_declined() {
     };
     assert!(why.contains("implicit"), "the refusal must name the implicit weights, not the driver: {why}");
     assert!(why.contains("per reference index"), "the refusal must say why the record cannot carry them: {why}");
+    // The refusal is latched, because the pictures after a picture that could not be built are decoded
+    // against a picture buffer that is missing it — which is a plausible-looking wrong picture, not an
+    // error. So the decoder keeps saying no, and nothing comes out of a flush.
+    for after in &s.samples[at + 1..at + 4] {
+        let e = va
+            .decode(&after.0, after.1)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| panic!("sample {} decoded after the decoder gave up on the run", after.1));
+        assert!(e.contains("gave up on this run"), "the next refusal repeats the reason rather than a new one: {e}");
+        assert!(e.contains("implicit"), "and keeps naming why the run ended: {e}");
+    }
+    assert!(va.flush().is_empty(), "no picture is readable out of a decoder that has given up on its run");
+    // A seek clears the latch — it is the one thing that starts a run over, and the picture buffer is
+    // empty afterwards. What the next decode then says is the decoder's own fresh decision about this
+    // sample, not the carried-over reason: this one is a mid-GOP access unit, so its references are gone
+    // and the refusal is about that rather than about weights. What matters is that the latch is gone.
+    va.reset();
+    let again = va
+        .decode(&s.samples[at].0, s.samples[at].1)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| panic!("a seek cleared the picture buffer and the decoder then accepted a mid-GOP access unit"));
+    assert!(!again.contains("gave up on this run"), "the latch is cleared by a seek, so this is a fresh decision: {again}");
     let kinds = h264_slice_types(&filmcraft_codecs::hw::NalStreamInfo::from_entry(&s.entry).unwrap().unwrap(), &s);
     let slice_type = kinds.get(&s.samples[at].1).copied().unwrap_or(9);
     assert_eq!(slice_type % 5, 1, "the first refusal is at sample {at}, which is not a B picture (slice_type {slice_type})");

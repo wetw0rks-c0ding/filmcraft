@@ -10,6 +10,13 @@
 //! with it — a decoder that is skipped a sample falls behind and then reports a missing reference,
 //! which is a fact about the harness and not about the backend.
 //!
+//! Both decoders are flushed before they are compared, and the comparison walks the **union** of the
+//! two presentation-time sets. Either half matters: without the flush a reordering decoder's last
+//! pictures are simply not there (a 72-picture stream reads as 65, which looks like pictures going
+//! missing), and without the union a picture only one decoder produced is skipped instead of counted
+//! — which is how a stream this backend refuses in hardware read as a match on the few pictures it
+//! decoded before the refusal.
+//!
 //! Off-tree on purpose: it needs a real driver, and a test that only runs when one does not belong
 //! in the crate's test suite. `vaprobe` is the shipped diagnostic; this is the parity harness I use
 //! to check `vaprobe`'s numbers against something independent.
@@ -94,6 +101,12 @@ fn parity(path: &str, hw: bool) {
             }
         }
     }
+    // Both decoders are flushed, and the pictures the flush returns are the run: a decoder that
+    // reorders holds the last pictures of a run back, and counting only what `decode` returned is how
+    // a 72-picture stream reads as 65 — which looks like pictures going missing and is not.
+    for f in software.flush() {
+        sw_by_pts.insert(f.pts, luma_hash(&f.frame));
+    }
     if let Some(d) = hardware.as_mut() {
         for f in d.flush() {
             hw_by_pts.insert(f.pts, luma_hash(&f.frame));
@@ -114,32 +127,53 @@ fn parity(path: &str, hw: bool) {
         return;
     }
     if !hw {
-        println!("{path}: {} pictures from the software decoder, {} of them distinct pts", sw_by_pts.len(), sw_by_pts.len());
+        println!("{path}: {} pictures from the software decoder, all with distinct pts", sw_by_pts.len());
         return;
     }
     let (mut agree, mut differ) = (0usize, 0usize);
     let mut first_diff = None;
-    let mut pts: Vec<i64> = sw_by_pts.keys().copied().collect();
-    pts.sort_unstable();
-    for p in pts {
-        let (Some(a), Some(b)) = (sw_by_pts.get(&p), hw_by_pts.get(&p)) else {
-            differ += 1;
-            if first_diff.is_none() {
-                first_diff = Some(format!("pts {p}: present in one decoder only"));
+    // The **union** of both sets, not the software one's: a picture only the hardware decoder produced is
+    // a difference, and iterating the software set alone would skip it — which is what made a stream
+    // this backend refuses in hardware (every picture after the refusal comes from software) read as a
+    // match on the few the hardware had before it.
+    let mut all: Vec<i64> = sw_by_pts.keys().chain(hw_by_pts.keys()).copied().collect();
+    all.sort_unstable();
+    all.dedup();
+    let mut only_hardware = 0usize;
+    let mut only_software = 0usize;
+    for p in &all {
+        let (a, b) = (sw_by_pts.get(p), hw_by_pts.get(p));
+        match (a, b) {
+            (Some(a), Some(b)) if a == b => agree += 1,
+            (Some(_), None) => {
+                differ += 1;
+                only_software += 1;
+                if first_diff.is_none() {
+                    first_diff = Some(format!("pts {p}: only the software decoder produced it"));
+                }
             }
-            continue;
-        };
-        if a == b {
-            agree += 1;
-        } else {
-            differ += 1;
-            if first_diff.is_none() {
-                first_diff = Some(format!("pts {p}: software {a:016x} != hardware {b:016x}"));
+            (None, Some(_)) => {
+                differ += 1;
+                only_hardware += 1;
+                if first_diff.is_none() {
+                    first_diff = Some(format!("pts {p}: only the hardware decoder produced it"));
+                }
             }
+            (Some(a), Some(b)) => {
+                differ += 1;
+                if first_diff.is_none() {
+                    first_diff = Some(format!("pts {p}: software {a:016x} != hardware {b:016x}"));
+                }
+            }
+            (None, None) => unreachable!("the union of two key sets"),
         }
     }
+    let total = all.len();
     let verdict = if differ == 0 && agree > 0 { "MATCH" } else { "MISMATCH" };
-    println!("{verdict} {path}: {agree} pictures identical, {differ} differ (of {} software pictures)", sw_by_pts.len());
+    println!("{verdict} {path}: {agree} of {total} pictures identical, {differ} differ");
+    if only_hardware > 0 || only_software > 0 {
+        println!("  {only_hardware} of them only the hardware decoder produced, {only_software} only the software decoder's");
+    }
     if let Some(why) = first_diff {
         println!("  first difference: {why}");
     }
