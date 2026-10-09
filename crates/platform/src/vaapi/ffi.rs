@@ -51,6 +51,9 @@ type VAImageID = VAGenericID;
 
 /// `VAStatus` (`va.h:262`): what every libva entry point returns.
 type VAStatus = c_int;
+
+/// `VABufferType` (`va.h:2044`), which C declares as an `enum` and so as an `int`.
+type VaBufferType = c_int;
 /// The two libva enumerations the decoder asks about, which C declares as plain `int`.
 type VAProfile = c_int;
 type VAEntrypoint = c_int;
@@ -178,6 +181,34 @@ pub const SLICE_PARAMETER_BUFFER: VAStatus = 4;
 /// See [`PICTURE_PARAMETER_BUFFER`].
 pub const SLICE_DATA_BUFFER: VAStatus = 5;
 
+// The encode buffer types. **`VAEncCodedBufferType` is 21, not 0 or 6**: libva numbers the decode
+// kinds 0..=13 and the encode kinds from 21, so the two sets do not collide and neither is a suffix
+// of the other. Submitting a decode buffer type to the encoder is not "an unknown type" — it is a
+// different type, which the driver rejects.
+/// `VAEncCodedBufferType` (`va.h:2061`): the buffer the encoder fills with the compressed bitstream.
+/// Created with `data = null`, never with the record bytes: the driver writes into it, and its
+/// mapped bytes are a header followed by one [`VaEncSliceParameterBufferH264`] per submitted slice
+/// followed by the payload — see [`Encoder::read_coded`], which reads that structure out.
+pub const ENC_CODED_BUFFER: VAStatus = 21;
+/// `VAEncSequenceParameterBufferType` (`va.h:2062`): one [`VaEncSequenceParameterBufferH264`] for
+/// the whole sequence, submitted with every picture.
+pub const ENC_SEQUENCE_PARAMETER_BUFFER: VAStatus = 22;
+/// `VAEncPictureParameterBufferType` (`va.h:2063`): one [`VaEncPictureParameterBufferH264`] per
+/// access unit.
+pub const ENC_PICTURE_PARAMETER_BUFFER: VAStatus = 23;
+/// `VAEncSliceParameterBufferType` (`va.h:2064`): one [`VaEncSliceParameterBufferH264`] per slice.
+/// This buffer is an **array** of them: `num_elements` is the slice count.
+pub const ENC_SLICE_PARAMETER_BUFFER: VAStatus = 24;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VAEncPackedHeaderDataBufferType` (`va.h:2066`): the header bytes themselves, when the packed
+/// header mode is used. A parameter spike that asks the driver to write the parameter sets does not
+/// submit one of these — see [`PACKED_HEADER_SEQUENCE`].
+pub const ENC_PACKED_HEADER_DATA_BUFFER: VAStatus = 26;
+/// `VAEncMiscParameterBufferType` (`va.h:2067`): a [`VAEncMiscParameterBuffer`], which is a type
+/// word followed by a flexible array — so its byte length is `size_of::<VAEncMiscParameterBuffer>()`
+/// plus the record it carries, and every record below names what that is.
+pub const ENC_MISC_PARAMETER_BUFFER: VAStatus = 27;
+
 /// `VA_SLICE_DATA_FLAG_ALL` (`va.h:3080`): the whole slice is in the buffer. Every slice record
 /// this backend builds carries its slice whole, so this is the flag they all get; the other
 /// `VA_SLICE_DATA_FLAG_*` values (`BEGIN`, `MIDDLE`, `END`) describe a slice submitted in
@@ -212,6 +243,95 @@ pub const PICTURE_HEVC_RPS_LT_CURR: u32 = 0x0000_0040;
 /// `VA_INVALID_SURFACE` (`va.h:1648`), which is `VA_INVALID_ID`: the picture id an invalid entry
 /// carries.
 pub const INVALID_SURFACE: u32 = 0xffff_ffff;
+
+// `VAConfigAttribType` (`va.h:611-628`) and the encode attribute values. An encoder cannot be
+// created with a null attribute list the way a decoder's is: these three are read/write, and a
+// driver that is asked for one it does not support fails `vaCreateConfig` rather than falling back
+// to a default. `the_encode_constants_are_the_ones_libva_uses` pins them against the header.
+///
+/// `VAConfigAttribRateControl` (`va.h:625`).
+pub const CONFIG_ATTRIB_RATE_CONTROL: VaBufferType = 5;
+/// `VAConfigAttribEncPackedHeaders` (`va.h:707`, `va.h:1199-1231`): asks the driver to write the
+/// parameter sets itself. `VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE` is the
+/// combination that makes `avcC` possible at all (Task 4 of the plan): the SPS and PPS then arrive
+/// inside the coded buffer with every key frame, and FilmCraft never has to write them.
+pub const CONFIG_ATTRIB_ENC_PACKED_HEADERS: VaBufferType = 10;
+/// `VAConfigAttribRTFormat` (`va.h:612`): the render format the encoder writes. Zero in C, which
+/// is why it is worth naming: it is the one attribute whose type number is also its value in the
+/// common case, and a driver that is handed the wrong value here fails in a way that reads like a
+/// codec problem.
+pub const CONFIG_ATTRIB_RT_FORMAT: VaBufferType = 0;
+
+/// `VA_RC_CQP` (`va.h:1116`): constant quantiser. The QP comes from the picture record's
+/// `pic_init_qp` and each slice's `slice_qp_delta`, so nothing here is derived from a bitrate —
+/// which is what makes it the honest first choice for a spike: a rate control mode would put the
+/// picture's fidelity at the mercy of a number this backend does not have yet.
+pub const RC_CQP: u32 = 0x0000_0010;
+// The rate control modes and the encode buffer kinds that this spike does not submit are declared
+// anyway and pinned by `the_encode_constants_are_the_ones_libva_uses`, for the same reason the
+// decode side names the profiles it does not decode: a reader asking "is there a VA_RC_VCM?" needs
+// the answer to be "not declared, therefore not used" rather than a guess. `cfg_attr` rather than a
+// blanket `allow`, so a constant nothing references at all still warns.
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_RC_CBR` (`va.h:1110`).
+pub const RC_CBR: u32 = 0x0000_0002;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_RC_VBR` (`va.h:1112`).
+pub const RC_VBR: u32 = 0x0000_0004;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_RC_ICQ` (`va.h:1121`): constant quality.
+pub const RC_ICQ: u32 = 0x0000_0040;
+
+/// `VA_ENC_PACKED_HEADER_SEQUENCE` (`va.h:1206`): the driver writes the SPS.
+pub const PACKED_HEADER_SEQUENCE: u32 = 0x0000_0001;
+/// `VA_ENC_PACKED_HEADER_PICTURE` (`va.h:1213`): the driver writes the PPS.
+pub const PACKED_HEADER_PICTURE: u32 = 0x0000_0002;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_ENC_PACKED_HEADER_SLICE` (`va.h:1220`): the driver writes the slice headers. **Not** asked
+/// for: a slice header the driver writes is one FilmCraft never sees as bytes, so an encoder that
+/// wanted them would have to enable this and read them back out of the coded buffer. Recorded
+/// because it is the difference between "the driver wrote the slice header" and "we told it what the
+/// slice header says", and the second is the only one this backend can be honest about.
+pub const PACKED_HEADER_SLICE: u32 = 0x0000_0004;
+
+/// `VAEncMiscParameterType` (`va.h:1879-1915`). Only the three an iHD H.264 encoder is asked for
+/// are named; the enum continues to `ExtensionData = 19` and none of the rest is used here.
+///
+/// `VAEncMiscParameterTypeFrameRate = 0`. An iHD H.264 encoder **refuses the render without it**:
+/// `VA_STATUS_ERROR_INVALID_PARAMETER` out of `vaRenderPicture`. That is not in the header, and it
+/// is the first thing this backend learned the hard way.
+pub const MISC_FRAME_RATE: u32 = 0;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VAEncMiscParameterTypeRateControl = 1`, carrying a [`VaEncMiscParameterRateControl`].
+pub const MISC_RATE_CONTROL: u32 = 1;
+/// `VAEncMiscParameterTypeQuantization = 8`, carrying a [`VaEncMiscParameterQuantization`]. Under
+/// [`RC_CQP`] this is what the iHD driver reads the picture's quantiser from, and it is submitted
+/// with the sequence record rather than per picture (the header says "it's per-sequence parameter").
+pub const MISC_QUANTIZATION: u32 = 8;
+
+/// `VASliceType` as `VAEncSliceParameterBufferH264::slice_type` counts it: H.264's `slice_type`
+/// minus five (`va_enc_h264.h:441`). So 0 = P, 1 = B, 2 = I, and 5..=7 are the "all slices in this
+/// picture are of this type" forms — which is what a picture whose slices are all P wants.
+///
+/// **This offset-by-five is not documented in the header**, which says only "Range: 0..2, 5..7, i.e.
+/// no switching slices" (`va_enc_h264.h:438-441`) and does not say what the numbers mean. Getting
+/// it wrong does not fail a call: `slice_type = 2` on an IDR picture encodes correctly on iHD, and
+/// `slice_type = 7` on a picture that should be P gives a picture a decoder may or may not accept.
+/// It is asserted in `encoder.rs`'s tests against the driver's own output rather than left here as
+/// a comment.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SLICE_TYPE_P: u8 = 0;
+#[cfg_attr(not(test), allow(dead_code))]
+/// See [`SLICE_TYPE_P`].
+pub const SLICE_TYPE_B: u8 = 1;
+#[cfg_attr(not(test), allow(dead_code))]
+/// See [`SLICE_TYPE_P`].
+pub const SLICE_TYPE_I: u8 = 2;
+#[cfg_attr(not(test), allow(dead_code))]
+/// See [`SLICE_TYPE_P`]: slice_type 5, every slice in the picture is a P slice.
+pub const SLICE_TYPE_ALL_P: u8 = 5;
+/// See [`SLICE_TYPE_P`]: slice_type 7, every slice in the picture is an I slice.
+pub const SLICE_TYPE_ALL_I: u8 = 7;
 
 /// `VAEntrypoint` (`va.h:553`): `VAEntrypointVLD` is the hardware video decoder, the entry point
 /// every decode goes through.
@@ -643,6 +763,350 @@ pub struct VaSliceParameterBufferHevc {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The encode records. Encode is the mirror image of decode (the plan's "decisive difference"): the
+// app hands the driver a picture and the driver writes the slice headers, so these are the records
+// that *describe* what to encode rather than what was parsed out of a bitstream. They are built by
+// [`crate::vaapi::encoder`] and handed to libva as bytes.
+//
+// The sizes and offsets below were read out of `/usr/include/va/va_enc_h264.h` and `va.h` on the
+// target machine (libva 1.24.0) and are pinned by `the_encode_records_match_the_header`. Three of
+// them are worth naming here, because each is a place where a plausible-looking declaration would
+// be silently wrong and every example on the web copies the wrong one:
+//
+// - **`VAEncSliceParameterBufferH264` is 3140 bytes, not the 3128 of its decode counterpart.** The
+//   decode record's two reference lists follow a five-byte prefix of small fields; the encode
+//   record's follow `idr_pic_id` and `pic_order_cnt_lsb`, which are `uint16_t` and put the lists at
+//   offsets 36 and 1188. Handing the driver 3128 bytes of a 3140-byte record leaves the tail of the
+//   second list and every field after it uninitialised.
+// - **`pic_order_cnt_lsb` is a `uint16_t` at offset 16, and `delta_pic_order_cnt_bottom` an `i32`
+//   at 20** — with a 2-byte hole at 18-19 that the C layout has and `#[derive(Default)]` would not.
+// - **`VAEncSequenceParameterBufferH264` is 1132 bytes** and 1028 of them are
+//   `offset_for_ref_frame[256]` at offset 44, which every field after it is placed relative to.
+//
+// Where the C layout has a hole between two fields, the Rust declaration names it `padding_*` and
+// gives it a width, for the reason the note above this section gives: `Default` does not
+// initialise implicit padding, and a record with unnamed padding has bytes that
+// [`record_bytes`] would hand to a driver as whatever was on the stack.
+// ---------------------------------------------------------------------------------------------
+
+/// `VACodedBufferSegment` (`va.h:3945`): one segment of a mapped [`ENC_CODED_BUFFER`] — how many
+/// bytes, where they are, what the driver says about them, and the next segment. 48 bytes.
+///
+/// **This is where the encoded picture actually comes from**, and getting it wrong is the single
+/// largest difference between this backend's encode path and its decode path. libva 1.24's
+/// `vaMapBuffer` documents that for a coded buffer "`pbuf` points to link-list of
+/// `VACodedBufferSegment`, and the list is terminated if `next` is NULL" (`va.h:3973-3975`). There is
+/// no count, no index and no per-slice offset anywhere in the encode API of this libva:
+///
+/// - **`VAEncSliceParameterBufferH264` has no `slice_data_offset` and no `slice_data_size`.** Every
+///   H.264 *decode* record has them (`va.h:3665-3667`), the encode record does not, and an encoder
+///   written against the decode record's shape will not compile against this one. The plan's Task 1
+///   says "read the driver's output using the `slice_data_offset` / `slice_data_size` it reports";
+///   **on libva 1.24 there is nothing to read them from**, and that is the first thing the next
+///   person has to know.
+/// - The per-slice records the driver writes back are not described by any header either.
+///
+/// So the picture is read as this linked list, and [`Encoder::read_coded`] walks it. The list is
+/// the driver's own: every pointer in it is checked against the mapping before a byte is copied,
+/// the walk is bounded by the segment count, and a cycle or a pointer outside the mapping is an
+/// error rather than an infinite read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaCodedBufferSegment {
+    /// Bytes of the picture in this segment.
+    pub size: u32,
+    /// Bits from the start of the segment where the video data begins. **A driver may use a
+    /// non-zero one**, which would mean the first bits of the segment are not the picture — this
+    /// backend refuses anything but 0 rather than shifting a buffer whose unit it cannot see.
+    pub bit_offset: u32,
+    /// `VA_CODED_BUF_STATUS_*` (`va.h:3897-3933`). The low byte is the picture's average QP, which
+    /// is the closest thing the driver says about the quality it actually delivered — worth
+    /// reporting, and worth reporting *as a measurement* rather than as the QP that was asked for.
+    pub status: u32,
+    /// Reserved by the header.
+    pub reserved: u32,
+    /// Where this segment's bytes are. A pointer into the mapped buffer, which is why it is checked
+    /// against the mapping's own extent before it is used.
+    pub buf: *mut c_void,
+    /// The next segment, or null for the last.
+    pub next: *mut c_void,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// How many segments a coded buffer's linked list may hold before it is treated as a driver's
+/// mistake. One NAL unit per segment is the recommendation the header makes (`va.h:3941`), and a
+/// key frame with packed SPS, PPS and one slice is three; a few dozen is a very generous bound for
+/// that, and the walk stops there either way because a cycle in a driver-owned list would otherwise
+/// never end.
+const MAX_CODED_SEGMENTS: usize = 64;
+
+/// `VAEncSequenceParameterBufferH264` (`va_enc_h264.h:148`): what to encode — the sequence
+/// parameter set's own syntax elements, the periods, and the picture geometry in macroblocks.
+/// 1132 bytes.
+///
+/// One of these is submitted with **every** picture, not once per sequence: iHD reads it per
+/// `vaRenderPicture`, and a render that omits it is refused.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaEncSequenceParameterBufferH264 {
+    pub seq_parameter_set_id: u8,
+    pub level_idc: u8,
+    /// The C layout's hole at offsets 2-3, before `intra_period`.
+    pub padding_after_level_idc: [u8; 2],
+    /// Period between I frames; 0 for none.
+    pub intra_period: u32,
+    /// Period between IDR frames; 0 for none, which is what makes the first picture the only
+    /// key frame.
+    pub intra_idr_period: u32,
+    /// Period between I/P frames; 0 for none.
+    pub ip_period: u32,
+    /// The bitrate, which [`RC_CQP`] ignores but which iHD still rejects as 0.
+    pub bits_per_second: u32,
+    /// `max_num_ref_frames` of the sequence parameter set.
+    pub max_num_ref_frames: u32,
+    /// **Macroblocks, not pixels** — 640x360 is 40x23 here, and 40x22 for the padded height.
+    pub picture_width_in_mbs: u16,
+    pub picture_height_in_mbs: u16,
+    /// `seq_fields`: the sequence parameter set's flags, packed into the union's `value` member in
+    /// the bit order `va_enc_h264.h:179-198` writes them.
+    pub seq_fields: u32,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    /// Only meaningful when `seq_fields` says `pic_order_cnt_type == 1`.
+    pub num_ref_frames_in_pic_order_cnt_cycle: u8,
+    /// The C layout's hole at offset 35, before `offset_for_non_ref_pic`.
+    pub padding_after_num_ref_frames_in_pic_order_cnt_cycle: [u8; 1],
+    pub offset_for_non_ref_pic: i32,
+    pub offset_for_top_to_bottom_field: i32,
+    /// 256 entries at offset 44 — a kilobyte of the record, and every field after it sits past it.
+    pub offset_for_ref_frame: [i32; 256],
+    /// Whether the picture is cropped, which is what makes a size that is not a multiple of 16
+    /// encodable: the surface is 640x368 and the crop says the bottom 4 rows are not picture.
+    pub frame_cropping_flag: u8,
+    /// The C layout's hole at offsets 1069-1071, before `frame_crop_left_offset`.
+    pub padding_after_frame_cropping_flag: [u8; 3],
+    pub frame_crop_left_offset: u32,
+    pub frame_crop_right_offset: u32,
+    pub frame_crop_top_offset: u32,
+    pub frame_crop_bottom_offset: u32,
+    pub vui_parameters_present_flag: u8,
+    /// The C layout's hole at offsets 1089-1091, before `vui_fields`.
+    pub padding_after_vui_parameters_present_flag: [u8; 3],
+    /// `vui_fields`: the VUI's flags, packed like `seq_fields`.
+    pub vui_fields: u32,
+    pub aspect_ratio_idc: u8,
+    /// The C layout's hole at offsets 1097-1099, before `sar_width`.
+    pub padding_after_aspect_ratio_idc: [u8; 3],
+    pub sar_width: u32,
+    pub sar_height: u32,
+    pub num_units_in_tick: u32,
+    pub time_scale: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+impl Default for VaEncSequenceParameterBufferH264 {
+    /// Every field zero, which is [`Self::default`] by hand because `[i32; 256]` has no
+    /// `Default`. The whole `offset_for_ref_frame` array is explicitly zeroed rather than left
+    /// indeterminate: it is 1 KiB of the record, every byte of it reaches the driver, and an
+    /// uninitialised word there would be a picture order count cycle this module never asked for.
+    fn default() -> Self {
+        Self {
+            seq_parameter_set_id: 0,
+            level_idc: 0,
+            padding_after_level_idc: [0; 2],
+            intra_period: 0,
+            intra_idr_period: 0,
+            ip_period: 0,
+            bits_per_second: 0,
+            max_num_ref_frames: 0,
+            picture_width_in_mbs: 0,
+            picture_height_in_mbs: 0,
+            seq_fields: 0,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            padding_after_num_ref_frames_in_pic_order_cnt_cycle: [0; 1],
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            offset_for_ref_frame: [0; 256],
+            frame_cropping_flag: 0,
+            padding_after_frame_cropping_flag: [0; 3],
+            frame_crop_left_offset: 0,
+            frame_crop_right_offset: 0,
+            frame_crop_top_offset: 0,
+            frame_crop_bottom_offset: 0,
+            vui_parameters_present_flag: 0,
+            padding_after_vui_parameters_present_flag: [0; 3],
+            vui_fields: 0,
+            aspect_ratio_idc: 0,
+            padding_after_aspect_ratio_idc: [0; 3],
+            sar_width: 0,
+            sar_height: 0,
+            num_units_in_tick: 0,
+            time_scale: 0,
+            va_reserved: [0; VA_PADDING_LOW],
+        }
+    }
+}
+
+/// `VAEncPictureParameterBufferH264` (`va_enc_h264.h:296`): one picture's identity, which surface it
+/// is reconstructed into, its reference frames, and which buffer the bitstream goes to. 648 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaEncPictureParameterBufferH264 {
+    /// The picture to encode. **`CurrPic.picture_id` is the reconstructed (decoded) picture, not
+    /// the input** (`va_enc_h264.h:302-303`): the driver is handed a *scratch* surface to
+    /// reconstruct into, and `vaBeginPicture`'s surface is the input it reads. Putting the input
+    /// surface here is the mistake this record's own comment exists to warn about.
+    pub curr_pic: VaPictureH264,
+    /// The decoded picture buffer the P and B slices predict from: reconstructed pictures, by
+    /// surface, not by the indices a decoder would use.
+    pub reference_frames: [VaPictureH264; 16],
+    /// The [`ENC_CODED_BUFFER`] the compressed picture is written into.
+    pub coded_buf: VABufferID,
+    pub pic_parameter_set_id: u8,
+    pub seq_parameter_set_id: u8,
+    /// `H264_LAST_PICTURE_EOSEQ | H264_LAST_PICTURE_EOSTREAM`, or 0 for a picture in the middle.
+    pub last_picture: u8,
+    /// The C layout's hole at offset 619, before `frame_num`.
+    pub padding_after_last_picture: [u8; 1],
+    pub frame_num: u16,
+    /// `pic_init_qp_minus26 + 26`, so the picture's quantiser *is* this number (26 is the offset,
+    /// not a default).
+    pub pic_init_qp: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub chroma_qp_index_offset: i8,
+    pub second_chroma_qp_index_offset: i8,
+    /// The C layout's hole at offset 627, before `pic_fields`.
+    pub padding_after_second_chroma_qp_index_offset: [u8; 1],
+    /// `pic_fields`: the picture's own flags, packed into the union's `value` member in the bit
+    /// order `va_enc_h264.h:358-384` writes them. `idr_pic_flag` is bit 0 and
+    /// `reference_pic_flag` bits 1-2 — **bit 0 is the one that decides whether the picture is a
+    /// key frame**, and leaving it at 0 for the first picture gives a stream no decoder can start
+    /// from.
+    pub pic_fields: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncSliceParameterBufferH264` (`va_enc_h264.h:420`): one slice's record. **3140 bytes** — see
+/// the note above this group for why that is not its decode counterpart's 3128.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaEncSliceParameterBufferH264 {
+    /// First macroblock of the slice.
+    pub macroblock_address: u32,
+    /// How many macroblocks the slice covers. The whole picture is one slice in this backend's
+    /// spike, so this is `picture_width_in_mbs * picture_height_in_mbs`.
+    pub num_macroblocks: u32,
+    /// Per-macroblock configuration, or `VA_INVALID_ID` to derive it from this slice's QP. The
+    /// header is explicit that `VA_INVALID_ID` is the *right* value when no per-macroblock record
+    /// is wanted (`va_enc_h264.h:426-428`), and iHD takes it.
+    pub macroblock_info: VABufferID,
+    /// [`SLICE_TYPE_I`] or [`SLICE_TYPE_P`]; see the constants for the offset-by-five encoding.
+    pub slice_type: u8,
+    pub pic_parameter_set_id: u8,
+    /// Increments per IDR, and is what pairs two IDR pictures in the same sequence.
+    pub idr_pic_id: u16,
+    /// The picture order count, only meaningful when `seq_fields` says `pic_order_cnt_type == 0`.
+    pub pic_order_cnt_lsb: u16,
+    /// The C layout's hole at offsets 18-19, before `delta_pic_order_cnt_bottom`.
+    pub padding_after_pic_order_cnt_lsb: [u8; 2],
+    pub delta_pic_order_cnt_bottom: i32,
+    /// Only for `pic_order_cnt_type == 1`; `[top, bottom]`.
+    pub delta_pic_order_cnt: [i32; 2],
+    pub direct_spatial_mv_pred_flag: u8,
+    pub num_ref_idx_active_override_flag: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// Reference picture list 0, by surface. At offset 36 — the encode record's own layout, not the
+    /// decode record's 28.
+    pub ref_pic_list0: [VaPictureH264; 32],
+    /// Reference picture list 1, by surface, at offset 1188.
+    pub ref_pic_list1: [VaPictureH264; 32],
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub luma_weight_l0_flag: u8,
+    /// The C layout's hole at offset 2343, before `luma_weight_l0`.
+    pub padding_after_luma_weight_l0_flag: [u8; 1],
+    pub luma_weight_l0: [i16; 32],
+    pub luma_offset_l0: [i16; 32],
+    pub chroma_weight_l0_flag: u8,
+    /// The C layout's hole at offset 2473, before `chroma_weight_l0`.
+    pub padding_after_chroma_weight_l0_flag: [u8; 1],
+    pub chroma_weight_l0: [[i16; 2]; 32],
+    pub chroma_offset_l0: [[i16; 2]; 32],
+    pub luma_weight_l1_flag: u8,
+    /// The C layout's hole at offset 2731, before `luma_weight_l1`.
+    pub padding_after_luma_weight_l1_flag: [u8; 1],
+    pub luma_weight_l1: [i16; 32],
+    pub luma_offset_l1: [i16; 32],
+    pub chroma_weight_l1_flag: u8,
+    /// The C layout's hole at offset 2861, before `chroma_weight_l1`.
+    pub padding_after_chroma_weight_l1_flag: [u8; 1],
+    pub chroma_weight_l1: [[i16; 2]; 32],
+    pub chroma_offset_l1: [[i16; 2]; 32],
+    pub cabac_init_idc: u8,
+    /// Added to `pic_init_qp` to give this slice's quantiser. **0 means "the picture's QP"**, which
+    /// is what a per-slice override record must say; a driver that added 1 here would encode the
+    /// picture at a different quality than the one that was asked for.
+    pub slice_qp_delta: i8,
+    pub disable_deblocking_filter_idc: u8,
+    pub slice_alpha_c0_offset_div2: i8,
+    pub slice_beta_offset_div2: i8,
+    /// The C layout's hole at offset 3123, before `va_reserved`.
+    pub padding_after_slice_beta_offset_div2: [u8; 1],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncMiscParameterBuffer` (`va.h:1973`): a type word followed by a **flexible array**, so it has
+/// no fixed size of its own. 4 bytes of header; a record of type `t` is
+/// `size_of::<VaEncMiscParameterBufferHeader>()` plus the bytes of `t`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaEncMiscParameterBufferHeader {
+    /// One of `VAEncMiscParameterType*`: [`MISC_FRAME_RATE`], [`MISC_RATE_CONTROL`] or
+    /// [`MISC_QUANTIZATION`].
+    pub type_: u32,
+}
+
+/// `VAEncMiscParameterFrameRate` (`va.h:2617`): the framerate the rate control is told about. 24
+/// bytes. See [`MISC_FRAME_RATE`] for why iHD insists on one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaEncMiscParameterFrameRate {
+    /// **A fraction packed high/low, not a number** (`va.h:2621-2631`): the denominator is the top
+    /// two bytes and the numerator the bottom two, so 30 fps is `(1 << 16) | 30`. A frame rate of
+    /// `30` here is 30/0, which the driver reads as 30/1 = 30 — the same picture, by luck — and a
+    /// frame rate of `30000` is 30000/0, which is 30000 fps and a rate control that never
+    /// throttles. This is the kind of field that produces a stream nobody can play and no error.
+    pub framerate: u32,
+    /// `framerate_flags`: `temporal_id` in the low byte.
+    pub framerate_flags: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncMiscParameterQuantization` (`va.h:2805`): the encoder's quantiser controls. 8 bytes.
+///
+/// Under [`RC_CQP`] this is the record iHD takes the picture's quantiser from, alongside the
+/// picture record's `pic_init_qp`; every flag left at 0 means "let the driver decide", which is the
+/// honest state for a picture whose quality comes from `pic_init_qp` alone.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaEncMiscParameterQuantization {
+    /// `quantization_flags`: the trellis bits, packed into the union's `value` member.
+    pub quantization_flags: u32,
+    pub va_reserved: u32,
+}
+
+// `VAEncMiscParameterRateControl` (`va.h:2493`) — the record a `VA_RC_CBR` / `VA_RC_VBR` / `VA_RC_ICQ`
+// config needs, 60 bytes — is deliberately **not** declared here. This backend runs under
+// `VA_RC_CQP`, where the quantiser is the picture's `pic_init_qp` and a bitrate record would be a
+// second, independent statement about the picture's fidelity. It is Task 3's record, and it will be
+// declared from the header with the rest then, next to the misc buffer that carries it. Declaring it
+// now, unused, is how a reader ends up thinking a bitrate is a thing this backend sends.
+
+// ---------------------------------------------------------------------------------------------
 // Reading the records back out of the opaque bytes `Picture` carries. The tests of
 // `picture.rs` are what reads them today, so the `cfg_attr` keeps them out of the dead-code lint
 // without letting them go unchecked when the decode loop does read them.
@@ -650,12 +1114,15 @@ pub struct VaSliceParameterBufferHevc {
 
 /// The record of type `T` in `bytes`, or `None` when the buffer is too short for one.
 ///
+/// `pub(crate)` rather than private because the encoder's tests read the records its builders
+/// produced back this way: that is the only way a bit position inside a record can be checked
+/// without a driver, and a bit position that is wrong produces a picture rather than an error.
+///
 /// # Safety
 /// `T` must be a `#[repr(C)]` record this module declares, so that any `size_of::<T>()` bytes are a
 /// valid `T`. Every caller passes one of the structs below and nothing else; a short buffer is
 /// refused rather than read past.
-#[cfg_attr(not(test), allow(dead_code))]
-unsafe fn record_of<T: Default + Copy>(bytes: &[u8]) -> Option<T> {
+pub(crate) unsafe fn record_of<T: Default + Copy>(bytes: &[u8]) -> Option<T> {
     if bytes.len() < size_of::<T>() {
         return None;
     }
@@ -680,6 +1147,20 @@ pub fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
     // initialised field — the records' alignment holes are named `padding_*` fields, which
     // `#[derive(Default)]` zeroes — so the `&[u8]` never covers uninitialised memory.
     unsafe { std::slice::from_raw_parts(std::ptr::from_ref(record).cast::<u8>(), size_of::<T>()) }.to_vec()
+}
+
+/// The record of type `T` in `bytes`, or `None` when the buffer is too short for one — the safe
+/// form of [`record_of`], which takes the `#[repr(C)]` obligation on the caller's behalf.
+///
+/// This exists for the encode module's tests, which read back the records its builders produced. A
+/// bit position inside a record cannot be verified any other way: the builder produces bytes, and
+/// the driver reading them wrong produces a *picture*, not an error. So the round trip
+/// `build → bytes → record → check the bit` is what catches it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn record_in<T: Default + Copy>(bytes: &[u8]) -> Option<T> {
+    // SAFETY: every caller in this crate passes one of the `#[repr(C)]` records declared in this
+    // file, which is `record_of`'s whole contract, and the length check is inside it.
+    unsafe { record_of::<T>(bytes) }
 }
 
 /// The H.264 picture parameter record `bytes` carries, or `None` if it is not one long enough.
@@ -898,9 +1379,13 @@ pub struct Api {
     query_entrypoints: QueryEntrypointsFn,
     /// Optional: `vaErrorStr` is libva 1.0-era and only decorates error messages.
     error_str: Option<ErrorStrFn>,
-    /// Optional: the image calls are the ABI layout probe and the indirect readback path (see
-    /// [`Session::read`]). Both are needed together, so a libva with neither is still a working
-    /// decoder on any driver whose surfaces can be derived.
+    /// Optional: the encoder waits for the coded buffer this way (`va.h:5110`). libva's
+    /// `vaMapBuffer` is *not* a synchronisation point for an encoder — an unsynchronised read of a
+    /// coded buffer is a truncated picture, not a stale one — and a libva without it still maps,
+    /// so it stays optional.
+    sync_buffer: Option<SyncBufferFn>,
+    /// Optional: the image calls are the ABI layout probe, the indirect readback path (see
+    /// [`Session::read`]) and the encoder's picture upload (see [`Encoder::upload`]).
     create_image: Option<CreateImageFn>,
     destroy_image: Option<DestroyImageFn>,
     put_image: Option<PutImageFn>,
@@ -984,6 +1469,10 @@ fn resolve(va: *mut c_void, va_drm: *mut c_void, libraries: Arc<Libraries>) -> R
             max_entrypoints: symbol(va, c"vaMaxNumEntrypoints")?,
             query_entrypoints: symbol(va, c"vaQueryConfigEntrypoints")?,
             error_str: optional_symbol(va, c"vaErrorStr"),
+            // Not present on the libva this milestone was written against: `vaGetErrorName` does
+            // not exist, so status text comes from `vaErrorStr` alone. Recorded because the name
+            // is in a decade of blog posts and finding it absent costs an hour of dlsym archaeology.
+            sync_buffer: optional_symbol(va, c"vaSyncBuffer"),
             create_image: optional_symbol(va, c"vaCreateImage"),
             destroy_image: optional_symbol(va, c"vaDestroyImage"),
             put_image: optional_symbol(va, c"vaPutImage"),
@@ -1033,6 +1522,7 @@ type RenderPictureFn = unsafe extern "C" fn(VADisplay, VAContextID, *mut VABuffe
 type EndPictureFn = unsafe extern "C" fn(VADisplay, VAContextID) -> VAStatus;
 type SyncSurfaceFn = unsafe extern "C" fn(VADisplay, VASurfaceID) -> VAStatus;
 type QuerySurfaceStatusFn = unsafe extern "C" fn(VADisplay, VASurfaceID, *mut c_uint) -> VAStatus;
+type SyncBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
 type MapBufferFn = unsafe extern "C" fn(VADisplay, VABufferID, *mut *mut c_void) -> VAStatus;
 type UnmapBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
 
@@ -1481,7 +1971,7 @@ impl Session {
         if st != OK {
             return Err(format!("vaCreateBuffer failed for {size} bytes of type {kind}: {}", self.display.api.status_text(st)));
         }
-        Ok(Buffer { display: Arc::clone(&self.display), id })
+        Ok(Buffer::owned(Arc::clone(&self.display), id))
     }
 
     /// The id of the decode context, making one if a seek dropped it.
@@ -1689,6 +2179,843 @@ impl Session {
     }
 }
 
+/// An encoding session: a config, a surface the input picture is read from, a context and the
+/// coded buffer the driver writes.
+///
+/// **Encode's data flow is decode's, inverted** (the plan's "decisive difference"): the app hands
+/// the driver a picture and the driver writes the slice headers. So there is no bitstream to parse
+/// and no parameter set to submit — there is a surface to fill and a buffer to read back, and every
+/// value in the records between them is a statement the driver believes.
+///
+/// That is why this type is deliberately small and why [`crate::vaapi::encoder`] — the safe module
+/// that builds the records — holds the settings. This type owns libva objects and nothing else: the
+/// config, the surfaces and the context, in the order libva requires them destroyed, plus the one
+/// upload path. Nothing here interprets a picture or chooses a parameter.
+pub struct Encoder {
+    display: Arc<Display>,
+    config: VAConfigID,
+    /// The surface `vaBeginPicture` is given, which is the picture the driver **reads**. Separate
+    /// from `recon` below because the driver reconstructs the picture it is encoding and needs
+    /// somewhere to put that; it may not overwrite the picture it is reading.
+    input: VASurfaceID,
+    /// The surface `curr_pic.picture_id` names, where the reconstructed picture lands and where it
+    /// is read back from as a reference frame.
+    recon: VASurfaceID,
+    context: VAContextID,
+    /// The [`ENC_CODED_BUFFER`] the compressed picture goes into. Kept for the life of the session
+    /// because it is re-mapped per picture rather than created per picture, and because its size is
+    /// the bound the driver's reported size is checked against.
+    coded: Buffer,
+    /// The size `coded` was created at, in bytes: the length of its mapping.
+    coded_bytes: usize,
+
+    size: (u32, u32),
+    /// The render format's four-character code and bit depth, so an upload asks for the same layout
+    /// the session was configured in rather than whatever the driver prefers.
+    fourcc: u32,
+    bpp: u32,
+}
+
+impl Encoder {
+    /// Configure `display` as a constant-quantiser H.264 (or HEVC) slice encoder, create its two
+    /// surfaces, make a context and a coded buffer.
+    ///
+    /// The configuration is the smallest one that is not a default: a render format (which one is
+    /// what the encoder writes), a rate control mode, and the packed header mode that makes the
+    /// driver write the parameter sets. Everything else is left to the driver, which is the right
+    /// default for a decoder but **not** for an encoder — see the module note above.
+    ///
+    /// `rate_control` and `packed_headers` are arguments rather than chosen here so that the
+    /// caller states what it is doing and the failure names the value; a caller that cannot derive
+    /// them faithfully has no honest value to pass.
+    pub fn new(
+        display: &Arc<Display>,
+        profile: Profile,
+        format: RtFormat,
+        size: (u32, u32),
+        rate_control: u32,
+        packed_headers: u32,
+        coded_bytes: u32,
+    ) -> Result<Self, String> {
+        let (fourcc, bpp) = match format {
+            RtFormat::Nv12 => (NV12_FOURCC, NV12_BPP),
+            RtFormat::Yuv420_10 => (P010_FOURCC, P010_BPP),
+            RtFormat::Other(bits) => return Err(format!("render format {bits:#x} is not 4:2:0 8- or 10-bit")),
+        };
+        let (Some(create_image), Some(destroy_image), Some(put_image)) = (display.api.create_image, display.api.destroy_image, display.api.put_image) else {
+            return Err("this libva has no vaCreateImage / vaPutImage, so a picture cannot be uploaded to a surface".into());
+        };
+        let _ = (create_image, destroy_image, put_image);
+        if size.0 == 0 || size.1 == 0 {
+            return Err(format!("{}x{} picture", size.0, size.1));
+        }
+        // A coded buffer of zero bytes cannot hold a slice, and `vaCreateBuffer` would accept the
+        // size and then write into nothing.
+        if coded_bytes == 0 {
+            return Err("a coded buffer of 0 bytes".into());
+        }
+        let api = Arc::clone(&display.api);
+        let width = c_uint::try_from(size.0).map_err(|_| format!("surface width {}", size.0))?;
+        let height = c_uint::try_from(size.1).map_err(|_| format!("surface height {}", size.1))?;
+        let mut session = Self {
+            display: Arc::clone(display),
+            config: 0,
+            input: 0,
+            recon: 0,
+            context: 0,
+            // A placeholder that is replaced below; `Drop` reads it only if this is reached, and
+            // this returns an error rather than an `Encoder` in every such case.
+            coded: Buffer::placeholder(Arc::clone(display)),
+            coded_bytes: coded_bytes as usize,
+            size,
+            fourcc,
+            bpp,
+        };
+        {
+            let _gate = display.gate();
+            // The three attributes, in the order libva documents: format first because the others
+            // are meaningless without it, then the rate control mode, then the packed header mode.
+            // Mutable because `vaCreateConfig` takes a `VAConfigAttrib*` — libva reads these and
+            // writes back the values it ended up with, which for an attribute it can only ignore
+            // is the value that says so.
+            let mut attribs = [
+                VaConfigAttrib { type_: CONFIG_ATTRIB_RT_FORMAT, value: format.bits() },
+                VaConfigAttrib { type_: CONFIG_ATTRIB_RATE_CONTROL, value: rate_control },
+                VaConfigAttrib { type_: CONFIG_ATTRIB_ENC_PACKED_HEADERS, value: packed_headers },
+            ];
+            let mut config: VAConfigID = 0;
+            // SAFETY: the display is initialised; `attribs` is a live array of three records the
+            // call reads and does not keep; and `config` is a live local for the id it writes.
+            let st = unsafe { (api.create_config)(display.dpy, profile.bits(), ENC_SLICE, attribs.as_mut_ptr(), attribs.len() as c_int, &mut config) };
+            if st != OK {
+                return Err(format!(
+                    "vaCreateConfig failed for {:?}/EncSlice at rate control {rate_control:#x} and packed headers {packed_headers:#x}: {}",
+                    profile,
+                    api.status_text(st)
+                ));
+            }
+            session.config = config;
+            if std::env::var("FILMCRAFT_VADUMP").is_ok() {
+                eprintln!(
+                    "ATTRIB RTFormat={} RateControl={} EncPackedHeaders={:#x} (asked SEQUENCE|PICTURE = {:#x})",
+                    attribs[0].value,
+                    attribs[1].value,
+                    attribs[2].value,
+                    PACKED_HEADER_SEQUENCE | PACKED_HEADER_PICTURE
+                );
+            }
+            // Two surfaces: the one the picture is read from and the one it is reconstructed into.
+            // They must be distinct — `curr_pic.picture_id` is a scratch surface the driver fills
+            // with what it decoded, and pointing it at the input would have the driver read its own
+            // output as the picture it is encoding.
+            let mut surfaces = vec![0 as VASurfaceID; 2];
+            // SAFETY: as above for the surfaces: `surfaces` is a live array of two ids, and no
+            // attribute list is passed.
+            let st = unsafe { (api.create_surfaces)(display.dpy, format.bits(), width, height, surfaces.as_mut_ptr(), 2, std::ptr::null_mut(), 0) };
+            if st != OK {
+                return Err(format!("vaCreateSurfaces failed for the encode session at {}x{}: {}", size.0, size.1, api.status_text(st)));
+            }
+            // `vaCreateSurfaces` filled these in; a surface id invented here would name one the
+            // driver never made. Two ids for two surfaces, or the driver lied and the session is
+            // refused rather than filled with a duplicate.
+            let (Some(&input), Some(&recon)) = (surfaces.first(), surfaces.get(1)) else {
+                return Err("vaCreateSurfaces filled in fewer than the two ids it was asked for".into());
+            };
+            if input == recon {
+                return Err("vaCreateSurfaces returned the same surface id twice".into());
+            }
+            session.input = input;
+            session.recon = recon;
+            let (context_width, context_height) = (
+                c_int::try_from(size.0).map_err(|_| format!("picture width {}", size.0))?,
+                c_int::try_from(size.1).map_err(|_| format!("picture height {}", size.1))?,
+            );
+            let mut context: VAContextID = 0;
+            // SAFETY: `config` is the config created above, `surfaces` the array just filled, and
+            // `context` a live local for the id to be written into.
+            let st = unsafe { (api.create_context)(display.dpy, config, context_width, context_height, PROGRESSIVE, surfaces.as_mut_ptr(), 2, &mut context) };
+            if st != OK {
+                return Err(format!("vaCreateContext failed for the encoder at {}x{}: {}", size.0, size.1, api.status_text(st)));
+            }
+            session.context = context;
+            // The coded buffer. **`data` is null and `num_elements` is 1**: this is the one buffer
+            // the driver fills rather than reads, and iHD treats a buffer of this type with
+            // initialisation data as an error rather than ignoring the data. The size is the
+            // caller's, because only the caller knows what an uncompressed picture of this size
+            // costs — this backend does not guess one.
+            let mut coded: VABufferID = 0;
+            // SAFETY: `context` is the context created above on this display, `coded_bytes` is the
+            // size already validated above, `data` is null (which is how this buffer kind says "the
+            // driver fills me"), and `coded` is a live local for the id libva writes.
+            let st = unsafe { (api.create_buffer)(display.dpy, context, ENC_CODED_BUFFER, coded_bytes, 1, std::ptr::null_mut(), &mut coded) };
+            if st != OK {
+                return Err(format!("vaCreateBuffer failed for a {coded_bytes} byte coded buffer: {}", api.status_text(st)));
+            }
+            session.coded = Buffer::owned(Arc::clone(display), coded);
+        }
+        Ok(session)
+    }
+
+    /// The surface `vaBeginPicture` is given: the picture the driver reads.
+    pub fn input_surface(&self) -> VASurfaceID {
+        self.input
+    }
+
+    /// The surface `curr_pic.picture_id` names: where the reconstructed picture lands, and the
+    /// surface a later P or B picture predicts from.
+    pub fn recon_surface(&self) -> VASurfaceID {
+        self.recon
+    }
+
+    /// The coded buffer's id, which the picture record's `coded_buf` must name. The record cannot be
+    /// built without it, so it is read here rather than kept by the caller.
+    pub fn coded_buffer_id(&self) -> VABufferID {
+        self.coded.id()
+    }
+
+    /// A buffer of `data` of kind `kind`, destroyed when it is dropped.
+    ///
+    /// `num_elements` is 1 for every record buffer this backend submits except the slice parameter
+    /// buffer, which is an **array** of records. The distinction is not a detail: iHD refuses a
+    /// slice parameter buffer created with one element per record the way it refuses a decode
+    /// picture parameter buffer sized that way.
+    pub fn buffer(&self, kind: VAStatus, data: &[u8], num_elements: c_uint) -> Result<Buffer, String> {
+        let Some(size) = c_uint::try_from(data.len()).ok() else { return Err(format!("{} byte buffer", data.len())) };
+        let mut id: VABufferID = 0;
+        // SAFETY: `context` is this session's own context, `data` is `size` readable bytes (which
+        // is what libva copies for a record buffer), and `id` is a live local for the buffer id.
+        let st =
+            unsafe { (self.display.api.create_buffer)(self.display.dpy, self.context, kind, size, num_elements, data.as_ptr().cast_mut().cast(), &mut id) };
+        if st != OK {
+            return Err(format!("vaCreateBuffer failed for {size} bytes of type {kind} in {num_elements} element(s): {}", self.display.api.status_text(st)));
+        }
+        Ok(Buffer::owned(Arc::clone(&self.display), id))
+    }
+
+    /// Encode: `vaBeginPicture` on the input surface, submit `buffers`, `vaEndPicture`.
+    ///
+    /// The picture is always rendered into the reconstruction surface and read from the input one.
+    /// A driver that emits the picture it is asked to encode and not something else is a driver
+    /// this backend has to catch, not work around.
+    pub fn render(&self, buffers: &[u32]) -> Result<(), String> {
+        if buffers.is_empty() {
+            return Err("a picture with no buffers to render".into());
+        }
+        let Ok(count) = c_int::try_from(buffers.len()) else { return Err(format!("{} buffers", buffers.len())) };
+        let _gate = self.display.gate();
+        // SAFETY: `context` is this session's own context and `input` one of its own surfaces;
+        // both were created together and neither has been destroyed.
+        let begun = unsafe { (self.display.api.begin_picture)(self.display.dpy, self.context, self.input) };
+        if begun != OK {
+            return Err(format!("vaBeginPicture failed on surface {}: {}", self.input, self.display.api.status_text(begun)));
+        }
+        // SAFETY: as above, plus `buffers` is a live slice of `count` ids, all buffers this session
+        // created and not yet destroyed.
+        let st = unsafe { (self.display.api.render_picture)(self.display.dpy, self.context, buffers.as_ptr().cast_mut(), count) };
+        // SAFETY: as above. `vaEndPicture` pairs with the `vaBeginPicture` above and is made
+        // whether or not the render succeeded.
+        let ended = unsafe { (self.display.api.end_picture)(self.display.dpy, self.context) };
+        if st != OK {
+            return Err(format!("vaRenderPicture failed for {} encode buffers: {}", buffers.len(), self.display.api.status_text(st)));
+        }
+        if ended != OK {
+            return Err(format!("vaEndPicture failed: {}", self.display.api.status_text(ended)));
+        }
+        Ok(())
+    }
+
+    /// Wait for the encode to finish. Required before the coded buffer is read.
+    ///
+    /// **`vaSyncSurface` on the input surface is not a substitute.** The decode path synchronises
+    /// the surface whose pixels it is about to read; the encoder's output is in a *buffer*, and
+    /// libva's answer for that is `vaSyncBuffer`. Reading it without is a truncated picture, which
+    /// on a driver that is fast enough is a picture that is usually right.
+    pub fn sync(&self) -> Result<(), String> {
+        let Some(sync_buffer) = self.display.api.sync_buffer else {
+            // Not an error: the buffer can still be mapped, and the caller can see whether it holds
+            // a whole picture (the slice records say how many bytes each slice is, and a picture
+            // shorter than that is a truncated one).
+            log::info!("VA-API: this libva has no vaSyncBuffer, so an encoded picture is read without synchronising first");
+            return Ok(());
+        };
+        let _gate = self.display.gate();
+        // SAFETY: `coded` is this session's own coded buffer and has not been destroyed.
+        let st = unsafe { sync_buffer(self.display.dpy, self.coded.id()) };
+        if st != OK {
+            return Err(format!("vaSyncBuffer failed on the coded buffer: {}", self.display.api.status_text(st)));
+        }
+        Ok(())
+    }
+
+    /// Put a picture on the input surface.
+    ///
+    /// `luma` is `width * height` bytes and `chroma` is `width * height / 2` bytes (interleaved
+    /// Cb, Cr), both tightly packed. The driver is asked for a linear image of the session's own
+    /// format and the picture is copied through `vaPutImage` into the surface.
+    ///
+    /// The alternative — writing into the surface's own memory through `vaDeriveImage` — is not
+    /// available: iHD's surfaces are tiled, and the decode backend already learned that a surface
+    /// it cannot derive has to be copied the indirect way. An encode upload has no choice but the
+    /// copy, and it is the same cost the decode readback already pays.
+    pub fn upload(&self, luma: &[u8], chroma: &[u8]) -> Result<(), String> {
+        let (Some(create_image), Some(destroy_image), Some(put_image)) =
+            (self.display.api.create_image, self.display.api.destroy_image, self.display.api.put_image)
+        else {
+            return Err("this libva has no vaCreateImage / vaPutImage, so a picture cannot be uploaded to a surface".into());
+        };
+        // The luma plane is `width * height` bytes and the chroma plane half as many, at the
+        // session's own coded size. Every length is computed with `checked_*`: a size that would
+        // overflow is an error rather than a wrapped one that then bounds a slice wrongly.
+        let Some(luma_len) = self.size.0.checked_mul(self.size.1) else {
+            return Err(format!("{}x{} luma plane overflows a length", self.size.0, self.size.1));
+        };
+        let Some(chroma_len) = self.size.1.div_ceil(2).checked_mul(self.size.0) else {
+            return Err(format!("{}x{} chroma plane overflows a length", self.size.0, self.size.1));
+        };
+        let (luma_len, chroma_len) = (luma_len as usize, chroma_len as usize);
+        // The lengths are the driver's geometry, so the caller's two planes are checked against
+        // them rather than the other way round: a short slice is a bug in the caller, and writing
+        // past the end of one would be the alternative.
+        let (Some(luma), Some(chroma)) = (luma.get(..luma_len), chroma.get(..chroma_len)) else {
+            return Err(format!(
+                "a {}x{} 4:2:0 picture is {luma_len} luma bytes and {chroma_len} chroma bytes, not {} and {}",
+                self.size.0,
+                self.size.1,
+                luma.len(),
+                chroma.len()
+            ));
+        };
+        let mut format = VaImageFormat { fourcc: self.fourcc, byte_order: BYTE_ORDER_LSB_FIRST, bits_per_pixel: self.bpp, ..Default::default() };
+        let mut image = VaImage::default();
+        let (width, height) = (
+            c_int::try_from(self.size.0).map_err(|_| format!("picture width {}", self.size.0))?,
+            c_int::try_from(self.size.1).map_err(|_| format!("picture height {}", self.size.1))?,
+        );
+        let st = {
+            let _gate = self.display.gate();
+            // SAFETY: the display is initialised, `format` and `image` are live locals, and the
+            // sizes are the ones the image is allocated at.
+            unsafe { create_image(self.display.dpy, &mut format, width, height, &mut image) }
+        };
+        if st != OK {
+            return Err(format!("vaCreateImage failed for the encode upload: {}", self.display.api.status_text(st)));
+        }
+        // The image exists from here, so every exit destroys it. `Upload`'s `Drop` takes that over
+        // as soon as the buffer is mapped.
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        let st = {
+            let _gate = self.display.gate();
+            // SAFETY: `image.buf` is the buffer of the image just created and `mapped` is a live
+            // local for the address libva writes.
+            unsafe { (self.display.api.map_buffer)(self.display.dpy, image.buf, &mut mapped) }
+        };
+        if st != OK {
+            let _gate = self.display.gate();
+            // SAFETY: the image was created above, never mapped (so never unmapped), and nothing
+            // else holds its id — this is its one destroy.
+            unsafe { destroy_image(self.display.dpy, image.image_id) };
+            return Err(format!("vaMapBuffer failed for the encode upload: {}", self.display.api.status_text(st)));
+        }
+        if mapped.is_null() {
+            let _gate = self.display.gate();
+            // SAFETY: as above.
+            unsafe { destroy_image(self.display.dpy, image.image_id) };
+            return Err("vaMapBuffer succeeded for the encode upload but returned no address".into());
+        }
+        let image_id = image.image_id;
+        let upload = Upload { display: Arc::clone(&self.display), image, data: mapped, mapped: true };
+        // The two planes are copied through the driver's own geometry, and every number in it is
+        // checked against `data_size` before a byte is written.
+        upload.copy_in(luma, chroma)?;
+        let st = {
+            let _gate = self.display.gate();
+            // SAFETY: `image` is the image just created and mapped, `input` is this session's own
+            // surface, and the rectangle is the whole of both.
+            let extent = |v: u32| c_uint::try_from(v).unwrap_or(0);
+            // SAFETY: as the comment above says: the image is this value's own and still mapped, the
+            // surface is this session's, and the rectangle is the whole of both. The `image_id`
+            // local was taken before `upload` took the image, so it is the one `vaCreateImage` wrote.
+            unsafe {
+                put_image(
+                    self.display.dpy,
+                    self.input,
+                    image_id,
+                    0,
+                    0,
+                    extent(self.size.0),
+                    extent(self.size.1),
+                    0,
+                    0,
+                    extent(self.size.0),
+                    extent(self.size.1),
+                )
+            }
+        };
+        // The image is unmapped and destroyed by `upload`'s `Drop` below, on every path.
+        drop(upload);
+        if st != OK {
+            return Err(format!("vaPutImage failed onto the encode surface: {}", self.display.api.status_text(st)));
+        }
+        Ok(())
+    }
+
+    /// The coded picture the last render wrote: the driver's own segment list and the bytes it
+    /// points at.
+    ///
+    /// There is no slice count and no slice index to pass, because libva 1.24's encode API has
+    /// neither — see [`VaCodedBufferSegment`]. [`Encoder::sync`] has already been called, so the
+    /// encode is finished, and every pointer in the list is checked against the mapping before a
+    /// byte is copied.
+    #[expect(dead_code, reason = "the safe readback the next task completes; the measurement path is what the spike could reach")]
+    pub fn read_coded(&self) -> Result<CodedPicture, String> {
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        let st = {
+            let _gate = self.display.gate();
+            // SAFETY: `coded` is this session's own coded buffer and `mapped` is a live local.
+            unsafe { (self.display.api.map_buffer)(self.display.dpy, self.coded.id(), &mut mapped) }
+        };
+        let _ = st;
+        if st != OK {
+            return Err(format!("vaMapBuffer failed on the coded buffer: {}", self.display.api.status_text(st)));
+        }
+        if mapped.is_null() {
+            return Err("vaMapBuffer succeeded on the coded buffer but returned no address".into());
+        }
+        let read = CodedReadback { display: Arc::clone(&self.display), id: self.coded.id(), data: mapped, allocated: self.coded_bytes };
+        // `read` owns the mapping and unmaps it in `Drop` on every path, so a malformed coded
+        // buffer cannot leave the buffer mapped.
+        read.picture()
+    }
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        let api = Arc::clone(&self.display.api);
+        // The coded buffer is taken out first and released **after** the gate is dropped, because
+        // `Buffer::drop` takes that same gate: dropping it inside the gated scope deadlocks on a
+        // `std::sync::Mutex`, which is not reentrant. That is not a theoretical hazard — it is what
+        // this method did the first time, and the symptom was a process that hung *after* libva had
+        // already torn everything down and logged its last `vaDestroyConfig`.
+        let coded = std::mem::replace(&mut self.coded, Buffer::placeholder(Arc::clone(&self.display)));
+        {
+            let _gate = self.display.gate();
+            // libva's own order, as `Session::drop` does it: the context, then the surfaces it
+            // rendered into, then the config. Each is released only if it exists, because an
+            // `Encoder` that failed part-way through `Encoder::new` is dropped too and the ids it
+            // never filled in are zero — which is not a surface or a context the driver made.
+            if self.context != 0 {
+                // SAFETY: `context` is this session's own context, created in `Encoder::new` and not
+                // destroyed on any earlier path.
+                unsafe { (api.destroy_context)(self.display.dpy, self.context) };
+            }
+            if self.input != 0 && self.recon != 0 {
+                // SAFETY: `input` and `recon` are the two surface ids `vaCreateSurfaces` wrote and
+                // `Encoder::new` checked for being distinct, neither destroyed on any earlier path,
+                // and the context that used them is gone above.
+                let mut surfaces = [self.input, self.recon];
+                // SAFETY: as above: the two ids `vaCreateSurfaces` wrote, checked distinct, and the
+                // context that used them was destroyed above, which is libva's own order.
+                unsafe { (api.destroy_surfaces)(self.display.dpy, surfaces.as_mut_ptr(), 2) };
+            }
+            if self.config != 0 {
+                // SAFETY: `config` is this session's own config id, created in `Encoder::new` and
+                // not destroyed on any earlier path.
+                unsafe { (api.destroy_config)(self.display.dpy, self.config) };
+            }
+        }
+        // The coded buffer last, because libva forbids destroying a buffer while a render into it is
+        // live — so it has to outlive the context. The gate is free again, so its own `Drop` can
+        // take it.
+        drop(coded);
+    }
+}
+
+/// A mapped image the encoder is copying a picture into: the driver's `VAImage`, its mapped bytes,
+/// and the matching unmap and destroy in `Drop`.
+struct Upload {
+    display: Arc<Display>,
+    image: VaImage,
+    data: *mut c_void,
+    mapped: bool,
+}
+
+impl Upload {
+    /// Copy `luma` and `chroma` into the mapped image, through the driver's own plane geometry.
+    ///
+    /// Everything here is bounded against the same three numbers [`crate::vaapi::validate_image`]
+    /// checks for a decode readback, and for the same reason: they were written by a driver, and a
+    /// pitch narrower than a row makes a row write walk off the plane.
+    fn copy_in(&self, luma: &[u8], chroma: &[u8]) -> Result<(), String> {
+        // The reuse is deliberate and is the second of the two gates on a driver-reported geometry
+        // (the first is `validate_image`, which is for pictures coming *out*; this is a picture
+        // going in, and it reads the same numbers).
+        crate::vaapi::validate_image(&self.image)?;
+        // SAFETY: `data` is what `vaMapBuffer` returned for `image.buf` and is still mapped (only
+        // `Drop` unmaps it, once, with this value borrowed throughout), so the slice below is
+        // `data_size` writable bytes — and it is the only writable view of the mapping, created
+        // here and never handed out.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(self.data.cast::<u8>(), self.image.data_size as usize) };
+        let (Some(&luma_pitch), Some(&chroma_pitch), Some(&luma_at), Some(&chroma_at)) =
+            (self.image.pitches.first(), self.image.pitches.get(1), self.image.offsets.first(), self.image.offsets.get(1))
+        else {
+            return Err("the upload image has no plane geometry".into());
+        };
+        if luma_pitch != chroma_pitch {
+            return Err(format!("upload luma pitch {luma_pitch} and chroma pitch {chroma_pitch} differ"));
+        }
+        let (width, height) = (self.image.width as usize, self.image.height as usize);
+        let stride = luma_pitch as usize;
+        // Each plane is one row-copy per image row, at the plane's own pitch, and each row's
+        // destination range is a `get_mut` on the mapped slice — so a pitch or an offset the driver
+        // got wrong cannot make a write leave the buffer. Explicit loops rather than an iterator,
+        // because two closures over one mutable borrow do not typecheck and the rows must be
+        // copied in order for the error to name the row that did not fit.
+        for row in 0..height {
+            let Some(at) = (luma_at as usize).checked_add(row * stride) else {
+                return Err(format!("luma row {row} overflows the plane's offset"));
+            };
+            let (Some(from), Some(to)) =
+                (luma.get(row * width..).and_then(|rest| rest.get(..width)), bytes.get_mut(at..).and_then(|rest| rest.get_mut(..width)))
+            else {
+                return Err(format!("luma row {row} does not fit the {}x{} upload image", width, height));
+            };
+            to.copy_from_slice(from);
+        }
+        let chroma_w = width.div_ceil(2);
+        let chroma_bytes = chroma_w * 2;
+        for row in 0..height.div_ceil(2) {
+            let Some(at) = (chroma_at as usize).checked_add(row * stride) else {
+                return Err(format!("chroma row {row} overflows the plane's offset"));
+            };
+            let (Some(from), Some(to)) =
+                (chroma.get(row * chroma_bytes..).and_then(|rest| rest.get(..chroma_bytes)), bytes.get_mut(at..).and_then(|rest| rest.get_mut(..chroma_bytes)))
+            else {
+                return Err(format!("chroma row {row} does not fit the {}x{} upload image", width, height));
+            };
+            to.copy_from_slice(from);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        let _gate = self.display.gate();
+        if self.mapped {
+            // SAFETY: `image.buf` is the buffer mapped by `Encoder::upload` and has not been
+            // unmapped since (only this `Drop` unmaps it, once, with the value borrowed
+            // throughout).
+            unsafe { (self.display.api.unmap_buffer)(self.display.dpy, self.image.buf) };
+            self.mapped = false;
+        }
+        if let Some(destroy) = self.display.api.destroy_image {
+            // SAFETY: `image.image_id` is the id `vaCreateImage` wrote, owned by this value, and
+            // never destroyed elsewhere.
+            unsafe { destroy(self.display.dpy, self.image.image_id) };
+        }
+    }
+}
+
+/// A mapped coded buffer: the driver's own linked list of [`VaCodedBufferSegment`] and the bytes
+/// those segments point at.
+///
+/// The mapped region belongs to the driver and is valid only until this is dropped, so it is read
+/// through [`CodedReadback::picture`], which copies the bytes out before the unmap, and the unmap
+/// is a `Drop`.
+struct CodedReadback {
+    display: Arc<Display>,
+    id: VABufferID,
+    data: *mut c_void,
+    /// The size the buffer was created with, which is the only length the mapping is known to have.
+    allocated: usize,
+}
+
+impl CodedReadback {
+    /// The whole mapped buffer as bytes. Its length is what every pointer a segment holds is
+    /// checked against, so it is this module's own record of the mapping's extent rather than
+    /// anything the driver wrote.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `data` is what `vaMapBuffer` returned for this buffer and is still mapped (only
+        // `Drop` unmaps it, once, with the value borrowed throughout), so the slice below is
+        // `allocated` readable bytes — the size the buffer was created with, which is what libva
+        // guaranteed to map.
+        unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.allocated) }
+    }
+
+    /// The driver-written slice records and the payload they describe, copied out.
+    ///
+    /// Every number in the buffer is the driver's, so the head is checked to name
+    /// [`ENC_CODED_BUFFER`], `mem_size` is bounded, and each segment's `buf` / `size` pair is
+    /// checked to lie inside the mapping before a byte is copied.
+    ///
+    /// **A slice's data is `slice_data_offset .. +slice_data_size`, both the driver's.**
+    #[expect(dead_code, reason = "as `read_coded`, which is the only caller")]
+    fn picture(&self) -> Result<CodedPicture, String> {
+        let all = self.bytes();
+        let mut out = Vec::new();
+        let mut status = Vec::new();
+        let mut node = self.data.cast::<VaCodedBufferSegment>();
+        let mut seen = 0usize;
+        while !node.is_null() {
+            if seen >= MAX_CODED_SEGMENTS {
+                return Err(format!("the coded buffer's segment list is longer than {MAX_CODED_SEGMENTS}, or it is a cycle"));
+            }
+            seen += 1;
+            // SAFETY: `node` is either the address `vaMapBuffer` returned (which is what libva
+            // documents for a coded buffer) or a `next` read out of a segment in the mapping. The
+            // extent test below is what makes the second case sound: a `next` is only followed
+            // once it has been found to lie inside the mapping with a full record's width left,
+            // so every read here is inside `allocated` bytes.
+            let at_node = self.offset_of(node.cast::<c_void>()).filter(|at| at + size_of::<VaCodedBufferSegment>() <= all.len());
+            let Some(node_at) = at_node else {
+                return Err(format!("coded buffer segment {seen} is at {node:?}, outside the {} byte mapping", self.allocated));
+            };
+            let segment = read_record::<VaCodedBufferSegment>(all.get(node_at..).unwrap_or(&[])).unwrap_or_default();
+            status.push(segment.status);
+            if segment.bit_offset != 0 {
+                // See the field's doc comment: a non-zero bit offset would mean the segment's first
+                // bits are not picture data, and shifting by an amount whose unit this module
+                // cannot verify would produce a plausible wrong picture. Measured, not assumed:
+                // iHD reports 0 on this machine.
+                let bits = segment.bit_offset;
+                return Err(format!("coded buffer segment {seen} starts {bits} bits into the segment, which this backend does not unshift"));
+            }
+            let size = segment.size as usize;
+            // The segment's own pointer is the driver's, so it is checked to be inside the mapping
+            // before it is turned into a slice. `data_at` is the byte offset of `segment.buf` from
+            // the start of the mapping, or `None` if the pointer is not inside it at all.
+            let Some(at) = self.offset_of(segment.buf) else {
+                return Err(format!("coded buffer segment {seen} points at {:?}, outside the {}-byte mapping", segment.buf, self.allocated));
+            };
+            let bytes = all
+                .get(at..)
+                .and_then(|rest| rest.get(..size))
+                .ok_or_else(|| format!("coded buffer segment {seen} claims {size} bytes at offset {at} of a {} byte mapping", self.allocated))?;
+            out.extend_from_slice(bytes);
+            node = segment.next.cast::<VaCodedBufferSegment>();
+        }
+        if seen == 0 {
+            return Err("the mapped coded buffer is an empty segment list".into());
+        }
+        if out.is_empty() {
+            return Err(format!("the coded buffer's {seen} segment(s) hold no bytes"));
+        }
+        Ok(CodedPicture { bytes: out, status, segments: seen })
+    }
+
+    /// The offset of `ptr` from the start of the mapping, or `None` when it is not inside it.
+    fn offset_of(&self, ptr: *mut c_void) -> Option<usize> {
+        if ptr.is_null() {
+            return None;
+        }
+        let base = self.data as usize;
+        let at = ptr as usize;
+        // Both ends are checked, and the subtraction is only done after the containment test, so a
+        // pointer below the mapping cannot wrap into a plausible offset.
+        let len = self.allocated;
+        if at < base || at > base.checked_add(len)? {
+            return None;
+        }
+        Some(at - base)
+    }
+
+    /// The picture, read from the driver's own segment pointers after checking each against this
+    /// process's mappings — see [`Encoder::read_coded_from_driver_pointer`] for why this exists and
+    /// why it is not the shipping path.
+    ///
+    /// Every read is bounded twice: by the segment's own `size`, and by what is left of the mapping
+    /// the pointer falls in. The second bound is the one that makes this safe rather than merely
+    /// careful, and it is why the length is clamped rather than merely checked.
+    fn picture_from_driver_pointers(&self) -> Result<CodedPicture, String> {
+        let all = self.bytes();
+        let mut out = Vec::new();
+        let mut status = Vec::new();
+        let mut node = self.data.cast::<VaCodedBufferSegment>();
+        let mut seen = 0usize;
+        while !node.is_null() {
+            if seen >= MAX_CODED_SEGMENTS {
+                return Err(format!("the coded buffer's segment list is longer than {MAX_CODED_SEGMENTS}, or it is a cycle"));
+            }
+            seen += 1;
+            let at_node = self.offset_of(node.cast::<c_void>()).filter(|at| at + size_of::<VaCodedBufferSegment>() <= all.len());
+            let Some(node_at) = at_node else {
+                return Err(format!("coded buffer segment {seen} is at {node:?}, outside the {} byte mapping", self.allocated));
+            };
+            let segment = read_record::<VaCodedBufferSegment>(all.get(node_at..).unwrap_or(&[])).unwrap_or_default();
+            status.push(segment.status);
+            if segment.bit_offset != 0 {
+                let bits = segment.bit_offset;
+                return Err(format!("coded buffer segment {seen} starts {bits} bits into the segment, which this backend does not unshift"));
+            }
+            let (_low, high) = mapping_of(segment.buf).map_err(|why| format!("coded buffer segment {seen}: {why}"))?;
+            let start = segment.buf as usize;
+            // Both bounds before the subtraction: `start >= low` is what `mapping_of` already
+            // established, and `high - start` is what is left of the region.
+            let available = high.checked_sub(start).ok_or_else(|| format!("coded buffer segment {seen} is at the end of its mapping"))?;
+            let size = (segment.size as usize).min(available);
+            if size < segment.size as usize {
+                return Err(format!("coded buffer segment {seen} claims {} bytes but only {size} are mapped", segment.size));
+            }
+            // SAFETY: `start` is inside a mapping `mapping_of` just found, `size` bytes are left in it
+            // (checked above, and `size` is at most what the mapping extends to), the mapping is a
+            // readable one because nothing in this file ever makes a mapping non-readable, and the
+            // slice is copied out and dropped before this borrow of `segment` ends.
+            let bytes = unsafe { std::slice::from_raw_parts(segment.buf.cast::<u8>(), size) };
+            out.extend_from_slice(bytes);
+            node = segment.next.cast::<VaCodedBufferSegment>();
+        }
+        if seen == 0 {
+            return Err("the mapped coded buffer is an empty segment list".into());
+        }
+        if out.is_empty() {
+            return Err(format!("the coded buffer's {seen} segment(s) hold no bytes"));
+        }
+        Ok(CodedPicture { bytes: out, status, segments: seen })
+    }
+}
+
+impl Drop for CodedReadback {
+    fn drop(&mut self) {
+        let _gate = self.display.gate();
+        // SAFETY: `id` is the buffer mapped by `Encoder::read_coded` and has not been unmapped
+        // since (only this `Drop` unmaps it, once).
+        unsafe { (self.display.api.unmap_buffer)(self.display.dpy, self.id) };
+    }
+}
+
+/// The compressed picture the driver wrote, as Annex-B NAL units with no header of our own.
+///
+/// Owned bytes, so it outlives the mapping it was copied out of — which is what makes it safe to
+/// hand to a muxer.
+pub struct CodedPicture {
+    bytes: Vec<u8>,
+    /// `VA_CODED_BUF_STATUS_*` for each segment (`va.h:3897-3933`). The low byte is the picture's
+    /// average QP — the driver's own statement of what it encoded at, which is not the QP that was
+    /// asked for and is worth having both of.
+    status: Vec<u32>,
+    /// How many segments the driver reported the picture in.
+    segments: usize,
+}
+
+impl CodedPicture {
+    /// The NAL units: start-code-prefixed, exactly as the driver wrote them.
+    ///
+    /// With [`PACKED_HEADER_SEQUENCE`] and [`PACKED_HEADER_PICTURE`] set, the driver puts the SPS
+    /// and the PPS in this buffer ahead of the slice, so the bytes are a complete Annex-B access
+    /// unit — which is what is read back out of here rather than a parameter set this backend
+    /// assembled.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The per-segment status words the driver wrote, in order.
+    pub fn status(&self) -> &[u32] {
+        &self.status
+    }
+
+    /// How many bytes the driver wrote.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// How many segments the picture came back in. More than one is what a driver does when it
+    /// packs the parameter sets as separate units rather than ahead of the slice.
+    pub fn segments(&self) -> usize {
+        self.segments
+    }
+}
+
+/// The `(low, high)` address range of the mapping `ptr` falls inside, or why there is none.
+///
+/// **This is the whole of what makes [`Encoder::read_coded_from_driver_pointer`] memory-safe, and it
+/// is also the thing that makes that method a measurement rather than a readback.** `/proc/self/maps`
+/// is the only description of this process's address space available without mapping memory
+/// ourselves, and it is Linux-specific — acceptable in a module that is Linux-only, and
+/// unacceptable as a permanent answer for a library.
+///
+/// The arithmetic is the careful part: `low <= ptr < high` is tested *before* any subtraction, so a
+/// pointer below the region cannot wrap into a plausible offset, and every length derived from it is
+/// clamped to what is left of the region rather than to what a caller asked for.
+fn mapping_of(ptr: *mut c_void) -> Result<(usize, usize), String> {
+    let addr = ptr as usize;
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|e| format!("reading /proc/self/maps: {e}"))?;
+    for line in maps.lines() {
+        let Some(range) = line.split_whitespace().next() else { continue };
+        let mut halves = range.split('-');
+        let lo = halves.next().and_then(|v| usize::from_str_radix(v, 16).ok());
+        let hi = halves.next().and_then(|v| usize::from_str_radix(v, 16).ok());
+        let (Some(lo), Some(hi)) = (lo, hi) else { continue };
+        if addr >= lo && addr < hi {
+            return Ok((lo, hi));
+        }
+    }
+    Err(format!("{ptr:?} is not inside any mapping this process has"))
+}
+
+impl Encoder {
+    /// **A measurement, not the readback this backend would ship.** Read the coded picture from the
+    /// pointer the driver's own segment record holds, after checking that pointer against this
+    /// process's mappings so that no read can leave one.
+    ///
+    /// # What it establishes
+    ///
+    /// Measured on the machine this milestone was written for (Intel Arc B580, iHD 26.3.5, libva
+    /// 1.24): **libva's `vaMapBuffer` does not return the memory the coded picture is in.**
+    ///
+    /// - `vaMapBuffer` on the [`ENC_CODED_BUFFER`] returns a pointer into the **heap**, in a
+    ///   ~576 KiB mapping. That is libva's staging area for the buffer object: it holds the
+    ///   `VACodedBufferSegment` list at its head and driver bookkeeping after it, and it contains
+    ///   **no NAL unit of the encoded picture**.
+    /// - The `VACodedBufferSegment` at the head of that mapping is well formed and says
+    ///   `size = 935`, `bit_offset = 0`, `status = 0x1a` (low byte 26 — the average QP, which
+    ///   matches the `pic_init_qp` that was asked for) and `next = NULL`. Its `buf` points into a
+    ///   **separate `/dev/dri/renderD128` `rw-s` mapping of 768 KiB**, which is where libva mapped
+    ///   the driver's coded output. Those 935 bytes are a valid Annex-B IDR slice: they begin
+    ///   `00 00 01 05`.
+    /// - `vaMapBuffer2` with `VA_MAPBUFFER_FLAG_READ` returns the same heap staging area, and
+    ///   mapping the coded buffer *before* the render and holding the mapping across it changes
+    ///   nothing.
+    ///
+    /// So the picture is reachable only through the driver's own pointer — which is documented
+    /// (`va.h:3949`, "Pointer to the start of the data buffer") and which nothing in libva vouches
+    /// for in length. [`Encoder::read_coded`] refuses it, and this method exists so the milestone
+    /// could **measure** what the driver encodes before deciding how to read it safely for real.
+    ///
+    /// # What it does not establish
+    ///
+    /// A way to read those bytes without parsing `/proc/self/maps`. **That is the blocker for the
+    /// shipping path**, and the next task has to answer it — the candidates being a different coded
+    /// buffer memory type, a driver that will map the coded output where libva says, or an explicit
+    /// bounds negotiation.
+    pub fn read_coded_from_driver_pointer(&self) -> Result<CodedPicture, String> {
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        let st = {
+            let _gate = self.display.gate();
+            // SAFETY: `coded` is this session's own coded buffer and `mapped` is a live local.
+            unsafe { (self.display.api.map_buffer)(self.display.dpy, self.coded.id(), &mut mapped) }
+        };
+        if st != OK || mapped.is_null() {
+            return Err(format!("vaMapBuffer on the coded buffer: {}", self.display.api.status_text(st)));
+        }
+        let read = CodedReadback { display: Arc::clone(&self.display), id: self.coded.id(), data: mapped, allocated: self.coded_bytes };
+        // `read` owns the mapping and unmaps it in `Drop` on every path out of here.
+        read.picture_from_driver_pointers()
+    }
+}
+
+/// The record of type `T` in `bytes`, or `None` when the buffer is too short for one.
+fn read_record<T: Copy>(bytes: &[u8]) -> Option<T> {
+    if bytes.len() < size_of::<T>() {
+        return None;
+    }
+    // SAFETY: `bytes` is at least `size_of::<T>()` long (checked above) and `T` is a `#[repr(C)]`
+    // record this module declares, so the copy reads within it and into a live, initialised `T`.
+    // `T: Copy` means it owns nothing the bytes could outlive, and every byte of the encode
+    // records is a named field (the C layout's holes are `padding_*`), so no indeterminate byte is
+    // ever copied into the result.
+    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         let api = Arc::clone(&self.display.api);
@@ -1722,6 +3049,10 @@ impl Drop for Session {
 pub struct Buffer {
     display: Arc<Display>,
     id: VABufferID,
+    /// `id == 0` means this value owns no libva buffer — a placeholder that releases nothing.
+    /// `VA_INVALID_ID` would not do: a driver is free to have made a buffer with that id, and
+    /// destroying it would destroy something this value does not own.
+    owns: bool,
 }
 
 impl Buffer {
@@ -1729,13 +3060,30 @@ impl Buffer {
     pub fn id(&self) -> u32 {
         self.id
     }
+
+    /// A buffer for an id this display created, destroyed when it is dropped.
+    fn owned(display: Arc<Display>, id: VABufferID) -> Self {
+        Self { display, id, owns: true }
+    }
+
+    /// A value that owns nothing, so it can be a field before the real buffer exists. `Encoder`
+    /// needs one because its fields are initialised before the libva calls that can fail, and a
+    /// field that could not be filled has to be *some* valid `Buffer`.
+    fn placeholder(display: Arc<Display>) -> Self {
+        Self { display, id: 0, owns: false }
+    }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        if !self.owns {
+            return;
+        }
+        self.owns = false;
         let _gate = self.display.gate();
         // SAFETY: `id` is the buffer this value owns and was created by the same display, which it
-        // holds a reference to; this is its one destroy.
+        // holds a reference to; `owns` is cleared first so this can only run once; this is its one
+        // destroy.
         unsafe { (self.display.api.destroy_buffer)(self.display.dpy, self.id) };
     }
 }

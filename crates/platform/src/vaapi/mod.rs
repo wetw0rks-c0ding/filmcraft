@@ -28,11 +28,22 @@ mod stream;
 // What a picture is submitted as, read out of FilmCraft's own parsers. Safe code with nothing
 // OS-specific in it either, for the same reason as `stream` above.
 mod picture;
+// The SPS and PPS for a picture this module encoded, derived from the records it submitted and
+// verified by FilmCraft's own H.264 parser. It exists because iHD 26.3.5 on the machine this
+// milestone was written for accepts the packed-header mode and then writes no parameter sets at all
+// (see the module's own note, which has the measured evidence).
+mod params;
 // The decoder itself — the surfaces, the decode loop and the readback. Part of this module, split
 // into its own file because the module is large; it is safe code like everything here but `ffi`.
 mod decoder;
+// The encoder's other half: the records that describe what to encode, and the drive of one
+// picture through it. Encode inverts decode's data flow (the app hands the driver a picture and the
+// driver writes the slice headers), so there is nothing to parse here and this module builds
+// records instead. Safe code, like everything here but `ffi`.
+mod encoder;
 
 pub use decoder::{Timings, VaDecoder};
+pub use encoder::{EncodeRequest, EncodedPicture, VaEncoder, macroblocks_of, ramp_picture};
 // What a caller outside this module needs to build a decoder: [`Display`] is the initialised libva
 // connection a session is created on; [`stream_info`] reads a sample entry into the codec-agnostic
 // `StreamInfo` the rest of the workspace speaks, and [`Stream`] is this backend's own view of a
@@ -52,6 +63,20 @@ use ffi::VaImage;
 /// decoder here at all. A machine without them reports that it has none rather than failing to start.
 pub fn available() -> bool {
     ffi::load().and_then(|api| Display::new(&api)).is_ok()
+}
+
+/// An initialised VA-API display on this machine's DRM render node, or why there is none.
+///
+/// The same call [`VaDecoder::new`] makes internally. It is public because the encode path needs a
+/// display of its own — the decoder's is created and owned inside the decoder — and a caller
+/// driving [`VaEncoder`] directly (the encode milestone's probe, `examples/vaencprobe.rs`) needs one
+/// to hand it.
+///
+/// It returns the whole [`Display`] rather than the `Api` behind it, because a `Display` is the safe
+/// wrapper: no libva handle leaves [`ffi`].
+pub fn open_display() -> Result<std::sync::Arc<Display>, String> {
+    let api = ffi::load()?;
+    Display::new(&api)
 }
 
 /// How many pictures a stream's sequence parameter set says its decoded picture buffer holds, or why
