@@ -500,7 +500,7 @@ impl VaEncoder {
         // Mandatory before the read: the encode is asynchronous and an unsynchronised read of the
         // coded buffer is a truncated picture rather than a stale one.
         self.encoder.sync()?;
-        let coded = self.encoder.read_coded_from_driver_pointer()?;
+        let coded = self.encoder.read_coded()?;
         let segments = coded.segments();
         let status = coded.status().to_vec();
         let coded_buffer_used = u32::try_from(coded.bytes().len()).unwrap_or(u32::MAX);
@@ -1577,6 +1577,43 @@ fn a_reference_depth_this_module_cannot_make_correct_is_refused() {
             assert!(why.contains("wrong"), "and says the failure is a wrong picture: {why}");
         }
     }
+}
+
+/// The encode readback returns a whole, decodable picture — out of storage this backend mapped
+/// itself.
+///
+/// This is the test the readback could only fail before: it drives one key frame and two predicted
+/// frames and asks for the bytes back. If the picture were still being read through a pointer whose
+/// extent nothing reports, this is where that would show — and it is worth a test that says so,
+/// because the alternative the readback replaced returned correct bytes and was wrong anyway.
+#[test]
+fn the_encode_readback_returns_a_whole_decodable_picture() {
+    let Ok(api) = super::open_display() else {
+        eprintln!("SKIPPED: no VA display");
+        return;
+    };
+    let mut encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let mut sizes = Vec::new();
+    for index in 0..3u32 {
+        // A different picture every time, which is what makes the prediction observable at all.
+        let (luma, chroma) = ramp_shifted(640, 360, 8 * index);
+        encoder.upload(&luma, &chroma).expect("the ramp uploads");
+        let request = EncodeRequest::new(26, index == 0).expect("QP 26 is in range");
+        let picture = encoder.encode(request).unwrap_or_else(|e| panic!("picture {index} did not encode: {e}"));
+        sizes.push(picture.bytes.len());
+        assert!(!picture.bytes.is_empty(), "picture {index} came back empty");
+        assert_eq!(picture.bytes[..4.min(picture.bytes.len())], [0, 0, 0, 1], "picture {index} does not begin with an Annex-B start code");
+        // **Every NAL unit in the readback is a whole one.** This is what `check_annex_b` inside
+        // `read_coded` guarantees, and it is restated here because it is the property the caller
+        // depends on: a window that ended mid-unit would still decode, and would decode to noise.
+        assert!(ffi::check_annex_b(&picture.bytes).is_ok(), "picture {index} is not a whole Annex-B run");
+        // The bytes are owned: they outlive the mapping they were copied out of.
+        assert!(picture.bytes.iter().any(|b| *b != 0), "picture {index} is all zeroes");
+    }
+    // The key frame is bigger than what follows it, which is the shape an encode that is really
+    // predicting produces. A readback returning the same buffer's stale contents every time would
+    // not have this shape.
+    assert!(sizes[0] > sizes[1], "the key frame ({}) is not larger than the first P frame ({})", sizes[0], sizes[1]);
 }
 
 /// The record of type `T` in `bytes`, or `None` when it is too short. The safe reader this module's

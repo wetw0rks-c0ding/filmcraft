@@ -19,6 +19,12 @@
 
 #[allow(unsafe_code)]
 mod ffi;
+// How the encode readback gets at a libva buffer object's own storage: the descriptor FilmCraft
+// already holds the display open on, asked DRM to map the object libva named. A second FFI module
+// because it is a second ABI — plain DRM rather than libva — and the rule that `unsafe` lives only
+// in FFI modules is what keeps that boundary where it is.
+#[allow(unsafe_code)]
+mod drm;
 // Safe code with nothing OS-specific in it, so its tables could be tested on any machine. The module
 // it lives in is Linux-only today (`ffi` needs `dlopen`), so that is where these tests run, and
 // compiling them on macOS and Windows is tracked follow-up work: the allow below is what keeps that

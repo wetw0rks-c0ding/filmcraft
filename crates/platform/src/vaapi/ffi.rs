@@ -25,7 +25,9 @@
 //! actually installed ([`Display::probe_image_layout`]) — libva has no `sizeof` / `offsetof` of its
 //! own to ask, so a behavioural check is the only way to hold the declaration to the driver.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
+
+use super::drm;
 use std::mem::size_of;
 use std::sync::{Arc, MutexGuard, OnceLock};
 
@@ -155,6 +157,11 @@ pub const OPERATION_FAILED: i32 = 0x1;
 /// it while the reset runs and succeeds on a later call, so [`Session::sync`] asks again rather
 /// than reporting a decode failure the stream may not have had.
 pub const HW_BUSY: i32 = 0x22;
+/// `VA_STATUS_ERROR_TIMEDOUT` (`va.h:284`): `vaSyncBuffer` was not finished. **`va.h:4381-4382` is
+/// explicit that this means "synchronization is still in progress, client should call the function
+/// again to complete synchronization"** — not that the encode failed — so [`Encoder::sync`] asks
+/// again rather than reporting a failure the picture may not have had.
+pub const TIMED_OUT: i32 = 0x26;
 
 /// `VASurfaceRendering` / `VASurfaceDisplaying` / `VASurfaceReady` (`va.h:4296-4299`): what
 /// `vaQuerySurfaceStatus` says about a surface. `READY` is the state a surface has to be in before
@@ -827,10 +834,10 @@ pub struct VaSliceParameterBufferHevc {
 ///   person has to know.
 /// - The per-slice records the driver writes back are not described by any header either.
 ///
-/// So the picture is read as this linked list, and [`Encoder::read_coded`] walks it. The list is
-/// the driver's own: every pointer in it is checked against the mapping before a byte is copied,
-/// the walk is bounded by the segment count, and a cycle or a pointer outside the mapping is an
-/// error rather than an infinite read.
+/// So the picture is read as this linked list, and [`Encoder::read_coded`] reads the **length** from
+/// its head. The list is the driver's own, so a second segment is refused rather than followed (see
+/// [`CodedReadback::picture`]); the bytes themselves come out of the buffer's own storage, mapped by
+/// [`crate::vaapi::drm`] rather than through the `buf` pointer below.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VaCodedBufferSegment {
@@ -846,20 +853,46 @@ pub struct VaCodedBufferSegment {
     pub status: u32,
     /// Reserved by the header.
     pub reserved: u32,
-    /// Where this segment's bytes are. A pointer into the mapped buffer, which is why it is checked
-    /// against the mapping's own extent before it is used.
+    /// Where this segment's bytes are. **The readback does not follow it.** libva documents it as
+    /// "Pointer to the start of the data buffer" (`va.h:3949`) and vouches for no length, so reading
+    /// it means reading at a driver-chosen pointer whose extent nothing reports — the thing
+    /// [`crate::vaapi::drm`] exists to stop. The picture is found at the start of the buffer's own
+    /// storage instead, at the length this record's `size` gives.
     pub buf: *mut c_void,
     /// The next segment, or null for the last.
     pub next: *mut c_void,
     pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
-/// How many segments a coded buffer's linked list may hold before it is treated as a driver's
-/// mistake. One NAL unit per segment is the recommendation the header makes (`va.h:3941`), and a
-/// key frame with packed SPS, PPS and one slice is three; a few dozen is a very generous bound for
-/// that, and the walk stops there either way because a cycle in a driver-owned list would otherwise
-/// never end.
-const MAX_CODED_SEGMENTS: usize = 64;
+/// `VABufferInfo` (`va.h:4032`): what a buffer's underlying storage *is*.
+///
+/// This is the only documented query libva offers of a buffer's memory, and it is the one that makes
+/// the encode readback possible: `handle` is the DRM buffer object behind a
+/// [`ENC_CODED_BUFFER`] and `mem_size` is "Size of the underlying buffer" (`va.h:4046`), which is
+/// what [`crate::vaapi::drm`] maps. Measured on this stack: `mem_type` is
+/// `VA_SURFACE_ATTRIB_MEM_TYPE_DRM` and `mem_size` is exactly the size the buffer was created with.
+///
+/// `va.h:4086` requires the struct to be zeroed on input — `VaBufferInfo::ZEROED` is that value —
+/// because `mem_type` doubles as a hint on the way in.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaBufferInfo {
+    /// "Buffer handle" (`va.h:4034`). A DRM buffer-object handle on this stack, which is why it is
+    /// `usize` here and narrowed to `u32` before it is used as one.
+    pub handle: usize,
+    /// "Buffer type (See VABufferType)." Out-parameter; unused, the buffer's type is known.
+    pub buffer_type: u32,
+    /// "Buffer memory type (See VASurfaceAttribMemoryType)." A hint on input, the type actually used
+    /// on output. `0x20000000` is the DRM one (`va.h:1752` reserves bits 31:28 for Linux DRM).
+    pub mem_type: u32,
+    /// "Size of the underlying buffer" (`va.h:4046`).
+    pub mem_size: usize,
+}
+
+impl VaBufferInfo {
+    /// The all-zero struct `va.h:4086` requires on input to `vaAcquireBufferHandle`.
+    pub const ZEROED: Self = Self { handle: 0, buffer_type: 0, mem_type: 0, mem_size: 0 };
+}
 
 /// `VAEncSequenceParameterBufferH264` (`va_enc_h264.h:148`): what to encode — the sequence
 /// parameter set's own syntax elements, the periods, and the picture geometry in macroblocks.
@@ -1422,6 +1455,8 @@ pub struct Api {
     destroy_context: DestroyContextFn,
     create_buffer: CreateBufferFn,
     destroy_buffer: DestroyBufferFn,
+    acquire_buffer_handle: AcquireBufferHandleFn,
+    release_buffer_handle: ReleaseBufferHandleFn,
     derive_image: DeriveImageFn,
     begin_picture: BeginPictureFn,
     render_picture: RenderPictureFn,
@@ -1510,6 +1545,8 @@ fn resolve(va: *mut c_void, va_drm: *mut c_void, libraries: Arc<Libraries>) -> R
             destroy_context: symbol(va, c"vaDestroyContext")?,
             create_buffer: symbol(va, c"vaCreateBuffer")?,
             destroy_buffer: symbol(va, c"vaDestroyBuffer")?,
+            acquire_buffer_handle: symbol(va, c"vaAcquireBufferHandle")?,
+            release_buffer_handle: symbol(va, c"vaReleaseBufferHandle")?,
             derive_image: symbol(va, c"vaDeriveImage")?,
             begin_picture: symbol(va, c"vaBeginPicture")?,
             render_picture: symbol(va, c"vaRenderPicture")?,
@@ -1543,13 +1580,17 @@ type CreateContextFn = unsafe extern "C" fn(VADisplay, VAConfigID, c_int, c_int,
 type DestroyContextFn = unsafe extern "C" fn(VADisplay, VAContextID) -> VAStatus;
 type CreateBufferFn = unsafe extern "C" fn(VADisplay, VAContextID, VAStatus, c_uint, c_uint, *mut c_void, *mut VABufferID) -> VAStatus;
 type DestroyBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
+/// `va.h:4104`: fills in a [`VaBufferInfo`] naming the buffer's underlying storage.
+type AcquireBufferHandleFn = unsafe extern "C" fn(VADisplay, VABufferID, *mut VaBufferInfo) -> VAStatus;
+/// `va.h:4117`: releases what [`AcquireBufferHandleFn`] locked.
+type ReleaseBufferHandleFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
 type DeriveImageFn = unsafe extern "C" fn(VADisplay, VASurfaceID, *mut VaImage) -> VAStatus;
 type BeginPictureFn = unsafe extern "C" fn(VADisplay, VAContextID, VASurfaceID) -> VAStatus;
 type RenderPictureFn = unsafe extern "C" fn(VADisplay, VAContextID, *mut VABufferID, c_int) -> VAStatus;
 type EndPictureFn = unsafe extern "C" fn(VADisplay, VAContextID) -> VAStatus;
 type SyncSurfaceFn = unsafe extern "C" fn(VADisplay, VASurfaceID) -> VAStatus;
 type QuerySurfaceStatusFn = unsafe extern "C" fn(VADisplay, VASurfaceID, *mut c_uint) -> VAStatus;
-type SyncBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
+type SyncBufferFn = unsafe extern "C" fn(VADisplay, VABufferID, c_ulong) -> VAStatus;
 type MapBufferFn = unsafe extern "C" fn(VADisplay, VABufferID, *mut *mut c_void) -> VAStatus;
 type UnmapBufferFn = unsafe extern "C" fn(VADisplay, VABufferID) -> VAStatus;
 
@@ -1703,6 +1744,17 @@ impl Display {
     /// The driver's own description of itself ("Intel iHD"), or `None` when it has none.
     pub fn vendor(&self) -> Option<&'static str> {
         self.vendor
+    }
+
+    /// The DRM render node this display was opened on, or `None` once it has been closed.
+    ///
+    /// [`crate::vaapi::drm`] maps a buffer's storage on this descriptor, which is what lets the
+    /// encode readback read the picture out of storage this backend chose rather than out of a
+    /// pointer the driver handed over. It is the *same* descriptor libva is using — libva was given
+    /// it by [`Display::new`] and keeps it for the life of the display — so a buffer object libva
+    /// names is one this descriptor can be asked to map.
+    pub fn drm_fd(&self) -> Option<c_int> {
+        self.drm
     }
 
     /// Every profile the driver's decoder can be configured for. Unknown profiles are reported as
@@ -2272,11 +2324,11 @@ pub struct Encoder {
     recon: VASurfaceID,
     context: VAContextID,
     /// The [`ENC_CODED_BUFFER`] the compressed picture goes into. Kept for the life of the session
-    /// because it is re-mapped per picture rather than created per picture, and because its size is
-    /// the bound the driver's reported size is checked against.
+    /// because it is mapped per picture rather than created per picture, and because its storage is
+    /// what [`CodedReadback`] maps. **Its size is not recorded here**: the readback takes the length
+    /// of the storage from libva's own [`VaBufferInfo`], which describes the bytes being read rather
+    /// than the size this backend happened to ask for.
     coded: Buffer,
-    /// The size `coded` was created at, in bytes: the length of its mapping.
-    coded_bytes: usize,
 
     size: (u32, u32),
     /// The render format's four-character code and bit depth, so an upload asks for the same layout
@@ -2337,7 +2389,6 @@ impl Encoder {
             // A placeholder that is replaced below; `Drop` reads it only if this is reached, and
             // this returns an error rather than an `Encoder` in every such case.
             coded: Buffer::placeholder(Arc::clone(display)),
-            coded_bytes: coded_bytes as usize,
             size,
             fourcc,
             bpp,
@@ -2576,12 +2627,25 @@ impl Encoder {
             return Ok(());
         };
         let _gate = self.display.gate();
-        // SAFETY: `coded` is this session's own coded buffer and has not been destroyed.
-        let st = unsafe { sync_buffer(self.display.dpy, self.coded.id()) };
-        if st != OK {
-            return Err(format!("vaSyncBuffer failed on the coded buffer: {}", self.display.api.status_text(st)));
+        // **The timeout argument is passed explicitly.** `vaSyncBuffer`'s third parameter
+        // (`va.h:4391`) is `uint64_t timeout_ns`, and omitting it leaves the driver reading
+        // whatever happened to be in that argument slot: which is why this call reported
+        // `VA_STATUS_ERROR_TIMEDOUT` in an unoptimised build and succeeded in an optimised one.
+        // Ten milliseconds per attempt is far longer than a 640x360 picture takes on this driver and
+        // keeps the bounded worst case at about two thirds of a second.
+        const SYNC_TIMEOUT_NS: c_ulong = 10_000_000;
+        for _ in 0..MAX_SYNC_ATTEMPTS {
+            // SAFETY: `coded` is this session's own coded buffer and has not been destroyed, and
+            // `SYNC_TIMEOUT_NS` is the `uint64_t` the third parameter is declared as.
+            let st = unsafe { sync_buffer(self.display.dpy, self.coded.id(), SYNC_TIMEOUT_NS) };
+            match st {
+                OK => return Ok(()),
+                // Both of these are "not finished", not "failed": see `TIMED_OUT`'s doc comment.
+                TIMED_OUT | HW_BUSY => continue,
+                other => return Err(format!("vaSyncBuffer failed on the coded buffer: {other} ({})", self.display.api.status_text(other))),
+            }
         }
-        Ok(())
+        Err(format!("vaSyncBuffer on the coded buffer was still busy after {MAX_SYNC_ATTEMPTS} attempts"))
     }
 
     /// Put a picture on the input surface.
@@ -2696,14 +2760,20 @@ impl Encoder {
         Ok(())
     }
 
-    /// The coded picture the last render wrote: the driver's own segment list and the bytes it
-    /// points at.
+    /// The coded picture the last render wrote, copied out of the buffer object's own storage.
     ///
-    /// There is no slice count and no slice index to pass, because libva 1.24's encode API has
-    /// neither — see [`VaCodedBufferSegment`]. [`Encoder::sync`] has already been called, so the
-    /// encode is finished, and every pointer in the list is checked against the mapping before a
-    /// byte is copied.
-    #[expect(dead_code, reason = "the safe readback the next task completes; the measurement path is what the spike could reach")]
+    /// [`Encoder::sync`] has already been called, so the encode is finished.
+    ///
+    /// **Every byte comes from a mapping this backend made.** The picture is not read through
+    /// `VaCodedBufferSegment::buf`, which is a pointer the driver chose that nothing bounds, and not
+    /// through `vaMapBuffer`'s return, which on this stack is libva's own staging allocation rather
+    /// than the picture. It is read from [`crate::vaapi::drm`]: libva names the buffer's DRM object
+    /// and its size, and that object is mapped on FilmCraft's own descriptor, so the length of every
+    /// read is one this backend chose.
+    ///
+    /// What is still the driver's is the **length**: `VaCodedBufferSegment::size` is the only place
+    /// libva says how many bytes the picture is, so it is read, and it is checked to fit inside the
+    /// storage libva described.
     pub fn read_coded(&self) -> Result<CodedPicture, String> {
         let mut mapped: *mut c_void = std::ptr::null_mut();
         let st = {
@@ -2711,14 +2781,13 @@ impl Encoder {
             // SAFETY: `coded` is this session's own coded buffer and `mapped` is a live local.
             unsafe { (self.display.api.map_buffer)(self.display.dpy, self.coded.id(), &mut mapped) }
         };
-        let _ = st;
         if st != OK {
             return Err(format!("vaMapBuffer failed on the coded buffer: {}", self.display.api.status_text(st)));
         }
         if mapped.is_null() {
             return Err("vaMapBuffer succeeded on the coded buffer but returned no address".into());
         }
-        let read = CodedReadback { display: Arc::clone(&self.display), id: self.coded.id(), data: mapped, allocated: self.coded_bytes };
+        let read = CodedReadback { display: Arc::clone(&self.display), id: self.coded.id(), data: mapped };
         // `read` owns the mapping and unmaps it in `Drop` on every path, so a malformed coded
         // buffer cannot leave the buffer mapped.
         read.picture()
@@ -2855,161 +2924,106 @@ impl Drop for Upload {
     }
 }
 
-/// A mapped coded buffer: the driver's own linked list of [`VaCodedBufferSegment`] and the bytes
-/// those segments point at.
+/// The coded buffer, mapped only long enough for the driver to say what it wrote about it.
 ///
-/// The mapped region belongs to the driver and is valid only until this is dropped, so it is read
-/// through [`CodedReadback::picture`], which copies the bytes out before the unmap, and the unmap
-/// is a `Drop`.
+/// `vaMapBuffer` on a coded buffer does not return the picture. On the stack this milestone was
+/// measured on it returns libva's own staging allocation, and the pointer the picture's segment
+/// record holds names a different allocation again — the measured evidence is in the milestone
+/// report, and [`crate::vaapi::drm`] is what replaced reading through either.
+///
+/// What `vaMapBuffer` does return is documented, and is needed: `va.h:3946`, "if buffer type is
+/// VAEncCodedBufferType, pbuf points to link-list of VACodedBufferSegment". That list is the only
+/// place libva says **how many bytes** the picture is. So the mapping is held for exactly as long as
+/// it takes to read that one record and copy the bytes out of the storage
+/// [`crate::vaapi::drm`] mapped, and is unmapped in `Drop` on every path out of here.
 struct CodedReadback {
     display: Arc<Display>,
     id: VABufferID,
+    /// What `vaMapBuffer` returned: **the segment list is here, the picture is not.**
     data: *mut c_void,
-    /// The size the buffer was created with, which is the only length the mapping is known to have.
-    allocated: usize,
 }
 
 impl CodedReadback {
-    /// The whole mapped buffer as bytes. Its length is what every pointer a segment holds is
-    /// checked against, so it is this module's own record of the mapping's extent rather than
-    /// anything the driver wrote.
-    fn bytes(&self) -> &[u8] {
+    /// The head of the segment list, which the header states begins at the address `vaMapBuffer`
+    /// returns.
+    fn head_segment(&self) -> VaCodedBufferSegment {
         // SAFETY: `data` is what `vaMapBuffer` returned for this buffer and is still mapped (only
-        // `Drop` unmaps it, once, with the value borrowed throughout), so the slice below is
-        // `allocated` readable bytes — the size the buffer was created with, which is what libva
-        // guaranteed to map.
-        unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.allocated) }
+        // `Drop` unmaps it, once, with the value borrowed throughout), and `va.h:3946` states that
+        // the list starts at that address, so one whole record is readable there. The read is
+        // unaligned because nothing states the alignment of what `vaMapBuffer` returns, and
+        // `VaCodedBufferSegment` is `Copy`, so nothing is moved and nothing is left initialised
+        // behind.
+        unsafe { std::ptr::read_unaligned(self.data.cast::<VaCodedBufferSegment>()) }
     }
 
-    /// The driver-written slice records and the payload they describe, copied out.
+    /// The coded picture, copied out of the buffer object's own storage.
     ///
-    /// Every number in the buffer is the driver's, so the head is checked to name
-    /// [`ENC_CODED_BUFFER`], `mem_size` is bounded, and each segment's `buf` / `size` pair is
-    /// checked to lie inside the mapping before a byte is copied.
-    ///
-    /// **A slice's data is `slice_data_offset .. +slice_data_size`, both the driver's.**
-    #[expect(dead_code, reason = "as `read_coded`, which is the only caller")]
+    /// The only numbers the driver supplies are the length, the bit offset and the status word, and
+    /// each is checked before a byte is used: a non-zero bit offset would mean the segment does not
+    /// begin where this backend can name it, a length of 0 is not a picture, and a length past the
+    /// storage libva described is refused rather than clamped to what happens to be there. The bytes
+    /// themselves are then checked to be a whole run of Annex-B NAL units, which is what makes "the
+    /// picture is at the start of the storage" something this backend verifies rather than assumes.
     fn picture(&self) -> Result<CodedPicture, String> {
-        let all = self.bytes();
-        let mut out = Vec::new();
-        let mut status = Vec::new();
-        let mut node = self.data.cast::<VaCodedBufferSegment>();
-        let mut seen = 0usize;
-        while !node.is_null() {
-            if seen >= MAX_CODED_SEGMENTS {
-                return Err(format!("the coded buffer's segment list is longer than {MAX_CODED_SEGMENTS}, or it is a cycle"));
-            }
-            seen += 1;
-            // SAFETY: `node` is either the address `vaMapBuffer` returned (which is what libva
-            // documents for a coded buffer) or a `next` read out of a segment in the mapping. The
-            // extent test below is what makes the second case sound: a `next` is only followed
-            // once it has been found to lie inside the mapping with a full record's width left,
-            // so every read here is inside `allocated` bytes.
-            let at_node = self.offset_of(node.cast::<c_void>()).filter(|at| at + size_of::<VaCodedBufferSegment>() <= all.len());
-            let Some(node_at) = at_node else {
-                return Err(format!("coded buffer segment {seen} is at {node:?}, outside the {} byte mapping", self.allocated));
-            };
-            let segment = read_record::<VaCodedBufferSegment>(all.get(node_at..).unwrap_or(&[])).unwrap_or_default();
-            status.push(segment.status);
-            if segment.bit_offset != 0 {
-                // See the field's doc comment: a non-zero bit offset would mean the segment's first
-                // bits are not picture data, and shifting by an amount whose unit this module
-                // cannot verify would produce a plausible wrong picture. Measured, not assumed:
-                // iHD reports 0 on this machine.
-                let bits = segment.bit_offset;
-                return Err(format!("coded buffer segment {seen} starts {bits} bits into the segment, which this backend does not unshift"));
-            }
-            let size = segment.size as usize;
-            // The segment's own pointer is the driver's, so it is checked to be inside the mapping
-            // before it is turned into a slice. `data_at` is the byte offset of `segment.buf` from
-            // the start of the mapping, or `None` if the pointer is not inside it at all.
-            let Some(at) = self.offset_of(segment.buf) else {
-                return Err(format!("coded buffer segment {seen} points at {:?}, outside the {}-byte mapping", segment.buf, self.allocated));
-            };
-            let bytes = all
-                .get(at..)
-                .and_then(|rest| rest.get(..size))
-                .ok_or_else(|| format!("coded buffer segment {seen} claims {size} bytes at offset {at} of a {} byte mapping", self.allocated))?;
-            out.extend_from_slice(bytes);
-            node = segment.next.cast::<VaCodedBufferSegment>();
+        let segment = self.head_segment();
+        if segment.bit_offset != 0 {
+            // See the field's doc comment: a non-zero bit offset would mean the segment's first
+            // bits are not picture data, and shifting by an amount whose unit this module cannot
+            // verify would produce a plausible wrong picture. Measured, not assumed: iHD reports 0
+            // on this machine.
+            let bits = segment.bit_offset;
+            return Err(format!("the coded picture starts {bits} bits into its segment, which this backend does not unshift"));
         }
-        if seen == 0 {
-            return Err("the mapped coded buffer is an empty segment list".into());
+        if !segment.next.is_null() {
+            // **A second segment is refused, not read.** Following `next` means reading at a
+            // pointer the driver chose, inside the staging allocation whose length no API reports —
+            // exactly the unbounded read this readback exists to remove, and it would put back the
+            // one this task took out. One slice per picture is what this backend asks the driver
+            // for, so a driver that answers with more is reported rather than half-read.
+            return Err("the driver reported the picture in more than one coded-buffer segment, whose links this backend does not follow".into());
         }
-        if out.is_empty() {
-            return Err(format!("the coded buffer's {seen} segment(s) hold no bytes"));
+        let size = segment.size as usize;
+        if size == 0 {
+            return Err("the driver reported a coded picture of 0 bytes".into());
         }
-        Ok(CodedPicture { bytes: out, status, segments: seen })
+        let storage = self.storage()?;
+        let bytes = storage
+            .bytes()
+            .get(..size)
+            .ok_or_else(|| format!("the driver reported a {size}-byte picture but libva described {} bytes of storage", storage.len()))?;
+        check_annex_b(bytes)?;
+        Ok(CodedPicture { bytes: bytes.to_vec(), status: vec![segment.status], segments: 1 })
     }
 
-    /// The offset of `ptr` from the start of the mapping, or `None` when it is not inside it.
-    fn offset_of(&self, ptr: *mut c_void) -> Option<usize> {
-        if ptr.is_null() {
-            return None;
+    /// The coded buffer's own storage, mapped by this process: libva names the DRM object and its
+    /// size, and [`crate::vaapi::drm`] maps it on FilmCraft's own descriptor.
+    fn storage(&self) -> Result<drm::Storage, String> {
+        let mut info = VaBufferInfo::ZEROED;
+        let st = {
+            let _gate = self.display.gate();
+            // SAFETY: `id` is this session's own coded buffer and `info` is a live local, zeroed on
+            // input, which is what `va.h:4086` requires of `vaAcquireBufferHandle`.
+            unsafe { (self.display.api.acquire_buffer_handle)(self.display.dpy, self.id, &mut info) }
+        };
+        // The handle is released on every path out of here, the errors below included, because
+        // `vaReleaseBufferHandle` requires it (`va.h:4098-4104`).
+        let _release = BufferHandle { display: Arc::clone(&self.display), id: self.id };
+        if st != OK {
+            return Err(format!("vaAcquireBufferHandle on the coded buffer: {}", self.display.api.status_text(st)));
         }
-        let base = self.data as usize;
-        let at = ptr as usize;
-        // Both ends are checked, and the subtraction is only done after the containment test, so a
-        // pointer below the mapping cannot wrap into a plausible offset.
-        let len = self.allocated;
-        if at < base || at > base.checked_add(len)? {
-            return None;
+        // `VA_SURFACE_ATTRIB_MEM_TYPE_DRM`. `va.h:1752` reserves bits 31:28 of the memory type for
+        // Linux DRM and this is the value in that range, measured on this stack; it is the only one
+        // the export below means anything for, so anything else is reported rather than being sent
+        // an ioctl it was not named for.
+        const MEM_TYPE_DRM: u32 = 0x2000_0000;
+        if info.mem_type != MEM_TYPE_DRM {
+            return Err(format!("libva gave the coded buffer memory type {:#x}, not the DRM one this backend can map", info.mem_type));
         }
-        Some(at - base)
-    }
-
-    /// The picture, read from the driver's own segment pointers after checking each against this
-    /// process's mappings — see [`Encoder::read_coded_from_driver_pointer`] for why this exists and
-    /// why it is not the shipping path.
-    ///
-    /// Every read is bounded twice: by the segment's own `size`, and by what is left of the mapping
-    /// the pointer falls in. The second bound is the one that makes this safe rather than merely
-    /// careful, and it is why the length is clamped rather than merely checked.
-    fn picture_from_driver_pointers(&self) -> Result<CodedPicture, String> {
-        let all = self.bytes();
-        let mut out = Vec::new();
-        let mut status = Vec::new();
-        let mut node = self.data.cast::<VaCodedBufferSegment>();
-        let mut seen = 0usize;
-        while !node.is_null() {
-            if seen >= MAX_CODED_SEGMENTS {
-                return Err(format!("the coded buffer's segment list is longer than {MAX_CODED_SEGMENTS}, or it is a cycle"));
-            }
-            seen += 1;
-            let at_node = self.offset_of(node.cast::<c_void>()).filter(|at| at + size_of::<VaCodedBufferSegment>() <= all.len());
-            let Some(node_at) = at_node else {
-                return Err(format!("coded buffer segment {seen} is at {node:?}, outside the {} byte mapping", self.allocated));
-            };
-            let segment = read_record::<VaCodedBufferSegment>(all.get(node_at..).unwrap_or(&[])).unwrap_or_default();
-            status.push(segment.status);
-            if segment.bit_offset != 0 {
-                let bits = segment.bit_offset;
-                return Err(format!("coded buffer segment {seen} starts {bits} bits into the segment, which this backend does not unshift"));
-            }
-            let (_low, high) = mapping_of(segment.buf).map_err(|why| format!("coded buffer segment {seen}: {why}"))?;
-            let start = segment.buf as usize;
-            // Both bounds before the subtraction: `start >= low` is what `mapping_of` already
-            // established, and `high - start` is what is left of the region.
-            let available = high.checked_sub(start).ok_or_else(|| format!("coded buffer segment {seen} is at the end of its mapping"))?;
-            let size = (segment.size as usize).min(available);
-            if size < segment.size as usize {
-                return Err(format!("coded buffer segment {seen} claims {} bytes but only {size} are mapped", segment.size));
-            }
-            // SAFETY: `start` is inside a mapping `mapping_of` just found, `size` bytes are left in it
-            // (checked above, and `size` is at most what the mapping extends to), the mapping is a
-            // readable one because nothing in this file ever makes a mapping non-readable, and the
-            // slice is copied out and dropped before this borrow of `segment` ends.
-            let bytes = unsafe { std::slice::from_raw_parts(segment.buf.cast::<u8>(), size) };
-            out.extend_from_slice(bytes);
-            node = segment.next.cast::<VaCodedBufferSegment>();
-        }
-        if seen == 0 {
-            return Err("the mapped coded buffer is an empty segment list".into());
-        }
-        if out.is_empty() {
-            return Err(format!("the coded buffer's {seen} segment(s) hold no bytes"));
-        }
-        Ok(CodedPicture { bytes: out, status, segments: seen })
+        // `VABufferInfo::handle` is a `uintptr_t` and a DRM handle is 32 bits: a wider value cannot
+        // name a buffer object, so it is refused rather than truncated into one that might.
+        let handle = u32::try_from(info.handle).map_err(|_| format!("libva reported buffer handle {}, which is not a DRM handle", info.handle))?;
+        let drm_fd = self.display.drm_fd().ok_or_else(|| "the display holds no DRM descriptor to map the coded buffer with".to_string())?;
+        drm::map(drm_fd, handle, info.mem_size)
     }
 }
 
@@ -3020,6 +3034,76 @@ impl Drop for CodedReadback {
         // since (only this `Drop` unmaps it, once).
         unsafe { (self.display.api.unmap_buffer)(self.display.dpy, self.id) };
     }
+}
+
+/// A buffer whose handle libva has been asked for, released when this is dropped.
+struct BufferHandle {
+    display: Arc<Display>,
+    id: VABufferID,
+}
+
+impl Drop for BufferHandle {
+    fn drop(&mut self) {
+        let _gate = self.display.gate();
+        // SAFETY: `id` is this session's own coded buffer and this is the one release of the one
+        // `vaAcquireBufferHandle` in flight, which is the pairing `va.h:4098-4104` requires.
+        unsafe { (self.display.api.release_buffer_handle)(self.display.dpy, self.id) };
+    }
+}
+
+/// The offset and width of the Annex-B start code at or after `from`, if there is one.
+///
+/// A 4-byte code is preferred at the same offset, so a start code preceded by a zero bit of
+/// `trailing_zero_8bits` is reported at the width that puts the NAL header after it where it is.
+fn annex_b_start(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut at = from;
+    while at + 3 <= bytes.len() {
+        if bytes.get(at..at + 4) == Some(&[0, 0, 0, 1]) {
+            return Some((at, 4));
+        }
+        if bytes.get(at..at + 3) == Some(&[0, 0, 1]) {
+            return Some((at, 3));
+        }
+        at += 1;
+    }
+    None
+}
+
+/// `bytes` is a whole run of Annex-B start-code-prefixed NAL units: it begins with a start code, no
+/// unit in it is empty, and the last one holds at least a NAL header.
+///
+/// This is what stops the readback from *assuming* where the picture is. `va.h:3949` calls
+/// `VaCodedBufferSegment::buf` "Pointer to the start of the data buffer", and a buffer's data
+/// buffer is its storage — but libva reports **no offset** for it, and the offset has to be 0 for
+/// the read to be a read of storage this backend mapped. So it is not taken on faith: the window the
+/// driver named is checked to be a whole run of NAL units, and a driver that put the picture
+/// anywhere else produces an error here instead of bytes that decode to noise. Measured on this
+/// stack: the picture is at offset 0 of all six pictures of a sequence, and the driver writes
+/// nothing past the length it reports.
+pub(crate) fn check_annex_b(bytes: &[u8]) -> Result<(), String> {
+    let Some((mut at, mut width)) = annex_b_start(bytes, 0) else {
+        return Err("the coded buffer's storage does not begin with an Annex-B start code".into());
+    };
+    if at != 0 {
+        return Err(format!("the coded picture begins {at} bytes into the buffer's storage rather than at its start"));
+    }
+    let mut units = 1usize;
+    // The next code is searched for **past the one just consumed**, `at + width` and not `at + 1`:
+    // a 4-byte code `00 00 00 01` also *is* a 3-byte code one byte in, so a search from `at + 1`
+    // finds the tail of the start code it is standing in and reports the same NAL unit twice.
+    while let Some((next, next_width)) = annex_b_start(bytes, at + width) {
+        let empty = bytes.get(at + width..next).is_none_or(|gap| gap.iter().all(|b| *b == 0));
+        if empty {
+            return Err(format!("NAL unit {units} of the coded picture is empty"));
+        }
+        at = next;
+        width = next_width;
+        units += 1;
+    }
+    if bytes.len().saturating_sub(at + width) < 1 {
+        return Err(format!("the last of {units} NAL units of the coded picture holds no header"));
+    }
+    Ok(())
 }
 
 /// The compressed picture the driver wrote, as Annex-B NAL units with no header of our own.
@@ -3062,97 +3146,6 @@ impl CodedPicture {
     pub fn segments(&self) -> usize {
         self.segments
     }
-}
-
-/// The `(low, high)` address range of the mapping `ptr` falls inside, or why there is none.
-///
-/// **This is the whole of what makes [`Encoder::read_coded_from_driver_pointer`] memory-safe, and it
-/// is also the thing that makes that method a measurement rather than a readback.** `/proc/self/maps`
-/// is the only description of this process's address space available without mapping memory
-/// ourselves, and it is Linux-specific — acceptable in a module that is Linux-only, and
-/// unacceptable as a permanent answer for a library.
-///
-/// The arithmetic is the careful part: `low <= ptr < high` is tested *before* any subtraction, so a
-/// pointer below the region cannot wrap into a plausible offset, and every length derived from it is
-/// clamped to what is left of the region rather than to what a caller asked for.
-fn mapping_of(ptr: *mut c_void) -> Result<(usize, usize), String> {
-    let addr = ptr as usize;
-    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|e| format!("reading /proc/self/maps: {e}"))?;
-    for line in maps.lines() {
-        let Some(range) = line.split_whitespace().next() else { continue };
-        let mut halves = range.split('-');
-        let lo = halves.next().and_then(|v| usize::from_str_radix(v, 16).ok());
-        let hi = halves.next().and_then(|v| usize::from_str_radix(v, 16).ok());
-        let (Some(lo), Some(hi)) = (lo, hi) else { continue };
-        if addr >= lo && addr < hi {
-            return Ok((lo, hi));
-        }
-    }
-    Err(format!("{ptr:?} is not inside any mapping this process has"))
-}
-
-impl Encoder {
-    /// **A measurement, not the readback this backend would ship.** Read the coded picture from the
-    /// pointer the driver's own segment record holds, after checking that pointer against this
-    /// process's mappings so that no read can leave one.
-    ///
-    /// # What it establishes
-    ///
-    /// Measured on the machine this milestone was written for (Intel Arc B580, iHD 26.3.5, libva
-    /// 1.24): **libva's `vaMapBuffer` does not return the memory the coded picture is in.**
-    ///
-    /// - `vaMapBuffer` on the [`ENC_CODED_BUFFER`] returns a pointer into the **heap**, in a
-    ///   ~576 KiB mapping. That is libva's staging area for the buffer object: it holds the
-    ///   `VACodedBufferSegment` list at its head and driver bookkeeping after it, and it contains
-    ///   **no NAL unit of the encoded picture**.
-    /// - The `VACodedBufferSegment` at the head of that mapping is well formed and says
-    ///   `size = 935`, `bit_offset = 0`, `status = 0x1a` (low byte 26 — the average QP, which
-    ///   matches the `pic_init_qp` that was asked for) and `next = NULL`. Its `buf` points into a
-    ///   **separate `/dev/dri/renderD128` `rw-s` mapping of 768 KiB**, which is where libva mapped
-    ///   the driver's coded output. Those 935 bytes are a valid Annex-B IDR slice: they begin
-    ///   `00 00 01 05`.
-    /// - `vaMapBuffer2` with `VA_MAPBUFFER_FLAG_READ` returns the same heap staging area, and
-    ///   mapping the coded buffer *before* the render and holding the mapping across it changes
-    ///   nothing.
-    ///
-    /// So the picture is reachable only through the driver's own pointer — which is documented
-    /// (`va.h:3949`, "Pointer to the start of the data buffer") and which nothing in libva vouches
-    /// for in length. [`Encoder::read_coded`] refuses it, and this method exists so the milestone
-    /// could **measure** what the driver encodes before deciding how to read it safely for real.
-    ///
-    /// # What it does not establish
-    ///
-    /// A way to read those bytes without parsing `/proc/self/maps`. **That is the blocker for the
-    /// shipping path**, and the next task has to answer it — the candidates being a different coded
-    /// buffer memory type, a driver that will map the coded output where libva says, or an explicit
-    /// bounds negotiation.
-    pub fn read_coded_from_driver_pointer(&self) -> Result<CodedPicture, String> {
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        let st = {
-            let _gate = self.display.gate();
-            // SAFETY: `coded` is this session's own coded buffer and `mapped` is a live local.
-            unsafe { (self.display.api.map_buffer)(self.display.dpy, self.coded.id(), &mut mapped) }
-        };
-        if st != OK || mapped.is_null() {
-            return Err(format!("vaMapBuffer on the coded buffer: {}", self.display.api.status_text(st)));
-        }
-        let read = CodedReadback { display: Arc::clone(&self.display), id: self.coded.id(), data: mapped, allocated: self.coded_bytes };
-        // `read` owns the mapping and unmaps it in `Drop` on every path out of here.
-        read.picture_from_driver_pointers()
-    }
-}
-
-/// The record of type `T` in `bytes`, or `None` when the buffer is too short for one.
-fn read_record<T: Copy>(bytes: &[u8]) -> Option<T> {
-    if bytes.len() < size_of::<T>() {
-        return None;
-    }
-    // SAFETY: `bytes` is at least `size_of::<T>()` long (checked above) and `T` is a `#[repr(C)]`
-    // record this module declares, so the copy reads within it and into a live, initialised `T`.
-    // `T: Copy` means it owns nothing the bytes could outlive, and every byte of the encode
-    // records is a named field (the C layout's holes are `padding_*`), so no indeterminate byte is
-    // ever copied into the result.
-    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
 }
 
 impl Drop for Session {
@@ -3742,5 +3735,51 @@ mod tests {
         image.num_planes = 1;
         image.width = 32;
         assert!(!plane_geometry_is_consistent(&image, 64, 64), "a size we did not ask for");
+    }
+
+    /// The check that makes "the picture is at the start of the storage" something the readback
+    /// **verifies** rather than assumes. Every rejection below is a case where the offset-0 window
+    /// is not a whole run of Annex-B NAL units — which is what a driver that put the picture
+    /// somewhere else, or that reported a length running past the picture, would look like.
+    #[test]
+    fn the_coded_picture_window_is_checked_as_a_whole_annex_b_run() {
+        // What the driver writes, and what must be accepted: one slice, and three NAL units with
+        // the parameter sets ahead of it.
+        assert!(check_annex_b(&[0, 0, 1, 0x67, 1, 2]).is_ok());
+        assert!(check_annex_b(&[0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 1, 0x21, 9]).is_ok());
+        // A zero byte ahead of a 3-byte start code is `trailing_zero_8bits`, not the start of it,
+        // and must not be read as an empty NAL unit.
+        assert!(check_annex_b(&[0, 0, 1, 0x65, 9, 0, 0, 0, 1, 0x41, 7]).is_ok());
+
+        // **No start code at the start of the storage**: the picture is not where this backend
+        // reads it, and returning these bytes would be returning something that decodes to noise.
+        assert!(check_annex_b(&[0x42, 0, 0, 1, 0x65, 9]).is_err(), "a picture that does not begin at the start");
+        assert!(check_annex_b(&[0x11; 64]).is_err(), "no start code anywhere");
+        assert!(check_annex_b(&[]).is_err(), "no bytes at all");
+
+        // A window too short to hold a start code and a NAL header.
+        assert!(check_annex_b(&[0, 0, 1]).is_err(), "a start code with no NAL header");
+        assert!(check_annex_b(&[0, 0, 1, 0x65, 9, 0, 0, 0, 1]).is_err(), "a trailing start code with no unit");
+
+        // Two start codes with nothing but zero bits between them: the NAL unit between them is
+        // empty, which a decoder would report and a muxer could not carry.
+        assert!(check_annex_b(&[0, 0, 1, 0, 0, 0, 1, 0x41, 7]).is_err(), "an empty NAL unit");
+    }
+
+    /// The start-code scan itself: both widths, both offsets, and the fact that it finds a 4-byte
+    /// code at its own offset rather than as the 3-byte code one byte in.
+    #[test]
+    fn annex_b_start_codes_are_found_at_both_widths_and_only_once() {
+        let bytes = [0xaa, 0, 0, 0, 1, 0x67, 0, 0, 1, 0x68];
+        assert_eq!(annex_b_start(&bytes, 0), Some((1, 4)), "the 4-byte code, at its own offset");
+        // From one byte past it, the *3-byte* reading of the same four bytes is what a search from
+        // the wrong place would find — which is why `check_annex_b` searches from `at + width`.
+        assert_eq!(annex_b_start(&bytes, 2), Some((2, 3)));
+        assert_eq!(annex_b_start(&bytes, 4), Some((6, 3)), "past the 4-byte code, the next code is found");
+        assert_eq!(annex_b_start(&bytes, 6), Some((6, 3)));
+        assert_eq!(annex_b_start(&bytes, 7), None, "nothing after the last start code");
+        // A range too short to hold either code finds nothing rather than reading past the end.
+        assert_eq!(annex_b_start(&[0, 0], 0), None);
+        assert_eq!(annex_b_start(&[], 0), None);
     }
 }
