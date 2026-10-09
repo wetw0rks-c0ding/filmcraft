@@ -28,12 +28,13 @@ filmcraft-export = { workspace = true }
 filmcraft-frame = { workspace = true }
 filmcraft-isobmff = { workspace = true }
 # Our own parsers: the VA-API picture-parameter records are built from the slice headers and
-# parameter sets these decode, so both backends read one description of a stream.
-filmcraft-av1 = { workspace = true }
+# parameter sets these decode, so the backend and the software decoders read one description of a
+# stream. Only the codecs the backend actually decodes are listed: H.264 and HEVC. `filmcraft-vp9`
+# and `filmcraft-av1` are deliberately absent — nothing here parses those headers (see
+# `src/vaapi/stream.rs` on why the VP9 and AV1 records are declined rather than guessed).
 filmcraft-h264 = { workspace = true }
 filmcraft-hevc = { workspace = true }
 filmcraft-time = { workspace = true }
-filmcraft-vp9 = { workspace = true }
 log = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

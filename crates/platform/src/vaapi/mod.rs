@@ -71,9 +71,9 @@ pub fn surfaces_for(info: &filmcraft_codecs::hw::NalStreamInfo) -> Result<usize,
     picture::reference_pictures(info)
 }
 
-/// What this driver's decoder offers, for diagnostics (`examples/vacaps.rs`): the vendor string, the
-/// libva version, and every profile the driver names with a yes or no for whether it offers the video
-/// decoder for it.
+/// What this driver's decoder offers, for diagnostics (`examples/vaprobe.rs --caps`): the vendor
+/// string, the libva version, and every profile the driver names with a yes or no for whether it
+/// offers the video decoder for it.
 ///
 /// The whole profile list is reported, including the ones this backend does not decode: a user asking
 /// why a clip falls back to software wants to know whether the machine can do it at all, and a

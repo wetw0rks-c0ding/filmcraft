@@ -96,8 +96,7 @@ fn assign_reassigns_conflicts_and_undoes() {
     let reported = r["conflicts"].as_array().unwrap();
     assert!(
         reported.iter().any(|c| {
-            c["keys"] == json!("M")
-                && c["commands"].as_array().is_some_and(|cmds| cmds.contains(&json!("markers.add")) && cmds.contains(&json!("edit.redo")))
+            c["keys"] == json!("M") && c["commands"].as_array().is_some_and(|cmds| cmds.contains(&json!("markers.add")) && cmds.contains(&json!("edit.redo")))
         }),
         "the `M` conflict between markers.add and edit.redo is reported: {r}"
     );

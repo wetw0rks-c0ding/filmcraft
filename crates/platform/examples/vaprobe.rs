@@ -2,9 +2,10 @@
 //! or decline a stream, and where does a decode spend its time?
 //!
 //! ```text
-//! vacaps                              the vendor string, the libva version and every profile
+//! vaprobe --caps                      the vendor string, the libva version and every profile
 //! vaprobe [--time] [--pixels] <file>  decode a real file and report the pixels that come out
-//! ```
+//!
+//! `--caps` prints the profile table; with no arguments that is what this example does.
 //!
 //! `--time` decodes every sample and prints the driver decode, GPU-to-CPU readback and plane
 //! conversion costs per picture. `--pixels` prints the first and last decoded picture's luma samples
