@@ -70,7 +70,11 @@ Registering a hardware decoder never makes a file undecodable, and never changes
   bit, while the one H.264 configuration a slice record cannot express — B slices with H.264's
   *implicit* weighted prediction (`weighted_bipred_idc == 2`, which is x264's default for High
   profile with B frames) — is asserted to be declined, so those streams play through the software
-  decoder instead.
+  decoder instead. The reason is structural rather than cautious: 8.4.3 derives the implicit weight
+  from `pic0 = RefPicList0[refIdxL0]` and `pic1 = RefPicList1[refIdxL1]`, making it a function of
+  the **pair**, while `VASliceParameterBufferH264` holds one weight per **list position**. Submitting
+  a per-position table anyway was measured to decode 60 of `h264_high.mp4`'s 72 pictures wrongly with
+  no error raised, so a decline is the only correct answer here.
 
 ## Consequences
 

@@ -1160,9 +1160,20 @@ fn h264_slice_record(
     Ok(record_bytes(&record))
 }
 
-/// H.264 8.4.2.3.1's implicit prediction weight for one (`ref0`, `ref1`) pair, as `(weight, offset)`
+/// H.264 **8.4.3**'s implicit prediction weight for one (`ref0`, `ref1`) pair, as `(weight, offset)`
 /// on a `luma_log2_weight_denom` of 5 — which is how `filmcraft_h264` applies it
 /// (`crates/h264/src/slicedec.rs:316-331`, `Weight::Weighted { log_wd: 5, .. }`).
+///
+/// 8.4.3 step 1 derives `pic0 = RefPicList0[ refIdxL0 ]` and `pic1 = RefPicList1[ refIdxL1 ]` for a
+/// frame macroblock, and Equations 8-201/8-202 then give `tb = DiffPicOrderCnt(currPic, pic0)` and
+/// `td = DiffPicOrderCnt(pic1, pic0)`. **Both weights are functions of the pair.** `tb` depends on
+/// `refIdxL0` alone, but `td` — and so `DistScaleFactor`, and so both `w0C = 64 − (dsf >> 2)` and
+/// `w1C = dsf >> 2` — depends on `refIdxL0` *and* `refIdxL1`. Verified against the ITU-T H.264
+/// (V16) 06/2026 edition, the edition `crates/h264` was written from, and against the 03/2010 and
+/// 05/2003 editions, which word the same derivation identically.
+///
+/// A `luma_weight_l0[ i ]` / `luma_weight_l1[ j ]` record indexes each list's own positions and
+/// cannot hold a function of two indices at once; see [`h264_weights`] for what follows.
 ///
 /// **`(32, 32)` is no weighting at all**: 32 with a denominator of 2⁵ is 1.0, and both offsets are 0.
 /// The pair is what decides that, so it is the only thing [`h264_implicit_weights`] needs to look at.
@@ -1193,22 +1204,31 @@ fn h264_implicit_pair(cur_poc: i32, r0: &DpbEntry, r1: &DpbEntry) -> (i32, i32) 
 /// `weighted_bipred_idc == 2` is x264's default for High profile with B frames, so it is most H.264.
 /// Its `weighted_bipred_flag` is a per-slice bit `filmcraft_h264` does not read, and `filmcraft_h264`
 /// resolves such a slice as H.264's **implicit** weighting ([`h264_implicit_pair`]) — which is what it
-/// decodes, and it is bit-exact with ffmpeg while doing so. A `VASliceParameterBufferH264` cannot say
-/// that: `luma_weight_l0` / `luma_weight_l1` are one weight **per reference index per list**
-/// (`va_dec_h264.h:3702-3723`), and an implicit weight is a function of the *pair* of indices, which
-/// changes from macroblock to macroblock inside one slice. Two per-index arrays cannot hold a
-/// pair-dependent function.
+/// decodes, and it is bit-exact with ffmpeg while doing so (checked: 72 of 72 pictures of
+/// `h264_high.mp4` identical to ffmpeg's own luma). A `VASliceParameterBufferH264` cannot say that:
+/// `luma_weight_l0` / `luma_weight_l1` are one weight **per list position**, indexed by the same `i`
+/// and `j` as `RefPicList0` / `RefPicList1` (`va.h:3702-3717`; the spec's own explicit-mode Equations
+/// 8-289/8-290 index them by `refIdxL0WP` / `refIdxL1WP`), and 8.4.3's implicit weight is a function of
+/// the **pair**, as [`h264_implicit_pair`] documents.
 ///
 /// So the slice is checked rather than guessed. Every (`ref0`, `ref1`) pair the slice's own reference
 /// lists could use is computed; if they are all `(32, 32)` — 1.0, no offset, i.e. the stream does not
 /// actually exercise implicit weighting — the default explicit table is submitted and the picture
 /// decodes. If any pair is not, the slice is **declined**, and the error hands the stream to
-/// `HybridDecoder`, which finishes it in software. Approximating is not an option: submitting 1.0 for a
-/// pair that wants something else decodes the wrong picture, and that is a silent corruption on a
-/// timeline rather than a visible failure. Measured on this machine: x264's default `weightb=1` on
-/// `testsrc2` exercises implicit weighting, so such a stream declines, while the same encode with
-/// `weightb=0` (`weighted_bipred_idc == 0`, which codes no weight table and no implicit mode at all) is
-/// bit-exact against both ffmpeg and `filmcraft_h264` on every picture.
+/// `HybridDecoder`, which finishes it in software. Approximating is not an option: submitting one
+/// weight per position for a pair-dependent weight decodes the wrong picture, and that is a silent
+/// corruption on a timeline rather than a visible failure.
+///
+/// That is not a theoretical worry: doing it anyway was measured. Submitting the per-position table
+/// this record *can* express — `luma_weight_l0[0]` = 48, the weight one particular pair wants — decodes
+/// `h264_high.mp4` to **60 of 72 pictures that differ from ffmpeg with no error raised at all**, because
+/// the list-0 weight the specification derives depends on which list-1 reference it is paired with. The
+/// decline is what keeps that stream correct.
+///
+/// Measured on this machine: x264's default `weightb=1` on `testsrc2` exercises implicit weighting, so
+/// such a stream declines, while the same encode with `weightb=0` (`weighted_bipred_idc == 0`, which
+/// codes no weight table and no implicit mode at all) is bit-exact against both ffmpeg and
+/// `filmcraft_h264` on every picture.
 ///
 /// **The all-1.0 branch has no end-to-end test.** Every fixture with `weighted_bipred_idc == 2` this
 /// suite can produce exercises the decline, and the ones that do not (`weightb=0`) never reach this
@@ -1216,6 +1236,8 @@ fn h264_implicit_pair(cur_poc: i32, r0: &DpbEntry, r1: &DpbEntry) -> (i32, i32) 
 /// `an_implicitly_weighted_b_slice_is_refused_rather_than_guessed`, which asserts the bytes it writes. A
 /// wrong weight there that still happened to be 1.0 would pass every test in the suite. That is stated
 /// here because the branch is reachable and its cost if it is wrong is a wrong picture, not an error.
+/// `the_record_carries_one_implicit_weight_per_list_position` pins those bytes against the record's
+/// own field layout, so a `33`-instead-of-`32` error cannot pass.
 fn h264_weights(
     sh: &filmcraft_h264::slice::SliceHeader,
     pps: &filmcraft_h264::params::Pps,
@@ -1324,7 +1346,7 @@ fn h264_implicit_weights(cur_poc: i32, dpb: &[DpbEntry], lists: &[Vec<usize>; 2]
             if pair != (32, 32) {
                 return Err(format!(
                     "this H.264 stream weights its B slices with H.264 implicit weights (weighted_bipred_idc 2): the pair of references ({}, {}) wants {:?}, not 1.0, \
-                     and a VASliceParameterBufferH264 carries one weight per reference index rather than per pair",
+                     and a VASliceParameterBufferH264 carries one weight per list position rather than per pair",
                     r0, r1, pair
                 ));
             }
@@ -2989,7 +3011,7 @@ mod tests {
         let why = first_error
             .unwrap_or_else(|| panic!("no picture of the fixture was refused, so the implicit weights were never exercised and this rule is untested"));
         assert!(why.contains("implicit"), "the first refusal must name the implicit weights, not the driver: {why}");
-        assert!(why.contains("per reference index"), "the first refusal must say why the record cannot carry them: {why}");
+        assert!(why.contains("per list position"), "the first refusal must say why the record cannot carry them: {why}");
 
         // The all-default case, on entries whose POC distances make every pair 1.0, and the refusal on ones
         // that do not. Both are the distances the fixture's own second B picture has, so the numbers
@@ -3011,11 +3033,80 @@ mod tests {
         let dpb = vec![entry(0), entry(8)];
         let e = super::h264_implicit_weights(2, &dpb, &lists).unwrap_err();
         assert!(e.contains("implicit"), "{e}");
-        assert!(e.contains("per reference index"), "{e}");
+        assert!(e.contains("per list position"), "{e}");
         assert!(e.contains("(48, 16)"), "{e}");
         // …and a reference the buffer does not hold is an error rather than a pair left unchecked.
         let e = super::h264_implicit_weights(2, &dpb[..1], &lists).unwrap_err();
         assert!(e.contains("not in the decoded picture buffer"), "{e}");
+
+        // **The weight is not separable per list position, and this is why the refusal above is right
+        // rather than merely cautious.** 8.4.3 derives `td = DiffPicOrderCnt(pic1, pic0)` with
+        // `pic1 = RefPicList1[refIdxL1]`, so `td` — and so both weights — depend on `refIdxL1` as well
+        // as `refIdxL0`. These are the fixture's own POC distances: one list-0 reference and two list-1
+        // ones, so a single `luma_weight_l0[0]` would have to serve both.
+        let two_in_list1 = vec![entry(0), entry(4), entry(8)];
+        let lists = [vec![0], vec![1, 2]];
+        assert_eq!(super::h264_implicit_pair(2, &two_in_list1[0], &two_in_list1[1]), (32, 32), "paired with list 1 position 0 this wants 1.0");
+        assert_eq!(super::h264_implicit_pair(2, &two_in_list1[0], &two_in_list1[2]), (48, 16), "paired with list 1 position 1 it does not");
+        // Same list-0 position, two different weights. One array slot cannot hold both, which is the
+        // whole of the limitation, and it is measured rather than assumed: submitting this table anyway
+        // decodes h264_high.mp4 to 60 of 72 pictures that differ from ffmpeg, with no error raised.
+        assert!(
+            super::h264_implicit_weights(2, &two_in_list1, &lists).is_err(),
+            "a list-0 weight that depends on the list-1 index cannot be submitted per position"
+        );
+    }
+
+    /// The weights the record actually carries for a known slice, read back out of the record's own
+    /// serialized bytes rather than out of the struct that produced them.
+    ///
+    /// This is the test that makes a `33`-instead-of-`32` error impossible to miss. A struct-level
+    /// assertion can agree with a builder that is wrong in the same way twice — it checks the value
+    /// against the value the code meant to write. Round-tripping through `record_bytes` and parsing it
+    /// back checks the value against the **ABI**: `va.h:3702-3717` puts `RefPicList0`/`RefPicList1`
+    /// first, then `luma_log2_weight_denom`, `chroma_log2_weight_denom`, the four `*_flag` bytes, and
+    /// then `luma_weight_l0[32]`, `luma_offset_l0[32]`, `chroma_weight_l0[32][2]`,
+    /// `chroma_offset_l0[32][2]` and the same four arrays for list 1. Every position of every one of
+    /// those arrays is asserted here, so an off-by-one that shifted a table by a slot, or a weight
+    /// written one byte off, fails rather than decoding a subtly wrong picture on a user's timeline.
+    ///
+    /// The slice is the fixture's own second B picture — `cur_poc` 2 with references at POC 0 and 4 —
+    /// so `tb = 2`, `td = 4` and 8.4.3's derivation gives 1.0 for the `(0, 4)` pair, which is the
+    /// branch that is otherwise only reached by synthetic entries.
+    #[test]
+    fn the_record_carries_one_implicit_weight_per_list_position() {
+        let entry = |poc: i32| super::DpbEntry { surface: 0, frame_num: 0, poc, mark: super::Mark::Short };
+        let dpb = vec![entry(0), entry(4)];
+        let lists = [vec![0], vec![1]];
+        let record = super::h264_implicit_weights(2, &dpb, &lists).unwrap_or_else(|e| panic!("this pair is 1.0 and must not be refused: {e}"));
+
+        // Independently of the struct: the bytes the driver will read.
+        let bytes = super::record_bytes(&record);
+        let back = crate::vaapi::ffi::slice_params_h264(&bytes).unwrap_or_else(|| panic!("the record does not parse back"));
+
+        assert_eq!(back.luma_log2_weight_denom, 5, "1.0 is 32 on a denominator of 2^5 (8.4.3 defines it on 2^5)");
+        assert_eq!(back.chroma_log2_weight_denom, 5, "the implicit weights apply to chroma on the same denominator");
+        assert_eq!(back.luma_weight_l0_flag, 1, "the weight is in use, not absent (7.4.3.2)");
+        assert_eq!(back.chroma_weight_l0_flag, 1, "and so is the chroma one");
+        assert_eq!(back.luma_weight_l1_flag, 1);
+        assert_eq!(back.chroma_weight_l1_flag, 1);
+        // Every position of every table, not just the first: an off-by-one in the record's layout moves
+        // these, and only the whole array shows it.
+        for i in 0..32 {
+            assert_eq!(back.luma_weight_l0[i], 32, "luma_weight_l0[{i}]");
+            assert_eq!(back.luma_weight_l1[i], 32, "luma_weight_l1[{i}]");
+            assert_eq!(back.luma_offset_l0[i], 0, "luma_offset_l0[{i}]");
+            assert_eq!(back.luma_offset_l1[i], 0, "luma_offset_l1[{i}]");
+            assert_eq!(back.chroma_weight_l0[i], [32, 32], "chroma_weight_l0[{i}]");
+            assert_eq!(back.chroma_weight_l1[i], [32, 32], "chroma_weight_l1[{i}]");
+            assert_eq!(back.chroma_offset_l0[i], [0, 0], "chroma_offset_l0[{i}]");
+            assert_eq!(back.chroma_offset_l1[i], [0, 0], "chroma_offset_l1[{i}]");
+        }
+        // And the two lists are not the same field: swapping them would satisfy every assertion above
+        // on this fixture (both are all-32), so the pair that breaks the tie is the declining one.
+        let refusing = vec![entry(0), entry(8)];
+        let e = super::h264_implicit_weights(2, &refusing, &lists).unwrap_err();
+        assert!(e.contains("(48, 16)"), "and the same slice one POC further wants {e}");
     }
 
     /// A slice segment that does not belong to the picture the record was filled in from is an

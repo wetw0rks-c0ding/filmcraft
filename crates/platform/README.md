@@ -103,8 +103,12 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
     of them resolve to the default 1.0 it submits the default table and the picture decodes, and if
     any pair differs the slice is refused. It has to be checked rather than guessed, because
     `VASliceParameterBufferH264` carries `luma_weight_l0[32]` / `luma_weight_l1[32]` — one weight
-    per reference index per list — and an implicit weight is a function of the *pair*, which two
-    per-index arrays cannot hold. Measured on an Arc B580 (driver `iHD 26.3.5`): the 3 pictures of
+    per **list position**, each array parallel to the `RefPicList0` / `RefPicList1` of the same index
+    (`va.h:3702-3717`; H.264's own explicit-mode Equations 8-289/8-290 index them by `refIdxL0WP`) —
+    and 8.4.3's implicit weight is a function of the *pair*, since `td = DiffPicOrderCnt(pic1, pic0)`
+    moves with `refIdxL1`. Two per-position arrays cannot hold that. Measured on an Arc B580 (driver
+    `iHD 26.3.5`): submitting a per-position table anyway decodes **60 of the fixture's 72 pictures
+    wrongly, with no error raised**, which is why the slice is refused instead. The 3 pictures of
     `h264_high.mp4` before its first B slice are bit-exact against ffmpeg, the 69 access units
     after it are refused, and `HybridDecoder` finishes the run in software; the same encode with
     `weightb=0` is bit-exact against ffmpeg on all 72 pictures with no declines at all.

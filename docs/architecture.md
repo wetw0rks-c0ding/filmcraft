@@ -281,8 +281,10 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   that profile `VAProfileH264High10` and this backend does not carry it); an H.264 stream whose B
   slices carry H.264's *implicit* weights (`weighted_bipred_idc == 2`, x264's default for High
   profile with B frames, so most H.264) is declined at the first such slice, because
-  `VASliceParameterBufferH264` holds one weight per reference index per list and an implicit
-  weight is a function of the *pair*; and HEVC with `sps_scaling_list_enabled_flag` is declined
+  `VASliceParameterBufferH264` holds one weight per **list position** (each array parallel to the
+  `RefPicList0` / `RefPicList1` of the same index) and 8.4.3's implicit weight is a function of the
+  *pair* — `td = DiffPicOrderCnt(pic1, pic0)` moves with `refIdxL1`; and HEVC with
+  `sps_scaling_list_enabled_flag` is declined
   because `VAIQMatrixBufferHEVC` is not built, and a driver defaulting the quantizer would decode
   a picture the stream does not contain.
 - **Hardware encoding.** On Windows, `platform::nvenc::export::factory` is registered with

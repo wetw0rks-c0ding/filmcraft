@@ -813,10 +813,13 @@ fn an_h264_fixture_this_record_can_express_is_bit_exact_against_ffmpeg() {
 ///
 /// `h264_high.mp4` is x264's default `weightb=1` over High profile with B frames, so its picture
 /// parameter set says `weighted_bipred_idc == 2` and `filmcraft_h264` resolves each B slice as H.264
-/// implicit weighting — a weight per (`ref0`, `ref1`) pair. `VASliceParameterBufferH264` has one
-/// weight per reference index, so this backend cannot say that, and **submitting 1.0 instead is what
-/// decoded 60 of the fixture's 72 pictures wrongly** (only 12 of 72 agreed with ffmpeg, measured
-/// before the check that now declines them). Approximating is not available; the slice is refused.
+/// implicit weighting. H.264 8.4.3 derives that weight from `pic0 = RefPicList0[refIdxL0]` and
+/// `pic1 = RefPicList1[refIdxL1]`, so it is a function of the **pair** — `td = DiffPicOrderCnt(pic1, pic0)`
+/// moves when `refIdxL1` does, and `luma_weight_l0` is one weight per list position, indexed by `i`
+/// alone (`va.h:3702-3717`; the spec's own explicit-mode Equations 8-289/8-290 index it by `refIdxL0WP`).
+/// So this backend cannot say that, and **submitting a per-position table anyway is what decoded 60 of
+/// the fixture's 72 pictures wrongly** (only 12 of 72 agreed with ffmpeg, re-measured while checking
+/// this, with no error raised at all). Approximating is not available; the slice is refused.
 ///
 /// What is asserted here is the refusal and its consequence: the raw decoder returns an `Err` whose
 /// reason names the implicit weights, and the factory's decoder — the one a user gets — finishes the
@@ -850,7 +853,7 @@ fn an_h264_b_slice_this_record_cannot_weight_is_declined() {
         panic!("every picture of h264_high.mp4 decoded in hardware, so the implicit weights were not exercised after all and this test is measuring nothing");
     };
     assert!(why.contains("implicit"), "the refusal must name the implicit weights, not the driver: {why}");
-    assert!(why.contains("per reference index"), "the refusal must say why the record cannot carry them: {why}");
+    assert!(why.contains("per list position"), "the refusal must say why the record cannot carry them: {why}");
     // The refusal is latched, because the pictures after a picture that could not be built are decoded
     // against a picture buffer that is missing it — which is a plausible-looking wrong picture, not an
     // error. So the decoder keeps saying no, and nothing comes out of a flush.
