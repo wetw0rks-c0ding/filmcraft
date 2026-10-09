@@ -261,6 +261,27 @@ pub const CONFIG_ATTRIB_ENC_PACKED_HEADERS: VaBufferType = 10;
 /// common case, and a driver that is handed the wrong value here fails in a way that reads like a
 /// codec problem.
 pub const CONFIG_ATTRIB_RT_FORMAT: VaBufferType = 0;
+/// `VAConfigAttribEncMaxRefFrames` (`va.h:734-745`): **the read-only attribute that matters to an
+/// inter picture**, and the header's spelling is `MaxRefFrames` — there is no
+/// `VAConfigAttribEncMaxReferenceFrames`, and searching for that name finds nothing.
+///
+/// The value is the maximum number of reference frames the driver supports for this configuration,
+/// and for H.264 the low 16 bits are reference list 0 and the high 16 bits reference list 1
+/// (`va.h:737-739`).
+pub const CONFIG_ATTRIB_ENC_MAX_REF_FRAMES: VaBufferType = 13;
+/// `VAConfigAttribEncSliceStructure` (`va.h:743-758`): the slice layouts the driver accepts,
+/// against `VA_ENC_SLICE_STRUCTURE_*` (`va.h:1251-1263`).
+pub const CONFIG_ATTRIB_ENC_SLICE_STRUCTURE: VaBufferType = 15;
+// `VA_ENC_SLICE_STRUCTURE_*` (`va.h:1251-1263`) is **not** declared here. A whole-picture slice is
+// `macroblock_address = 0, num_macroblocks = picture_width_in_mbs * picture_height_in_mbs`, which is
+// an arbitrary run of macroblocks rather than a power of two in rows (640x368 is 23 rows), so
+// `VA_ENC_SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS` (`va.h:1253`) is the bit that covers this
+// encoder's only slice structure. It is recorded here rather than named because **nothing checks
+// it**: `vaCreateConfig` does not validate the slice structure against the records submitted, and a
+// driver that rejected an unexpected structure reports it at `vaEndPicture` with
+// `VA_STATUS_ERROR_ENCODING_ERROR` and no field name. Measured on iHD 26.3.5 with 640x368 (23
+// macroblock rows, not a power of two) — accepted, so the driver's answer to this attribute was
+// never needed.
 
 /// `VA_RC_CQP` (`va.h:1116`): constant quantiser. The QP comes from the picture record's
 /// `pic_init_qp` and each slice's `slice_qp_delta`, so nothing here is derived from a bitrate —
@@ -1377,6 +1398,10 @@ pub struct Api {
     query_profiles: QueryProfilesFn,
     max_entrypoints: MaxEntrypointsFn,
     query_entrypoints: QueryEntrypointsFn,
+    /// `vaGetConfigAttributes` (`va.h:686`): what a driver supports for a profile and entry point,
+    /// asked before any config exists. Optional because a libva without it can still encode — the
+    /// encoder then works at the reference depth it is given and finds out at `vaEndPicture`.
+    get_config_attributes: Option<GetConfigAttributesFn>,
     /// Optional: `vaErrorStr` is libva 1.0-era and only decorates error messages.
     error_str: Option<ErrorStrFn>,
     /// Optional: the encoder waits for the coded buffer this way (`va.h:5110`). libva's
@@ -1468,6 +1493,7 @@ fn resolve(va: *mut c_void, va_drm: *mut c_void, libraries: Arc<Libraries>) -> R
             query_profiles: symbol(va, c"vaQueryConfigProfiles")?,
             max_entrypoints: symbol(va, c"vaMaxNumEntrypoints")?,
             query_entrypoints: symbol(va, c"vaQueryConfigEntrypoints")?,
+            get_config_attributes: optional_symbol(va, c"vaGetConfigAttributes"),
             error_str: optional_symbol(va, c"vaErrorStr"),
             // Not present on the libva this milestone was written against: `vaGetErrorName` does
             // not exist, so status text comes from `vaErrorStr` alone. Recorded because the name
@@ -1505,6 +1531,7 @@ type MaxEntrypointsFn = unsafe extern "C" fn(VADisplay) -> VAStatus;
 type QueryProfilesFn = unsafe extern "C" fn(VADisplay, *mut VAProfile, *mut c_int) -> VAStatus;
 type QueryEntrypointsFn = unsafe extern "C" fn(VADisplay, VAProfile, *mut VAEntrypoint, *mut c_int) -> VAStatus;
 type ErrorStrFn = unsafe extern "C" fn(VAStatus) -> *const c_char;
+type GetConfigAttributesFn = unsafe extern "C" fn(VADisplay, VAProfile, VAEntrypoint, *mut VaConfigAttrib, c_int) -> VAStatus;
 type CreateImageFn = unsafe extern "C" fn(VADisplay, *mut VaImageFormat, c_int, c_int, *mut VaImage) -> VAStatus;
 type DestroyImageFn = unsafe extern "C" fn(VADisplay, VAImageID) -> VAStatus;
 type PutImageFn = unsafe extern "C" fn(VADisplay, VASurfaceID, VAImageID, c_int, c_int, c_uint, c_uint, c_int, c_int, c_uint, c_uint) -> VAStatus;
@@ -1713,6 +1740,43 @@ impl Display {
         }
         let count = usize::try_from(reported).unwrap_or(0).min(entrypoints.len());
         Ok(entrypoints.into_iter().take(count).map(Entrypoint::from_bits).collect())
+    }
+
+    /// What the driver says about a configuration, for the attributes in `types` — or why it will
+    /// not say.
+    ///
+    /// This is the read-side counterpart of `vaCreateConfig`: an attribute the driver does not
+    /// support comes back with its bit **clear**, and libva does not tell a caller which bit meant
+    /// "supported" and which meant "I have never heard of this". So a caller cannot read a
+    /// read-only attribute off a config it did not create, and `vaGetConfigAttributes` — which asks
+    /// about a profile and entry point *before* any config exists — is how a caller asks what an
+    /// encoder may do at all.
+    ///
+    /// Each returned value is what the driver wrote back into the record, so the caller compares it
+    /// against the bit it cares about rather than assuming the attribute was honoured.
+    pub fn config_attributes(&self, profile: Profile, entrypoint: Entrypoint, types: &[VaBufferType]) -> Result<Vec<u32>, String> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A libva without `vaGetConfigAttributes` cannot answer, and that is reported rather than
+        // papered over: a caller that needs this to know whether an inter picture is possible gets
+        // an error, not zeroes that look like "the driver supports nothing".
+        let Some(get) = self.api.get_config_attributes else {
+            return Err("this libva has no vaGetConfigAttributes, so it cannot say what the driver supports for a configuration".into());
+        };
+        let _gate = self.gate();
+        // SAFETY: the display is initialised; `attribs` is a live array of `types.len()` records
+        // initialised to zero, which is what libva expects to be handed, and its length is the count
+        // passed, so libva writes exactly into `attribs` and reads no further.
+        let values = unsafe {
+            let mut attribs: Vec<VaConfigAttrib> = types.iter().map(|t| VaConfigAttrib { type_: *t, value: 0 }).collect();
+            let st = get(self.dpy, profile.bits(), entrypoint.bits(), attribs.as_mut_ptr(), attribs.len() as c_int);
+            if st != OK {
+                return Err(format!("vaGetConfigAttributes failed: {}", self.api.status_text(st)));
+            }
+            attribs.into_iter().map(|a| a.value).collect()
+        };
+        Ok(values)
     }
 
     /// Whether the installed driver fills a `VAImage` the way this module declares it: libva has
@@ -2195,9 +2259,14 @@ pub struct Encoder {
     display: Arc<Display>,
     config: VAConfigID,
     /// The surface `vaBeginPicture` is given, which is the picture the driver **reads**. Separate
-    /// from `recon` below because the driver reconstructs the picture it is encoding and needs
-    /// somewhere to put that; it may not overwrite the picture it is reading.
+    /// from the reconstruction pool below because the driver reconstructs the picture it is
+    /// encoding and needs somewhere to put that; it may not overwrite the picture it is reading,
+    /// and it may not be a reference, because the caller overwrites it with the next picture.
     input: VASurfaceID,
+    /// Where reconstructions go, in rotation. **Length is what makes inter prediction possible**:
+    /// an encoder with one surface has a reconstruction and nothing to predict from, so a P picture
+    /// has no reference to name. `recon` is `recon_pool[0]` until the caller rotates it.
+    recon_pool: Vec<VASurfaceID>,
     /// The surface `curr_pic.picture_id` names, where the reconstructed picture lands and where it
     /// is read back from as a reference frame.
     recon: VASurfaceID,
@@ -2236,6 +2305,7 @@ impl Encoder {
         rate_control: u32,
         packed_headers: u32,
         coded_bytes: u32,
+        refs: u32,
     ) -> Result<Self, String> {
         let (fourcc, bpp) = match format {
             RtFormat::Nv12 => (NV12_FOURCC, NV12_BPP),
@@ -2261,6 +2331,7 @@ impl Encoder {
             display: Arc::clone(display),
             config: 0,
             input: 0,
+            recon_pool: Vec::new(),
             recon: 0,
             context: 0,
             // A placeholder that is replaced below; `Drop` reads it only if this is reached, and
@@ -2295,45 +2366,63 @@ impl Encoder {
                 ));
             }
             session.config = config;
-            if std::env::var("FILMCRAFT_VADUMP").is_ok() {
-                eprintln!(
-                    "ATTRIB RTFormat={} RateControl={} EncPackedHeaders={:#x} (asked SEQUENCE|PICTURE = {:#x})",
-                    attribs[0].value,
-                    attribs[1].value,
-                    attribs[2].value,
-                    PACKED_HEADER_SEQUENCE | PACKED_HEADER_PICTURE
-                );
-            }
-            // Two surfaces: the one the picture is read from and the one it is reconstructed into.
-            // They must be distinct — `curr_pic.picture_id` is a scratch surface the driver fills
-            // with what it decoded, and pointing it at the input would have the driver read its own
-            // output as the picture it is encoding.
-            let mut surfaces = vec![0 as VASurfaceID; 2];
-            // SAFETY: as above for the surfaces: `surfaces` is a live array of two ids, and no
+            // **The surface count is what makes inter prediction possible at all**, and it is
+            // `2 + max_ref_frames` for a reason worth stating:
+            //
+            // - one surface is the picture being read (`vaBeginPicture`'s argument), which must
+            //   never be a reference: the caller overwrites it with the next picture, and a
+            //   reference that has been overwritten is a reference to the wrong picture;
+            // - one is the reconstruction target (`curr_pic.picture_id`), which must differ from
+            //   the input or the driver reads its own output as the picture it is encoding;
+            // - and `max_ref_frames` more hold the reconstructions a later picture predicts from.
+            //
+            // With the two surfaces Task 1 used, a P picture has nowhere to put its reference, so
+            // the honest size is three at least. `max_ref_frames` is clamped because it comes from
+            // the caller and each surface is real driver memory at the full picture size.
+            let count = 2usize.saturating_add(refs as usize).clamp(2, MAX_SURFACES);
+            let mut surfaces = vec![0 as VASurfaceID; count];
+            // SAFETY: as above for the surfaces: `surfaces` is a live array of `count` ids, and no
             // attribute list is passed.
-            let st = unsafe { (api.create_surfaces)(display.dpy, format.bits(), width, height, surfaces.as_mut_ptr(), 2, std::ptr::null_mut(), 0) };
+            let st =
+                unsafe { (api.create_surfaces)(display.dpy, format.bits(), width, height, surfaces.as_mut_ptr(), count as c_uint, std::ptr::null_mut(), 0) };
             if st != OK {
-                return Err(format!("vaCreateSurfaces failed for the encode session at {}x{}: {}", size.0, size.1, api.status_text(st)));
+                return Err(format!("vaCreateSurfaces failed for the encode session's {count} surfaces at {}x{}: {}", size.0, size.1, api.status_text(st)));
             }
             // `vaCreateSurfaces` filled these in; a surface id invented here would name one the
-            // driver never made. Two ids for two surfaces, or the driver lied and the session is
-            // refused rather than filled with a duplicate.
-            let (Some(&input), Some(&recon)) = (surfaces.first(), surfaces.get(1)) else {
-                return Err("vaCreateSurfaces filled in fewer than the two ids it was asked for".into());
-            };
-            if input == recon {
-                return Err("vaCreateSurfaces returned the same surface id twice".into());
+            // driver never made. **A zero id is legal and is not a failure**: surface ids are
+            // allocated by the driver from its own counter, and the first surface a session creates
+            // is id 0 on this driver (Task 1's trace shows `render_targets = 0x00000000`). Checking
+            // for zero here would refuse every first session — which is the mistake this very probe
+            // made before the comment above was written. What is checked instead is the count and
+            // the absence of duplicates, neither of which has a legal zero.
+            //
+            // This matters beyond this call: `VA_INVALID_SURFACE` is `0xffff_ffff` precisely
+            // because 0 is a real surface id, which is why every unused reference slot in this
+            // module is `VA_INVALID_SURFACE` and never zero.
+            if surfaces.len() < count {
+                return Err(format!("vaCreateSurfaces filled in fewer than the {count} surface ids it was asked for"));
             }
-            session.input = input;
-            session.recon = recon;
+            for (i, a) in surfaces.iter().enumerate() {
+                if surfaces.get(i + 1..).is_some_and(|rest| rest.contains(a)) {
+                    return Err("vaCreateSurfaces returned the same surface id twice".into());
+                }
+            }
+            // Surface 0 is the input and is never a reference; the rest are the DPB.
+            session.input = surfaces[0];
+            session.recon_pool = surfaces[1..].to_vec();
+            session.recon = session.recon_pool[0];
             let (context_width, context_height) = (
                 c_int::try_from(size.0).map_err(|_| format!("picture width {}", size.0))?,
                 c_int::try_from(size.1).map_err(|_| format!("picture height {}", size.1))?,
             );
             let mut context: VAContextID = 0;
             // SAFETY: `config` is the config created above, `surfaces` the array just filled, and
-            // `context` a live local for the id to be written into.
-            let st = unsafe { (api.create_context)(display.dpy, config, context_width, context_height, PROGRESSIVE, surfaces.as_mut_ptr(), 2, &mut context) };
+            // `context` a live local for the id to be written into. The whole pool is the context's
+            // render target list: a reconstruction a later picture predicts from is rendered into
+            // and read from as a surface, so it has to be one the context knows.
+            let st = unsafe {
+                (api.create_context)(display.dpy, config, context_width, context_height, PROGRESSIVE, surfaces.as_mut_ptr(), count as c_int, &mut context)
+            };
             if st != OK {
                 return Err(format!("vaCreateContext failed for the encoder at {}x{}: {}", size.0, size.1, api.status_text(st)));
             }
@@ -2367,10 +2456,58 @@ impl Encoder {
         self.recon
     }
 
+    /// **Move the reconstruction target to the next surface in the pool**, and say which one it is
+    /// now.
+    ///
+    /// This is the whole of the surface management an inter picture needs, and its absence is why
+    /// Task 1 could not encode a P picture: with one reconstruction surface there is nowhere for the
+    /// *previous* picture's reconstruction to live while the current one is being written. Rotating
+    /// through a pool of `2 + max_ref_frames` is enough for one reference, and the caller decides
+    /// which surfaces are live references — this module only knows that the target has moved.
+    ///
+    /// It wraps rather than running off the end, and a caller that has not reserved enough surfaces
+    /// for its reference depth will find a reference overwritten. The surface count is the caller's
+    /// because only the caller knows its own `max_num_ref_frames`.
+    pub fn rotate_reconstruction(&mut self) -> VASurfaceID {
+        // `recon_pool` is non-empty whenever `recon` is set: `Encoder::new` fills it from
+        // `surfaces[1..]`, and the count clamp guarantees at least one element there. An empty pool
+        // means the encoder was never built, and rotating it would leave `recon` at 0 — a surface
+        // that does not exist — so the length is checked rather than assumed.
+        if self.recon_pool.len() > 1 {
+            self.recon_pool.rotate_left(1);
+            if let Some(next) = self.recon_pool.first().copied() {
+                self.recon = next;
+            }
+        }
+        self.recon
+    }
+
     /// The coded buffer's id, which the picture record's `coded_buf` must name. The record cannot be
     /// built without it, so it is read here rather than kept by the caller.
     pub fn coded_buffer_id(&self) -> VABufferID {
         self.coded.id()
+    }
+
+    /// What the driver says it supports for [`CONFIG_ATTRIB_ENC_MAX_REF_FRAMES`] on this profile and
+    /// entry point, as `(list 0, list 1)`.
+    ///
+    /// **This is a driver query, not this session's state**, so it is asked of the display before
+    /// any config exists — see [`Display::config_attributes`]. A driver that does not answer is
+    /// reported as `(0, 0)` rather than an error, because a libva without `vaGetConfigAttributes` can
+    /// still encode; the caller learns the depth is unknown by the zero, and a zero depth is the
+    /// honest answer for "I cannot tell you".
+    pub fn driver_max_reference_frames(display: &Display, profile: Profile) -> (u32, u32) {
+        let wanted = [CONFIG_ATTRIB_ENC_MAX_REF_FRAMES, CONFIG_ATTRIB_ENC_SLICE_STRUCTURE];
+        match display.config_attributes(profile, Entrypoint::EncSlice, &wanted) {
+            // The low 16 bits are list 0 and the high 16 list 1 (`va.h:737-739`). Masking each half
+            // rather than shifting the whole word means a driver that fills the high half with
+            // something else does not become a reference depth of 65535.
+            Ok(values) => (values.first().copied().unwrap_or(0) & 0xffff, values.first().copied().unwrap_or(0) >> 16),
+            Err(why) => {
+                log::info!("VA-API: no vaGetConfigAttributes, so the driver's reference depth is unknown: {why}");
+                (0, 0)
+            }
+        }
     }
 
     /// A buffer of `data` of kind `kind`, destroyed when it is dropped.
@@ -2608,14 +2745,16 @@ impl Drop for Encoder {
                 // destroyed on any earlier path.
                 unsafe { (api.destroy_context)(self.display.dpy, self.context) };
             }
-            if self.input != 0 && self.recon != 0 {
-                // SAFETY: `input` and `recon` are the two surface ids `vaCreateSurfaces` wrote and
-                // `Encoder::new` checked for being distinct, neither destroyed on any earlier path,
-                // and the context that used them is gone above.
-                let mut surfaces = [self.input, self.recon];
-                // SAFETY: as above: the two ids `vaCreateSurfaces` wrote, checked distinct, and the
-                // context that used them was destroyed above, which is libva's own order.
-                unsafe { (api.destroy_surfaces)(self.display.dpy, surfaces.as_mut_ptr(), 2) };
+            if self.input != 0 && !self.recon_pool.is_empty() {
+                // The input plus the whole reconstruction pool, which is every surface the context
+                // was created with. `self.input` is `surfaces[0]` and `recon_pool` is `surfaces[1..]`,
+                // so this reassembles the exact array `Encoder::new` created, in the same order.
+                let mut surfaces = vec![self.input];
+                surfaces.extend_from_slice(&self.recon_pool);
+                // SAFETY: `surfaces` is a live array of exactly the ids `vaCreateSurfaces` wrote in
+                // `Encoder::new`, none destroyed on any earlier path, and the context that used them
+                // was destroyed above — which is libva's own order.
+                unsafe { (api.destroy_surfaces)(self.display.dpy, surfaces.as_mut_ptr(), surfaces.len() as c_int) };
             }
             if self.config != 0 {
                 // SAFETY: `config` is this session's own config id, created in `Encoder::new` and

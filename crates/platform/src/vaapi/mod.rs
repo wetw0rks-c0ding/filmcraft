@@ -43,7 +43,7 @@ mod decoder;
 mod encoder;
 
 pub use decoder::{Timings, VaDecoder};
-pub use encoder::{EncodeRequest, EncodedPicture, VaEncoder, macroblocks_of, ramp_picture};
+pub use encoder::{Current, EncodeRequest, EncodedPicture, MAX_REFERENCES, Reference, VaEncoder, macroblocks_of, ramp_picture, ramp_shifted};
 // What a caller outside this module needs to build a decoder: [`Display`] is the initialised libva
 // connection a session is created on; [`stream_info`] reads a sample entry into the codec-agnostic
 // `StreamInfo` the rest of the workspace speaks, and [`Stream`] is this backend's own view of a
@@ -63,6 +63,25 @@ use ffi::VaImage;
 /// decoder here at all. A machine without them reports that it has none rather than failing to start.
 pub fn available() -> bool {
     ffi::load().and_then(|api| Display::new(&api)).is_ok()
+}
+
+/// What the driver says it can hold references for, as `(reference list 0, reference list 1)`.
+///
+/// The header's attribute is **`VAConfigAttribEncMaxRefFrames`** (`va.h:734-745`) — there is no
+/// `VAConfigAttribEncMaxReferenceFrames`, and the H.264 answer packs list 0 into the low 16 bits
+/// and list 1 into the high 16 (`va.h:737-739`).
+///
+/// It is asked of the *profile and entry point* through `vaGetConfigAttributes` rather than read off
+/// a config, because it is a read-only attribute and libva gives no way to read one off a config that
+/// did not set it. `(0, 0)` means "unknown" — either the driver said zero or libva cannot answer —
+/// and it is not a claim that the driver supports nothing: see [`VaEncoder::new`], which treats a
+/// zero as "cannot tell" and works at the depth the caller asked for.
+///
+/// On the machine this milestone was written for (Intel Arc B580, iHD 26.3.5) this answers
+/// **(1, 1)**: one reference in each list, which is exactly enough for the P chain
+/// `examples/vaencprobe.rs` measures.
+pub fn max_reference_frames(display: &Display) -> (u32, u32) {
+    ffi::Encoder::driver_max_reference_frames(display, ffi::Profile::H264Main)
 }
 
 /// An initialised VA-API display on this machine's DRM render node, or why there is none.

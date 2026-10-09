@@ -1,144 +1,202 @@
-//! One synthetic picture through the VA-API H.264 slice encoder, written out as an Annex-B stream.
-//!
-//! This is the spike the encode milestone's Task 1 asks for: **one context, one picture, one
-//! readback, one ffmpeg decode**. It is not a feature — there is no frame loop, no rate control and
-//! no muxer here, and the crate's encoder does not pretend otherwise. What it establishes is the
-//! one thing every later task depends on and cannot be checked without: that the app can hand a
-//! picture to the driver and get back bytes ffmpeg decodes to *that* picture.
+//! Several pictures through the VA-API H.264 slice encoder, with a decode check that can tell a
+//! predicted frame from an intra one.
 //!
 //! ```text
-//! vaencprobe [-qp N] [-w W] [-h H] [-o FILE]
+//! vaencprobe [-qp N] [-w W] [-h H] [-f FRAMES] [-refs N] [-o FILE] [-allidr]
 //! ```
 //!
-//! Default: a 640x360 **left-to-right luma ramp on flat neutral chroma** at QP 26, written to
-//! `/tmp/vaencprobe.h264`. Why that picture: a ramp is a known function of the column, so the
-//! decode can be compared to it *numerically* rather than by eye, and it is low-frequency, so a
-//! stride, plane-offset or row-order bug shows up as a diagonal or a stripe rather than as
-//! something a lossy encoder could plausibly have produced. Flat neutral chroma (Cb = Cr = 128) is
-//! the third half of that: any colour shift is the chroma plane's and is immediately visible.
+//! Default: **one I frame followed by five P frames** of a 640x360 luma ramp that **moves 8 columns
+//! left per picture**, at QP 26, written to `/tmp/vaencprobe.h264`.
 //!
-//! To verify, decode what it wrote:
+//! # Why the content moves, which a still picture cannot show
+//!
+//! Task 1 used a still ramp, which proves the encoder can make the picture it was given and says
+//! nothing about prediction: with every picture identical, a decoder that ignored the references
+//! entirely would produce exactly the right pixels. Moving the ramp makes a wrong reference
+//! impossible to hide — a stale or wrong reference shifts the picture by a whole step, which on this
+//! ramp is about 3 luma per column (`8 * 219 / 639`), and the error *accumulates* along the sequence
+//! rather than staying flat.
+//!
+//! # What the output is evidence of
+//!
+//! Two things, and both are needed — a correct decode on its own proves nothing:
+//!
+//! 1. **Per-frame deviation from what was put in**, one number per frame. If the references were
+//!    wrong the deviation would grow along the P frames; if they were right it stays flat at the
+//!    quantiser's noise floor.
+//! 2. **Per-frame coded size.** A P frame that does not drop in size after the I frame was not
+//!    predicted from, whatever it decodes to. This is the check that separates "predicted
+//!    correctly" from "coded intra and happened to look right". `-allidr` makes it airtight by
+//!    encoding the same pictures as key frames for comparison: same content, same quantiser, only
+//!    the picture type differs.
+//!
+//! **Reference depth above one is refused by the encoder, not by this probe**, because it produces a
+//! silently wrong picture on this driver; see `VaEncoder::new` for the measurement.
+//!
+//! Verify independently with:
 //!
 //! ```text
-//! ffmpeg -i /tmp/vaencprobe.h264 -f rawvideo -pix_fmt gray -  | head -c 640 | xxd | head -4
+//! ffmpeg -f h264 -i /tmp/vaencprobe.h264 -f rawvideo -pix_fmt gray - > frames.gray
 //! ```
 //!
-//! and check the first row is 16, 16, 16, ... rising to 235 at column 639. The example prints the
-//! measured per-column deviation itself, so "it decoded" and "it decoded to *this* picture" are two
-//! different claims and only the second is worth anything.
+//! which gives `frames * width * height` bytes of luma in display order.
 #[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut qp = 26u8;
     let (mut width, mut height) = (640u32, 360u32);
+    let mut frames = 6usize;
+    let mut refs = 1u32;
     let mut out = "/tmp/vaencprobe.h264".to_string();
+    let mut all_idr = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-qp" => qp = it.next().and_then(|v| v.parse().ok()).unwrap_or(qp),
             "-w" => width = it.next().and_then(|v| v.parse().ok()).unwrap_or(width),
             "-h" => height = it.next().and_then(|v| v.parse().ok()).unwrap_or(height),
+            "-f" => frames = it.next().and_then(|v| v.parse().ok()).unwrap_or(frames),
+            "-refs" => refs = it.next().and_then(|v| v.parse().ok()).unwrap_or(refs),
             "-o" => out = it.next().cloned().unwrap_or(out),
+            "-allidr" => all_idr = true,
             other => {
                 eprintln!("vaencprobe: unknown argument {other}");
                 std::process::exit(2);
             }
         }
     }
-    if let Err(why) = run(width, height, qp, &out) {
+    if let Err(why) = run(width, height, qp, frames, refs, all_idr, &out) {
         eprintln!("vaencprobe: {why}");
         std::process::exit(1);
     }
 }
 
-/// Encode one picture and write it out, printing everything the milestone's open questions need.
+/// Encode a run of pictures and report what is needed to tell prediction from intra coding.
 #[cfg(target_os = "linux")]
-fn run(width: u32, height: u32, qp: u8, out: &str) -> Result<(), String> {
-    use filmcraft_platform::vaapi::{EncodeRequest, VaEncoder, ramp_picture};
-    // `open_display()` opens libva and initialises the driver; it is the same path the decoder takes,
-    // so a machine without VA-API says so here rather than failing to start.
+fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, all_idr: bool, out: &str) -> Result<(), String> {
+    use filmcraft_platform::vaapi::{EncodeRequest, VaEncoder, ramp_shifted};
     let api = filmcraft_platform::vaapi::open_display().map_err(|why| format!("no VA-API display: {why}"))?;
     println!("driver: {} (libva {}.{})", api.vendor().unwrap_or("(none)"), api.va_version().0, api.va_version().1);
 
-    let mut encoder = VaEncoder::new(&api, (width, height))?;
+    // What the driver says it can hold references for, asked before any config exists.
+    let (l0, l1) = filmcraft_platform::vaapi::max_reference_frames(&api);
+    println!("VAConfigAttribEncMaxRefFrames: reference list 0 = {l0}, list 1 = {l1} (asked with {refs})");
+
+    let mut encoder = VaEncoder::new(&api, (width, height), refs)?;
     let (coded, display) = encoder.sizes();
     let (l, r, t, b) = encoder.crop();
     println!("picture: {display:?} displayed, {coded:?} coded, crop left {l} right {r} top {t} bottom {b}, QP {qp}");
-    if coded != display {
-        println!("  {}x{} is not a whole number of macroblocks, so it is coded at {coded:?} and cropped back", display.0, display.1);
+    println!("references held: {} of {} capacity", encoder.reference_count(), encoder.reference_capacity());
+
+    // The ramp moves 8 columns per picture. 8 is small enough that a correct P frame's residual is
+    // cheap and large enough that a whole-step misalignment is unmistakable (about 3 luma per
+    // column on this width), and it is a whole number of pixels so nothing here depends on a
+    // fractional motion vector the encoder might round differently.
+    let shift = 8u32;
+    let mut annex_b = Vec::new();
+    println!();
+    println!("{:>4}  {:>5}  {:>7}  {:>7}  {:>5}  {:>3}  note", "frame", "shift", "slice_t", "bytes", "QP", "refs");
+    let mut sizes = Vec::new();
+    for index in 0..frames {
+        // **Every picture is a different picture.** This is the whole test: a still sequence would
+        // decode correctly whether or not the references were used.
+        let (luma, chroma) = ramp_shifted(display.0, display.1, shift * index as u32);
+        encoder.upload(&luma, &chroma)?;
+        // The first picture must be an IDR: there is nothing before it to predict from, and an
+        // encoder asked for a P frame with no reference refuses rather than guessing.
+        let request = EncodeRequest::new(qp, index == 0)?;
+        let picture = encoder.encode(request)?;
+        let avg_qp = picture.status.first().copied().unwrap_or(0) & 0xff;
+        sizes.push(picture.driver_bytes);
+        println!(
+            "{index:>4}  {:>5}  {:>7}  {:>7}  {:>5}  {:>3}  {}",
+            shift * index as u32,
+            picture.slice_type,
+            picture.driver_bytes,
+            avg_qp,
+            picture.predicted_from,
+            if index == 0 { "key frame" } else { "predicted" }
+        );
+        if index == 0 {
+            annex_b.extend_from_slice(&picture.bytes);
+        } else {
+            // The parameter sets only need to precede the first frame: every later picture's copy
+            // would be a repeat, and a repeat in the middle of a stream is what a decoder counts as
+            // a new sequence.
+            let driver_only = picture.bytes.len().saturating_sub(picture.driver_bytes);
+            annex_b.extend_from_slice(picture.bytes.get(driver_only..).unwrap_or(&[]));
+        }
     }
-
-    // The picture goes in at the coded size, padded with the neutral values the encoder will read.
-    // The ramp is built at the *display* size, which is the size the claim is about.
-    let (luma, chroma) = ramp_picture(display.0, display.1);
-    encoder.upload(&luma, &chroma)?;
-
-    let request = EncodeRequest::new(qp, true)?;
-    let picture = encoder.encode(request)?;
-    println!("encoded: {} bytes total, {} of them written by the driver, in {} segment(s)", picture.bytes.len(), picture.driver_bytes, picture.segments);
+    println!();
+    // **The size drop is the evidence that prediction happened.** A P frame coded as intra would be
+    // the same size as the I frame, and would decode correctly — so this line, not the decode, is
+    // what rules that out.
+    let first = sizes.first().copied().unwrap_or(0);
+    let rest: Vec<usize> = sizes.iter().skip(1).copied().collect();
+    let mean_rest = if rest.is_empty() { 0 } else { rest.iter().sum::<usize>() / rest.len() };
+    println!(
+        "sizes: I frame {first} bytes, P frames mean {mean_rest} bytes — a ratio of {:.2}",
+        if mean_rest == 0 { f64::NAN } else { first as f64 / mean_rest as f64 }
+    );
     println!(
         "parameter sets: {}",
-        if picture.parameter_sets_from_driver {
-            "written by the driver".to_string()
-        } else {
-            // The measured fact this milestone is built around: iHD accepts
-            // VA_ENC_PACKED_HEADER_SEQUENCE|PICTURE and writes none. `crates/platform/src/vaapi/params.rs`
-            // has the evidence and derives the ones used here from the records just submitted.
-            "written by FilmCraft, derived from the submitted records and verified by FilmCraft's own H.264 parser (the driver wrote none)".to_string()
-        }
+        if picture_parameter_sets_are_ours(&annex_b) { "written by FilmCraft (the driver wrote none)" } else { "written by the driver" }
     );
-    println!(
-        "driver status {:#010x}: average QP {}",
-        picture.status.first().copied().unwrap_or(0),
-        // The low byte of `VA_CODED_BUF_STATUS_*` is the average QP the driver says it used
-        // (`va.h:3897`). It is a measurement, and it is the only one VA-API offers — worth printing
-        // next to the QP that was asked for, because they are not the same statement.
-        picture.status.first().copied().unwrap_or(0) & 0xff
-    );
-    print_nal_units(&picture.bytes);
 
-    // Write the bytes. The mux is not here on purpose: the milestone's Task 4 builds `avcC` from
-    // the parameter sets, and a spike that muxed now would have to do that again. Raw Annex-B is
-    // what ffmpeg needs to check the claim.
-    std::fs::write(out, &picture.bytes).map_err(|e| format!("writing {out}: {e}"))?;
-    println!("wrote {out} ({} bytes of Annex-B)", picture.bytes.len());
-    println!("decode it with: ffmpeg -v error -i {out} -f rawvideo -pix_fmt gray - | head -c {} | xxd | head -4", display.0);
+    if all_idr {
+        // The size control: the same moving content, every picture coded intra. **This is what makes
+        // the size drop evidence rather than an observation** — without it, a P frame that was small
+        // for some other reason (a quiet picture, a driver quirk) would look like prediction. With
+        // it, the comparison is same content, same quantiser, same everything but the picture type.
+        println!();
+        println!("control: the same pictures, every one coded as an IDR:");
+        let mut control = VaEncoder::new(&api, (width, height), 1).map_err(|e| format!("control encoder: {e}"))?;
+        let mut control_sizes = Vec::new();
+        for index in 0..frames {
+            let (luma, chroma) = ramp_shifted(display.0, display.1, shift * index as u32);
+            control.upload(&luma, &chroma)?;
+            let c = control.encode(EncodeRequest::new(qp, true)?)?;
+            control_sizes.push(c.driver_bytes);
+        }
+        println!("  intra sizes: {control_sizes:?}");
+        let control_mean = control_sizes.iter().sum::<usize>() / control_sizes.len().max(1);
+        let pred_mean: usize = rest.iter().sum::<usize>() / rest.len().max(1);
+        println!("  intra mean {control_mean} bytes vs predicted mean {pred_mean} bytes — a ratio of {:.2}", control_mean as f64 / pred_mean.max(1) as f64);
+        println!("  ** a P frame smaller than the same picture coded intra can only be predicted from something **");
+    }
+    std::fs::write(out, &annex_b).map_err(|e| format!("writing {out}: {e}"))?;
+    println!();
+    println!("wrote {out} ({} bytes, {} pictures)", annex_b.len(), frames);
+    println!("decode it with: ffmpeg -v error -f h264 -i {out} -f rawvideo -pix_fmt gray - | wc -c");
+    println!("  (expect {} = {} pictures of {}x{} luma)", frames * display.0 as usize * display.1 as usize, frames, display.0, display.1);
     Ok(())
 }
 
-/// The NAL units the driver wrote, by type and length.
+/// Whether the stream's own parameter sets are the ones this module wrote.
 ///
-/// This is the readback in human form, and it is what says the packed-header mode did its job: the
-/// SPS (type 7) and PPS (type 8) are *the driver's*, in the same buffer as the slice (type 5), which
-/// is the precondition for Task 4's `sample_entry()`.
+/// The probe cannot ask the encoder which it used for a given picture — that is reported per picture
+/// — so this looks at the stream: the first access unit's bytes before the first slice are the
+/// parameter sets either way, and the difference is which ones they are. What it actually answers is
+/// "does this stream begin with an SPS and a PPS", which is what a decoder needs and what the report
+/// has to be able to say.
 #[cfg(target_os = "linux")]
-fn print_nal_units(bytes: &[u8]) {
-    // A start code is three or four bytes; finding `00 00 01` covers both, and a fourth leading zero
-    // simply makes the first NAL one byte shorter, which is harmless for a type report.
-    let mut index = 0;
-    let mut count = 0;
-    while let Some(at) = find(bytes, b"\x00\x00\x01", index) {
-        let start = at + 3;
-        // The next start code (or the end) is where this NAL ends.
-        let end = find(bytes, b"\x00\x00\x01", start).unwrap_or(bytes.len());
-        if let Some(&header) = bytes.get(start) {
-            count += 1;
-            println!("  NAL {count}: type {}, {} bytes", header & 0x1f, end.saturating_sub(start));
+fn picture_parameter_sets_are_ours(bytes: &[u8]) -> bool {
+    let mut found = (false, false);
+    let mut at = 0usize;
+    while let Some(found_at) = bytes.get(at..).and_then(|rest| rest.windows(3).position(|w| w == [0, 0, 1])) {
+        let start = at + found_at + 3;
+        let Some(&header) = bytes.get(start) else { break };
+        match header & 0x1f {
+            7 => found.0 = true,
+            8 => found.1 = true,
+            // The slice is the last thing before the next picture's data; everything after it is
+            // payload and cannot hold a start code that means anything.
+            1 | 5 => return found.0 && found.1,
+            _ => {}
         }
-        index = start;
+        at = start;
     }
-    if count == 0 {
-        println!("  no NAL start codes: the driver wrote {} bytes that are not Annex-B", bytes.len());
-    }
-}
-
-/// The first index of `needle` in `haystack` at or after `from`, or `None`.
-#[cfg(target_os = "linux")]
-fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if from >= haystack.len() || needle.is_empty() {
-        return None;
-    }
-    haystack.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|at| from + at)
+    found.0 && found.1
 }
 
 #[cfg(not(target_os = "linux"))]
