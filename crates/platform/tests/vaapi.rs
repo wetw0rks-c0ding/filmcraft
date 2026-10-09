@@ -59,12 +59,23 @@
 //!    asserts the bytes it writes. A weight that is wrong but still near 1.0 would pass every test in
 //!    this file. The branch's own doc says so at `vaapi::picture::h264_weights`.
 //! 2. **Per-segment HEVC reference lists.** `hevc_multi_segment.mp4` has two segments in every picture
-//!    and each segment's record is checked against that segment's own header — but the only encoder
-//!    available here gives both segments of a picture the same `num_ref_idx`, so handing the second the
-//!    first's lists produces byte-identical records and no assertion here can tell the two apart. The
-//!    mechanism is proved separately, in
-//!    `vaapi::picture::tests::a_segment_record_must_name_its_own_lists_not_the_first_segments`, and the
-//!    gap is stated at `vaapi::picture::build_hevc`.
+//!    and each segment's record is checked against that segment's own header — but **no
+//!    encoder-produced fixture reaches the case this is about**: the only encoder available here gives
+//!    both segments of a picture the same `num_ref_idx`, so handing the second the first's lists produces
+//!    byte-identical records and no assertion here can tell the two apart. The mechanism is proved
+//!    separately, in
+//!    `vaapi::picture::tests::a_segment_record_must_name_its_own_lists_not_the_first_segments`, and the gap
+//!    is stated at `vaapi::picture::build_hevc`.
+//!
+//!    **What would reach it**, for whoever picks it up: a stream whose segments differ in
+//!    `num_ref_idx_l0/l1_active_minus1` — from a real multi-segment hardware-encoded source, or built by
+//!    mutating the fixture, since the field is a `ue(v)` the B segments code as `010` and `010` → `011` is
+//!    an in-place three-bit flip that shifts nothing. It needs a bit offset for that field, which
+//!    `filmcraft_hevc::slice::SliceHeader` does not expose, so either the position is found by searching
+//!    the header's bits or `crates/hevc` learns to report it. And the result must be a
+//!    **record-consistency test, not a parity test**: a segment asking for more references than it was
+//!    coded with decodes a different picture, so comparing its output with ffmpeg would be comparing
+//!    against a stream that is not the fixture.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -843,7 +854,12 @@ fn an_h264_b_slice_this_record_cannot_weight_is_declined() {
     // The refusal is latched, because the pictures after a picture that could not be built are decoded
     // against a picture buffer that is missing it — which is a plausible-looking wrong picture, not an
     // error. So the decoder keeps saying no, and nothing comes out of a flush.
-    for after in &s.samples[at + 1..at + 4] {
+    // `at + 1` is the sample after the refusal and `at + 4` three further on, both clamped to the stream:
+    // `at` comes out of the stream itself, so a stream whose first refusal is near its end would
+    // otherwise make this a slice-range panic instead of the assertion below it.
+    let end = (at + 4).min(s.samples.len());
+    assert!(at < end, "the refusal is at sample {at} of {}, so there is at least one sample after it", s.samples.len());
+    for after in &s.samples[at + 1..end] {
         let e = va
             .decode(&after.0, after.1)
             .err()

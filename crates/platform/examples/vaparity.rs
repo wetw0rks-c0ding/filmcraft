@@ -74,6 +74,11 @@ fn parity(path: &str, hw: bool) {
 
     let mut sw_by_pts: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
     let mut hw_by_pts: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
+    // Pictures **returned**, alongside the maps. Two pictures at one presentation time collapse into one
+    // map entry, so the map's length alone would read as pictures going missing — the very confusion
+    // this file's doc exists to remove — and nothing in a `HashMap` records that it happened. The two
+    // counts are compared instead, and a difference is reported rather than claimed away.
+    let (mut sw_pictures, mut hw_pictures) = (0usize, 0usize);
     let mut hw_errors: Vec<(usize, String)> = Vec::new();
     let mut sw_errors: Vec<(usize, String)> = Vec::new();
 
@@ -84,6 +89,7 @@ fn parity(path: &str, hw: bool) {
         // picture behind, and the reference list for the next sample would be missing an entry.
         match software.decode(&s, pts) {
             Ok(frames) => {
+                sw_pictures += frames.len();
                 for f in frames {
                     sw_by_pts.insert(f.pts, luma_hash(&f.frame));
                 }
@@ -93,6 +99,7 @@ fn parity(path: &str, hw: bool) {
         if let Some(d) = hardware.as_mut() {
             match d.decode(&s, pts) {
                 Ok(frames) => {
+                    hw_pictures += frames.len();
                     for f in frames {
                         hw_by_pts.insert(f.pts, luma_hash(&f.frame));
                     }
@@ -105,10 +112,12 @@ fn parity(path: &str, hw: bool) {
     // reorders holds the last pictures of a run back, and counting only what `decode` returned is how
     // a 72-picture stream reads as 65 — which looks like pictures going missing and is not.
     for f in software.flush() {
+        sw_pictures += 1;
         sw_by_pts.insert(f.pts, luma_hash(&f.frame));
     }
     if let Some(d) = hardware.as_mut() {
         for f in d.flush() {
+            hw_pictures += 1;
             hw_by_pts.insert(f.pts, luma_hash(&f.frame));
         }
     }
@@ -127,7 +136,10 @@ fn parity(path: &str, hw: bool) {
         return;
     }
     if !hw {
-        println!("{path}: {} pictures from the software decoder, all with distinct pts", sw_by_pts.len());
+        println!("{path}: {sw_pictures} pictures from the software decoder over {} distinct presentation times", sw_by_pts.len());
+        if sw_pictures != sw_by_pts.len() {
+            println!("  {} of them share a presentation time with another, which is why the two counts differ", sw_pictures - sw_by_pts.len());
+        }
         return;
     }
     let (mut agree, mut differ) = (0usize, 0usize);
@@ -143,34 +155,48 @@ fn parity(path: &str, hw: bool) {
     let mut only_software = 0usize;
     for p in &all {
         let (a, b) = (sw_by_pts.get(p), hw_by_pts.get(p));
-        match (a, b) {
-            (Some(a), Some(b)) if a == b => agree += 1,
-            (Some(_), None) => {
-                differ += 1;
-                only_software += 1;
-                if first_diff.is_none() {
-                    first_diff = Some(format!("pts {p}: only the software decoder produced it"));
-                }
-            }
-            (None, Some(_)) => {
-                differ += 1;
-                only_hardware += 1;
-                if first_diff.is_none() {
-                    first_diff = Some(format!("pts {p}: only the hardware decoder produced it"));
-                }
-            }
-            (Some(a), Some(b)) => {
+        // `p` came out of the union, so exactly one side has it once the both-sides case is out of the
+        // way — which is what makes the `else` below "only the hardware decoder's" rather than a
+        // catch-all that would mislabel a picture neither has. Nothing here can panic: an example that
+        // reports on a decoder has no business unwinding, and the examples/ target is not covered by the
+        // lib crate's `deny`, so a panic path there would not be caught by the build.
+        if let (Some(a), Some(b)) = (a, b) {
+            if a == b {
+                agree += 1;
+            } else {
                 differ += 1;
                 if first_diff.is_none() {
                     first_diff = Some(format!("pts {p}: software {a:016x} != hardware {b:016x}"));
                 }
             }
-            (None, None) => unreachable!("the union of two key sets"),
+            continue;
+        }
+        differ += 1;
+        if a.is_some() {
+            only_software += 1;
+            if first_diff.is_none() {
+                first_diff = Some(format!("pts {p}: only the software decoder produced it"));
+            }
+        } else {
+            only_hardware += 1;
+            if first_diff.is_none() {
+                first_diff = Some(format!("pts {p}: only the hardware decoder produced it"));
+            }
         }
     }
     let total = all.len();
     let verdict = if differ == 0 && agree > 0 { "MATCH" } else { "MISMATCH" };
     println!("{verdict} {path}: {agree} of {total} pictures identical, {differ} differ");
+    println!(
+        "  {sw_pictures} pictures from the software decoder over {} distinct presentation times, {hw_pictures} from the hardware decoder over {}",
+        sw_by_pts.len(),
+        hw_by_pts.len()
+    );
+    for (what, pictures, distinct) in [("software", sw_pictures, sw_by_pts.len()), ("hardware", hw_pictures, hw_by_pts.len())] {
+        if pictures != distinct {
+            println!("  {} of the {what} decoder's pictures share a presentation time with another, so the two counts differ", pictures - distinct);
+        }
+    }
     if only_hardware > 0 || only_software > 0 {
         println!("  {only_hardware} of them only the hardware decoder produced, {only_software} only the software decoder's");
     }

@@ -1518,12 +1518,23 @@ fn build_hevc(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface: u3
             // segment's record against that segment's own header; `a_segment_record_must_name_its_own_lists_not_the_first_segments`
             // constructs a second segment asking for more references than the first's lists hold and
             // shows the two sets of lists are not interchangeable. What neither can do is **catch this
-            // line being reverted**, because the only encoder available here (x265, `slices=2:no-tskip=1`
-            // and `slices=4`) gives both segments of a picture the same `num_ref_idx`, so the reused
-            // lists produce byte-identical records and every assertion above still passes. A stream
-            // that varied `num_ref_idx` between its segments — hardware encoders and broadcast sources
-            // do — is what would fail. That gap is stated here rather than left for the next reader to
-            // assume is covered.
+            // line being reverted**, because **no encoder-produced fixture reaches it**: the only
+            // encoder available here (x265, `slices=2:no-tskip=1` and `slices=4`) gives both segments of a
+            // picture the same `num_ref_idx`, so the reused lists produce byte-identical records and every
+            // assertion above still passes.
+            //
+            // What *would* reach it is a stream whose segments differ in `num_ref_idx_l0/l1_active_minus1`
+            // — hardware encoders and broadcast sources produce those, and it can also be built by hand:
+            // the field is a `ue(v)` and the fixture's B segments code `010`, so `010` → `011` is an
+            // in-place three-bit flip that changes the value to 2 and shifts nothing, the same class of
+            // mutation the damaged-sample tests already perform. Two things are needed for that, and
+            // neither is here: `filmcraft_hevc::slice::SliceHeader` exposes no bit offset for the field
+            // (only `data_offset`, after it), so the position has to be found by searching the header's
+            // bits or by teaching `crates/hevc` to report it; and the result would be a
+            // **record-consistency test, never a parity test** — a segment asking for more references
+            // than it was coded with decodes a different picture, so its output must not be compared
+            // with ffmpeg. Anyone writing it should keep that distinction, or the next reader will read a
+            // record check as a picture check.
             //
             // Deriving them again is safe: `hevc_ref_lists` applies 8.3.2's marking to the buffer as
             // it goes, and after the first segment the buffer already holds exactly the set's
