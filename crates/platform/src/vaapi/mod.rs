@@ -98,8 +98,12 @@ pub fn capabilities() -> String {
         // A profile whose entry points cannot be queried is reported as offering nothing rather than
         // skipped: a driver that answers the profile list and then refuses the entry point list is a
         // driver whose capability is unknown, and "unknown" belongs in the report.
-        let vld = display.entrypoints(profile).map(|e| e.contains(&ffi::Entrypoint::Vld)).unwrap_or(false);
-        out += &format!("{profile:?} VLD: {vld}\n");
+        let entrypoints = display.entrypoints(profile);
+        let has = |want: ffi::Entrypoint| entrypoints.as_ref().map(|e| e.contains(&want)).unwrap_or(false);
+        // `EncSlice` is reported next to `Vld` because the encode backend gates on exactly this
+        // question -- whether the driver offers a slice encoder for the profile -- and a capability
+        // report that cannot answer it is not one the encode path can decide against.
+        out += &format!("{profile:?} VLD: {} EncSlice: {}\n", has(ffi::Entrypoint::Vld), has(ffi::Entrypoint::EncSlice));
     }
     out
 }
