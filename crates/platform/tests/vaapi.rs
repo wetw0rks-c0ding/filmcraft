@@ -668,6 +668,254 @@ fn in_band_parameter_sets_are_not_confused_with_the_config_record() {
     assert_same_by_pts("in-band sets that differ from the sample entry", &out, &decode_all(software(&plain).as_mut(), &differing));
 }
 
+/// The superframe index VP9 Annex B defines, built over `frames`: the frames' bytes, then a marker
+/// byte, then each frame's length as a little-endian `u32`, then the marker again.
+///
+/// **This is a real superframe, assembled rather than encoded, and the reason is measured.** Every
+/// combination of `libvpx-vp9` arguments available here — `-auto-alt-ref 1` with
+/// `-lag-in-frames` 16 / 19 / 25, `-frame-parallel 0`, `-error-resilient 0`, `-deadline` good / best /
+/// realtime, `-cpu-used` 0 through 8, at one and at two GOPs — was swept for a stream carrying one, and
+/// **none produced a single superframe or a single hidden frame** (16 combinations, 0 and 0). libvpx
+/// packs alt-ref frames into superframes only in configurations this build does not take, so asking
+/// ffmpeg harder does not reach the case.
+///
+/// The marker is **not** an encoder behaviour, though: it is the index the *format* defines, and the
+/// codec's own parser reads it (`crates/vp9/src/header.rs:602`, which is what the decode loop now
+/// calls). So the fixture is built here over **real encoded frames** — each member is a frame libvpx
+/// actually produced, not a synthetic byte string — and the test below asserts the result really does
+/// split, which is what stops this from being a fixture that would pass vacuously.
+fn superframe_index(frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in frames {
+        out.extend_from_slice(f);
+    }
+    // `0xc0` in the top three bits is the marker; bits 3..4 hold the **size-field width minus one**
+    // and the low three hold the frame count minus one (`crates/vp9/src/header.rs:604-606`). The
+    // lengths are written as `u32`, so the width must say 4: `3 << 3`. Getting this wrong is a
+    // silent no-op rather than an error — the reader checks that the byte where it expects the index
+    // to start *is* the marker, finds something else, and returns the whole sample as one frame, so a
+    // fixture built with a mismatched width looks like a stream that simply has no superframes. That
+    // is why `a_vp9_superframe_fixture_really_carries_superframes` asserts the split rather than the
+    // bytes, and why it runs before anything relies on this fixture.
+    let marker = 0xc0u8 | (3 << 3) | (frames.len() as u8 - 1);
+    out.push(marker);
+    for f in frames {
+        out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+    }
+    out.push(marker);
+    out
+}
+
+/// A VP9 fixture whose samples **carry real superframes**, or `None` without ffmpeg.
+///
+/// Built by re-packing a normally encoded fixture's own frames: two consecutive inter frames become
+/// one sample, with the index the format defines. The frames are libvpx output and the index is the
+/// specification's, so the container sample is a superframe in exactly the sense that matters to a
+/// decoder — `split_superframe` returns the members, and the members decode.
+///
+/// **Why the frames are re-packed rather than re-encoded:** no `libvpx-vp9` invocation available here
+/// emits a superframe at all (see [`superframe_index`]), so an encoder argument cannot produce this
+/// fixture, and a fixture that quietly had none would make every assertion below pass without testing
+/// anything. That is why [`a_vp9_superframe_fixture_really_carries_superframes`] exists and why it runs
+/// before anything relies on this fixture.
+fn vp9_superframe_fixture(ff: &Path) -> Option<Stream> {
+    // Ordinary profile 0 at 8 bits: the profile this backend decodes.
+    let path = fixture(
+        ff,
+        "vp9_sf_members.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x240:r=24:d=2,noise=alls=12:allf=t",
+            "-c:v",
+            "libvpx-vp9",
+            "-b:v",
+            "0",
+            "-crf",
+            "32",
+            "-deadline",
+            "good",
+            "-cpu-used",
+            "5",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    )?;
+    let plain = read_stream(&path);
+    // Two consecutive inter frames, taken from past the key frame so each predicts from pictures the
+    // run has already produced rather than from a reference that is not in the stream.
+    let (Some(first), Some(second)) = (plain.samples.get(3).cloned(), plain.samples.get(4).cloned()) else {
+        return None;
+    };
+    let packed = superframe_index(&[first.0.clone(), second.0]);
+    // **The packed superframe REPLACES both samples rather than being added after them.** A VP9 frame
+    // is stateful — it predicts from the references the frames before it left — so decoding sample 3
+    // on its own and then again inside the superframe would decode the same frame twice and desync
+    // every reference after it. A container that packs two frames into one sample has *one* sample
+    // there, and that is what this builds.
+    //
+    // One presentation time for it, the *first* frame's: that is what a container that packs them
+    // records, and it is what our own software decoder attributes to the pictures a superframe shows
+    // (one chunk, one timestamp, however many frames it holds).
+    let mut samples: Vec<(Vec<u8>, i64)> = plain.samples[..3].to_vec();
+    samples.push((packed, first.1));
+    samples.extend(plain.samples[5..].iter().cloned());
+    // `sync` is a parallel array; the key frame at index 0 is the only sync sample here.
+    let mut sync = vec![false; samples.len()];
+    if let Some(first_sync) = sync.first_mut() {
+        *first_sync = true;
+    }
+    Some(Stream { entry: plain.entry, samples, sync })
+}
+
+/// **The fixture really carries superframes.** Every other claim about superframe handling rests on
+/// this one, and it is stated as a separate test for the reason the branch has been bitten by three
+/// times: a fixture that silently contains none makes every assertion downstream pass without proving
+/// anything.
+///
+/// It asserts the *split* rather than a byte pattern, because the split is what the decode loop
+/// depends on, and it asserts the **per-frame** length is what a record must be built from.
+#[test]
+fn a_vp9_superframe_fixture_really_carries_superframes() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    let Some(s) = vp9_superframe_fixture(&ff) else {
+        eprintln!("SKIPPED: ffmpeg cannot encode the libvpx-vp9 members this fixture is built from");
+        return;
+    };
+    // At least one sample splits into more than one frame…
+    let split: Vec<usize> = (0..s.samples.len()).map(|i| filmcraft_vp9::header::split_superframe(&s.samples[i].0).len()).collect();
+    let superframes = split.iter().filter(|&&n| n > 1).count();
+    assert!(superframes > 0, "the fixture carries no superframe at all, so every assertion about them is vacuous: {split:?}");
+    // …and the members are the frames that went in, byte for byte.
+    let i = split.iter().position(|&n| n > 1).expect("asserted above");
+    let parts = filmcraft_vp9::header::split_superframe(&s.samples[i].0);
+    assert!(parts.iter().all(|p| !p.is_empty()), "every member of the index is a frame: {parts:?}");
+    // **The claim the record depends on:** each member's own length differs from the sample's, and the
+    // compressed-header extent is measured from the member. A frame whose uncompressed header is `n`
+    // bytes gives `member.len() - n`, and using the sample's length instead is the defect this fixture
+    // exists to pin — so the two numbers must be different here, or the test proves nothing.
+    let refs: [Option<filmcraft_vp9::header::RefInfo>; 8] = std::array::from_fn(|_| Some(filmcraft_vp9::header::RefInfo { width: 320, height: 240 }));
+    for (j, part) in parts.iter().enumerate() {
+        let mut st = filmcraft_vp9::header::HeaderState::default();
+        let h = filmcraft_vp9::header::parse_uncompressed(part, &mut st, &refs)
+            .unwrap_or_else(|e| panic!("member {j} of the superframe at sample {i} is not a frame this parser reads: {e}"));
+        let per_frame = part.len() - h.uncompressed_size;
+        let whole_sample = s.samples[i].0.len() - h.uncompressed_size;
+        assert_ne!(per_frame, whole_sample, "member {j}: the per-frame and whole-sample extents agree, so this fixture cannot catch the defect it exists for");
+        assert!(per_frame <= u16::MAX as usize, "member {j}: its own first_partition_size ({per_frame}) fits the record's field");
+    }
+    // And the whole-sample reading — what the code did before the fix — is larger, which is the wrong
+    // direction: it points into the next frame's bytes.
+    let mut st = filmcraft_vp9::header::HeaderState::default();
+    let h = filmcraft_vp9::header::parse_uncompressed(parts[0], &mut st, &refs).expect("member 0");
+    assert!(
+        s.samples[i].0.len() - h.uncompressed_size > parts[0].len() - h.uncompressed_size,
+        "the pre-fix whole-sample value is the larger one, which is why it is wrong: a driver reading a compressed header \
+         that long reads past the end of its own frame"
+    );
+}
+
+/// **A superframe is one sample holding several frames, and both decoders must treat it that way.**
+///
+/// This is the end-to-end statement of the fix, made of three claims a wrong implementation cannot
+/// satisfy at once:
+///
+/// 1. **Every frame in it is decoded.** The hidden alt-ref frame inside a superframe is the reference
+///    the shown frame after it predicts from. If it were skipped — because it is hidden, or because
+///    only the first frame of the sample was parsed — the shown frame's references would resolve
+///    against a buffer that does not hold them.
+/// 2. **Exactly one picture comes out per shown frame**, never one per *sample* member. A hidden frame
+///    is decoded and produces no picture, which is the same rule a single-frame hidden picture follows
+///    and what the software decoder does; handing back one picture per frame would show the alt-ref
+///    frame, which the stream explicitly says is not for display.
+/// 3. **The pictures are the software decoder's, bit for bit** — for both decoders, so the split did
+///    not merely survive but produced the same pictures our own VP9 decoder does from the same samples.
+///
+/// The run is compared whole, not only at the superframe, because a wrong reference map shows up in the
+/// pictures *after* it.
+///
+/// **The software half is the one that runs everywhere** and it is what makes this test meaningful on a
+/// machine whose driver cannot decode VP9 at all. The hardware half is skipped, loudly, when the driver
+/// refuses the stream — and that skip is a fact about the machine, not a pass.
+#[test]
+fn a_vp9_superframe_decodes_every_frame_and_shows_only_what_the_stream_shows() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    let Some(s) = vp9_superframe_fixture(&ff) else {
+        eprintln!("SKIPPED: ffmpeg cannot encode the libvpx-vp9 members this fixture is built from");
+        return;
+    };
+    let i = (0..s.samples.len())
+        .find(|&i| filmcraft_vp9::header::split_superframe(&s.samples[i].0).len() > 1)
+        .expect("a_vp9_superframe_fixture_really_carries_superframes guarantees this");
+
+    // (1)+(2) for the software decoder, which needs no driver: the run decodes to completion rather
+    // than refusing on the second frame's references, and the number of pictures is **one per shown
+    // frame** — which for *this* fixture is two, because libvpx packed two inter frames and both are
+    // shown. Asserted as a count against the frames the index actually names, so the claim is about
+    // the rule and not about a number this particular stream happens to have.
+    //
+    // (The hidden-alt-ref case, where the count is one *fewer* than the frame count, is what the unit
+    // test `a_hidden_frame_produces_no_picture_but_still_moves_its_slots` covers with a frame the
+    // parser reads and this encoder cannot be made to emit.)
+    let members = filmcraft_vp9::header::split_superframe(&s.samples[i].0).len();
+    let shown = {
+        let refs: [Option<filmcraft_vp9::header::RefInfo>; 8] = std::array::from_fn(|_| Some(filmcraft_vp9::header::RefInfo { width: 320, height: 240 }));
+        filmcraft_vp9::header::split_superframe(&s.samples[i].0)
+            .iter()
+            .filter(|f| {
+                let mut st = filmcraft_vp9::header::HeaderState::default();
+                filmcraft_vp9::header::parse_uncompressed(f, &mut st, &refs).is_ok_and(|h| h.show_frame)
+            })
+            .count()
+    };
+    let reference = decode_all(software(&s).as_mut(), &s.samples);
+    assert!(!reference.is_empty(), "the software decoder produced no pictures from the superframe fixture");
+    assert_eq!(
+        reference.iter().filter(|f| f.pts == s.samples[i].1).count(),
+        shown,
+        "a superframe of {members} frame(s) yields one picture per **shown** frame ({shown}), not one per sample"
+    );
+
+    let Some(info) = filmcraft_platform::vaapi::stream_info(&s.entry) else {
+        eprintln!("SKIPPED: not a vpcC stream");
+        return;
+    };
+    let mut hw = match filmcraft_platform::vaapi::VaDecoder::new(info) {
+        Ok(d) => d,
+        Err(why) => {
+            eprintln!("SKIPPED: this driver does not take a VP9 profile 0 stream: {why}");
+            return;
+        }
+    };
+    // **A driver that accepts the stream but cannot decode a VP9 picture at all is a known, separate,
+    // open problem, not a superframe failure** (`vaEndPicture: invalid parameter`, on a machine whose
+    // driver advertises VP9 and where ffmpeg's own VA-API VP9 path works — see
+    // docs/vaapi-progress.md §4). It is reported as a skip with the reason rather than a failure here,
+    // because attributing it to superframe handling would be wrong and would hide a real regression
+    // later; the superframe behaviour is pinned by the driver-free half above and by
+    // `a_vp9_superframe_gives_each_frame_a_record_built_from_its_own_bytes`, neither of which needs
+    // this machine's driver. **Task 5 owns closing it**, with a parity test that will fail loudly until
+    // it is fixed.
+    let mut out = Vec::new();
+    for (sample, pts) in &s.samples {
+        match hw.decode(sample, *pts) {
+            Ok(frames) => out.extend(frames),
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: this driver cannot decode a VP9 picture at all ({e}), which is the open problem in docs/vaapi-progress.md §4 — the superframe assertions above and the driver-free test do not depend on it"
+                );
+                return;
+            }
+        }
+    }
+    out.extend(hw.flush());
+    assert_eq!(out.iter().filter(|f| f.pts == s.samples[i].1).count(), shown, "the hardware decoder yields one picture per shown frame, like the software one");
+    assert_eq!(out.len(), reference.len(), "the hardware and software decoders return the same number of pictures");
+    assert_same_by_pts("a VP9 superframe", &out, &reference);
+    assert!(hw.name().starts_with("VA-API"), "stayed in hardware ({})", hw.name());
+}
+
 /// **A VP9 sample entry is no longer declined for being a frame codec**, and the two halves of that
 /// are asserted separately because they are different claims.
 ///

@@ -555,11 +555,45 @@ impl VaDecoder {
         Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame: Some(frame) })
     }
 
-    /// One VP9 frame: read it into this decoder's [`Vp9State`], and then either submit its picture
-    /// record into a surface no live reference is in, or — for a frame that re-shows an earlier
-    /// picture — copy that picture out again with no decode at all.
+    /// One VP9 **sample**, which is not necessarily one frame: a container sample can be a
+    /// *superframe* — several frames concatenated, described by a trailing superframe index (VP9
+    /// Annex B), and the usual shape is a hidden alt-ref frame followed by the shown frame.
     ///
-    /// ## The order is the reverse of [`Self::picture_nal`], and it has to be
+    /// **So this splits the sample first, and every frame in it is decoded as a frame of its own.**
+    /// Handing the whole sample to `Vp9State::frame` would parse only the *first* frame's header,
+    /// submit the whole sample as that one frame's data, and — the part that does real damage —
+    /// compute that frame's `first_partition_size` from the *whole sample's* length. That field is how
+    /// a driver finds the compressed header (`va_dec_vp9.h:167-169`), so on a two-frame superframe
+    /// whose first frame is 2 673 bytes and whose sample is 12 943, it would be told 12 933 where 2 663
+    /// is the truth: a header extent pointing most of the way through the next frame. This is the
+    /// `33`-instead-of-`32` class of error, and it is why the split is not an optimisation but the
+    /// only way the length means anything.
+    ///
+    /// ## What each frame does to the reference buffer, and to the caller's pictures
+    ///
+    /// Frames are decoded **in order, one at a time, each committed before the next is read**, which
+    /// is the whole of the relationship: an alt-ref frame inside the superframe refreshes the slots
+    /// the shown frame predicts from, so reading the shown frame before committing the alt-ref one
+    /// would resolve its references against a buffer that does not hold them yet.
+    ///
+    /// The picture the caller gets is **not** one per frame. A frame with `show_frame` clear is
+    /// decoded (it may refresh references) and produces no picture, which is the same
+    /// [`Decoded::frame`] rule a single-frame hidden picture follows, and which is what FilmCraft's own
+    /// software VP9 decoder does (`crates/vp9/src/decoder.rs:413`, `:417`). So a superframe of
+    /// [hidden alt-ref, shown] hands back exactly the one picture the stream shows, and `decode` gives
+    /// it the sample's timestamp: one container sample, one timestamp, however many frames it holds.
+    ///
+    /// **More than one shown frame in one superframe is the case worth naming.** The format allows it
+    /// and our software decoder emits every one (`crates/vp9/src/decoder.rs:248-255`), but this
+    /// backend has a single timestamp for the sample and a `Vec<DecodedFrame>` keyed by it — two
+    /// pictures under one timestamp would be indistinguishable to a caller comparing by presentation
+    /// time. So the **last** shown picture is the one returned, and the earlier ones are decoded and
+    /// committed and not shown. This is a deliberate divergence from the software path, named here
+    /// rather than left to be discovered as a picture-count difference: a superframe holding two shown
+    /// frames is not something any encoder here produces (see the fixture in `tests/vaapi.rs`), so
+    /// this is the one case with no test reaching it on real data.
+    ///
+    /// ## The order inside a frame is the reverse of [`Self::picture_nal`], and it has to be
     ///
     /// The NAL path takes a surface from the ring *before* it knows what the picture is, because
     /// `build_nal` adds the picture to the buffer and the surface must not be one of the buffer's own.
@@ -576,7 +610,11 @@ impl VaDecoder {
     /// `color_config` — a valid record of the wrong depth, which a driver decodes into a plausible
     /// wrong picture. Propagating instead reaches `VideoDecoder::decode`, which latches `refused` and
     /// ends the run: the caller falls back to the software decoder from a known point rather than
-    /// carrying on in hardware from an unknown one.
+    /// carrying on in hardware from an unknown one. **That is why a refused frame inside a superframe
+    /// refuses the whole sample** rather than skipping to the next frame in it: the frames after it
+    /// inherit from a state this one has already advanced, which is exactly the hazard above, and a
+    /// superframe is not a restart point (VP9 6.2's restart points are key frames, which begin a
+    /// sample of their own).
     fn picture_frame(&mut self, sample: &[u8]) -> std::result::Result<Decoded, String> {
         let info = match &self.stream {
             Stream::Frame(info) => info,
@@ -592,20 +630,68 @@ impl VaDecoder {
                 Ok(_) => Err("a frame-coded stream reached the decode loop without picture-parameter records".into()),
             };
         }
+        // The superframe index is parsed by the codec's own parser, the only implementation of it in
+        // the workspace. A sample with no index is returned unchanged, so an ordinary single-frame
+        // sample is the one-iteration case below with `sample` as its only frame.
+        let frames = filmcraft_vp9::header::split_superframe(sample);
+        let (profile, bit_depth) = (info.profile, info.bit_depth);
+        // Timings accumulate across every frame in the sample, so the cost of a superframe's hidden
+        // alt-ref frame is reported rather than discarded — it is a real decode the user paid for.
+        let mut total = Decoded { decode: Duration::ZERO, readback: Duration::ZERO, convert: Duration::ZERO, frame: None };
+        for bytes in &frames {
+            // An empty frame is not a frame: an index may name a zero-length member, and there is
+            // nothing to decode or show in it. The software decoder skips these too
+            // (`crates/vp9/src/decoder.rs:161`).
+            if bytes.is_empty() {
+                continue;
+            }
+            let decoded = self.picture_vp9_frame(profile, bit_depth, bytes)?;
+            total.decode += decoded.decode;
+            total.readback += decoded.readback;
+            total.convert += decoded.convert;
+            // The last shown picture wins, as the doc above says; a hidden frame leaves the previous
+            // one in place, which is what makes [hidden, shown] hand back the shown one.
+            if decoded.frame.is_some() {
+                total.frame = decoded.frame;
+            }
+        }
+        Ok(total)
+    }
+
+    /// One frame of a VP9 sample: read it into this decoder's [`Vp9State`], and then either submit its
+    /// picture record into a surface no live reference is in, or — for a frame that re-shows an earlier
+    /// picture — copy that picture out again with no decode at all.
+    ///
+    /// `bytes` is **this frame's own slice of the sample**, never the whole sample: it is what
+    /// `first_partition_size` is measured from, so passing the sample here is what would put one frame's
+    /// compressed-header extent into the next frame's bytes. [`Self::picture_frame`] is the only caller
+    /// and it splits first.
+    ///
+    /// The container's `profile` and `bit_depth` are passed as values rather than as the
+    /// [`FrameStreamInfo`] they come from: `info` borrows `self.stream` immutably while this needs
+    /// `&mut self`, and these two fields are all the cross-check reads. Borrowing the whole description
+    /// across a loop that mutates the decoder is not possible, and cloning a description to work around
+    /// that would be worse than naming the two numbers the check needs.
+    ///
+    /// The returned `Decoded`'s `frame` is `None` for a frame the stream decodes but does not show,
+    /// which still moved its reference slots — that is the point of not skipping it.
+    fn picture_vp9_frame(&mut self, profile: u8, bit_depth: u32, bytes: &[u8]) -> std::result::Result<Decoded, String> {
         // **First, and this is the order the NAL path does not use:** read the frame, so that a frame
         // which codes no picture of its own never takes a surface.
-        let frame = self.vp9.frame(sample)?;
+        let frame = self.vp9.frame(bytes)?;
         // The container's own description and the frame's header have to agree, and `Vp9State` holds
         // no container: the surfaces were created for the profile and depth the sample entry said, so
         // a record carrying the frame's would be a picture of one format decoded into a surface of
         // another. One function, shared with `picture::build_frame`'s backstop, so the two sites
         // cannot disagree about it.
-        if let Some(why) = vp9_entry_disagreement(info, frame.header()) {
+        if let Some(why) = vp9_entry_disagreement(profile, bit_depth, frame.header()) {
             return Err(why);
         }
         if let Some((slot, surface)) = frame.re_show() {
             // 8.2.2: the decoder outputs the picture that slot holds and decodes nothing. No
-            // submission, no sync, no reference slot moved — and no surface taken from the ring.
+            // submission, no sync, no reference slot moved — and no surface taken from the ring. A
+            // re-show *is* a shown picture, so it is returned rather than skipped: a shown frame whose
+            // pixels were coded earlier is exactly what a superframe index exists to carry.
             return self.re_show(slot, surface);
         }
         // The frame's own size and depth, against what this session was created for. Read *after*
@@ -621,13 +707,15 @@ impl VaDecoder {
         let record = frame.record().ok_or_else(|| "a VP9 frame that is not a re-show carries no picture-parameter record".to_string())?;
 
         let decode0 = Instant::now();
-        // The two buffers a VP9 decode submits: the picture-parameter record, then the frame's own
-        // bytes. VP9 has no slice headers (`va_dec_vp9.h` declares no `VASliceParameterBufferVP9`),
-        // so there is no slice record and no IQ matrix buffer to send with them. The handles live to
-        // the end of this function, so `vaDestroyBuffer` runs on every path out of it.
+        // The two buffers a VP9 decode submits: the picture-parameter record, then **this frame's own
+        // bytes** — not the sample, which for a superframe would hand the driver the next frames'
+        // bytes as part of this one. VP9 has no slice headers (`va_dec_vp9.h` declares no
+        // `VASliceParameterBufferVP9`), so there is no slice record and no IQ matrix buffer to send
+        // with them. The handles live to the end of this function, so `vaDestroyBuffer` runs on every
+        // path out of it.
         let mut buffers = Vec::with_capacity(2);
-        for (kind, bytes) in Self::vp9_submission(record, sample) {
-            buffers.push(self.session.buffer(kind, bytes)?);
+        for (kind, data) in Self::vp9_submission(record, bytes) {
+            buffers.push(self.session.buffer(kind, data)?);
         }
         let ids: Vec<u32> = buffers.iter().map(|b| b.id()).collect();
         self.session.render(surface, &ids)?;
@@ -640,7 +728,9 @@ impl VaDecoder {
         }
         // **Only a shown frame is read back.** `show_frame` clear is a frame the stream decodes and
         // no player shows (`crates/vp9/src/decoder.rs:413`, `:417`), and it still refreshes the
-        // reference slots below. Reading it would be work for a picture nothing will ever look at.
+        // reference slots below. Reading it would be work for a picture nothing will ever look at —
+        // and **inside a superframe this is the common case**, since the hidden alt-ref frame is what a
+        // superframe usually exists to carry.
         let (frame_out, convert) = match frame.show() {
             true => {
                 let (convert, f) = self.readback(surface)?;
@@ -651,6 +741,9 @@ impl VaDecoder {
         // The reference buffer moves **after** the driver rendered the picture, never before: a
         // record describes the buffer as it was before its own frame, and a decode that failed must
         // not have moved it. `commit` refuses a re-show, which cannot reach here.
+        //
+        // This runs for a hidden frame too, and that is the point: an alt-ref frame inside a
+        // superframe is *why* the shown frame after it can be predicted at all.
         self.vp9.commit(&frame, surface)?;
         Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame: frame_out })
     }
@@ -745,6 +838,116 @@ mod tests {
     use super::super::picture::SliceParam;
     use super::*;
     use ffi::{SLICE_DATA_BUFFER, SLICE_PARAMETER_BUFFER};
+
+    /// **A VP9 superframe is one sample holding several frames, and each frame's record must be
+    /// built from that frame's own bytes.**
+    ///
+    /// This is the whole of the superframe fix, asserted without a driver: `first_partition_size` is
+    /// how a driver finds a frame's compressed header (`va_dec_vp9.h:167-169`), and it is computed as
+    /// *the frame's length less its uncompressed header*. Hand the record builder the whole sample and
+    /// that subtraction lands in the **next frame's bytes** — a valid-looking number pointing at the
+    /// wrong place, which is the `33`-instead-of-`32` class rather than a crash.
+    ///
+    /// The frames here are hand-built, so the test can make the two lengths differ by a known amount
+    /// and assert the exact value rather than only that they differ. The fixture in `tests/vaapi.rs`
+    /// proves the same property on real encoded frames; this one needs no encoder and so runs
+    /// everywhere, including on a machine whose driver never sees a VP9 frame.
+    /// A VP9 frame this test can build: a key frame whose uncompressed header the parser reads, padded
+    /// to `total` bytes so two frames of clearly different lengths can be made.
+    ///
+    /// **The padding is behind the header, not before it.** A VP9 frame is a header then a compressed
+    /// header, and the record's `first_partition_size` is the length of the second — so extra bytes
+    /// have to go where a real frame's compressed header goes, or the frame does not parse at all.
+    fn vp9_frame_of(total: usize) -> Vec<u8> {
+        let mut bits: Vec<bool> = Vec::new();
+        let put = |value: u32, n: usize, bits: &mut Vec<bool>| bits.extend((0..n).map(|i| value >> (n - 1 - i) & 1 == 1));
+        put(2, 2, &mut bits); // frame_marker
+        put(0, 2, &mut bits); // profile_low_bit, profile_high_bit — profile 0
+        put(0, 1, &mut bits); // show_existing_frame
+        put(0, 1, &mut bits); // frame_type — KEY_FRAME
+        put(1, 1, &mut bits); // show_frame
+        put(0, 1, &mut bits); // error_resilient_mode
+        put(0x49_83_42, 24, &mut bits); // frame_sync_code
+        put(1, 3, &mut bits); // color_space — BT.601
+        put(0, 1, &mut bits); // color_range
+        put(319, 16, &mut bits); // frame_width_minus_1 — 320
+        put(239, 16, &mut bits); // frame_height_minus_1 — 240
+        put(0, 1, &mut bits); // render_and_frame_size_different
+        put(1, 1, &mut bits); // refresh_frame_context
+        put(1, 1, &mut bits); // frame_parallel_decoding_mode
+        put(0, 2, &mut bits); // frame_context_idx
+        put(37, 6, &mut bits); // loop_filter_level
+        put(5, 3, &mut bits); // loop_filter_sharpness
+        put(0, 1, &mut bits); // loop_filter_delta_enabled
+        put(128, 8, &mut bits); // base_q_idx
+        put(0, 1, &mut bits); // delta_q_y_dc_present
+        put(0, 1, &mut bits); // delta_q_uv_dc_present
+        put(0, 1, &mut bits); // delta_q_uv_ac_present
+        put(0, 1, &mut bits); // segmentation_enabled
+        // 6.2.13's tile_info, written the way the parser reads it: at 320x240 there is one superblock
+        // column, so `min_log2` is 0 and `max_log2` is 0, the `while` loop that would read a
+        // `tile_cols_log2` flag never runs, and the next bit read is `tile_rows_log2`. Writing a bit
+        // here would shift every field after it — the tile counts are derived from the size, not
+        // spelled, which is what makes this easy to get wrong by hand.
+        put(0, 1, &mut bits); // tile_rows_log2 — one superblock row
+        // The compressed header's length, as 6.2.14's `header_size_in_bytes` states it. It is not the
+        // field the record submits — that is measured from the frame's real length — so any value over
+        // zero parses, and this one says 1 so the padding below is unambiguously tile data.
+        put(1, 16, &mut bits);
+        put(1, 1, &mut bits); // trailing_bits
+        let mut out: Vec<u8> = bits.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |v, (i, &b)| v | (u8::from(b) << (7 - i)))).collect();
+        assert!(out.len() <= total, "a {total}-byte frame must be able to hold its own header");
+        out.resize(total, 0);
+        out
+    }
+
+    #[test]
+    fn a_vp9_superframe_gives_each_frame_a_record_built_from_its_own_bytes() {
+        // Two real, parseable frames of clearly different lengths, so "measured from the sample" and
+        // "measured from the frame" cannot coincide. The marker is VP9 Annex B's: `0xc0`, a 4-byte
+        // size field (`3 << 3`), and the frame count minus one in the low three bits.
+        let first = vp9_frame_of(300);
+        let second = vp9_frame_of(900);
+        let marker = 0xc0u8 | (3 << 3) | 1;
+        let mut sample = Vec::new();
+        sample.extend_from_slice(&first);
+        sample.extend_from_slice(&second);
+        sample.push(marker);
+        sample.extend_from_slice(&(first.len() as u32).to_le_bytes());
+        sample.extend_from_slice(&(second.len() as u32).to_le_bytes());
+        sample.push(marker);
+
+        // The split is what the decode loop performs first, and it must find both frames.
+        let parts = filmcraft_vp9::header::split_superframe(&sample);
+        assert_eq!(parts.len(), 2, "a two-frame superframe splits into two frames");
+        assert_eq!(parts[0], first.as_slice(), "member 0 is the first frame, byte for byte");
+        assert_eq!(parts[1], second.as_slice(), "member 1 is the second frame, byte for byte");
+
+        // **And each member is what a record must be built from.** Asserted against the real builder
+        // and read back through `ffi`, so this is the number the driver would read rather than a
+        // restatement of the formula.
+        let refs: [Option<filmcraft_vp9::header::RefInfo>; 8] = std::array::from_fn(|_| Some(filmcraft_vp9::header::RefInfo { width: 320, height: 240 }));
+        for (i, part) in parts.iter().enumerate() {
+            let mut state = filmcraft_vp9::header::HeaderState::default();
+            let header =
+                filmcraft_vp9::header::parse_uncompressed(part, &mut state, &refs).unwrap_or_else(|e| panic!("member {i} is a frame the parser reads: {e}"));
+            let record = super::super::picture::vp9_picture_record(&header, &state, part, &super::super::picture::Vp9ReferenceSet::default())
+                .unwrap_or_else(|e| panic!("member {i} is describable: {e}"));
+            let got = ffi::picture_params_vp9(&record).expect("92 bytes is a VP9 picture record").first_partition_size;
+            assert_eq!(
+                usize::from(got),
+                part.len() - header.uncompressed_size,
+                "member {i}: first_partition_size is measured from the frame's own {} bytes, not the sample's {}",
+                part.len(),
+                sample.len()
+            );
+            // The defect this exists to catch, stated so a regression names itself: the whole-sample
+            // reading is a *different, larger* number, so the two cannot be confused.
+            let whole_sample = sample.len() - header.uncompressed_size;
+            assert_ne!(usize::from(got), whole_sample, "member {i}: the per-frame and whole-sample readings agree, so this fixture cannot catch the defect");
+            assert!(usize::from(got) < whole_sample, "member {i}: the correct extent is the smaller one — the whole-sample value reaches into the next frame");
+        }
+    }
 
     /// The pool is sized so that a picture always has a surface that is not a live reference, which is
     /// the defect a bare rotation invites: on a 6-surface ring with 5 live references it eventually

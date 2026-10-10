@@ -910,14 +910,19 @@ pub fn vp9_decline(profile: u8, bit_depth: u32) -> Option<String> {
 ///   depth against the previous frame's, which is a claim about the wrong frame — and, against a
 ///   fresh parse state, an 8-bit default that a 10-bit stream never said. So it is gated on
 ///   [`FrameHeader::frame_is_intra`], exactly the condition under which the header carries one.
-pub fn vp9_entry_disagreement(info: &FrameStreamInfo, h: &FrameHeader) -> Option<String> {
-    if h.profile != info.profile {
-        return Some(format!("VP9 picture parameters: the sample entry says profile {}, the frame header says profile {}", info.profile, h.profile));
+///
+/// **The container's two numbers are taken as values** rather than as the `FrameStreamInfo` that carries
+/// them, because the decode loop reads them once per frame inside a loop that mutates the decoder and
+/// cannot hold a borrow of its own stream description across it. They are also the *only* two fields
+/// the check reads, so nothing is lost by naming them.
+pub fn vp9_entry_disagreement(profile: u8, bit_depth: u32, h: &FrameHeader) -> Option<String> {
+    if h.profile != profile {
+        return Some(format!("VP9 picture parameters: the sample entry says profile {profile}, the frame header says profile {}", h.profile));
     }
-    if h.frame_is_intra && u32::from(h.color.bit_depth) != info.bit_depth {
+    if h.frame_is_intra && u32::from(h.color.bit_depth) != bit_depth {
         return Some(format!(
-            "VP9 picture parameters: the sample entry says {} bits, the frame header's colour configuration says {} bits",
-            info.bit_depth, h.color.bit_depth
+            "VP9 picture parameters: the sample entry says {bit_depth} bits, the frame header's colour configuration says {} bits",
+            h.color.bit_depth
         ));
     }
     None
@@ -1339,7 +1344,7 @@ fn vp9_frame_entry_error(info: &FrameStreamInfo, sample: &[u8]) -> String {
     // disagreement is a fact about the stream whatever the frame is — 6.2 reads the profile before the
     // `show_existing_frame` bit, so a re-show names one too, and answering "this frame is a re-show"
     // first would leave a container that disagrees with every frame of it unchecked.
-    if let Some(why) = vp9_entry_disagreement(info, &header) {
+    if let Some(why) = vp9_entry_disagreement(info.profile, info.bit_depth, &header) {
         return why;
     }
     // **A frame that carries no picture parameters of its own is told that**, in the same words
@@ -4512,27 +4517,27 @@ mod tests {
     ///   against `ColorConfig::default()`'s 8 bits, which a 10-bit stream never said.
     #[test]
     fn the_sample_entry_cross_check_is_asked_of_every_frame_and_the_depth_only_where_it_is_spelled() {
-        let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, 2, 10, (1, 1), (1920, 1080));
+        // The container's two numbers, which is all this function reads of a sample entry — see its doc.
         let good = |mut h: FrameHeader| {
             h.profile = 2;
             h.frame_is_intra = true;
             h.color.bit_depth = 10;
             h
         };
-        assert_eq!(super::vp9_entry_disagreement(&info, &good(FrameHeader::default())), None, "an intra frame that agrees");
+        assert_eq!(super::vp9_entry_disagreement(2, 10, &good(FrameHeader::default())), None, "an intra frame that agrees");
 
         // A profile disagreement is refused whatever the frame is — including a re-show, whose header
         // 6.2 fills in with the profile and nothing else.
         let mut re_show = FrameHeader { profile: 0, show_existing_frame: true, frame_to_show_map_idx: 3, ..FrameHeader::default() };
         re_show.frame_is_intra = false;
-        let why = super::vp9_entry_disagreement(&info, &re_show).expect("a re-show spells its profile, so it is checked too");
+        let why = super::vp9_entry_disagreement(2, 10, &re_show).expect("a re-show spells its profile, so it is checked too");
         assert!(why.contains("says profile 2"), "{why}");
         assert!(why.contains("says profile 0"), "{why}");
 
         // A depth disagreement is refused where `color_config` was read.
         let mut shallow_key = good(FrameHeader::default());
         shallow_key.color.bit_depth = 8;
-        let why = super::vp9_entry_disagreement(&info, &shallow_key).expect("a key frame spells its colour configuration");
+        let why = super::vp9_entry_disagreement(2, 10, &shallow_key).expect("a key frame spells its colour configuration");
         assert!(why.contains("says 10 bits"), "{why}");
         assert!(why.contains("says 8 bits"), "{why}");
 
@@ -4540,7 +4545,7 @@ mod tests {
         // frame for a colour configuration it never carried.
         let mut inter = FrameHeader { profile: 2, frame_is_intra: false, color: filmcraft_vp9::header::ColorConfig::default(), ..FrameHeader::default() };
         inter.color.bit_depth = 8;
-        assert_eq!(super::vp9_entry_disagreement(&info, &inter), None, "an inter frame inherits its colour, so this is not a disagreement");
+        assert_eq!(super::vp9_entry_disagreement(2, 10, &inter), None, "an inter frame inherits its colour, so this is not a disagreement");
     }
 
     /// A VP9 record is built from the frame's *own* uncompressed header, which libva wants as a
