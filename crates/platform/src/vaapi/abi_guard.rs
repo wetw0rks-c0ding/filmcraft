@@ -27,7 +27,7 @@
 //! run the VA-API backend at all — they are an assertion, not a courtesy.
 
 use super::*;
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 
 /// Where the libva headers live on this machine.
 const LIBVA_HEADERS: &str = "/usr/include/va";
@@ -139,6 +139,51 @@ fn every_entry_point_has_the_arity_the_header_declares() {
     assert!(!ENTRY_POINTS.is_empty(), "the table of entry points is empty, so the loop above proved nothing");
 }
 
+/// `VADecPictureParameterBufferVP9` (`va_dec_vp9.h:58`) is measured here for the reason the other
+/// records are, and the header's one structural difference from H.264 is worth naming: its
+/// `first_partition_size` is a `uint16_t` behind a one-byte hole (offset 46, not 45), so a
+/// declaration that reads the header's field order as its byte order is 92 bytes of record at
+/// offsets a driver did not compile against.
+#[test]
+fn the_vp9_picture_record_is_the_size_the_header_declares() {
+    if !std::path::Path::new(LIBVA_HEADERS).join("va_dec_vp9.h").is_file() {
+        eprintln!("SKIPPED: no {LIBVA_HEADERS}/va_dec_vp9.h");
+        return;
+    }
+    let Some(cc) = ["cc", "gcc", "clang"].into_iter().find_map(which) else {
+        eprintln!("SKIPPED: no C compiler to measure the headers with");
+        return;
+    };
+    // Both the size and the two offsets a plausible reading gets wrong, asked of the C compiler
+    // rather than of `offset_of!` on our own declaration: the point is that the two agree, and a
+    // test that reads both sides of the comparison out of our own code proves nothing.
+    let source = format!(
+        "#include <stdint.h>\n#include <va/va.h>\n#include <va/va_dec_vp9.h>\n\
+         _Static_assert(sizeof(VADecPictureParameterBufferVP9) == {size}, \"sizeof\");\n\
+         _Static_assert(__builtin_offsetof(VADecPictureParameterBufferVP9, first_partition_size) == {first}, \"first_partition_size\");\n\
+         _Static_assert(__builtin_offsetof(VADecPictureParameterBufferVP9, va_reserved) == {reserved}, \"va_reserved\");\n",
+        size = size_of::<VaPictureParameterBufferVp9>(),
+        first = offset_of!(VaPictureParameterBufferVp9, first_partition_size),
+        reserved = offset_of!(VaPictureParameterBufferVp9, va_reserved),
+    );
+    let dir = std::env::temp_dir().join(format!("filmcraft-va-vp9-abi-{}", std::process::id()));
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("SKIPPED: no writable temporary directory");
+        return;
+    }
+    let path = dir.join("vp9abi.c");
+    let written = std::fs::write(&path, source.as_bytes()).is_ok();
+    let out = if written {
+        std::process::Command::new(&cc).args(["-fsyntax-only", "-I", LIBVA_HEADERS, path.to_str().unwrap_or_default()]).output()
+    } else {
+        eprintln!("SKIPPED: cannot write {}", path.display());
+        return;
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = out.unwrap_or_else(|e| panic!("running {cc} failed: {e}"));
+    assert!(out.status.success(), "{cc} disagrees with our VADecPictureParameterBufferVP9:\n{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// Every declaration, judged by a C compiler reading the same headers.
 ///
 /// The entry points are *redeclared*, not merely counted: C requires a redeclaration to be
@@ -169,6 +214,7 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
         ("VAPictureHEVC", size_of::<VaPictureHevc>()),
         ("VAPictureParameterBufferHEVC", size_of::<VaPictureParameterBufferHevc>()),
         ("VASliceParameterBufferHEVC", size_of::<VaSliceParameterBufferHevc>()),
+        ("VADecPictureParameterBufferVP9", size_of::<VaPictureParameterBufferVp9>()),
         ("VACodedBufferSegment", size_of::<VaCodedBufferSegment>()),
         ("VABufferInfo", size_of::<VaBufferInfo>()),
         ("VAEncSequenceParameterBufferH264", size_of::<VaEncSequenceParameterBufferH264>()),
@@ -177,7 +223,8 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
         ("VAEncMiscParameterFrameRate", size_of::<VaEncMiscParameterFrameRate>()),
         ("VAEncMiscParameterQuantization", size_of::<VaEncMiscParameterQuantization>()),
     ];
-    let mut source = String::from("#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_enc_h264.h>\n");
+    let mut source =
+        String::from("#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n");
     source.push_str(
         "/* One line per entry point, exactly as ffi.rs declares it. A redeclaration\n   that disagrees with the header is an error, not a warning. */\n",
     );

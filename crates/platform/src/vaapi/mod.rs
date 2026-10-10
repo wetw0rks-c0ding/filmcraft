@@ -49,7 +49,12 @@ mod decoder;
 mod encoder;
 
 pub use decoder::{Timings, VaDecoder};
+// The VP9 picture-parameter record and the profile table it declines against. Exported from here so
+// that the record builder is reachable without naming a `VA*` structure — `mod.rs` never names one,
+// and a caller that has a `HeaderState` and a set of reference surfaces builds a VP9 record through
+// this path rather than through `build_frame`, which cannot (see `picture::build_frame`).
 pub use encoder::{Current, EncodeRequest, EncodedPicture, MAX_REFERENCES, Reference, VaEncoder, macroblocks_of, ramp_picture, ramp_shifted};
+pub use picture::{Vp9ReferenceSet, vp9_decline, vp9_is_new_frame, vp9_picture_record};
 // What a caller outside this module needs to build a decoder: [`Display`] is the initialised libva
 // connection a session is created on; [`stream_info`] reads a sample entry into the codec-agnostic
 // `StreamInfo` the rest of the workspace speaks, and [`Stream`] is this backend's own view of a

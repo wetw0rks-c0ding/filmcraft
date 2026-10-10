@@ -817,6 +817,60 @@ pub struct VaSliceParameterBufferHevc {
     pub va_reserved: [u32; VA_PADDING_LOW - 2],
 }
 
+/// `VADecPictureParameterBufferVP9` (`va_dec_vp9.h:58`): the VP9 picture-level record. **92 bytes**.
+///
+/// **VP9's shape is not H.264's or HEVC's, and the one that matters is `reference_frames`.** It is
+/// `VASurfaceID[8]` and it is the *whole* decoded picture buffer, not a list: there is no count
+/// beside it, no per-slice list that indexes it, and nothing that says how many of the eight slots
+/// are live. A slot that holds no picture says so with `VA_INVALID_SURFACE` (`va.h:1648`), because a
+/// slot naming a surface the driver never created is a reference to whatever surface 0 happens to
+/// hold. The `last_ref_frame` / `golden_ref_frame` / `alt_ref_frame` bits in `pic_fields` are indices
+/// *into this array*, so it is filled in whole or not at all.
+///
+/// The other two fields with no counterpart in the per-frame header are the ones this backend's
+/// parser supplies rather than a bitstream field:
+/// - `filter_level` / `sharpness_level` are the loop filter's own state, which VP9 6.2.8 carries
+///   across frames (its deltas are conditional updates to the previous frame's).
+/// - `mb_segment_tree_probs` / `segment_pred_probs` are VP9 6.2.11's segmentation probabilities,
+///   read only when `segmentation_update_map` is set and therefore persisting from frame to frame.
+///   The header's own comment on them — "They should be parsed directly from bitstream by
+///   application" (`va_dec_vp9.h:172-175`) — is what makes them this backend's job rather than the
+///   driver's.
+///
+/// `frame_header_length_in_bytes` is the byte length of the **uncompressed** header
+/// (`va_dec_vp9.h:157-164`) and `first_partition_size` that of the **compressed** one
+/// (`va_dec_vp9.h:167-169`, "the byte count of compressed header the bitstream buffer"). They are
+/// two different counts of the same frame and neither can be derived from the other alone, which is
+/// why the record is built from the frame's bytes as well as from its parsed header.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaPictureParameterBufferVp9 {
+    /// Coded picture width, "may not be multiple of 8" (`va_dec_vp9.h:59-62`).
+    pub frame_width: u16,
+    /// Coded picture height (`va_dec_vp9.h:63-66`).
+    pub frame_height: u16,
+    /// The whole decoded picture buffer, one surface per slot; see the note above.
+    pub reference_frames: [VASurfaceID; 8],
+    /// `pic_fields`: the header's flags and frame-context numbers, packed into the union's `value`
+    /// member by [`crate::vaapi::picture::vp9_pic_fields`].
+    pub pic_fields: u32,
+    pub filter_level: u8,
+    pub sharpness_level: u8,
+    pub log2_tile_rows: u8,
+    pub log2_tile_columns: u8,
+    pub frame_header_length_in_bytes: u8,
+    /// The C layout's hole at offset 45, before `first_partition_size`.
+    pub padding_before_first_partition_size: [u8; 1],
+    pub first_partition_size: u16,
+    pub mb_segment_tree_probs: [u8; 7],
+    pub segment_pred_probs: [u8; 3],
+    /// VP9 profile, "value range [0..3]" (`va_dec_vp9.h:179-182`).
+    pub profile: u8,
+    /// Bit depth per sample, luma and chroma alike (`va_dec_vp9.h:184-187`).
+    pub bit_depth: u8,
+    pub va_reserved: [u32; VA_PADDING_MEDIUM],
+}
+
 // ---------------------------------------------------------------------------------------------
 // The encode records. Encode is the mirror image of decode (the plan's "decisive difference"): the
 // app hands the driver a picture and the driver writes the slice headers, so these are the records
@@ -1292,6 +1346,13 @@ pub fn picture_params_hevc(bytes: &[u8]) -> Option<VaPictureParameterBufferHevc>
 pub fn slice_params_hevc(bytes: &[u8]) -> Option<VaSliceParameterBufferHevc> {
     // SAFETY: `VaSliceParameterBufferHevc` is a `#[repr(C)]` struct declared above.
     unsafe { record_of::<VaSliceParameterBufferHevc>(bytes) }
+}
+
+/// The VP9 picture parameter record `bytes` carries, or `None` if it is not one long enough.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn picture_params_vp9(bytes: &[u8]) -> Option<VaPictureParameterBufferVp9> {
+    // SAFETY: `VaPictureParameterBufferVp9` is a `#[repr(C)]` struct declared above.
+    unsafe { record_of::<VaPictureParameterBufferVp9>(bytes) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3730,6 +3791,84 @@ mod tests {
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, slice_data_num_emu_prevn_bytes), 252);
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, padding_before_va_reserved), 254, "the hole before va_reserved");
         assert_eq!(offset_of!(VaSliceParameterBufferHevc, va_reserved), 256);
+        // VP9 (va_dec_vp9.h:58). **92 bytes, and two of the offsets are the ones a plausible reading of
+        // the header gets wrong.** `first_partition_size` is a `uint16_t` at 46, not at 45: byte 45 is
+        // the hole the 2-byte alignment makes in front of it, so `frame_header_length_in_bytes` ends at
+        // 44 and the compressed-header count starts at 46. And `va_reserved[VA_PADDING_MEDIUM]` is 32
+        // bytes at 60 — 60 is already a multiple of 4, so `bit_depth` at 59 is followed by no
+        // padding at all, and the record is 92 bytes rather than the 96 a "round up to a multiple of
+        // 8" reading would give. Both are measured against `/usr/include/va/va_dec_vp9.h` by a C
+        // compiler in `every_declaration_matches_what_a_c_compiler_measures`, so the numbers below are
+        // not the ones Rust and the header happen to agree on by accident.
+        assert_eq!(size_of::<VaPictureParameterBufferVp9>(), 92, "VADecPictureParameterBufferVP9 (va_dec_vp9.h:58)");
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, frame_width), 0);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, frame_height), 2);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, reference_frames), 4, "the eight surfaces are 32 bytes from offset 4");
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, pic_fields), 36);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, filter_level), 40);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, sharpness_level), 41);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, log2_tile_rows), 42);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, log2_tile_columns), 43);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, frame_header_length_in_bytes), 44);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, padding_before_first_partition_size), 45, "the C layout's hole before first_partition_size");
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, first_partition_size), 46, "the uint16_t is 2-aligned, not 1-aligned");
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, mb_segment_tree_probs), 48);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, segment_pred_probs), 55);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, profile), 58);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, bit_depth), 59);
+        assert_eq!(offset_of!(VaPictureParameterBufferVp9, va_reserved), 60, "bit_depth ends at 60, which is already 4-aligned");
+    }
+
+    /// The `pic_fields` word is a C bitfield, and its layout is not a choice this crate makes: the
+    /// header declares its members least-significant-first on this target, and a word packed in any
+    /// other order is a *different picture*, not a different build.
+    ///
+    /// So this reads the bit positions out of `/usr/include/va/va_dec_vp9.h` rather than out of a
+    /// table someone typed, and compares them against the packing function that builds the word.
+    /// A record whose field order drifts from the header's fails here, where the message names the
+    /// member, instead of as a subtly wrong picture on screen.
+    ///
+    /// It is skipped, with a note, where the headers are not installed — which is every machine that
+    /// cannot run this backend at all, so it is an assertion and not a courtesy. (`abi_guard`
+    /// measures the *sizes* the same way; a bitfield's positions are not a `sizeof`, so nothing else
+    /// here covers them.)
+    #[test]
+    fn the_vp9_pic_fields_word_is_the_one_the_header_declares() {
+        let header = std::path::Path::new("/usr/include/va/va_dec_vp9.h");
+        let Ok(text) = std::fs::read_to_string(header) else {
+            eprintln!("SKIPPED: no {}, so there is no header to read the bit positions from", header.display());
+            return;
+        };
+        // Every `uint32_t <name> : <width>;` inside the `pic_fields` union. Only that union is
+        // scanned, so `VASegmentParameterVP9`'s own `uint16_t` bitfields below are not mistaken for
+        // it — the two are different records and their members have the same names' shapes for
+        // different reasons.
+        let Some((union, _)) = text.split_once("union {").and_then(|(_, rest)| rest.split_once("pic_fields")) else {
+            panic!("va_dec_vp9.h has no pic_fields union to read bit positions from");
+        };
+        let union = union.split_once("} bits;").map_or(union, |(bits, _)| bits);
+
+        let mut declared = Vec::new();
+        for line in union.lines() {
+            let line = line.split_once("uint32_t").map_or("", |(_, rest)| rest);
+            let Some((name, width)) = line.split_once(':') else { continue };
+            let name = name.trim();
+            let Some(width) = width.trim().strip_suffix(';').and_then(|w| w.trim().parse::<u32>().ok()) else { continue };
+            declared.push((name, width));
+        }
+        assert!(!declared.is_empty(), "no `uint32_t name : width;` lines were read out of the pic_fields union, so nothing was checked");
+
+        // The order the header declares them in is the order they occupy the word on this target, so
+        // the expected positions are a prefix sum of the declared widths — derived, not transcribed.
+        let mut at = 0u32;
+        let mut expected: Vec<(&str, u32, u32)> = Vec::new();
+        for (name, width) in &declared {
+            expected.push((name, at, *width));
+            at += *width;
+        }
+        assert_eq!(at, 32, "the header's members fill all 32 bits, so no bit of the word is unnamed");
+
+        assert_eq!(crate::vaapi::picture::vp9_pic_fields_positions(), expected, "the bit positions `vp9_pic_fields` packs by do not match va_dec_vp9.h:83-140");
     }
 
     /// Every byte of a record is a named field, so no byte of a default record is indeterminate —

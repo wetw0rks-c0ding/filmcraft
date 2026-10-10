@@ -26,9 +26,11 @@ use filmcraft_codecs::hw::{FrameCodec, FrameStreamInfo, NalCodec, NalStreamInfo}
 use super::ffi::{
     INVALID_SURFACE, PICTURE_H264_INVALID, PICTURE_H264_LONG_TERM_REFERENCE, PICTURE_H264_SHORT_TERM_REFERENCE, PICTURE_HEVC_INVALID,
     PICTURE_HEVC_LONG_TERM_REFERENCE, PICTURE_HEVC_RPS_LT_CURR, PICTURE_HEVC_RPS_ST_CURR_AFTER, PICTURE_HEVC_RPS_ST_CURR_BEFORE, SLICE_DATA_FLAG_ALL,
-    VA_PADDING_LOW, VaIqMatrixBufferH264, VaPictureH264, VaPictureHevc, VaPictureParameterBufferH264, VaPictureParameterBufferHevc, VaSliceParameterBufferH264,
-    VaSliceParameterBufferHevc, record_bytes,
+    VA_PADDING_LOW, VaIqMatrixBufferH264, VaPictureH264, VaPictureHevc, VaPictureParameterBufferH264, VaPictureParameterBufferHevc,
+    VaPictureParameterBufferVp9, VaSliceParameterBufferH264, VaSliceParameterBufferHevc, record_bytes,
 };
+
+use filmcraft_vp9::header::{FrameHeader, HeaderState, KEY_FRAME};
 
 /// The most reference frames a `VAPictureParameterBufferH264` holds (`ReferenceFrames[16]`,
 /// `va.h:3601`). The DPB a picture may use is bounded by the stream's own parsed DPB size and by
@@ -809,33 +811,459 @@ pub fn build_nal(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface:
     }
 }
 
-/// The tail both frame-codec declines end in: neither codec crate exposes the per-frame header a
-/// picture parameter record needs. [`super::plan_frame`] and [`build_frame`] both build their
-/// message from this, so a caller that hits either is told the same thing.
+/// The tail the **AV1** decline ends in. [`super::stream::plan_frame`] and [`build_frame`] both build
+/// their message from this, so a caller that hits either is told the same thing.
+///
+/// **VP9 does not use this any more, and that is the point of the split.** Its uncompressed frame
+/// header *is* exposed (`filmcraft_vp9::header`) and [`vp9_picture_record`] builds the record from
+/// it; what is missing there is the reference state, which has its own message. The wording is kept
+/// as one constant rather than inlined so the two AV1 sites cannot drift.
 pub(crate) const FRAME_HEADER_MISSING: &str = "does not expose the uncompressed frame header";
 
-/// The record one frame-coded (VP9 / AV1) sample is submitted as, or why it has none.
+/// The reason this backend does not decode a VP9 frame of this profile at this depth, or `None` for
+/// the ones it does.
 ///
-/// VP9 and AV1 carry their picture structure in each frame's own uncompressed header, and libva
-/// wants that header as a record. FilmCraft parses those headers — in `filmcraft_vp9` and
-/// `filmcraft_av1` — but exposes only the key frame's stream parameters and the AV1 sequence
-/// header, not the per-frame header a record needs (VP9's tile and loop-filter state, AV1's tile
-/// layout and quantizer). So this milestone submits neither, and says so, rather than hand a driver
-/// a record full of zeros it would read as a valid picture.
+/// **This is the one decline table for VP9**, and both sides of the decision call it:
+/// [`super::stream::plan_frame`] refuses a stream whose profile table rejects it,
+/// [`vp9_picture_record`] refuses a frame the same way, and `build_frame` refuses before looking at
+/// the sample at all. A stream that is planned into a record is therefore a stream the record
+/// builder accepts, and one refused is refused by both **in the same words** — which is what stops
+/// the two from drifting into the bug this backend already had once on H.264, where two records
+/// disagreed about the same frame and produced pictures nobody could explain.
 ///
-/// **This is a backstop, not the decision.** [`super::plan_frame`] declines every VP9 and AV1 stream
-/// while it is still a stream description, so a caller should never arrive here with one; the `Err`
-/// below says the same thing `plan_frame` says, for a caller that skips planning. The two must agree
-/// about what this backend supports: a decline that names a reason the other side does not is a bug
-/// in one of them. [`FrameCodec`] and [`FrameStreamInfo`] are the arguments this takes so that the
-/// signature does not change when the records arrive.
-pub fn build_frame(info: &FrameStreamInfo, _sample: &[u8]) -> Result<Picture, String> {
+/// VP9's *chroma format* and *bit depth* are two separate axes and the record carries them
+/// independently (`profile` and `bit_depth`), so the table is over the pair. Per VP9 6.2's
+/// `color_config`: profile 0 is 8-bit 4:2:0, profile 1 is 8/10-bit 4:2:2 or 4:4:0, profile 2 is
+/// 8/10/12-bit 4:2:0, profile 3 is 8/10/12-bit 4:4:4, and **profile 4 is reserved and undefined**.
+///
+/// What is declined, and why:
+///
+/// - **Profiles 1 and 3** — 4:2:2, 4:4:0 and 4:4:4. libva's VP9 decode API documents "This VP9
+///   decoding API supports 8-bit 420 format only" (`va_dec_vp9.h:42`), and every surface this
+///   backend creates is 4:2:0 (`RtFormat::Nv12` / `Yuv420_10`), so a 4:4:4 frame has no surface to
+///   decode into. The same reason H.264 and HEVC decline `chroma_format_idc` 2 and 3 — out of scope
+///   for the codec, not for this backend's effort.
+/// - **Profile 4** — reserved by the specification, so its meaning is *undefined*, not merely
+///   unimplemented. It is refused rather than parsed on the assumption that it behaves like another
+///   profile, which is precisely the guess that produces a plausible wrong picture.
+/// - **12-bit** — VP9 defines it (profile 2 or 3, `color_config`'s `twelve_bit` flag) and this
+///   backend has neither a 12-bit surface nor a 12-bit readback, so there is nowhere to put it.
+///
+/// Note that the reason is a property of the codec and of this backend's surface formats, **not** of
+/// whether the driver offers the profile: a driver advertises VP9 for all four (`VLD: true`), and
+/// being offered a profile says nothing about this backend having a surface to decode it into. That is
+/// why the table is here rather than read off the driver.
+pub fn vp9_decline_reason(profile: u8, bit_depth: u32) -> Option<&'static str> {
+    match (profile, bit_depth) {
+        // The two profiles this milestone is scoped to, each at the depths 4:2:0 has a surface for.
+        // Profile 2 at 8 bits is legal VP9 (a `ten_or_twelve_bit` of 0) and decodes as profile 2.
+        (0, 8) | (2, 8 | 10) => None,
+        (1 | 3, _) => Some("4:2:2, 4:4:0 or 4:4:4 chroma, which is out of scope here for any codec"),
+        (4, _) => Some("profile 4, which the VP9 specification reserves and does not define"),
+        (_, 12) => Some("12-bit, for which this backend has no surface and no readback"),
+        _ => Some("a profile and bit depth combination VP9 does not define"),
+    }
+}
+
+/// The reason as the sentence a decline carries: `"VP9 profile {profile} at {depth} bits: {why}"`.
+///
+/// One function, so that `plan_frame` and the check inside `vp9_picture_record` produce the *same*
+/// sentence for the same frame. A test walks the whole table and compares the two, which is what
+/// makes the agreement a fact rather than an intention.
+pub fn vp9_decline(profile: u8, bit_depth: u32) -> Option<String> {
+    vp9_decline_reason(profile, bit_depth).map(|why| format!("VP9 profile {profile} at {bit_depth} bits: {why}"))
+}
+
+/// The eight reference slots of a `VADecPictureParameterBufferVP9`, as surfaces.
+///
+/// **`reference_frames` is the whole decoded picture buffer, not a list of the references this frame
+/// uses.** That is the one place VP9's record shape differs from H.264's and HEVC's, and it is
+/// required by the specification: VP9 has no reference list modification and no per-slice list, and
+/// a reference is identified by its **slot number** (`ref_frame_idx` in the header, and the
+/// `last_ref_frame` / `golden_ref_frame` / `alt_ref_frame` members of the record) rather than by a
+/// position in a list. The driver's picture buffer is addressed by the same numbers, so the record
+/// must describe **all** of it — including the slots this frame does not happen to predict from.
+///
+/// A `None` is a slot with no picture in it, submitted as `VA_INVALID_SURFACE` (`0xffffffff`,
+/// `va.h:1648`) rather than left as a zero: surface ids come from `vaCreateSurfaces` and are not
+/// guaranteed to avoid any value, so a zero would name *some* surface and the driver would read it
+/// as a reference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Vp9ReferenceSet {
+    /// Indexed by VP9 reference *slot* (`ref_frame_idx`), 0..=7. `None` for an empty slot.
+    pub slots: [Option<u32>; 8],
+}
+
+impl Vp9ReferenceSet {
+    /// The slot a reference index names, or `None` if the index names no slot this set holds.
+    ///
+    /// A `ref_frame_idx` is 3 bits of bitstream, so it is in range by construction — but the bound is
+    /// still here, because the record's indices and its array are two different things and a caller
+    /// that assembled the set from somewhere else must not be able to index past it.
+    pub fn get(&self, index: u8) -> Option<u32> {
+        self.slots.get(index as usize).copied().flatten()
+    }
+
+    /// Every slot, as the record's own array: a `None` as `VA_INVALID_SURFACE`.
+    fn to_record(self) -> [u32; 8] {
+        std::array::from_fn(|i| self.slots[i].unwrap_or(INVALID_SURFACE))
+    }
+}
+
+/// The bit positions `vp9_pic_fields` packs by, as `(first bit, width, member name)` in the order
+/// `va_dec_vp9.h:83-140` declares them.
+///
+/// **The order is the header's, not a choice this crate makes.** A C bitfield's members are allocated
+/// in declaration order from the least significant end on this target, so the positions are the
+/// running sum of the widths before each member. A word packed in any other order is a *different
+/// picture* and a driver reads it without complaint, which is why the positions are derived from the
+/// header rather than trusted: the test in `ffi.rs` reads them out of `/usr/include/va/va_dec_vp9.h`
+/// and compares them with this function's, so a reordering of the C struct — or of this table — fails
+/// with the member's name in the message.
+///
+/// The widths are what makes the count checkable: three-bit members (`mcomp_filter_type`,
+/// `last_ref_frame`, `golden_ref_frame`, `alt_ref_frame`) and two-bit ones (`reset_frame_context`,
+/// `frame_context_idx`) are where a wrong order does damage, since a `golden_ref_frame` shifted by one
+/// bit is a different reference picture.
+fn vp9_pic_field_positions() -> [(u32, u32, &'static str); 22] {
+    [
+        (0, 1, "subsampling_x"),
+        (1, 1, "subsampling_y"),
+        (2, 1, "frame_type"),
+        (3, 1, "show_frame"),
+        (4, 1, "error_resilient_mode"),
+        (5, 1, "intra_only"),
+        (6, 1, "allow_high_precision_mv"),
+        (7, 3, "mcomp_filter_type"),
+        (10, 1, "frame_parallel_decoding_mode"),
+        (11, 2, "reset_frame_context"),
+        (13, 1, "refresh_frame_context"),
+        (14, 2, "frame_context_idx"),
+        (16, 1, "segmentation_enabled"),
+        (17, 1, "segmentation_temporal_update"),
+        (18, 1, "segmentation_update_map"),
+        (19, 3, "last_ref_frame"),
+        (22, 1, "last_ref_frame_sign_bias"),
+        (23, 3, "golden_ref_frame"),
+        (26, 1, "golden_ref_frame_sign_bias"),
+        (27, 3, "alt_ref_frame"),
+        (30, 1, "alt_ref_frame_sign_bias"),
+        (31, 1, "lossless_flag"),
+    ]
+}
+
+/// The same positions as `(member, first bit, width)`, for the tests: `ffi.rs`'s compares them with
+/// the header, and `picture.rs`'s packs and unpacks by them.
+#[cfg(test)]
+pub(crate) fn vp9_pic_fields_positions() -> Vec<(&'static str, u32, u32)> {
+    vp9_pic_field_positions().into_iter().map(|(bit, width, name)| (name, bit, width)).collect()
+}
+
+/// The `pic_fields` word of a `VADecPictureParameterBufferVP9`: the frame header's flags, packed from
+/// bit 0 up in the order `va_dec_vp9.h:83-140` declares them.
+///
+/// `seg` is the segmentation parameters the frame was parsed into, because the three segmentation
+/// flags live on **VP9 6.2.11's** structure rather than on the header: 6.2.11 reads them as
+/// conditional updates to the previous frame's, exactly as the record's own comment says
+/// ("corresponds to variable temporal_update in VP9 code", `va_dec_vp9.h:97-102`), so a frame that
+/// does not set them still submits the values in force.
+///
+/// Loop filter level and sharpness are in the same category and are read from the state by
+/// [`vp9_picture_record`], not from here — the record has plain `uint8_t` fields for them.
+fn vp9_pic_fields(h: &FrameHeader, seg: &filmcraft_vp9::header::Segmentation) -> u32 {
+    // `ref_frame_sign_bias` is indexed by reference frame and `ref_frame_idx` is in the same order
+    // (LAST, GOLDEN, ALTREF), which is VP9 6.2.3's numbering: 0 is INTRA_FRAME, unused for the three
+    // an inter frame names. The indices come from the bitstream, so they are read through `get` — an
+    // out-of-range index contributes zero rather than indexing past a four-entry array, and zero is
+    // what a frame with no such reference has anyway.
+    let bias = |frame: usize| h.ref_frame_sign_bias.get(frame).copied().unwrap_or(false);
+    let refs = h.ref_frame_idx;
+    let mut word = 0u32;
+    for (at, width, name) in vp9_pic_field_positions() {
+        word |= bits(vp9_pic_field_value(h, seg, name, &refs, &bias), width) << at;
+    }
+    word
+}
+
+/// One member of the `pic_fields` word, by name.
+///
+/// The name comes from [`vp9_pic_field_positions`], so this match and that table have to agree on the
+/// spelling. A member renamed in one place and not the other would leave its bits zero with nothing
+/// saying so, which is why the test above compares the table with the header *and* this with the
+/// table.
+fn vp9_pic_field_value(h: &FrameHeader, seg: &filmcraft_vp9::header::Segmentation, name: &str, refs: &[u8; 3], bias: &impl Fn(usize) -> bool) -> u32 {
+    match name {
+        "subsampling_x" => u32::from(h.color.subsampling_x),
+        "subsampling_y" => u32::from(h.color.subsampling_y),
+        "frame_type" => u32::from(h.frame_type),
+        "show_frame" => u32::from(h.show_frame),
+        "error_resilient_mode" => u32::from(h.error_resilient_mode),
+        "intra_only" => u32::from(h.intra_only),
+        "allow_high_precision_mv" => u32::from(h.allow_high_precision_mv),
+        // `mcomp_filter_type` is 6.2.7's `filter_type`. The parser has already resolved
+        // `filter_type` through `LITERAL_TO_TYPE` and turned "switchable" into its own value, so this
+        // is the three-bit number the record wants rather than the two raw bits.
+        "mcomp_filter_type" => u32::from(h.interp_filter),
+        "frame_parallel_decoding_mode" => u32::from(h.frame_parallel_decoding_mode),
+        // The stateful three, and the risky ones. `reset_frame_context` and `frame_context_idx` are
+        // 6.2's own numbers and `refresh_frame_context` its flag; `frame_context_idx` the parser has
+        // already forced to 0 for a frame that resets its context (6.2.5), which is what the record
+        // has to say too, and the decode loop has to advance the right context next frame.
+        "reset_frame_context" => u32::from(h.reset_frame_context),
+        "refresh_frame_context" => u32::from(h.refresh_frame_context),
+        "frame_context_idx" => u32::from(h.frame_context_idx),
+        "segmentation_enabled" => u32::from(seg.enabled),
+        "segmentation_temporal_update" => u32::from(seg.temporal_update),
+        "segmentation_update_map" => u32::from(seg.update_map),
+        // The three references, by VP9 6.2.3's order and indexed into `reference_frames[]`.
+        "last_ref_frame" => u32::from(refs.first().copied().unwrap_or(0)),
+        "last_ref_frame_sign_bias" => u32::from(bias(LAST_FRAME_INDEX)),
+        "golden_ref_frame" => u32::from(refs.get(1).copied().unwrap_or(0)),
+        "golden_ref_frame_sign_bias" => u32::from(bias(GOLDEN_FRAME_INDEX)),
+        "alt_ref_frame" => u32::from(refs.get(2).copied().unwrap_or(0)),
+        "alt_ref_frame_sign_bias" => u32::from(bias(ALTREF_FRAME_INDEX)),
+        // The header states the definition in full (`va_dec_vp9.h:132-139`) and it is what our parser
+        // computes at `crates/vp9/src/header.rs:337`: `base_qindex == 0` and all three quantizer
+        // deltas 0. A driver reads this to decide a lossless decode path, so it is not a flag that can
+        // be approximated.
+        "lossless_flag" => u32::from(h.lossless),
+        _ => 0,
+    }
+}
+
+/// `value` narrowed to `width` bits, or zero if it does not fit.
+///
+/// The record's flags are fixed-width, so a value that does not fit cannot be described: masking it
+/// would submit a flag the bitstream never set, inside a member that is read as something else. This
+/// is the belt to [`vp9_picture_record`]'s braces — the checks there are the refusal a caller acts on,
+/// and this is what stops one member spilling into its neighbour if a check is ever missed.
+fn bits(value: u32, width: u32) -> u32 {
+    match 1u32.checked_shl(width) {
+        Some(limit) if value < limit => value,
+        _ => 0,
+    }
+}
+
+/// `LAST_FRAME` in the numbering `ref_frame_sign_bias` is indexed by: VP9 6.2.3 counts `INTRA_FRAME`
+/// 0, `LAST_FRAME` 1, `GOLDEN_FRAME` 2, `ALTREF_FRAME` 3, and index 0 is unused for the three an inter
+/// frame names.
+const LAST_FRAME_INDEX: usize = 1;
+/// See [`LAST_FRAME_INDEX`].
+const GOLDEN_FRAME_INDEX: usize = 2;
+/// See [`LAST_FRAME_INDEX`].
+const ALTREF_FRAME_INDEX: usize = 3;
+
+/// `INTER_FRAME` (VP9 6.2's `frame_type`): the other value than [`KEY_FRAME`]. A frame that is
+/// neither is not a frame this backend describes, which is what `vp9_is_new_frame` says.
+const INTER_FRAME: u8 = 1;
+
+/// The `VADecPictureParameterBufferVP9` for one VP9 frame, as the bytes the driver reads, or why this
+/// frame cannot be described.
+///
+/// `h` is the frame's own uncompressed header and `st` the parse state that produced it — the header
+/// is parsed *into* `st`, which is why the loop filter level, the sharpness and the two segmentation
+/// probability arrays are read from `st` and not from `h`. In VP9 those persist across frames (6.2.8
+/// and 6.2.11 read them as conditional updates to the previous frame's), so a frame that does not
+/// update them still has to submit the values in force. The record's own comment on the two
+/// probability arrays — "They should be parsed directly from bitstream by application"
+/// (`va_dec_vp9.h:172-175`) — is what makes them this backend's job rather than the driver's, and it is
+/// satisfied here because `filmcraft_vp9` has already parsed them.
+///
+/// **`data` is the frame's own bytes, and this is not an optimisation.**
+/// `frame_header_length_in_bytes` is the length of the **uncompressed** header and
+/// `first_partition_size` that of the **compressed** one; the second is `data.len() - uncompressed
+/// header length`. `FrameHeader` carries only the uncompressed side — `header_size_in_bytes` is the
+/// compressed header's length *as the bitstream states it*, which a corrupt stream can get wrong and
+/// which the record must not take on trust. So the record cannot be built from the parsed header
+/// alone, and taking `data` is what makes the difference between the two lengths the one the frame
+/// really has.
+///
+/// `surfaces` is the decoded picture buffer as the driver should see it — see [`Vp9ReferenceSet`],
+/// which is a named type rather than a bare array so that the *whole set* requirement is stated where
+/// a caller has to satisfy it.
+pub fn vp9_picture_record(h: &FrameHeader, st: &HeaderState, data: &[u8], surfaces: &Vp9ReferenceSet) -> Result<Vec<u8>, String> {
+    // The profile declines first, in the same words `plan_frame` uses, so a caller cannot get a record
+    // for a frame it was told it could not decode.
+    if let Some(why) = vp9_decline(h.profile, u32::from(h.color.bit_depth)) {
+        return Err(why);
+    }
+    // `show_existing_frame` re-shows an earlier frame rather than coding a new one, so none of this
+    // record's fields describe it: no size, no loop filter level, no reference indices. VP9 6.2 returns
+    // from the header parse as soon as `frame_to_show_map_idx` is read, which is why this has to be
+    // checked here — the parse *succeeds*, with almost nothing set, and a record built from it would
+    // be a zero-width picture of a frame that was never decoded. Whether such a frame should be shown
+    // at all (by re-showing the surface it names, with no decode) is the decode loop's decision and is
+    // left to it; what is refused here is describing it as a frame of its own.
+    if h.show_existing_frame {
+        return Err("a VP9 frame that re-shows an earlier one carries no picture parameters of its own".into());
+    }
+    // Every fixed-width field is bounded *before* anything is packed, so an out-of-range value is an
+    // error the caller can act on rather than a flag the driver reads as something else. These are the
+    // values `vp9_pic_fields` cannot express: a bitstream value in a narrower record member, or a
+    // `u32` into a one-byte record field. None of them can happen on a header `parse_uncompressed`
+    // produced — it reads each in exactly its width — and all of them are reachable from a
+    // `FrameHeader` a caller assembled itself, which is why they are checked rather than assumed.
+    vp9_field_check("frame_type", u32::from(h.frame_type), 1)?;
+    vp9_field_check("mcomp_filter_type", u32::from(h.interp_filter), 3)?;
+    vp9_field_check("reset_frame_context", u32::from(h.reset_frame_context), 2)?;
+    vp9_field_check("frame_context_idx", u32::from(h.frame_context_idx), 2)?;
+    for (i, &slot) in h.ref_frame_idx.iter().enumerate() {
+        vp9_field_check(
+            match i {
+                0 => "last_ref_frame",
+                1 => "golden_ref_frame",
+                _ => "alt_ref_frame",
+            },
+            u32::from(slot),
+            3,
+        )?;
+    }
+    vp9_byte_field("log2_tile_rows", h.tile_rows_log2)?;
+    vp9_byte_field("log2_tile_columns", h.tile_cols_log2)?;
+
+    // The two header lengths, and the reason this takes `data`.
+    //
+    // `uncompressed_size` is where the compressed header starts, measured from the bit reader, so it
+    // is the byte length of the uncompressed header — which is what `frame_header_length_in_bytes` is
+    // defined as (`va_dec_vp9.h:157-164`, "the byte count from bit stream buffer start to the last
+    // byte of uncompressed frame header"). The record's field is a `uint8_t`, and a VP9 header longer
+    // than 255 bytes is legal and undescribable, so that is a refusal rather than a truncation.
+    let header_len = u8::try_from(h.uncompressed_size)
+        .map_err(|_| format!("a VP9 uncompressed header of {} bytes does not fit the record's one-byte field", h.uncompressed_size))?;
+    // `first_partition_size` is "the byte count of compressed header the bitstream buffer"
+    // (`va_dec_vp9.h:167-169`) — the rest of the frame. `checked_sub` because a frame shorter than
+    // the header inside it is a corrupt frame, and `filter(|&n| n > 0)` because a frame that *ends*
+    // at the header has no compressed header at all: `first_partition_size == 0` would tell a driver
+    // there is nothing to parse, which is a claim the frame does not support.
+    let compressed = data
+        .len()
+        .checked_sub(h.uncompressed_size)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| format!("a VP9 frame of {} bytes has no room for the {} byte uncompressed header", data.len(), h.uncompressed_size))?;
+    let first_partition_size =
+        u16::try_from(compressed).map_err(|_| format!("a VP9 compressed header of {compressed} bytes is longer than the record's field"))?;
+
+    let record = VaPictureParameterBufferVp9 {
+        frame_width: field_u16(h.width, "frame_width")?,
+        frame_height: field_u16(h.height, "frame_height")?,
+        // The whole reference set, in the record's own order, from the caller.
+        reference_frames: surfaces.to_record(),
+        pic_fields: vp9_pic_fields(h, &st.seg),
+        // 6.2.8's loop filter level and sharpness, from the state — the parser wrote them as part of
+        // this frame's header, so they are this frame's values even where the bitstream only
+        // conditionally updated them. Neither is in the `pic_fields` word: the record gives them their
+        // own `uint8_t` fields.
+        filter_level: st.lf.level,
+        sharpness_level: st.lf.sharpness,
+        // 6.2.13's tile_info, already parsed: the record carries the two log2 counts the header names with
+        // the same names ("It corresponds the variable with same name in VP9 code",
+        // `va_dec_vp9.h:149-156`), not the tile counts themselves.
+        log2_tile_rows: field_u8(h.tile_rows_log2, "log2_tile_rows")?,
+        log2_tile_columns: field_u8(h.tile_cols_log2, "log2_tile_columns")?,
+        first_partition_size,
+        frame_header_length_in_bytes: header_len,
+        // 6.2.11's probabilities, from the state, in the order 6.2.11 read them. The header calls
+        // these out as the application's to parse and this is where they are submitted.
+        mb_segment_tree_probs: st.seg.tree_probs,
+        segment_pred_probs: st.seg.pred_probs,
+        profile: h.profile,
+        bit_depth: h.color.bit_depth,
+        // The C layout's hole and the reserved tail, zeroed rather than left to `Default` to leave
+        // uninitialised: `record_bytes` hands these bytes to a driver, so every one of the 92 is named.
+        padding_before_first_partition_size: [0; 1],
+        va_reserved: [0; super::ffi::VA_PADDING_MEDIUM],
+    };
+    Ok(record_bytes(&record))
+}
+
+/// A fixed-width member of the `pic_fields` word: the value has to fit its `width` bits.
+///
+/// The width comes from the header, never from the value — `vp9_field_check("frame_type", v, 1)` says
+/// "the header gives `frame_type` one bit", and a `v` of 2 or 3 is a value no bitstream can produce
+/// but a hand-built `FrameHeader` can. The alternative is `bits`'s silent zero, which would submit a
+/// member the frame never set.
+fn vp9_field_check(what: &str, value: u32, width: u32) -> Result<(), String> {
+    match 1u32.checked_shl(width) {
+        Some(limit) if value < limit => Ok(()),
+        _ => Err(format!("VP9 {what} of {value} does not fit its {width}-bit record field")),
+    }
+}
+
+/// A `uint8_t` field of the record: the value has to fit a byte. `frame_width` and `frame_height` are
+/// `uint16_t` and are checked by [`field_u16`]; the tile counts are `uint8_t`.
+fn vp9_byte_field(what: &str, value: u32) -> Result<(), String> {
+    if value <= u32::from(u8::MAX) { Ok(()) } else { Err(format!("VP9 {what} of {value} does not fit the record's byte")) }
+}
+
+/// The record one frame-coded sample is submitted as, or why it has none.
+///
+/// **This is a backstop, not the decision.** [`super::stream::plan_frame`] declines every frame-coded
+/// stream while it is still a stream description, so a caller should never arrive here with one; the
+/// `Err` below says the same thing `plan_frame` says, for a caller that skips planning. The two must
+/// agree about what this backend supports — a decline that names a reason the other side does not is a
+/// bug in one of them — and the tests below compare the two for every profile.
+///
+/// **AV1 remains declined**: `filmcraft_av1` exposes a sequence header, not the per-frame header a
+/// record needs, so an invented AV1 record would be one a driver reads as a valid picture.
+///
+/// **VP9's record *is* built**, by [`vp9_picture_record`]. What this function cannot do from a stream
+/// description alone is name the eight reference surfaces, because those are state: which surface
+/// holds which decoded picture is something only the pictures decoded before this one know. A caller
+/// that has a `HeaderState` and a surface set calls `vp9_picture_record` directly; `build_frame` has
+/// no way to be given them without the signature changing, and a signature that looks like it takes
+/// everything it needs is worse than one that says so.
+pub fn build_frame(info: &FrameStreamInfo, sample: &[u8]) -> Result<Picture, String> {
     match info.codec {
-        // A key frame's parameters are public, but the record needs the whole frame header; saying
-        // which codec it is makes the reason readable in the logs a decline ends up in.
-        FrameCodec::Vp9 => Err(format!("VP9 picture parameters: filmcraft-vp9 {FRAME_HEADER_MISSING}")),
+        FrameCodec::Vp9 => Err(vp9_frame_entry_error(info, sample)),
         FrameCodec::Av1 => Err(format!("AV1 picture parameters: filmcraft-av1 {FRAME_HEADER_MISSING}")),
     }
+}
+
+/// Why the VP9 arm of [`build_frame`] cannot build a record from a sample alone, which is the whole of
+/// what [`build_frame`] can do for VP9 today.
+///
+/// This is the honest boundary of the function. The order of the checks matters and is worth stating:
+/// a profile this backend does not decode is refused **before the sample is looked at**, so a 4:2:2
+/// frame is declined as 4:2:2 rather than as a parse error or a missing state — whatever bytes it
+/// happens to carry. Only then is the sample read, and only then is the missing state named.
+fn vp9_frame_entry_error(info: &FrameStreamInfo, sample: &[u8]) -> String {
+    // **The profile first, before the sample is looked at at all.** Same table and same words as
+    // `plan_frame` and as `vp9_picture_record`.
+    if let Some(why) = vp9_decline(info.profile, info.bit_depth) {
+        return format!("VP9 picture parameters: {why}");
+    }
+    // Then the sample: there has to be a header to read, and saying so is more use than saying the
+    // state is missing.
+    if sample.is_empty() {
+        return "VP9 picture parameters: an empty frame".into();
+    }
+    match filmcraft_vp9::header::parse_uncompressed(sample, &mut HeaderState::default(), &[None; 8]) {
+        Err(why) => format!("VP9 picture parameters: uncompressed frame header: {why}"),
+        // The container's `vpcC` and the frame's own header disagreeing is a stream this backend will
+        // not describe: the surfaces were created for one profile and depth and the record would say
+        // another. (`FrameStreamInfo::parameters_changed` makes the same check for the decode loop;
+        // saying so here keeps the two from disagreeing about the same stream.)
+        Ok(h) if h.profile != info.profile || u32::from(h.color.bit_depth) != info.bit_depth => format!(
+            "VP9 picture parameters: the sample entry says profile {} at {} bits, the frame header says profile {} at {} bits",
+            info.profile, info.bit_depth, h.profile, h.color.bit_depth
+        ),
+        // Otherwise the state, named as what it is: the boundary between a record that can be built
+        // and one that would have to be invented.
+        Ok(_) => "VP9 picture parameters: VADecPictureParameterBufferVP9 is built from the frame header by `vp9_picture_record`, which also \
+                  needs the reference surfaces of the pictures decoded before this one; a stream description alone carries none"
+            .into(),
+    }
+}
+
+/// Whether `h` is a VP9 frame that carries a picture of its own, i.e. one a record can describe.
+///
+/// A key frame and an inter frame both do; a `show_existing_frame` does not (see
+/// [`vp9_picture_record`]). Exposed for the decode loop, which has to make the same decision about
+/// whether the current sample produces a new surface at all — a frame that only re-shows one is
+/// submitted without a picture record and no decode, which is a decision Task 3 has to make
+/// explicitly rather than let fall out of the code.
+pub fn vp9_is_new_frame(h: &FrameHeader) -> bool {
+    !h.show_existing_frame && (h.frame_type == KEY_FRAME || h.frame_type == INTER_FRAME)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2115,6 +2543,9 @@ mod tests {
     use std::sync::Arc;
 
     use filmcraft_codecs::hw::{FrameCodec, FrameStreamInfo, NalCodec, NalStreamInfo};
+    // The VP9 record tests below build a `FrameHeader` by hand, so the type is named here as well as
+    // at the top of the file.
+    use filmcraft_vp9::header::FrameHeader;
 
     /// The IQ matrix record carries the sequence parameter set's own scaling lists, in the raster
     /// order the record wants, and flat 16s when the set declares none.
@@ -3557,36 +3988,71 @@ mod tests {
         assert!(p.slice_offsets.windows(2).all(|w| w[0] < w[1]), "the offsets run in slice order: {:?}", p.slice_offsets);
     }
 
-    /// VP9 and AV1 need a per-frame header FilmCraft does not expose, so no record is built for them
-    /// and the reason is named rather than a record of zeros handed over. `plan_frame` is where the
-    /// decision is made; this is the backstop for a caller that skips it, and the two say the same
-    /// thing.
+    /// `build_frame` is the backstop for a caller that skipped `plan_frame`, so its two arms have to say
+    /// what is actually missing for each codec — and for VP9 that is **not** the frame header.
+    ///
+    /// AV1 still has no exposed per-frame header (`FRAME_HEADER_MISSING` is true of it). VP9's header
+    /// *is* exposed and its record *is* built by [`super::vp9_picture_record`]; what `build_frame`
+    /// cannot do from a stream description alone is name the eight reference surfaces, which is state
+    /// the caller must have. The old test asserted the shared constant for both codecs, which asserted
+    /// something false about VP9, so it is split here into what each arm actually claims.
     #[test]
-    fn frame_codecs_are_declined_until_their_frame_headers_are_public() {
-        for codec in [FrameCodec::Vp9, FrameCodec::Av1] {
-            let info = FrameStreamInfo::for_tests(codec, 0, 8, (1, 1), (1920, 1080));
-            let e = super::build_frame(&info, &[0x9d, 0x01, 0x2a]).expect_err("a frame codec with no record built yet");
-            assert!(e.contains("frame header"), "{codec:?}: {e}");
-            assert!(e.contains(super::FRAME_HEADER_MISSING), "{codec:?}: {e}");
-            // an empty sample is declined too, and never reaches a parser
-            assert!(super::build_frame(&info, &[]).is_err(), "{codec:?}");
-            // and `plan_frame` declines the same stream with the same reason, in the same words
-            let planned = crate::vaapi::stream::plan_frame(&info).expect_err("plan_frame declines every frame codec");
-            assert!(planned.contains(super::FRAME_HEADER_MISSING), "{codec:?}: {planned}");
-            assert!(planned.contains(if codec == FrameCodec::Vp9 { "filmcraft-vp9" } else { "filmcraft-av1" }), "{codec:?}: {planned}");
+    fn the_frame_codec_declines_say_what_each_one_is_missing() {
+        // A profile this backend takes, with a sample that is not a VP9 frame at all: refused as an
+        // unparsable header, which is the first thing worth saying about it.
+        let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, 0, 8, (1, 1), (1920, 1080));
+        let e = super::build_frame(&info, &[0xff, 0xff, 0xff]).expect_err("a sample that is not a VP9 frame");
+        assert!(e.contains("uncompressed frame header"), "{e}");
+        // An empty sample is declined too, and never reaches a parser.
+        assert!(super::build_frame(&info, &[]).is_err(), "an empty frame");
+        // And so is AV1, whose decline never parses anything: its per-frame header is not exposed, so
+        // there is nothing to parse and nothing to say about the sample. Both samples, because the
+        // point is that the sample makes no difference to this arm.
+        let av1 = FrameStreamInfo::for_tests(FrameCodec::Av1, 0, 8, (1, 1), (1920, 1080));
+        for sample in [&[][..], &[0xff, 0xff, 0xff]] {
+            let e = super::build_frame(&av1, sample).expect_err("AV1");
+            assert!(e.contains("filmcraft-av1"), "AV1: {e}");
+            assert!(e.contains(super::FRAME_HEADER_MISSING), "AV1: {e}");
         }
+        // `plan_frame` says the same thing for AV1, which is the invariant this module holds.
+        let planned = crate::vaapi::stream::plan_frame(&av1).expect_err("plan_frame declines AV1");
+        assert!(planned.contains("filmcraft-av1"), "AV1: {planned}");
+
+        // VP9: a profile the record builder would refuse is refused as *that profile*, with the
+        // codec's reason, **before the sample is looked at**. A caller never sees "I could not describe
+        // this because of state" for a frame that was never going to be described — and never sees a
+        // parse error for a 4:2:2 frame whose header happens not to parse.
+        for (profile, bits, why) in [(1u8, 8u32, "4:2:2"), (3, 8, "4:2:2"), (4, 8, "reserves"), (0, 12, "12-bit"), (0, 9, "does not define")] {
+            let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, profile, bits, (1, 1), (1920, 1080));
+            let e = super::build_frame(&info, &[]).expect_err("VP9 profile {profile}");
+            assert!(e.contains(why), "VP9 profile {profile} at {bits} bits: {e}");
+        }
+        // And a profile this backend *would* decode says what is missing, which is the state — for a
+        // sample that parses as well, so the message cannot be about the sample.
+        let (frame, _, _) = vp9_key_frame();
+        let ok = FrameStreamInfo::for_tests(FrameCodec::Vp9, 0, 8, (1, 1), (1920, 1080));
+        let e = super::build_frame(&ok, &frame).expect_err("a decodable VP9 profile");
+        assert!(e.contains("reference surfaces"), "{e}");
+        // And `plan_frame` says the same thing, in words that do *not* claim the header is missing.
+        let planned = crate::vaapi::stream::plan_frame(&ok).expect_err("plan_frame declines a VP9 stream at this level");
+        assert!(planned.contains("reference surface"), "VP9: {planned}");
+        assert!(planned.contains("filmcraft-vp9"), "VP9: {planned}");
+        assert!(!planned.contains(super::FRAME_HEADER_MISSING), "VP9's frame header IS exposed: {planned}");
     }
 
     /// A VP9 record is built from the frame's *own* uncompressed header, which libva wants as a
     /// `VADecPictureParameterBufferVP9`. That header is parsed by `filmcraft_vp9`, so the record has
-    /// to be derived from that parse rather than invented: an invented record is one a driver reads
-    /// as a valid picture, which is why the AV1 half above is still declined.
+    /// to be derived from that parse rather than invented — and it now is, by
+    /// [`super::vp9_picture_record`]. So this test is the **compile-time** guard on the dependency
+    /// that builder is written against: it names the exact paths, so a dropped `filmcraft-vp9`
+    /// dependency or a `header` module that went back to private fails here, at the test, with the
+    /// reason attached, instead of surfacing later as an unresolved import in the middle of the
+    /// record builder where the error says nothing about which dependency went missing.
     ///
-    /// This test is the guard the dependency needs, and it is deliberately a *compile-time* one. It
-    /// names the exact paths the picture builder is written against, so a dropped `filmcraft-vp9`
-    /// dependency or a `header` module that went back to private fails here — at the test, with the
-    /// reason attached — instead of surfacing later as an unresolved import in the middle of the
-    /// record builder, where the error says nothing about which dependency went missing.
+    /// It also keeps the fixture-free half of the job. The header it writes is the same one
+    /// [`vp9_key_frame`] builds for the record tests below, so those need no encoder and cannot fail
+    /// because a fixture is missing — which matters, because a test that silently skips when ffmpeg is
+    /// absent is not a test that pins anything.
     #[test]
     fn the_vp9_frame_header_is_reachable_through_our_own_parser() {
         // The parse, with its whole signature spelled out. Naming it this way pins the types it
@@ -3680,6 +4146,584 @@ mod tests {
             let e = parse(bad, &mut state, &[None; 8]).expect_err("a header that is not there is an error, not a default");
             assert!(!e.to_string().is_empty(), "the error says why: {e:?}");
         }
+    }
+
+    // --- the VP9 picture-parameter record ------------------------------------------------------
+    //
+    // Everything below is built from a **hand-written frame**, not a fixture, for two reasons: a
+    // fixture needs ffmpeg, so a machine without it would silently skip the tests that pin the record's
+    // bytes (the worst possible failure for the tests that matter most); and a hand-written frame lets
+    // every field of the record be given a *distinguishable* value, so a field filled from the wrong
+    // place shows up as a different byte rather than as an indistinguishable zero.
+
+    /// A bit writer for a hand-built VP9 uncompressed header: MSB first, as VP9's `f(n)` is.
+    struct Bits(Vec<bool>);
+
+    impl Bits {
+        fn put(&mut self, value: u32, bits: usize) {
+            for i in (0..bits).rev() {
+                self.0.push((value >> i) & 1 == 1);
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            let mut out = vec![0u8; self.0.len().div_ceil(8)];
+            for (i, &b) in self.0.iter().enumerate() {
+                if b {
+                    out[i / 8] |= 0x80 >> (i % 8);
+                }
+            }
+            out
+        }
+    }
+
+    /// A profile 0 key frame whose uncompressed header sets every field an intra frame can set, with
+    /// values chosen to be **distinguishable in a pinned byte**: none is 0 or 255 except where the
+    /// format requires it, and the two segmentation probability arrays hold distinct numbers so a
+    /// permutation of either is visible.
+    ///
+    /// VP9 6.2. Each line names the syntax element it writes and the order is the parser's own
+    /// (`crates/vp9/src/header.rs:222-403`), because a header written in the wrong order still parses
+    /// some of the time and produces a record that is wrong in a way no assertion would explain.
+    fn vp9_key_frame() -> (Vec<u8>, filmcraft_vp9::header::HeaderState, filmcraft_vp9::header::FrameHeader) {
+        const WIDTH: u32 = 320;
+        const HEIGHT: u32 = 180;
+        /// How long the frame's compressed header **claims** to be, as 6.3's `header_size_in_bytes`
+        /// states it.
+        ///
+        /// Deliberately **different** from [`COMPRESSED`], the length the frame really has. A corrupt
+        /// bitstream can state anything here, and the record must submit the real length rather than
+        /// the claim — so a fixture where the two agree could not tell the two apart, and a builder
+        /// that used the claim would pass. Making them differ is what gives the byte-pinning test its
+        /// power here: `first_partition_size` must come out at `COMPRESSED`, not `CLAIMED`.
+        const CLAIMED: u32 = 6;
+        /// How long the frame's compressed header really is.
+        ///
+        /// `parse_uncompressed` only checks `header_size_in_bytes` is non-zero — no test here calls
+        /// `parse_compressed`, which is what actually reads those bytes — but the record's
+        /// `first_partition_size` is the *real* length, so the frame below is built to be exactly this
+        /// long after the uncompressed header.
+        const COMPRESSED: u32 = 9;
+        let mut w = Bits(Vec::new());
+        w.put(2, 2); // frame_marker
+        w.put(0, 1); // profile_low_bit
+        w.put(0, 1); // profile_high_bit — profile 0
+        w.put(0, 1); // show_existing_frame
+        w.put(0, 1); // frame_type — KEY_FRAME
+        w.put(1, 1); // show_frame
+        w.put(0, 1); // error_resilient_mode
+        w.put(0x49_83_42, 24); // frame_sync_code
+        w.put(1, 3); // color_space — BT.601
+        w.put(0, 1); // color_range — studio swing
+        w.put(WIDTH - 1, 16); // frame_width_minus_1
+        w.put(HEIGHT - 1, 16); // frame_height_minus_1
+        w.put(0, 1); // render_and_frame_size_different
+        w.put(1, 1); // refresh_frame_context
+        w.put(1, 1); // frame_parallel_decoding_mode
+        w.put(0, 2); // frame_context_idx
+        // 6.2.8 loop_filter_params: a level and sharpness that are not zero, because zero is what a
+        // zeroed record carries and a zero cannot tell "right" from "never set".
+        w.put(37, 6); // loop_filter_level
+        w.put(5, 3); // loop_filter_sharpness
+        w.put(0, 1); // loop_filter_delta_enabled
+        // 6.2.9 quantization_params: base_q_idx 128 with no deltas, so the frame is **not** lossless
+        // (`lossless_flag` is then 0; the value 1 is pinned by `the_vp9_pic_fields_…` test instead,
+        // which sets the member directly).
+        w.put(128, 8); // base_q_idx
+        w.put(0, 1); // delta_q_y_dc_present
+        w.put(0, 1); // delta_q_uv_dc_present
+        w.put(0, 1); // delta_q_uv_ac_present
+        // 6.2.11 segmentation_params, **with an update**, so the tree probabilities are actually read.
+        // They are the two arrays the header says the application must parse itself
+        // (`va_dec_vp9.h:172-177`), and a frame that does not update them leaves the defaults in
+        // place — which is a different property, and one the state carries, not the header.
+        w.put(1, 1); // segmentation_enabled
+        w.put(1, 1); // segmentation_update_map
+        for p in [7u32, 11, 13, 17, 19, 23, 29] {
+            w.put(1, 1); // mb_segment_tree_prob's update flag
+            w.put(p, 8); // mb_segment_tree_prob — distinct primes, so a permuted array shows
+        }
+        w.put(1, 1); // segmentation_temporal_update — so the pred probs are read rather than defaulted
+        for p in [31u32, 37, 41] {
+            w.put(1, 1); // segment_pred_prob's update flag
+            w.put(p, 8); // segment_pred_prob
+        }
+        w.put(0, 1); // segmentation_update_data
+        // 6.2.13 tile_info: 320x180 is a single superblock column, so the tile-width loop does not run
+        // and `tile_cols_log2` is 0 — the correct answer for this size rather than a default.
+        //
+        // `tile_rows_log2` is one bit, and **a 1 there is followed by a second bit** (6.2.13: the row
+        // count is 1, 2 or 4, so a first bit of 1 means "read one more"). Writing only the first bit
+        // would make the parser read the first bit of `header_size_in_bytes` as the second one, which
+        // shifts the field and every byte after it — so both bits are written here, and the record's
+        // `log2_tile_rows` is 1, a value a zeroed record would not carry.
+        w.put(1, 1); // tile_rows_log2 — high bit, so a second bit follows
+        w.put(0, 1); // tile_rows_log2 — low bit; 1 + 0 = 1 tile row
+        w.put(CLAIMED, 16); // header_size_in_bytes — the bitstream's claim, which is not what the record submits
+
+        let header_bytes = w.bytes();
+        // The frame is the uncompressed header followed by exactly `COMPRESSED` bytes of compressed
+        // header, while the header *claims* `CLAIMED`. `first_partition_size` is the difference of the
+        // two real lengths, which is asserted below and is `COMPRESSED` — **not** the claim. That is
+        // the whole reason the builder takes the bytes: a `FrameHeader` carries both numbers and cannot
+        // be used to check either against the frame.
+        let mut frame = header_bytes.clone();
+        frame.extend(std::iter::repeat_n(0u8, COMPRESSED as usize));
+        let mut state = filmcraft_vp9::header::HeaderState::default();
+        let header = filmcraft_vp9::header::parse_uncompressed(&header_bytes, &mut state, &[None; 8]).expect("a well-formed key frame header parses");
+        assert_eq!(header.uncompressed_size, header_bytes.len(), "the header is `header_bytes` long, which is what `first_partition_size` is measured from");
+        assert_eq!(header.header_size_in_bytes, CLAIMED, "the bitstream claims a {CLAIMED}-byte compressed header");
+        assert_eq!(frame.len() - header.uncompressed_size, COMPRESSED as usize, "and the frame really has a {COMPRESSED}-byte one");
+        (frame, state, header)
+    }
+
+    /// The record's bytes, pinned.
+    ///
+    /// **This is the test the brief asks for, and it pins the bytes rather than the fields.** Four
+    /// separate times on this branch a wrong constant passed the whole integration suite — a `33`
+    /// where a `32` belonged, and three like it — because every test in the file checked *fields*, and
+    /// a field check cannot see a byte that is in the wrong place. A record is handed to a driver as
+    /// 92 opaque bytes; a driver that reads them wrong produces a picture, not an error, so nothing
+    /// downstream of this test can catch it.
+    ///
+    /// So the whole record is asserted as **one literal 92-byte array**, after the per-field checks
+    /// that say *which* field is wrong when it is. A `pic_fields` member shifted by a bit, a
+    /// `first_partition_size` at 45 instead of 46, a hole left uninitialised, a `mb_segment_tree_probs`
+    /// permuted — each is a difference in these bytes, and the message names the byte index.
+    #[test]
+    fn the_vp9_record_for_a_key_frame_is_exactly_these_bytes() {
+        let (frame, state, header) = vp9_key_frame();
+        let surfaces = super::Vp9ReferenceSet { slots: [Some(11u32), None, Some(13), Some(14), None, Some(16), Some(17), Some(18)] };
+        let bytes = super::vp9_picture_record(&header, &state, &frame, &surfaces).expect("a profile 0 key frame is described");
+
+        // What the record holds, read back through the same reader the encode tests use — so the struct
+        // declaration and the packing are checked against each other before the bytes are.
+        let r = crate::vaapi::ffi::picture_params_vp9(&bytes).expect("92 bytes is a VP9 picture record");
+
+        // The size first: a record of a different length is a different structure to libva, which
+        // reads the buffer it was given rather than the type it expected. 92 is what a C compiler
+        // measures for `VADecPictureParameterBufferVP9` — see `ffi.rs`'s header test and `abi_guard`.
+        assert_eq!(bytes.len(), 92, "VADecPictureParameterBufferVP9 is 92 bytes");
+
+        // --- offsets 0..4: the coded picture size ------------------------------------------------
+        assert_eq!(&bytes[0..2], &320u16.to_le_bytes(), "frame_width at offset 0 — the header's frame_width_minus_1 + 1");
+        assert_eq!(&bytes[2..4], &180u16.to_le_bytes(), "frame_height at offset 2");
+
+        // --- offset 4..36: the whole reference set ------------------------------------------------
+        // `reference_frames[8]` is 32 bytes and is **the whole decoded picture buffer**: slot 1 and
+        // slot 4 are empty and say so with `VA_INVALID_SURFACE` (0xffffffff), and the other six carry
+        // their surfaces. A record that dropped the empty slots, or left them zero, would have the
+        // driver reading whatever surface that id happens to be as a reference.
+        for (i, &want) in surfaces.slots.iter().enumerate() {
+            let at = 4 + i * 4;
+            let got = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes at a slot"));
+            assert_eq!(got, want.unwrap_or(crate::vaapi::ffi::INVALID_SURFACE), "reference_frames[{i}] at offset {at}");
+        }
+
+        // --- offset 36..40: the packed flags word -------------------------------------------------
+        // Derived from the header's own bit order rather than typed as a constant: each entry is
+        // `(bit, value)` for one member, the bit positions are cross-checked against
+        // `vp9_pic_fields_positions()` (which the `ffi.rs` test compares with `va_dec_vp9.h` itself),
+        // and the word is their sum. A wrong constant would then have to be wrong twice, in two files,
+        // to get past this — which is the property the four near-misses on this branch lacked.
+        let members: [(u32, u32); 22] = [
+            (0, 1),  // subsampling_x = 1 — 4:2:0
+            (1, 1),  // subsampling_y = 1
+            (2, 0),  // frame_type = 0 (KEY_FRAME)
+            (3, 1),  // show_frame = 1
+            (4, 0),  // error_resilient_mode = 0
+            (5, 0),  // intra_only = 0
+            (6, 0),  // allow_high_precision_mv = 0 — a key frame predicts from nothing
+            (7, 0),  // mcomp_filter_type = 0 (EIGHTTAP), a three-bit member
+            (10, 1), // frame_parallel_decoding_mode = 1
+            (11, 0), // reset_frame_context = 0, a two-bit member
+            (13, 1), // refresh_frame_context = 1
+            (14, 0), // frame_context_idx = 0, two bits, forced to 0 by 6.2.5 for a key frame
+            (16, 1), // segmentation_enabled = 1
+            (17, 1), // segmentation_temporal_update = 1
+            (18, 1), // segmentation_update_map = 1
+            (19, 0), // last_ref_frame = 0 — a key frame names no reference
+            (22, 0), // last_ref_frame_sign_bias = 0
+            (23, 0), // golden_ref_frame = 0
+            (26, 0), // golden_ref_frame_sign_bias = 0
+            (27, 0), // alt_ref_frame = 0
+            (30, 0), // alt_ref_frame_sign_bias = 0
+            (31, 0), // lossless_flag = 0 — base_q_idx is 128, so the frame is not lossless
+        ];
+        for (index, (at, _)) in members.iter().enumerate() {
+            assert_eq!(super::vp9_pic_fields_positions()[index].1, *at, "member {index} is at bit {at} in va_dec_vp9.h");
+        }
+        let want_word: u32 = members.iter().map(|&(at, value)| value << at).sum();
+        assert_eq!(&bytes[36..40], &want_word.to_le_bytes(), "pic_fields at offset 36, little-endian");
+
+        // --- the bytes after it, each named ----------------------------------------------------
+        assert_eq!(bytes[40], 37, "filter_level at offset 40 — 6.2.8's loop_filter_level, from the state");
+        assert_eq!(bytes[41], 5, "sharpness_level at offset 41");
+        assert_eq!(bytes[42], 1, "log2_tile_rows at offset 42");
+        assert_eq!(bytes[43], 0, "log2_tile_columns at offset 43 — one superblock column at 320x180");
+        assert_eq!(
+            bytes[44], header.uncompressed_size as u8,
+            "frame_header_length_in_bytes at offset 44 — the UNCOMPRESSED header, and `uncompressed_size` is what the parser measured"
+        );
+        assert_eq!(bytes[45], 0, "the C layout's hole at offset 45 is submitted as zero, not as stack");
+        assert_eq!(
+            &bytes[46..48],
+            &9u16.to_le_bytes(),
+            "first_partition_size at offset 46 — the COMPRESSED header as the frame really is (`frame.len() - uncompressed_size`), \
+             NOT the `header_size_in_bytes` the bitstream claims, which is 6 here and must not be what a driver is told"
+        );
+        // The two arrays the header says the application must parse itself (`va_dec_vp9.h:172-177`),
+        // at 48 and 55, in the order 6.2.11 read them.
+        assert_eq!(&bytes[48..55], &[7u8, 11, 13, 17, 19, 23, 29], "mb_segment_tree_probs[7] at offset 48");
+        assert_eq!(&bytes[55..58], &[31u8, 37, 41], "segment_pred_probs[3] at offset 55");
+        assert_eq!(bytes[58], 0, "profile at offset 58");
+        assert_eq!(bytes[59], 8, "bit_depth at offset 59");
+        assert_eq!(&bytes[60..92], &[0u8; 32], "the reserved tail at 60 is zero, all 32 bytes of it");
+
+        // --- the whole record, as one literal array ----------------------------------------------
+        // The pin. Everything above checks a *derived* quantity against the bytes, which catches a
+        // packing or offset error; this catches anything the derivations both got wrong the same way —
+        // which is exactly the `33`-instead-of-`32` class, where every field-level test agrees with the
+        // record because they all read the same wrong constant. Written as literals rather than by
+        // field so that a change to the record's bytes shows up in the diff of this test.
+        assert_eq!(
+            bytes,
+            vec![
+                // 0: frame_width 320
+                0x40, 0x01, //
+                // 2: frame_height 180
+                0xb4, 0x00, //
+                // 4: reference_frames[8] — the whole set: 11, INVALID, 13, 14, INVALID, 16, 17, 18
+                0x0b, 0x00, 0x00, 0x00, //
+                0xff, 0xff, 0xff, 0xff, //
+                0x0d, 0x00, 0x00, 0x00, //
+                0x0e, 0x00, 0x00, 0x00, //
+                0xff, 0xff, 0xff, 0xff, //
+                0x10, 0x00, 0x00, 0x00, //
+                0x11, 0x00, 0x00, 0x00, //
+                0x12, 0x00, 0x00, 0x00, //
+                // 36: pic_fields, little-endian
+                0x0b, 0x24, 0x07, 0x00, //
+                // 40: filter_level 37, sharpness 5, log2_tile_rows 1, log2_tile_columns 0
+                37, 5, 1, 0, //
+                // 44: frame_header_length_in_bytes (uncompressed), the hole at 45, and
+                // 46: first_partition_size (compressed) as a uint16
+                26, 0x00, 0x09, 0x00, //
+                // 48: mb_segment_tree_probs[7]
+                7, 11, 13, 17, 19, 23, 29, //
+                // 55: segment_pred_probs[3]
+                31, 37, 41, //
+                // 58: profile 0, 59: bit_depth 8
+                0, 8, //
+                // 60..92: va_reserved[VA_PADDING_MEDIUM] — 32 zero bytes
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            "the 92 bytes of VADecPictureParameterBufferVP9 for this frame"
+        );
+
+        // And the struct view agrees with the bytes, which is what makes this a test of the *record*
+        // rather than of one reading of it.
+        assert_eq!((r.frame_width, r.frame_height), (320, 180));
+        assert_eq!(r.reference_frames[0], 11);
+        assert_eq!(r.reference_frames[1], crate::vaapi::ffi::INVALID_SURFACE);
+        assert_eq!((r.frame_header_length_in_bytes, r.first_partition_size), (26, 9), "two different counts of the same frame, both in the record");
+        assert_eq!((r.profile, r.bit_depth), (0, 8));
+        assert_eq!(r.va_reserved, [0; crate::vaapi::ffi::VA_PADDING_MEDIUM]);
+        assert_eq!(r.mb_segment_tree_probs, [7, 11, 13, 17, 19, 23, 29], "and not a permutation of them");
+        assert_eq!(r.segment_pred_probs, [31, 37, 41]);
+    }
+
+    /// Every member of the `pic_fields` word is packed at the bit the header gives it, and moves
+    /// **only** its own bits.
+    ///
+    /// The byte-pinning test above pins the whole word for one frame, which cannot tell a member that
+    /// is right by accident from one that is wrong by coincidence. This one moves each member on its
+    /// own — setting it if the key frame leaves it clear, clearing it if the key frame sets it — and
+    /// asserts two things per member: that its bits changed, and that **nothing else did**. The second
+    /// is what catches a member packed one bit low, which would still have "changed".
+    #[test]
+    fn the_vp9_pic_fields_are_packed_at_the_bit_the_header_gives_each() {
+        // Nineteen of the twenty-two members are header members; the three segmentation ones live on
+        // the segmentation structure (VP9 6.2.11), which is why a case carries two setters.
+        type Case = (&'static str, fn(&mut FrameHeader), Option<fn(&mut filmcraft_vp9::header::Segmentation)>);
+        let cases: [Case; 22] = [
+            // These are **on** in the key frame above, so the case clears them: the baseline must have
+            // them set for "only this member moved" to mean anything.
+            ("subsampling_x", |h| h.color.subsampling_x = false, None),
+            ("subsampling_y", |h| h.color.subsampling_y = false, None),
+            ("show_frame", |h| h.show_frame = false, None),
+            ("refresh_frame_context", |h| h.refresh_frame_context = false, None),
+            ("frame_parallel_decoding_mode", |h| h.frame_parallel_decoding_mode = false, None),
+            // ...and these are clear in it, so the case sets them. Three-bit members use their widest
+            // value, which a two-bit field could not hold.
+            ("frame_type", |h| h.frame_type = 1, None),
+            ("error_resilient_mode", |h| h.error_resilient_mode = true, None),
+            ("intra_only", |h| h.intra_only = true, None),
+            ("allow_high_precision_mv", |h| h.allow_high_precision_mv = true, None),
+            ("mcomp_filter_type", |h| h.interp_filter = 7, None),
+            ("reset_frame_context", |h| h.reset_frame_context = 3, None),
+            ("frame_context_idx", |h| h.frame_context_idx = 3, None),
+            ("segmentation_enabled", |_| {}, Some(|s| s.enabled = false)),
+            ("segmentation_temporal_update", |_| {}, Some(|s| s.temporal_update = false)),
+            ("segmentation_update_map", |_| {}, Some(|s| s.update_map = false)),
+            ("last_ref_frame", |h| h.ref_frame_idx[0] = 7, None),
+            ("last_ref_frame_sign_bias", |h| h.ref_frame_sign_bias[1] = true, None),
+            ("golden_ref_frame", |h| h.ref_frame_idx[1] = 5, None),
+            ("golden_ref_frame_sign_bias", |h| h.ref_frame_sign_bias[2] = true, None),
+            ("alt_ref_frame", |h| h.ref_frame_idx[2] = 3, None),
+            ("alt_ref_frame_sign_bias", |h| h.ref_frame_sign_bias[3] = true, None),
+            // The header defines lossless as `base_qindex == 0 && all three deltas 0`, which this
+            // frame (base_q_idx 128) does not satisfy — so the member is cleared, and its bits are the
+            // ones that pin the *last* member at bit 31 rather than somewhere in the middle.
+            ("lossless_flag", |h| h.lossless = true, None),
+        ];
+        let (_, state, header) = vp9_key_frame();
+        let base_word = super::vp9_pic_fields(&header, &state.seg);
+        let positions = super::vp9_pic_fields_positions();
+        assert_eq!(positions.len(), cases.len(), "every packed member has a case, and every case a member");
+
+        for (name, set_header, set_seg) in cases {
+            let Some((_, bit, width)) = positions.iter().find(|&&(n, _, _)| n == name).copied() else {
+                panic!("{name} is not one of the members the packer packs");
+            };
+            let mut h = header.clone();
+            let mut s = state.seg.clone();
+            set_header(&mut h);
+            if let Some(set) = set_seg {
+                set(&mut s);
+            }
+            let word = super::vp9_pic_fields(&h, &s);
+            let mask = (1u32 << width) - 1;
+            // The member's own bits changed. Every case either sets a member the key frame leaves
+            // clear or clears one it sets, so "changed" is the property — and the *value* is pinned by
+            // the byte test, which is what says which value each member holds.
+            assert_ne!(
+                (word >> bit) & mask,
+                (base_word >> bit) & mask,
+                "{name} at bit {bit} (width {width}) did not change at all: word {word:#010x} is the baseline {base_word:#010x}"
+            );
+            // Nothing else moved: every other member is bit-identical to the baseline's.
+            for (other, other_bit, other_width) in &positions {
+                if *other == name {
+                    continue;
+                }
+                let other_mask = (1u32 << other_width) - 1;
+                assert_eq!((word >> other_bit) & other_mask, (base_word >> other_bit) & other_mask, "{name} also moved {other}");
+            }
+            // And the difference is confined to this member's bits — which is the same statement
+            // about the *word* rather than about each other member, and catches a member packed into
+            // the next one's bits even where the next one's own width happens to hide it.
+            let changed = word ^ base_word;
+            assert_eq!(changed & !(mask << bit), 0, "{name} changed bits outside its own {bit}..{bit}+{width}: the whole difference is {changed:#010x}");
+        }
+    }
+
+    /// A profile or depth this backend does not decode is an `Err` naming why, never a record.
+    ///
+    /// The record would otherwise be a valid-looking picture of the wrong thing, which is the failure
+    /// this whole module is written to avoid: profiles 1 and 3 are 4:2:2 / 4:4:0 / 4:4:4, profile 4 is
+    /// reserved, and a driver advertising `VLD: true` for all four is not evidence that any of them is
+    /// decodable here.
+    #[test]
+    fn a_vp9_profile_this_backend_does_not_decode_is_an_error_not_a_record() {
+        let (frame, state, mut header) = vp9_key_frame();
+        for (profile, bits, why) in [
+            (1u8, 8u8, "4:2:2"),
+            (3, 8, "4:2:2"),
+            (1, 10, "4:2:2"),
+            (4, 8, "reserves"),
+            (4, 10, "reserves"),
+            // 12-bit is defined by VP9 and refused for a *different* reason: no surface, no readback.
+            (2, 12, "12-bit"),
+            (0, 12, "12-bit"),
+            // And pairs VP9 does not define at all.
+            (0, 9, "does not define"),
+            (5, 8, "does not define"),
+        ] {
+            header.profile = profile;
+            header.color.bit_depth = bits;
+            let e = super::vp9_picture_record(&header, &state, &frame, &super::Vp9ReferenceSet::default()).expect_err("VP9 profile {profile} at {bits} bits");
+            assert!(e.contains(why), "VP9 profile {profile} at {bits} bits: {e}");
+            assert!(e.contains(&format!("profile {profile} at {bits} bits")), "the numbers are in the sentence: {e}");
+        }
+        // The two this milestone decodes are **not** refused — checked here so the table above cannot
+        // grow to swallow one by accident.
+        for (profile, bits) in [(0u8, 8u8), (2, 8), (2, 10)] {
+            header.profile = profile;
+            header.color.bit_depth = bits;
+            assert!(
+                super::vp9_picture_record(&header, &state, &frame, &super::Vp9ReferenceSet::default()).is_ok(),
+                "VP9 profile {profile} at {bits} bits is decoded by this milestone"
+            );
+        }
+    }
+
+    /// `show_existing_frame` carries no picture parameters, so it is refused rather than described as
+    /// a frame that has none.
+    ///
+    /// VP9 6.2 returns from the header parse as soon as `frame_to_show_map_idx` is read: no size, no
+    /// loop filter level, no reference index. The parse **succeeds**, with almost nothing set, which is
+    /// exactly why this has to be refused in the record builder — a `FrameHeader` alone cannot be
+    /// trusted to mean "a frame was described".
+    ///
+    /// Whether such a frame should be *decoded* at all is a separate question the decode loop has to
+    /// answer explicitly (by re-showing the surface it names, with no decode) rather than let fall out
+    /// of the code. What is refused here is describing it as a frame of its own.
+    #[test]
+    fn a_frame_that_re_shows_an_earlier_one_is_refused() {
+        let (frame, state, mut header) = vp9_key_frame();
+        header.show_existing_frame = true;
+        assert!(!super::vp9_is_new_frame(&header), "it is not a new frame");
+        let e = super::vp9_picture_record(&header, &state, &frame, &super::Vp9ReferenceSet::default()).expect_err("a show_existing_frame");
+        assert!(e.contains("re-shows"), "{e}");
+        // And the two that *are* frames of their own are not refused.
+        header.show_existing_frame = false;
+        assert!(super::vp9_is_new_frame(&header), "a key frame is a frame of its own");
+        header.frame_type = 1;
+        assert!(super::vp9_is_new_frame(&header), "so is an inter frame");
+        // And a `frame_type` that is neither is not a frame at all.
+        header.frame_type = 2;
+        assert!(!super::vp9_is_new_frame(&header), "a frame_type VP9 does not define");
+    }
+
+    /// A frame whose header claims more than its own bytes hold is refused, and so is one whose
+    /// header is longer than the record's one-byte field, or whose compressed header is longer than
+    /// its two.
+    ///
+    /// These are the ways the two header lengths can be nonsense, and they are **the reason the
+    /// builder takes `data`**: nothing in a `FrameHeader` can detect any of them, because all three
+    /// are properties of the bytes rather than of the parse.
+    #[test]
+    fn a_frame_with_impossible_header_lengths_is_refused() {
+        let (frame, state, mut header) = vp9_key_frame();
+        // A frame that ends before its uncompressed header does — a truncated one, which is the shape
+        // a corrupt sample has. `checked_sub` on the length is what catches it.
+        let short = &frame[..header.uncompressed_size - 1];
+        let e = super::vp9_picture_record(&header, &state, short, &super::Vp9ReferenceSet::default()).expect_err("a frame shorter than its own header");
+        assert!(e.contains("no room"), "{e}");
+        // A frame that ends *exactly* at the header, so there is no compressed header at all: a
+        // `first_partition_size` of 0 would tell a driver there is nothing to parse, which is a claim
+        // the frame does not support.
+        let header_only = &frame[..header.uncompressed_size];
+        let e = super::vp9_picture_record(&header, &state, header_only, &super::Vp9ReferenceSet::default()).expect_err("no compressed header");
+        assert!(e.contains("no room"), "{e}");
+        // A header of more than 255 bytes cannot be described: the record's field is a `uint8_t`, and a
+        // VP9 header that long is legal and simply not expressible here.
+        header.uncompressed_size = 300;
+        let long = vec![0u8; 400];
+        let e = super::vp9_picture_record(&header, &state, &long, &super::Vp9ReferenceSet::default()).expect_err("a 300-byte uncompressed header");
+        assert!(e.contains("one-byte field"), "{e}");
+        // A compressed header of more than 65535 bytes cannot be described either: `uint16_t`.
+        header.uncompressed_size = 10;
+        let huge = vec![0u8; 70_000];
+        let e = super::vp9_picture_record(&header, &state, &huge, &super::Vp9ReferenceSet::default()).expect_err("a 70 KB compressed header");
+        assert!(e.contains("longer than the record's field"), "{e}");
+    }
+
+    /// A size or a packed member the record's fields cannot hold is refused, not truncated or wrapped.
+    ///
+    /// A `uint16_t` `frame_width` holding a truncated size describes a *different picture*; a tile count
+    /// past a byte describes a tile grid that is not the stream's; a three-bit member given a value it
+    /// cannot hold would be read as whatever fits. None of these can happen on a header
+    /// `parse_uncompressed` produced — it reads each in exactly its width — and all of them are
+    /// reachable from a `FrameHeader` assembled by a caller, which is why each is checked and named.
+    #[test]
+    fn a_value_the_record_cannot_hold_is_refused_not_truncated() {
+        let (frame, state, header) = vp9_key_frame();
+        let empty = super::Vp9ReferenceSet::default();
+        // A coded size past `uint16_t`, on each axis.
+        for (what, set) in [
+            ("frame_width", Box::new(|h: &mut FrameHeader| h.width = 70_000) as Box<dyn Fn(&mut FrameHeader)>),
+            ("frame_height", Box::new(|h: &mut FrameHeader| h.height = 70_000)),
+        ] {
+            let mut h = header.clone();
+            set(&mut h);
+            let e = super::vp9_picture_record(&h, &state, &frame, &empty).expect_err(what);
+            assert!(e.contains(what), "{what}: {e}");
+        }
+        // The two tile counts are `uint8_t`.
+        for (what, value) in [("log2_tile_rows", 300), ("log2_tile_columns", 300)] {
+            let mut h = header.clone();
+            if what == "log2_tile_rows" {
+                h.tile_rows_log2 = value;
+            } else {
+                h.tile_cols_log2 = value;
+            }
+            let e = super::vp9_picture_record(&h, &state, &frame, &empty).expect_err("{what} of {value}");
+            assert!(e.contains(what), "{what}: {e}");
+        }
+        // And a packed member whose value does not fit its width — the checks that stop one member
+        // being silently zeroed by `bits`, or from spilling into its neighbour. Each names itself.
+        for (what, set) in [
+            ("frame_type", Box::new(|h: &mut FrameHeader| h.frame_type = 2) as Box<dyn Fn(&mut FrameHeader)>),
+            ("mcomp_filter_type", Box::new(|h: &mut FrameHeader| h.interp_filter = 9)),
+            ("reset_frame_context", Box::new(|h: &mut FrameHeader| h.reset_frame_context = 4)),
+            ("frame_context_idx", Box::new(|h: &mut FrameHeader| h.frame_context_idx = 4)),
+            ("last_ref_frame", Box::new(|h: &mut FrameHeader| h.ref_frame_idx[0] = 8)),
+            ("golden_ref_frame", Box::new(|h: &mut FrameHeader| h.ref_frame_idx[1] = 8)),
+            ("alt_ref_frame", Box::new(|h: &mut FrameHeader| h.ref_frame_idx[2] = 8)),
+        ] {
+            let mut h = header.clone();
+            set(&mut h);
+            let e = super::vp9_picture_record(&h, &state, &frame, &empty).expect_err("{what} out of range");
+            assert!(e.contains(what), "{what}: {e}");
+        }
+    }
+
+    /// The whole reference set is submitted, all eight slots, whatever the frame refers to.
+    ///
+    /// This is the one place VP9's record shape differs from H.264's and HEVC's, and a field-by-field
+    /// check written by analogy would miss it: H.264's record has `num_ref_frames` beside its array and
+    /// marks its unused slots, HEVC's has 15 entries and a per-slice list — VP9's has **neither a
+    /// count nor a list**, so the array *is* the picture buffer and all eight of its slots are the
+    /// record's to fill.
+    #[test]
+    fn the_vp9_reference_frames_are_the_whole_set_of_eight() {
+        let (frame, state, header) = vp9_key_frame();
+        // Every slot filled, with ids a zero-filled array could not produce.
+        let all = super::Vp9ReferenceSet { slots: std::array::from_fn(|i| Some(100 + i as u32)) };
+        let bytes = super::vp9_picture_record(&header, &state, &frame, &all).expect("a key frame is described");
+        let r = crate::vaapi::ffi::picture_params_vp9(&bytes).expect("a record");
+        assert_eq!(r.reference_frames, [100, 101, 102, 103, 104, 105, 106, 107], "all eight slots, in order, even though a key frame refers to none of them");
+        assert!(r.reference_frames.iter().all(|&s| s != crate::vaapi::ffi::INVALID_SURFACE), "and none of them says it names no picture");
+        // The index lookup agrees with the array, and is bounded: a `ref_frame_idx` past the eight
+        // slots names nothing rather than reading past them.
+        assert_eq!(all.get(0), Some(100));
+        assert_eq!(all.get(7), Some(107));
+        assert_eq!(all.get(8), None, "slot 8 is not one of the eight");
+        assert_eq!(all.get(255), None, "and neither is any index past them");
+
+        // Every slot empty: eight `INVALID_SURFACE`s and no zero anywhere. A zero surface id is a real
+        // surface as far as libva is concerned — `vaCreateSurfaces` fills the ids in and promises
+        // nothing about their values — so a zeroed array would name a picture that may well exist.
+        let none = super::Vp9ReferenceSet::default();
+        let bytes = super::vp9_picture_record(&header, &state, &frame, &none).expect("a key frame is described");
+        let r = crate::vaapi::ffi::picture_params_vp9(&bytes).expect("a record");
+        assert_eq!(r.reference_frames, [crate::vaapi::ffi::INVALID_SURFACE; 8], "every empty slot says it names no picture");
+        assert_eq!(&bytes[4..36], &[0xff; 32], "eight 0xffffffff surface ids, at offsets 4..36");
+    }
+
+    /// The record is 92 bytes and no more, and a short buffer is refused rather than read past.
+    ///
+    /// `record_bytes` hands the driver exactly `size_of::<T>()` bytes, so the record's length is the
+    /// length libva reads: a record of any other length is a different structure to it. Both the number
+    /// and the offsets it comes from are measured against the header — `abi_guard` asks a C compiler for
+    /// the size and the two offsets a plausible reading gets wrong.
+    #[test]
+    fn the_vp9_record_is_exactly_the_size_the_driver_was_compiled_with() {
+        let (frame, state, header) = vp9_key_frame();
+        let bytes = super::vp9_picture_record(&header, &state, &frame, &super::Vp9ReferenceSet::default()).expect("a key frame is described");
+        assert_eq!(
+            bytes.len(),
+            std::mem::size_of_val(&crate::vaapi::ffi::VaPictureParameterBufferVp9::default()),
+            "the record and its declaration are the same length"
+        );
+        assert_eq!(bytes.len(), 92, "VADecPictureParameterBufferVP9 (va_dec_vp9.h:58), as a C compiler measures it");
+        // A short buffer is `None`, not a record read past its end.
+        assert!(crate::vaapi::ffi::picture_params_vp9(&bytes[..91]).is_none(), "91 bytes is not a record");
+        assert!(crate::vaapi::ffi::picture_params_vp9(&[]).is_none(), "nor is nothing");
+        assert!(crate::vaapi::ffi::picture_params_vp9(&bytes).is_some(), "and 92 is");
     }
 
     // --- fixtures -------------------------------------------------------------------------------
