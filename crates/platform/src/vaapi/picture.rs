@@ -1222,11 +1222,34 @@ pub fn build_frame(info: &FrameStreamInfo, sample: &[u8]) -> Result<Picture, Str
 /// Why the VP9 arm of [`build_frame`] cannot build a record from a sample alone, which is the whole of
 /// what [`build_frame`] can do for VP9 today.
 ///
-/// This is the honest boundary of the function. The order of the checks matters and is worth stating:
-/// a profile this backend does not decode is refused **before the sample is looked at**, so a 4:2:2
-/// frame is declined as 4:2:2 rather than as a parse error or a missing state — whatever bytes it
-/// happens to carry. Only then is the sample read, and only then is the missing state named.
+/// This is the honest boundary of the function, and **every sentence it can return has to name
+/// something the caller can act on.** Two of the three ways it used to be untruthful are worth
+/// recording, because both looked like faults in the frame and were not:
+///
+/// - **A non-intra frame does not spell its colour configuration.** 6.2 reads `color_config` only for
+///   a key frame and for an intra-only frame; a true inter frame *inherits* it
+///   (`crates/vp9/src/header.rs:265`). Parsed against a fresh `HeaderState` — which is all this arm
+///   has — an inter frame's `color.bit_depth` is therefore always `ColorConfig::default()`'s 8, and a
+///   10-bit profile 2 stream was told "the frame header says 8 bits". It never said that. So the
+///   depth half of the sample-entry cross-check is gated on [`FrameHeader::frame_is_intra`], which is
+///   exactly the condition under which `color_config` was read, and the **profile** half — which
+///   `parse_uncompressed` reads unconditionally, at `header.rs:226-228` — is not.
+/// - **A frame that takes its size from a reference slot cannot be read without the references.**
+///   6.2.5's `frame_size_with_refs` (`header.rs:271-284`) asks `refs` for the size of the slot the
+///   header names, and this arm passes `[None; 8]` because it has no surfaces. That comes back as
+///   `Error::MissingReference`, which is **the missing state itself**, not a malformed header — so it
+///   gets the missing-state sentence rather than a parse error the caller cannot fix.
+///
+/// The order of the checks matters and is worth stating: a profile this backend does not decode is
+/// refused **before the sample is looked at**, so a 4:2:2 frame is declined as 4:2:2 rather than as a
+/// parse error or a missing state — whatever bytes it happens to carry.
 fn vp9_frame_entry_error(info: &FrameStreamInfo, sample: &[u8]) -> String {
+    // The missing state, named as what it is: the boundary between a record that can be built and one
+    // that would have to be invented. One constant, because two different paths reach it and a user
+    // shown two wordings for one problem cannot tell whether they are one problem or two.
+    const MISSING_REFERENCE_STATE: &str = "VP9 picture parameters: VADecPictureParameterBufferVP9 is built from the frame header by \
+        `vp9_picture_record`, which also needs the reference surfaces of the pictures decoded before this one; a stream description \
+        alone carries none";
     // **The profile first, before the sample is looked at at all.** Same table and same words as
     // `plan_frame` and as `vp9_picture_record`.
     if let Some(why) = vp9_decline(info.profile, info.bit_depth) {
@@ -1238,20 +1261,30 @@ fn vp9_frame_entry_error(info: &FrameStreamInfo, sample: &[u8]) -> String {
         return "VP9 picture parameters: an empty frame".into();
     }
     match filmcraft_vp9::header::parse_uncompressed(sample, &mut HeaderState::default(), &[None; 8]) {
+        // A reference slot the header wanted a size from, and this arm has no surface for any of them.
+        // See the note above: this is the missing state, not a fault in the header.
+        Err(filmcraft_vp9::Error::MissingReference(_)) => MISSING_REFERENCE_STATE.into(),
+        // Every other parse failure really is the header's: truncated, or a syntax element out of
+        // range. Those are actionable in the sample, so they are reported as what they are.
         Err(why) => format!("VP9 picture parameters: uncompressed frame header: {why}"),
-        // The container's `vpcC` and the frame's own header disagreeing is a stream this backend will
-        // not describe: the surfaces were created for one profile and depth and the record would say
-        // another. (`FrameStreamInfo::parameters_changed` makes the same check for the decode loop;
-        // saying so here keeps the two from disagreeing about the same stream.)
-        Ok(h) if h.profile != info.profile || u32::from(h.color.bit_depth) != info.bit_depth => format!(
-            "VP9 picture parameters: the sample entry says profile {} at {} bits, the frame header says profile {} at {} bits",
-            info.profile, info.bit_depth, h.profile, h.color.bit_depth
-        ),
-        // Otherwise the state, named as what it is: the boundary between a record that can be built
-        // and one that would have to be invented.
-        Ok(_) => "VP9 picture parameters: VADecPictureParameterBufferVP9 is built from the frame header by `vp9_picture_record`, which also \
-                  needs the reference surfaces of the pictures decoded before this one; a stream description alone carries none"
-            .into(),
+        // The profile is spelled in every frame, so this half of the cross-check is not gated: a
+        // container whose `vpcC` says one profile and whose frames say another describes a stream this
+        // backend will not hand to a driver — the surfaces were created for one profile and the record
+        // would say another.
+        Ok(h) if h.profile != info.profile => {
+            format!("VP9 picture parameters: the sample entry says profile {}, the frame header says profile {}", info.profile, h.profile)
+        }
+        // The depth is spelled **only** where `color_config` was read. `frame_is_intra` is true for a
+        // key frame (`header.rs:249`) and for an intra-only frame (`header.rs:252`), which are the two
+        // cases that read it, and false for a true inter frame, which inherits it.
+        Ok(h) if h.frame_is_intra && u32::from(h.color.bit_depth) != info.bit_depth => {
+            format!(
+                "VP9 picture parameters: the sample entry says {} bits, the frame header's colour configuration says {} bits",
+                info.bit_depth, h.color.bit_depth
+            )
+        }
+        // Otherwise the state.
+        Ok(_) => MISSING_REFERENCE_STATE.into(),
     }
 }
 
@@ -4186,6 +4219,16 @@ mod tests {
     /// (`crates/vp9/src/header.rs:222-403`), because a header written in the wrong order still parses
     /// some of the time and produces a record that is wrong in a way no assertion would explain.
     fn vp9_key_frame() -> (Vec<u8>, filmcraft_vp9::header::HeaderState, filmcraft_vp9::header::FrameHeader) {
+        vp9_key_frame_at(0, false)
+    }
+
+    /// The same key frame at `profile` 0 or 2, and — for profile 2 — at 10 bits when `ten_bit` is true
+    /// (`color_config`'s `ten_or_twelve_bit`, `crates/vp9/src/header.rs:162`).
+    ///
+    /// **Profile 0 emits exactly the same bits as before this was parameterised** — `color_config`
+    /// reads no extra bit below profile 2 — so the byte-pinning test's fixture, and the 92 bytes it
+    /// pins, are untouched by taking the arguments.
+    fn vp9_key_frame_at(profile: u8, ten_bit: bool) -> (Vec<u8>, filmcraft_vp9::header::HeaderState, filmcraft_vp9::header::FrameHeader) {
         const WIDTH: u32 = 320;
         const HEIGHT: u32 = 180;
         /// How long the frame's compressed header **claims** to be, as 6.3's `header_size_in_bytes`
@@ -4206,13 +4249,18 @@ mod tests {
         const COMPRESSED: u32 = 9;
         let mut w = Bits(Vec::new());
         w.put(2, 2); // frame_marker
-        w.put(0, 1); // profile_low_bit
-        w.put(0, 1); // profile_high_bit — profile 0
+        w.put(u32::from(profile & 1), 1); // profile_low_bit
+        w.put(u32::from((profile >> 1) & 1), 1); // profile_high_bit — profile = (high << 1) | low
         w.put(0, 1); // show_existing_frame
         w.put(0, 1); // frame_type — KEY_FRAME
         w.put(1, 1); // show_frame
         w.put(0, 1); // error_resilient_mode
         w.put(0x49_83_42, 24); // frame_sync_code
+        // `ten_or_twelve_bit` is read only at profile 2 or above, so profile 0 writes nothing here —
+        // which is what keeps its bytes unchanged.
+        if profile >= 2 {
+            w.put(u32::from(ten_bit), 1); // ten_or_twelve_bit — 0 is 10-bit, 1 is 12-bit
+        }
         w.put(1, 3); // color_space — BT.601
         w.put(0, 1); // color_range — studio swing
         w.put(WIDTH - 1, 16); // frame_width_minus_1
@@ -4274,7 +4322,101 @@ mod tests {
         assert_eq!(header.uncompressed_size, header_bytes.len(), "the header is `header_bytes` long, which is what `first_partition_size` is measured from");
         assert_eq!(header.header_size_in_bytes, CLAIMED, "the bitstream claims a {CLAIMED}-byte compressed header");
         assert_eq!(frame.len() - header.uncompressed_size, COMPRESSED as usize, "and the frame really has a {COMPRESSED}-byte one");
+        // The two properties the tests below rest on, asserted here so a fixture that stops being the
+        // thing it is claimed to be fails at the builder.
+        assert_eq!(header.profile, profile);
+        assert_eq!(u32::from(header.color.bit_depth), if profile >= 2 { if ten_bit { 12 } else { 10 } } else { 8 });
+        assert!(header.frame_is_intra, "a key frame is intra, so its colour configuration is its own");
         (frame, state, header)
+    }
+
+    /// A profile 2 **inter** frame, as 6.2 writes one.
+    ///
+    /// This is the fixture the decline-message tests need, and the reason it exists is that an inter
+    /// frame and a key frame do not spell the same things. VP9 6.2 reads `color_config` only for a key
+    /// frame and an intra-only frame; a true inter frame **inherits** its colour from the parse state
+    /// (`crates/vp9/src/header.rs:265`), so parsed against a fresh `HeaderState` its `color.bit_depth`
+    /// is `ColorConfig::default()`'s 8 no matter what the stream is. It also may take its coded size
+    /// from a reference slot (`frame_size_with_refs`, `header.rs:271-284`), which needs the references
+    /// this arm does not have.
+    ///
+    /// `size_from_ref` chooses between the two: `true` writes the found-reference flag (one bit, and
+    /// the loop breaks on it — `header.rs:273-283`), `false` writes all three flags clear and then an
+    /// explicit `frame_size`.
+    fn vp9_inter_frame(profile: u8, size_from_ref: bool) -> Vec<u8> {
+        const WIDTH: u32 = 1920;
+        const HEIGHT: u32 = 1080;
+        let mut w = Bits(Vec::new());
+        w.put(2, 2); // frame_marker
+        w.put(u32::from(profile & 1), 1); // profile_low_bit
+        w.put(u32::from((profile >> 1) & 1), 1); // profile_high_bit
+        w.put(0, 1); // show_existing_frame
+        w.put(1, 1); // frame_type — INTER_FRAME
+        w.put(1, 1); // show_frame
+        w.put(0, 1); // error_resilient_mode — off, so reset_frame_context and both flags are read
+        // `show_frame` is set, so `intra_only` is not present (`header.rs:251`).
+        w.put(0, 2); // reset_frame_context
+        // An inter frame spells **none** of the following: no frame_sync_code, no color_config.
+        w.put(0xa5, 8); // refresh_frame_flags
+        for (idx, bias) in [(5u32, 1u32), (2, 0), (7, 1)] {
+            w.put(idx, 3); // ref_frame_idx[i]
+            w.put(bias, 1); // ref_frame_sign_bias[i]
+        }
+        // 6.2.5 frame_size_with_refs. The loop breaks on the first set flag, so `true` writes one bit
+        // and `false` writes all three clear and then the size itself.
+        if size_from_ref {
+            w.put(1, 1); // found_ref — slot 5, which a caller with no surfaces cannot supply
+        } else {
+            for _ in 0..3 {
+                w.put(0, 1); // found_ref, three times over: none is set
+            }
+            w.put(WIDTH - 1, 16); // frame_width_minus_1
+            w.put(HEIGHT - 1, 16); // frame_height_minus_1
+        }
+        w.put(0, 1); // render_and_frame_size_different
+        w.put(1, 1); // allow_high_precision_mv
+        w.put(0, 1); // is_filter_switchable — off, so a literal filter type follows
+        w.put(2, 2); // raw_filter_type — LITERAL_TO_TYPE[2] = 2 (SMOOTH)
+        w.put(1, 1); // refresh_frame_context
+        w.put(1, 1); // frame_parallel_decoding_mode
+        w.put(3, 2); // frame_context_idx — non-zero, so it is not the value a key frame forces
+        w.put(21, 6); // loop_filter_level
+        w.put(3, 3); // loop_filter_sharpness
+        w.put(0, 1); // loop_filter_delta_enabled — off, so no delta update block
+        w.put(128, 8); // base_q_idx
+        for _ in 0..3 {
+            w.put(0, 1); // delta_q_{y_dc,uv_dc,uv_ac}_present
+        }
+        w.put(0, 1); // segmentation_enabled — off, so no update_map and no update_data
+        // 6.2.13 tile_info at 1920x1080: 30 superblock columns, so the tile-width loop runs twice
+        // (min 0, max 2 — `header.rs:373-389`) and both flags are set.
+        w.put(1, 1); // tile_cols_log2 — up to 1
+        w.put(1, 1); // tile_cols_log2 — up to 2
+        w.put(1, 1); // tile_rows_log2 — high bit, so a second bit follows
+        w.put(0, 1); // tile_rows_log2 — low bit; 1 + 0 = 1 tile row
+        w.put(6, 16); // header_size_in_bytes
+
+        let header_bytes = w.bytes();
+        // The properties the tests below assert on, checked here so a fixture that stops being the
+        // thing it is claimed to be fails at the builder rather than inside a message assertion.
+        let mut state = filmcraft_vp9::header::HeaderState::default();
+        match filmcraft_vp9::header::parse_uncompressed(&header_bytes, &mut state, &[None; 8]) {
+            Ok(h) => {
+                assert!(!h.frame_is_intra, "a true inter frame is not intra, which is what gates the colour cross-check");
+                assert_eq!(h.profile, profile, "the header spells its profile, inherited or not");
+                assert_eq!(h.size_from_ref, size_from_ref);
+                // The whole point: against a **fresh** state, this is 8 whatever the profile is,
+                // because `header.rs:265` copies `HeaderState::default().color`.
+                assert_eq!(h.color, filmcraft_vp9::header::ColorConfig::default(), "an inter frame inherits the state's colour configuration");
+            }
+            Err(e) => {
+                assert!(size_from_ref, "only the size-from-a-reference frame is expected to fail to parse");
+                assert!(matches!(e, filmcraft_vp9::Error::MissingReference(_)), "and it fails because of the missing reference, not a syntax error: {e}");
+            }
+        }
+        let mut frame = header_bytes.clone();
+        frame.extend(std::iter::repeat_n(0u8, 6));
+        frame
     }
 
     /// The record's bytes, pinned.
@@ -4702,6 +4844,114 @@ mod tests {
         let r = crate::vaapi::ffi::picture_params_vp9(&bytes).expect("a record");
         assert_eq!(r.reference_frames, [crate::vaapi::ffi::INVALID_SURFACE; 8], "every empty slot says it names no picture");
         assert_eq!(&bytes[4..36], &[0xff; 32], "eight 0xffffffff surface ids, at offsets 4..36");
+    }
+
+    /// **A 10-bit profile 2 inter frame is not told the frame header "says 8 bits."**
+    ///
+    /// VP9 6.2 reads `color_config` only for a key frame and an intra-only frame; a true inter frame
+    /// *inherits* its colour configuration from the parse state
+    /// (`crates/vp9/src/header.rs:265`). `build_frame` parses against a fresh `HeaderState`, so an
+    /// inter frame's `color.bit_depth` is `ColorConfig::default()`'s 8 **whatever the stream is** — and
+    /// comparing it against the sample entry's 10 produced, for every 10-bit VP9 stream:
+    ///
+    /// > VP9 picture parameters: the sample entry says profile 2 at 10 bits, the frame header says
+    /// > profile 2 at 8 bits
+    ///
+    /// A claim the frame header never made. The message looks actionable — it names two numbers that
+    /// disagree — and the action it implies (fix the sample entry, or fix the encoder) is impossible,
+    /// which is what makes it worse than no message. So the depth half of the cross-check is gated on
+    /// `frame_is_intra`, and this asserts the message it produces now.
+    ///
+    /// The **profile** half is deliberately *not* gated: `parse_uncompressed` reads it in every frame
+    /// (`header.rs:226-228`), so a genuine profile disagreement is still caught — pinned below.
+    #[test]
+    fn a_ten_bit_inter_frame_is_not_told_the_frame_header_says_eight_bits() {
+        let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, 2, 10, (1, 1), (1920, 1080));
+        let frame = vp9_inter_frame(2, false);
+        let e = super::build_frame(&info, &frame).expect_err("a decodable VP9 profile is declined for the state, not its colour");
+
+        // The message the arm exists to give: the reference surfaces.
+        assert!(e.contains("reference surfaces"), "the missing state is what is actually missing: {e}");
+        assert!(e.contains("vp9_picture_record"), "and the message says which function would build it: {e}");
+        // And specifically **not** the false colour claim. Both wordings it used to take are checked,
+        // because the old one is the shape a later regression would take.
+        assert!(!e.contains("sample entry says"), "no claim the sample entry and the frame header disagree: {e}");
+        assert!(!e.contains("8 bits"), "and no bit depth the frame header never read: {e}");
+        assert!(!e.contains("uncompressed frame header"), "the header parsed fine: {e}");
+    }
+
+    /// **An inter frame whose coded size comes from a reference slot is not blamed on a bad header.**
+    ///
+    /// 6.2.5's `frame_size_with_refs` (`header.rs:271-284`) asks the parse for the size of the
+    /// reference slot the header names, and this arm passes `[None; 8]` because it has no surfaces. So
+    /// a perfectly valid frame came back as `Err(MissingReference)` and was reported as
+    ///
+    /// > VP9 picture parameters: uncompressed frame header: frame size from empty slot 5
+    ///
+    /// which blames the frame for the one thing the frame did not control. That is
+    /// `Error::MissingReference` — **the missing state itself**, wearing a header parse error's hat —
+    /// so it now gets the missing-state sentence.
+    ///
+    /// The other two parse failures are still reported as header faults, which is what makes the
+    /// distinction rather than a blanket swallow: a truncated frame and an out-of-range syntax element
+    /// really are the sample's, and both are asserted below.
+    #[test]
+    fn an_inter_frame_that_takes_its_size_from_a_reference_is_the_missing_state_not_a_bad_header() {
+        let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, 0, 8, (1, 1), (1920, 1080));
+        let frame = vp9_inter_frame(0, true);
+        let e = super::build_frame(&info, &frame).expect_err("a frame that needs a reference is declined");
+
+        assert!(e.contains("reference surfaces"), "the missing state is what is actually missing: {e}");
+        assert!(!e.contains("uncompressed frame header"), "not a header parse error the caller cannot act on: {e}");
+        assert!(!e.contains("empty slot"), "and not the reference slot, which is not what the caller has to fix: {e}");
+        // The same at profile 2, so the gate is on the failure and not on the profile.
+        let ten = FrameStreamInfo::for_tests(FrameCodec::Vp9, 2, 10, (1, 1), (1920, 1080));
+        let e = super::build_frame(&ten, &vp9_inter_frame(2, true)).expect_err("a frame that needs a reference is declined");
+        assert!(e.contains("reference surfaces"), "{e}");
+        assert!(!e.contains("uncompressed frame header"), "{e}");
+
+        // **A genuinely malformed header is still reported as one.** Truncated mid-header, and a frame
+        // whose frame marker is wrong: both are the sample's fault and both keep the parse-error wording,
+        // so the `MissingReference` fall-through did not swallow the case it was meant to leave alone.
+        for (what, sample) in [("a truncated frame", &vp9_inter_frame(0, false)[..6]), ("a frame that is not a VP9 frame at all", &[0xff, 0xff, 0xff][..])] {
+            let e = super::build_frame(&info, sample).expect_err(what);
+            assert!(e.contains("uncompressed frame header"), "{what} is the sample's fault and is reported as one: {e}");
+            assert!(!e.contains("reference surfaces"), "{what}: {e}");
+        }
+    }
+
+    /// **The sample-entry cross-check still fires where the frame really does spell both numbers.**
+    ///
+    /// The gate in the test above narrows the check; this proves it did not remove it. A key frame
+    /// spells its colour configuration (`header.rs:245`), so a `vpcC` that disagrees with it is a real
+    /// contradiction between the container and the bitstream — the surfaces were created for one depth
+    /// and the record would say another — and the message names both numbers, because here both *are*
+    /// the frame header's.
+    #[test]
+    fn the_sample_entry_cross_check_still_fires_for_a_key_frame() {
+        // A 10-bit key frame against a sample entry that says 8.
+        let (ten_bit_frame, _, ten_bit_header) = vp9_key_frame_at(2, false);
+        assert_eq!(ten_bit_header.color.bit_depth, 10, "the fixture really is 10-bit, and it spells that itself");
+        let eight = FrameStreamInfo::for_tests(FrameCodec::Vp9, 2, 8, (1, 1), (320, 180));
+        let e = super::build_frame(&eight, &ten_bit_frame).expect_err("a key frame that spells 10 bits against a sample entry saying 8");
+        assert!(e.contains("8 bits"), "the sample entry's depth: {e}");
+        assert!(e.contains("10 bits"), "and the frame header's: {e}");
+        assert!(e.contains("colour configuration"), "and the message says where the header's number comes from: {e}");
+
+        // The profile half, which is not gated at all — `parse_uncompressed` reads it in every frame.
+        // A profile 2 key frame against a sample entry that says profile 0: a profile *is* inherited
+        // never, so this is a real disagreement.
+        let zero = FrameStreamInfo::for_tests(FrameCodec::Vp9, 0, 8, (1, 1), (320, 180));
+        let e = super::build_frame(&zero, &ten_bit_frame).expect_err("a profile 2 key frame against a sample entry saying profile 0");
+        assert!(e.contains("says profile 0"), "{e}");
+        assert!(e.contains("says profile 2"), "{e}");
+
+        // And the matching case: a sample entry that agrees with the key frame gets the state message,
+        // so the check is a comparison and not a blanket refusal.
+        let agrees = FrameStreamInfo::for_tests(FrameCodec::Vp9, 2, 10, (1, 1), (320, 180));
+        let e = super::build_frame(&agrees, &ten_bit_frame).expect_err("an agreeing sample entry is declined for the state");
+        assert!(e.contains("reference surfaces"), "{e}");
+        assert!(!e.contains("sample entry says"), "an agreeing pair is not reported as a disagreement: {e}");
     }
 
     /// The record is 92 bytes and no more, and a short buffer is refused rather than read past.
