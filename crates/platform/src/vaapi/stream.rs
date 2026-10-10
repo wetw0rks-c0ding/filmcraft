@@ -63,8 +63,8 @@ impl From<FrameStreamInfo> for Stream {
 ///
 /// The same helper the Windows backend has, for the same two callers (the factory in front of our
 /// decoders, and the diagnostics that ask what this machine can decode): a frame-coded entry is
-/// recognised here even though `plan_frame` declines every one of them, so that the recognition
-/// and the decline cannot drift apart.
+/// recognised here whether or not `plan_frame` takes it, so that the recognition and the plan cannot
+/// drift apart.
 pub fn stream_info(entry: &filmcraft_isobmff::SampleEntry) -> Option<StreamInfo> {
     match NalStreamInfo::from_entry(entry) {
         Some(r) => r.ok().map(StreamInfo::Nal),
@@ -134,22 +134,21 @@ pub fn plan_nal(info: &NalStreamInfo) -> Result<Plan, String> {
 /// that stream" and takes the software decoder, rather than a mid-stream failure once a context
 /// exists.
 ///
-/// **Both frame codecs are still declined at this level, for different reasons.**
+/// **VP9 is planned here; AV1 is still declined, and says why.**
+///
+/// **VP9**: the record and the state it is built against both exist — `super::picture::Vp9State`
+/// threads one `filmcraft_vp9::header::HeaderState` across the stream and owns the eight reference
+/// slots, and `vp9_picture_record` lays the `VADecPictureParameterBufferVP9` out from the frame's
+/// uncompressed header. What this function has to say about that state is **nothing**: a
+/// `FrameStreamInfo` describes the stream, and the reference surfaces are the pictures decoded out of
+/// it — a run, not a description. So the missing state is not a reason to decline here, and the
+/// record is submitted by the one caller that threads a state (`VaDecoder::picture_frame`). The
+/// profile table below is the record builder's own table, called from here so the two cannot disagree
+/// about which VP9 this backend takes.
 ///
 /// **AV1**: `filmcraft_av1` exposes a sequence header, not the per-frame header libva wants as a
 /// record (`VADecPictureParameterBufferAV1`), so a record of invented values would be one a driver
-/// reads as a valid picture. Unchanged by the VP9 work below.
-///
-/// **VP9**: the *record* is built, and the *state* it is built against exists —
-/// `super::picture::Vp9State` threads one `filmcraft_vp9::header::HeaderState` across the stream and
-/// owns the eight reference slots, and `vp9_picture_record` lays the `VADecPictureParameterBufferVP9`
-/// out from the frame's uncompressed header. What `plan_frame` cannot have is **that state**: a
-/// `FrameStreamInfo` describes the stream, not the pictures decoded out of it, and the state is per
-/// run rather than per stream description. So this still declines, and says which object a decode
-/// would need — not because a record cannot be built, but because the half that says *which surface
-/// each reference slot holds* is the pictures before this one. The profile table below is the record
-/// builder's own table, called from here so the two cannot disagree about which VP9 this backend
-/// takes.
+/// reads as a valid picture. That is still true, and it is the whole of AV1's decline.
 pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
     if info.mono || info.subsampling != (1, 1) {
         return Err(format!("chroma subsampling {:?}{}", info.subsampling, if info.mono { " (monochrome)" } else { "" }));
@@ -178,23 +177,17 @@ pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
         (FrameCodec::Av1, 0, 10) => (Profile::Av1Main, RtFormat::Yuv420_10),
         (FrameCodec::Av1, p, b) => return Err(format!("AV1 profile {p} at {b} bits")),
     };
-    // Both codecs are declined here, and each says what is actually missing — see the note above.
-    // The VP9 arm names the reference **state**, not the frame header, because both the header and
-    // the record builder exist: `Vp9State` is the object that carries the state across a run, and a
-    // stream description is not a run.
-    Err(match info.codec {
-        FrameCodec::Vp9 => format!(
-            "VP9 picture parameters, which would be planned as {profile:?} at {format:?} in {} bits: filmcraft-vp9 exposes the \
-             uncompressed frame header, `Vp9State` carries the reference state across a run and `vp9_picture_record` builds the \
-             record from both, but the eight reference surfaces a record names are state this description does not carry",
-            info.bit_depth
-        ),
-        FrameCodec::Av1 => format!(
+    // One codec is planned and one is declined, and each arm says what is actually true — see the
+    // note above. The VP9 arms above have already refused every profile and depth this backend does
+    // not decode, so reaching `Ok` here means a record the backend can build for every frame.
+    match info.codec {
+        FrameCodec::Vp9 => Ok(Plan { profile, entrypoint: Entrypoint::Vld, format, size: info.size }),
+        FrameCodec::Av1 => Err(format!(
             "AV1 picture parameters, which would be planned as {profile:?} at {format:?} in {} bits: filmcraft-av1 {}",
             info.bit_depth,
             super::picture::FRAME_HEADER_MISSING
-        ),
-    })
+        )),
+    }
 }
 
 /// Whether this driver really decodes `plan`: it lists the profile, and it lists the video decoder
@@ -350,44 +343,61 @@ mod tests {
         assert!(plan_nal(&nal(NalCodec::H264, 100, 10, 1)).is_err(), "10-bit H.264 High");
     }
 
-    /// A frame-coded stream is declined while it is still a description, not at its first frame — and
-    /// the two codecs are declined for **different** reasons, which is the point of this test.
+    /// Which frame codecs are **planned**, and which are declined while still a description rather
+    /// than at their first frame — and the two answers are now genuinely different per codec.
     ///
-    /// AV1 is declined because its per-frame header is not exposed (`FRAME_HEADER_MISSING`, which is
-    /// still true). VP9 is declined because a record also names the eight reference surfaces, which
-    /// are state a stream description does not carry — `Vp9State` is the object that carries it, and
-    /// it is per run rather than per description. Asserting the old shared constant for VP9 would
-    /// assert something false about the code.
+    /// **VP9 is planned.** Its per-frame header is exposed, its record is built, and the state that
+    /// record needs (the eight reference slots and the parse state they are read against) belongs to a
+    /// *run* — so it is not a reason to refuse a *description*. What is still refused is the VP9 this
+    /// backend cannot put a surface for: profiles 1, 3 and 4, and 12-bit, which is the profile table
+    /// below. Asserting a decline for profile 0 or 2 here would assert that the decoder cannot decode
+    /// VP9, which is now false.
+    ///
+    /// **AV1 is declined**, because its per-frame header is not exposed
+    /// (`FRAME_HEADER_MISSING`, which is still true) and an invented record would be one a driver
+    /// reads as a valid picture.
     #[test]
-    fn every_frame_codec_is_declined_before_a_context_exists() {
+    fn the_frame_codecs_are_planned_or_declined_for_their_own_reason() {
         // `for_tests` is the crate's own hand-built description (hw_frame.rs:195)
-        for (codec, profile, bits) in [(FrameCodec::Vp9, 0u8, 8u32), (FrameCodec::Vp9, 2, 10), (FrameCodec::Av1, 0, 8), (FrameCodec::Av1, 0, 10)] {
+        for (codec, profile, bits) in [(FrameCodec::Vp9, 0u8, 8u32), (FrameCodec::Vp9, 2, 10)] {
             let info = FrameStreamInfo::for_tests(codec, profile, bits, (1, 1), (1920, 1080));
-            let e = plan_frame(&info).expect_err("{codec:?} profile {profile} at {bits} is declined");
-            match codec {
-                FrameCodec::Av1 => {
-                    assert!(e.contains("frame header"), "{codec:?} profile {profile} at {bits}: {e}");
-                    assert!(e.contains(crate::vaapi::picture::FRAME_HEADER_MISSING), "{codec:?} profile {profile} at {bits}: {e}");
-                }
-                FrameCodec::Vp9 => {
-                    // The reason names what is missing, and specifically *not* the frame header.
-                    assert!(e.contains("reference surface"), "{codec:?} profile {profile} at {bits}: {e}");
-                    assert!(!e.contains(crate::vaapi::picture::FRAME_HEADER_MISSING), "VP9's frame header IS exposed: {e}");
-                }
-            }
+            let plan = plan_frame(&info).unwrap_or_else(|e| panic!("{codec:?} profile {profile} at {bits} is planned: {e}"));
+            // The plan is the codec's own profile and depth, at the surface format for that depth — the
+            // same mapping the record's own `profile` and `bit_depth` bytes carry, so the config a driver
+            // is asked about is the one the records describe.
+            assert_eq!(plan.profile, Profile::Vp9(profile), "{codec:?} profile {profile} at {bits}");
+            assert_eq!(plan.format, if bits == 10 { RtFormat::Yuv420_10 } else { RtFormat::Nv12 }, "{codec:?} profile {profile} at {bits}");
+            assert_eq!(plan.entrypoint, Entrypoint::Vld, "a hardware decoder is the video decoder");
             // and the same stream through `Stream::plan`, which is what a decoder actually calls
+            assert!(Stream::from(info).plan().is_ok(), "{codec:?} profile {profile} at {bits} through Stream::plan");
+        }
+        for (codec, profile, bits) in [(FrameCodec::Av1, 0, 8u32), (FrameCodec::Av1, 0, 10)] {
+            let info = FrameStreamInfo::for_tests(codec, profile, bits, (1, 1), (1920, 1080));
+            let e = plan_frame(&info).expect_err("AV1 has no per-frame header to build a record from");
+            assert!(e.contains("frame header"), "{codec:?} profile {profile} at {bits}: {e}");
+            assert!(e.contains(crate::vaapi::picture::FRAME_HEADER_MISSING), "{codec:?} profile {profile} at {bits}: {e}");
             assert!(Stream::from(info).plan().is_err(), "{codec:?} through Stream::plan");
+        }
+        // VP9 profiles this backend has no surface for are still declined, and as *that*: a 4:2:2 stream
+        // is not told it lacks a parser, which it does not.
+        for (profile, bits, why) in [(1u8, 8u32, "4:2:2"), (3, 8, "4:2:2"), (4, 8, "reserves"), (0, 12, "12-bit")] {
+            let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, profile, bits, (1, 1), (1920, 1080));
+            let e = plan_frame(&info).expect_err("VP9 profile {profile} at {bits} bits");
+            assert!(e.contains(why), "VP9 profile {profile} at {bits} bits: {e}");
+            assert!(!e.contains(crate::vaapi::picture::FRAME_HEADER_MISSING), "VP9's frame header IS exposed: {e}");
+            assert!(Stream::from(info).plan().is_err(), "VP9 profile {profile} at {bits} bits through Stream::plan");
         }
     }
 
     /// The VP9 profile table is **one** table, and this is what makes it one: every pair it declines,
-    /// `plan_frame` and the record builder decline with the same sentence.
+    /// `plan_frame` and the record builder decline with the same sentence — and every pair it *takes*,
+    /// `plan_frame` plans and the record builder builds.
     ///
     /// The failure this guards against is not hypothetical — the H.264 milestone's `[3, 3]` index
     /// collision was a picture record and a slice record disagreeing about the same frame, and a
     /// decline that only one of the two sites knows about is the same kind of split, one step earlier.
     /// Both sites call `picture::vp9_decline`, so this test is really pinning that both sites still
-    /// call it: it walks the whole table, including every depth, and compares the two sentences.
+    /// call it: it walks the whole table, including every depth, and compares the two answers.
     #[test]
     fn the_vp9_decline_is_the_same_sentence_wherever_it_is_decided() {
         for profile in 0u8..=4 {
@@ -403,22 +413,21 @@ mod tests {
                     ..Default::default()
                 };
                 let from_record = crate::vaapi::picture::vp9_decline(header.profile, u32::from(header.color.bit_depth));
-                // `plan_frame` declines *every* frame-coded stream at this stage (VP9 because its reference state
-                // does not exist yet, AV1 because its per-frame header does not), so its error is
-                // never absent. What is compared is the part of it that must be shared.
                 match (from_plan, from_record) {
                     // A pair the backend does not take: both refuse, and `plan_frame` refuses with
-                    // the table's own sentence — the profile reason, not the missing state.
+                    // the table's own sentence — the profile reason, word for word.
                     (Err(planned), Some(from_table)) => assert_eq!(planned, from_table, "profile {profile} at {bits} bits"),
-                    // A pair both take: `plan_frame`'s decline is the missing-state one, and must
-                    // *not* carry the profile reason. This is the half that catches a table entry
-                    // added to `vp9_decline` without `plan_frame` declining it — the opposite drift.
-                    (Err(planned), None) => assert!(
-                        !planned.contains("out of scope") && !planned.contains("reserves") && !planned.contains("12-bit"),
-                        "profile {profile} at {bits} bits is taken by the table, so plan_frame's decline must be about state: {planned}"
-                    ),
+                    // A pair both take: `plan_frame` *plans* it, as the profile and depth the record
+                    // itself carries. This is the half that catches a table entry added to
+                    // `vp9_decline` without `plan_frame` declining it — the opposite drift — and the
+                    // other: a pair the table takes that `plan_frame` still refuses, which would be a
+                    // stream this backend can describe and will not decode.
+                    (Ok(planned), None) => {
+                        assert_eq!(planned.profile, Profile::Vp9(profile), "profile {profile} at {bits} bits is planned as its own profile");
+                        assert_eq!(planned.format, if bits == 10 { RtFormat::Yuv420_10 } else { RtFormat::Nv12 }, "profile {profile} at {bits} bits");
+                    }
                     (planned, from_table) => {
-                        panic!("profile {profile} at {bits} bits: plan_frame says {:?}, the record builder's table says {:?}", planned.err(), from_table)
+                        panic!("profile {profile} at {bits} bits: plan_frame says {planned:?}, the record builder's table says {from_table:?}")
                     }
                 }
             }
@@ -521,10 +530,15 @@ mod tests {
         }
     }
 
-    /// The profile and format each frame profile *would* be planned as, which the decline names and
-    /// `every_frame_codec_is_declined_before_a_context_exists` checks, plus the size bound that
-    /// applies to a frame stream whatever its profile: a VA-API surface is allocated at that size
-    /// and cropped on readback, so `MAX_SIDE` bounds it.
+    /// The profile and format each frame profile is planned as — for VP9 as a `Plan`, for AV1 named in
+    /// the decline it still is — plus the size bound that applies to a frame stream whatever its
+    /// profile: a VA-API surface is allocated at that size and cropped on readback, so `MAX_SIDE`
+    /// bounds it.
+    ///
+    /// The two halves are one table on purpose. AV1's rows assert that the decline still *names* the
+    /// profile and format it would have been planned as, so that the two codecs cannot drift apart in
+    /// what this backend would ask a driver about; VP9's rows assert the plan itself, because it now
+    /// has one.
     #[test]
     fn the_frame_profile_table_survives_the_decline() {
         for (codec, p, bits, profile, format) in [
@@ -533,18 +547,30 @@ mod tests {
             (FrameCodec::Av1, 0, 8, Profile::Av1Main, RtFormat::Nv12),
             (FrameCodec::Av1, 0, 10, Profile::Av1Main, RtFormat::Yuv420_10),
         ] {
-            let e = plan_frame(&frame(codec, p, bits, (1, 1))).expect_err("{codec:?} profile {p} at {bits}");
-            assert!(e.contains(&format!("{profile:?}")), "{codec:?} profile {p} at {bits} would be planned as {profile:?}: {e}");
-            assert!(e.contains(&format!("{format:?}")), "{codec:?} profile {p} at {bits} would use {format:?}: {e}");
-            assert!(e.contains(&format!("{bits} bits")), "{codec:?} profile {p} at {bits}: {e}");
+            let e = plan_frame(&frame(codec, p, bits, (1, 1)));
+            match codec {
+                FrameCodec::Vp9 => {
+                    let plan = e.unwrap_or_else(|why| panic!("{codec:?} profile {p} at {bits} is planned: {why}"));
+                    assert_eq!(plan.profile, profile, "{codec:?} profile {p} at {bits}");
+                    assert_eq!(plan.format, format, "{codec:?} profile {p} at {bits}");
+                    // The plan's size is the surface size, and it is the stream's own picture size — which
+                    // is what bounds both the allocation and the readback crop.
+                    assert_eq!(plan.size, (1920, 1080), "{codec:?} profile {p} at {bits}: surfaces are created at this size");
+                }
+                FrameCodec::Av1 => {
+                    let e = e.expect_err("{codec:?} profile {p} at {bits} is still declined");
+                    assert!(e.contains(&format!("{profile:?}")), "{codec:?} profile {p} at {bits} would be planned as {profile:?}: {e}");
+                    assert!(e.contains(&format!("{format:?}")), "{codec:?} profile {p} at {bits} would use {format:?}: {e}");
+                    assert!(e.contains(&format!("{bits} bits")), "{codec:?} profile {p} at {bits}: {e}");
+                }
+            }
         }
-        // and the size bound still applies to a frame stream, which is what bounds a surface
+        // and the size bound applies to a frame stream that *is* planned: a stream of exactly
+        // `MAX_SIDE` is within it and is taken, which is what makes the next line a bound and not a
+        // blanket refusal.
         let mut big = frame(FrameCodec::Vp9, 0, 8, (1, 1));
         big.size = (MAX_SIDE, MAX_SIDE);
-        assert!(
-            plan_frame(&big).expect_err("{MAX_SIDE} is declined like any other size in bounds").contains("picture parameters"),
-            "MAX_SIDE is within the bounds, so only the decline stops it"
-        );
+        assert_eq!(plan_frame(&big).expect("MAX_SIDE is within the bound").size, (MAX_SIDE, MAX_SIDE));
         let mut huge = frame(FrameCodec::Vp9, 0, 8, (1, 1));
         huge.size = (MAX_SIDE + 1, MAX_SIDE);
         assert!(plan_frame(&huge).expect_err("an oversized stream").starts_with("picture size"), "an oversized frame stream is still refused on its size");
@@ -623,10 +649,10 @@ mod tests {
             eprintln!("SKIPPED: no VA display");
             return;
         };
-        // Every profile this backend can plan (`plan_nal`), so the check is asked about each one the driver
-        // names rather than about one arbitrary profile. The frame profiles are absent because
-        // `plan_frame` declines them all: nothing plans them, so nothing asks a driver about them.
-        let ours = [Profile::H264ConstrainedBaseline, Profile::H264Main, Profile::H264High, Profile::HevcMain, Profile::HevcMain10];
+        // Every profile this backend can plan (`plan_nal`, and `plan_frame` for VP9), so the check is
+        // asked about each one the driver names rather than about one arbitrary profile.
+        let ours =
+            [Profile::H264ConstrainedBaseline, Profile::H264Main, Profile::H264High, Profile::HevcMain, Profile::HevcMain10, Profile::Vp9(0), Profile::Vp9(2)];
         let reported = d.profiles().expect("vaQueryConfigProfiles");
         let planned: Vec<Profile> = ours.iter().copied().filter(|p| reported.contains(p)).collect();
         if planned.is_empty() {

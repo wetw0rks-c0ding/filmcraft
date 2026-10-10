@@ -114,6 +114,30 @@ OS has a hardware encoder. Choosing the format is the opt-in, `filmcraft_export:
 probe the platform crate registers, and what the hardware path does not take (two-pass, odd sizes,
 a machine without the encoder) is an error naming the reason instead of a different encoder.
 
+## Addendum (2026-10-09): VP9 through VA-API on Linux
+
+VP9 is the one codec on Linux whose records FilmCraft builds by parsing the bitstream itself, and it
+is where this record's "never invent a record" rule is load-bearing rather than merely stated.
+`VADecPictureParameterBufferVP9`'s `reference_frames[8]` is **the whole decoded picture buffer
+addressed by slot**, not a per-slice list: a wrong slot map is not a crash and not an error, it is a
+driver reading some other picture as a reference and producing a plausible wrong one. `Vp9State`
+(`vaapi::picture`) therefore carries one `HeaderState` and the eight slots across a run, and a frame's
+`refresh_frame_flags` is applied only after the driver has rendered its picture — so a record always
+describes the buffer *before* its own frame. VP9 has no weighted prediction in either mode, so the
+class of defect that cost the H.264 milestone its budget cannot occur here.
+
+Scope is profiles 0 and 2 at 4:2:0, 8- and 10-bit. Profiles 1 and 3 (4:2:2 / 4:4:0 / 4:4:4) and
+profile 4 (reserved by the specification, so undefined rather than merely unimplemented) are declined,
+as is 12-bit: every surface this backend creates is 4:2:0 at 8 or 10 bits. **AV1 remains declined**,
+because `filmcraft_av1` does not expose its per-frame header and an invented record is precisely the
+failure this record exists to prevent.
+
+Two VP9 cases have no H.264 / HEVC analogue and are stated rather than left to fall out of the code:
+a frame that re-shows an earlier one (`show_existing_frame`) is **decoded** — VP9 8.2.2 has the
+decoder output the picture that slot holds and decode nothing, so it takes no surface from the ring
+and is a readback with no submission — and a frame with `show_frame` clear is rendered (it may refresh
+references) but produces no picture, which is what FilmCraft's own software VP9 decoder does too.
+
 ## Addendum (2026-10-08): VA-API hardware decoding on Linux
 
 Linux reaches the same GPU video engine through the driver's own media stack, libva. The rules
@@ -132,6 +156,13 @@ reports that it has no hardware decoder instead of failing to start — the same
 `mfplat.dll` and NVENC's driver. Decoded pictures come back to the CPU through `vaDeriveImage` +
 `vaMapBuffer` (or `vaCreateImage` + `vaPutImage`, when a driver cannot derive a surface into an
 image), so there is no zero-copy path on Linux yet — the same gap the other two platforms have.
+
+VP9 is decoded through the same rules (addendum below): profiles 0 and 2 at 4:2:0 8/10-bit, its
+picture-parameter record built by `vaapi::picture` from `filmcraft_vp9`'s own uncompressed-header
+parser, so libva's requirement that the application parse the frame headers is met by FilmCraft's
+own code rather than by a third-party one. AV1 is not, because `filmcraft_av1` does not expose its
+per-frame header; declining it is the same "never invent a record" rule the rest of this record
+applies.
 
 One caveat about this record's own claims: the safe decline tables in `vaapi::stream` and
 `vaapi::picture` have nothing OS-specific in them and would compile anywhere, but the module is

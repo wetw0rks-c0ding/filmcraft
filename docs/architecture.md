@@ -276,8 +276,10 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   `biplanar::to_frame`, so the readback is one copy and **zero-copy is not done here either**.
   A driver that does not list the profile with a video decoder for it is declined up front. Four
   limits are worth knowing at runtime, because each of them hands the stream to our decoder with no
-  error shown: VP9 and AV1 are declined while still a stream description (neither codec crate
-  exposes the per-frame header libva wants as a record); 10-bit H.264 is declined (libva names
+  error shown: AV1 is declined while still a stream description (`filmcraft_av1` does not expose
+  the per-frame header libva wants as a record), as is VP9 outside profiles 0 / 2 at 4:2:0 8/10-bit —
+  profiles 1 and 3 are 4:2:2 / 4:4:0 / 4:4:4, profile 4 is reserved by the specification, and 12-bit
+  has no surface here; 10-bit H.264 is declined (libva names
   that profile `VAProfileH264High10` and this backend does not carry it); an H.264 stream whose B
   slices carry H.264's *implicit* weights (`weighted_bipred_idc == 2`, x264's default for High
   profile with B frames, so most H.264) is declined at the first such slice, because

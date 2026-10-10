@@ -3,11 +3,11 @@
 
 use std::time::{Duration, Instant};
 
-use filmcraft_codecs::hw::{NalCodec, StreamInfo};
+use filmcraft_codecs::hw::{FrameCodec, NalCodec, StreamInfo};
 use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
 
 use super::ffi::{self, Display, Session};
-use super::picture::{NalPoc, Picture, surface_pool};
+use super::picture::{NalPoc, Picture, Vp9State, surface_pool, vp9_entry_disagreement, vp9_surface_pool};
 use super::stream::{Stream, plan_frame, supports};
 use super::{Ring, validate_image};
 use crate::biplanar::{self, Geometry};
@@ -59,8 +59,20 @@ pub struct VaDecoder {
     /// the order they are used in.
     ring: Ring,
     /// The decoder's own picture-order-count and reference state, which is what the records are built
-    /// from. `NalPoc` is [`super::picture`]'s, and its decoded-picture-buffer lives inside it.
+    /// from. `NalPoc` is [`super::picture`]'s, and its decoded-picture-buffer lives inside it. A VP9
+    /// stream does not use it: its own state is `vp9` below.
     poc: NalPoc,
+    /// The VP9 decode's reference state: the one parse state its frames inherit `color_config` and
+    /// the loop filter from, and the eight reference slots its record names. `Default` is an empty
+    /// state, which is the right one for a stream that is not VP9 and for the first frame of one that
+    /// is. See [`Vp9State`] for why this is a per-decode object and not a per-picture one.
+    vp9: Vp9State,
+    /// The significant bits per sample this session's surfaces hold (8 or 10), which is what a VP9
+    /// frame's own `color_config` is checked against: the surfaces were created in one format, and a
+    /// frame declaring another is a stream this session was not set up for — the same shape as
+    /// [`StreamInfo::parameters_changed`](filmcraft_codecs::hw::StreamInfo), which is what catches it
+    /// at a key frame; this catches the frames between them.
+    bits: u32,
     /// Presentation times of submitted access units whose picture has not come out yet.
     in_flight: Vec<i64>,
     /// The run started at a CRA / BLA picture: its RASL pictures are not decodable and are left out,
@@ -118,16 +130,23 @@ impl VaDecoder {
         // `Session::new` clamps the count, so this costs a clamp rather than an allocation.
         let count = match &stream {
             Stream::Nal(info) => surface_pool(info),
-            // Every frame-coded stream is declined by `plan` above, so this arm is unreachable today; it
-            // is written rather than unreachable so that adding a frame codec is not a compile error. An
-            // `Ok` here would mean a frame codec had been planned without the records to decode it, and
-            // that is refused too rather than turned into an allocation for a stream this cannot submit.
-            Stream::Frame(info) => {
-                let Err(why) = plan_frame(info) else {
-                    return Err("a frame-coded stream was planned without the picture-parameter records this backend cannot build".into());
-                };
-                return Err(why);
-            }
+            // A frame-coded stream that `plan` accepted, which today is VP9 only: the same bound as
+            // above and from the same place — its record's own `reference_frames` is all eight slots,
+            // and `Vp9State` holds a picture in a slot only while `refresh_frame_flags` says so.
+            Stream::Frame(info) => match info.codec {
+                FrameCodec::Vp9 => vp9_surface_pool(),
+                // AV1 is declined by `plan` above, so this arm is unreachable today; it is written
+                // rather than unreachable so that adding a frame codec is not a compile error. An `Ok`
+                // here would mean a frame codec had been planned without the records to decode it, and
+                // that is refused too rather than turned into an allocation for a stream this backend
+                // cannot submit.
+                FrameCodec::Av1 => {
+                    let Err(why) = plan_frame(info) else {
+                        return Err("a frame-coded stream was planned without the picture-parameter records this backend cannot build".into());
+                    };
+                    return Err(why);
+                }
+            },
         };
         let session = Session::new(&display, plan.profile, plan.entrypoint, plan.format, plan.size, count)?;
         let name = stream.name();
@@ -136,7 +155,8 @@ impl VaDecoder {
         // (`stream::plan_nal`, `plan_frame`). `first_geometry` is the one reader of those fields
         // that trusts them, and this is its only caller in this backend — so the order of the two
         // lines is load-bearing, not incidental.
-        let geometry = stream.first_geometry(plan_bits(plan.format)?);
+        let bits = plan_bits(plan.format)?;
+        let geometry = stream.first_geometry(bits);
         // The ring holds the ids the driver filled in, in the order it gave them: libva does not
         // promise surface ids are contiguous, so an id this code worked out rather than read would
         // name a surface that does not exist.
@@ -153,6 +173,8 @@ impl VaDecoder {
             session,
             ring,
             poc: NalPoc::default(),
+            vp9: Vp9State::new(),
+            bits,
             in_flight: Vec::new(),
             skip_rasl: false,
             first: true,
@@ -308,6 +330,11 @@ impl VideoDecoder for VaDecoder {
             self.drained = false;
             self.first = true;
             self.poc.reset();
+            // VP9's half of "what came before this point is gone", for the same reason: the first
+            // frame of the new run must be read as the first frame of a run, and the slots must be
+            // empty so that a reference resolves to nothing rather than to the previous run's
+            // picture. `Vp9State::reset` forgets both halves together, which is what a seek needs.
+            self.vp9.reset();
         }
         // HEVC RASL pictures after a CRA / BLA at the start of a run refer to pictures that were
         // never decoded, so they are left out — as the software decoder does, and so the pictures
@@ -331,9 +358,11 @@ impl VideoDecoder for VaDecoder {
             }
         }
         self.first = false;
-        // A frame-coded stream would say its picture size in the bitstream, which is not in the
-        // container; every one is declined while it is still a description, so there is nothing here
-        // to refresh — see `stream::plan_frame`.
+        // A VP9 key frame says its own size and colour, so the geometry a picture is read back at
+        // follows the bitstream rather than the container (`Stream::declared_picture`). This is the
+        // geometry a *later* frame is checked against in `picture_frame` — a stream whose resolution
+        // changes mid-run updates it here, and the check then refuses the run rather than decoding a
+        // frame into surfaces the session was not created at.
         if let Some(g) = self.stream.declared_picture(sample) {
             self.geometry = g;
         }
@@ -364,6 +393,13 @@ impl VideoDecoder for VaDecoder {
         // an empty frame list: an empty list for a sample the caller fed is indistinguishable from a
         // picture the stream has not produced yet, and a blank timeline is the worst answer available
         // — an error hands the stream to the software decoder instead.
+        //
+        // **The one frame that is decoded and produces no picture is the exception, and it is the
+        // stream's own answer rather than a blank one.** 6.2's `show_frame` clear is a VP9 frame the
+        // decoder must still render (it may refresh reference slots for later frames) but that no
+        // player shows, and FilmCraft's software decoder emits nothing for it either
+        // (`crates/vp9/src/decoder.rs:413`, `:417`). So `picture` reports it as `Decoded::shown ==
+        // false` and this returns an empty list, exactly as the HEVC RASL skip above does.
         let decoded = match self.picture(sample) {
             Ok(d) => d,
             // The submission is gone: nothing will come out of it, so it is not in flight any more.
@@ -382,7 +418,13 @@ impl VideoDecoder for VaDecoder {
         self.timings.decode += decoded.decode;
         self.timings.readback += decoded.readback;
         self.timings.convert += decoded.convert;
-        Ok(vec![DecodedFrame { pts: stamp, frame: decoded.frame, draft: false }])
+        let Some(frame) = decoded.frame else {
+            // A frame the stream does not show: it was rendered (and its slots moved), and there is
+            // nothing to hand back. Its presentation time came out of `in_flight` above, which is
+            // right — the sample was accounted for, it simply produced no picture.
+            return Ok(Vec::new());
+        };
+        Ok(vec![DecodedFrame { pts: stamp, frame, draft: false }])
     }
 
     fn flush(&mut self) -> Vec<DecodedFrame> {
@@ -391,6 +433,10 @@ impl VideoDecoder for VaDecoder {
         // a flush does is end the run, so that what follows starts like a new one.
         self.in_flight.clear();
         self.poc.reset();
+        // VP9's run ends with the others': a flush drains the driver, and the references of the run
+        // are gone with it. Keeping them would make the next run's first frame resolve a reference
+        // into a surface the driver has already been asked to overwrite.
+        self.vp9.reset();
         self.first = true;
         self.skip_rasl = false;
         self.need_headers = true;
@@ -404,6 +450,10 @@ impl VideoDecoder for VaDecoder {
         // something else. The surfaces and the config stay, since they depend only on the stream.
         self.session.clear_context();
         self.poc.reset();
+        // A seek is what `Vp9State::reset` exists for: the slots *and* the parse state go together,
+        // because the first frame of the new run must be read as the first frame of a run — an
+        // inherited `color_config` would describe the previous run's depth.
+        self.vp9.reset();
         self.in_flight.clear();
         self.skip_rasl = false;
         self.need_headers = true;
@@ -432,6 +482,20 @@ impl VaDecoder {
     /// Decode one access unit and read its picture back: the driver records built from the sample,
     /// submitted to a surface no live reference is in, then copied out.
     ///
+    /// **Which stream shape this is decides everything below it**, because the two are not the same
+    /// pipeline: a NAL codec builds a picture *then* takes a surface for it, while a VP9 frame is read
+    /// first and only then turns out to need a surface at all (a frame that re-shows an earlier
+    /// picture needs none). So the dispatch is here rather than inside either arm.
+    fn picture(&mut self, sample: &[u8]) -> std::result::Result<Decoded, String> {
+        match &self.stream {
+            Stream::Nal(_) => self.picture_nal(sample),
+            Stream::Frame(_) => self.picture_frame(sample),
+        }
+    }
+
+    /// One H.264 / HEVC access unit: build its picture record and slice records, submit them into a
+    /// surface no live reference is in, and copy the result out.
+    ///
     /// **The surface is chosen from the decoded picture buffer, not by rotating.** A surface a later
     /// picture still refers to may not be decoded into: the driver would read the new picture as that
     /// reference, and what comes out is a picture the stream never contained — the plausible-looking
@@ -444,7 +508,7 @@ impl VaDecoder {
     /// finished picture back to the CPU — of which the conversion into FilmCraft's planes is
     /// measured separately, so the reported readback is the copy and not the copy plus the
     /// conversion.
-    fn picture(&mut self, sample: &[u8]) -> std::result::Result<Decoded, String> {
+    fn picture_nal(&mut self, sample: &[u8]) -> std::result::Result<Decoded, String> {
         // Before `build_nal`, which adds this picture to the buffer: the surfaces that must not be
         // decoded into are the ones the *previous* pictures left referenced.
         let surface = self
@@ -453,13 +517,9 @@ impl VaDecoder {
             .ok_or_else(|| format!("every one of the {} surfaces is still a reference; the stream needs more", self.ring.len()))?;
         let info = match &self.stream {
             Stream::Nal(info) => info,
-            // Declined while it was still a description, so a caller that skipped planning is told
-            // exactly what `plan_frame` says rather than a reason invented here. An `Ok` would mean a
-            // frame codec got past `new`, which the ring sizing above already refused.
-            Stream::Frame(info) => match plan_frame(info) {
-                Err(why) => return Err(why),
-                Ok(_) => return Err("a frame-coded stream reached the decode loop without picture-parameter records".into()),
-            },
+            // Unreachable: `picture` dispatches here only for a NAL stream. Written as a refusal
+            // rather than an `unreachable!` because this backend has none of those.
+            Stream::Frame(_) => return Err("a frame-coded stream reached the H.264 / HEVC decode path".into()),
         };
         let (w, h) = self.session.size();
         let (width_mbs, height_mbs) = match info.codec {
@@ -492,7 +552,172 @@ impl VaDecoder {
             return Err(format!("surface {surface} is still being rendered into after vaSyncSurface"));
         }
         let (convert, frame) = self.readback(surface)?;
-        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame })
+        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame: Some(frame) })
+    }
+
+    /// One VP9 frame: read it into this decoder's [`Vp9State`], and then either submit its picture
+    /// record into a surface no live reference is in, or — for a frame that re-shows an earlier
+    /// picture — copy that picture out again with no decode at all.
+    ///
+    /// ## The order is the reverse of [`Self::picture_nal`], and it has to be
+    ///
+    /// The NAL path takes a surface from the ring *before* it knows what the picture is, because
+    /// `build_nal` adds the picture to the buffer and the surface must not be one of the buffer's own.
+    /// A VP9 frame inverts that: whether it needs a surface at all is a property of the frame
+    /// (`show_existing_frame`, which 6.2 resolves before the frame has a size), so [`Vp9State::frame`]
+    /// runs first and the ring is only asked if the frame turns out to code a picture. Taking a
+    /// surface first and then finding the frame is a re-show would leave a surface marked in use for a
+    /// frame that decoded nothing.
+    ///
+    /// ## Every refusal here is an `Err`, and that is load-bearing
+    ///
+    /// `frame()` may have advanced the parse state before it refused (see its own documentation), so
+    /// turning one of its errors into a *skip* would let the next frame inherit a refused frame's
+    /// `color_config` — a valid record of the wrong depth, which a driver decodes into a plausible
+    /// wrong picture. Propagating instead reaches `VideoDecoder::decode`, which latches `refused` and
+    /// ends the run: the caller falls back to the software decoder from a known point rather than
+    /// carrying on in hardware from an unknown one.
+    fn picture_frame(&mut self, sample: &[u8]) -> std::result::Result<Decoded, String> {
+        let info = match &self.stream {
+            Stream::Frame(info) => info,
+            // Unreachable: `picture` dispatches here only for a frame-coded stream.
+            Stream::Nal(_) => return Err("a NAL-coded stream reached the frame-coded decode path".into()),
+        };
+        if info.codec != FrameCodec::Vp9 {
+            // Declined while it was still a description, so a caller that skipped planning is told
+            // exactly what `plan_frame` says rather than a reason invented here. An `Ok` would mean a
+            // frame codec got past `new`, which the ring sizing there already refused.
+            return match plan_frame(info) {
+                Err(why) => Err(why),
+                Ok(_) => Err("a frame-coded stream reached the decode loop without picture-parameter records".into()),
+            };
+        }
+        // **First, and this is the order the NAL path does not use:** read the frame, so that a frame
+        // which codes no picture of its own never takes a surface.
+        let frame = self.vp9.frame(sample)?;
+        // The container's own description and the frame's header have to agree, and `Vp9State` holds
+        // no container: the surfaces were created for the profile and depth the sample entry said, so
+        // a record carrying the frame's would be a picture of one format decoded into a surface of
+        // another. One function, shared with `picture::build_frame`'s backstop, so the two sites
+        // cannot disagree about it.
+        if let Some(why) = vp9_entry_disagreement(info, frame.header()) {
+            return Err(why);
+        }
+        if let Some((slot, surface)) = frame.re_show() {
+            // 8.2.2: the decoder outputs the picture that slot holds and decodes nothing. No
+            // submission, no sync, no reference slot moved — and no surface taken from the ring.
+            return self.re_show(slot, surface);
+        }
+        // The frame's own size and depth, against what this session was created for. Read *after*
+        // `frame()`, because that is where the header is: a stream that changes resolution or depth
+        // mid-run would otherwise submit a `frame_width` larger than the surface the driver renders
+        // into, and read back a picture at a rectangle the frame does not fill.
+        self.check_vp9_shape(frame.header())?;
+        let live = self.vp9.live_surfaces();
+        let surface = self
+            .ring
+            .take_unreferenced(&live)
+            .ok_or_else(|| format!("every one of the {} surfaces is still a reference; the stream needs more", self.ring.len()))?;
+        let record = frame.record().ok_or_else(|| "a VP9 frame that is not a re-show carries no picture-parameter record".to_string())?;
+
+        let decode0 = Instant::now();
+        // The two buffers a VP9 decode submits: the picture-parameter record, then the frame's own
+        // bytes. VP9 has no slice headers (`va_dec_vp9.h` declares no `VASliceParameterBufferVP9`),
+        // so there is no slice record and no IQ matrix buffer to send with them. The handles live to
+        // the end of this function, so `vaDestroyBuffer` runs on every path out of it.
+        let mut buffers = Vec::with_capacity(2);
+        for (kind, bytes) in Self::vp9_submission(record, sample) {
+            buffers.push(self.session.buffer(kind, bytes)?);
+        }
+        let ids: Vec<u32> = buffers.iter().map(|b| b.id()).collect();
+        self.session.render(surface, &ids)?;
+        self.session.sync(surface)?;
+        let decode = decode0.elapsed();
+
+        let readback0 = Instant::now();
+        if !self.session.surface_ready(surface)? {
+            return Err(format!("surface {surface} is still being rendered into after vaSyncSurface"));
+        }
+        // **Only a shown frame is read back.** `show_frame` clear is a frame the stream decodes and
+        // no player shows (`crates/vp9/src/decoder.rs:413`, `:417`), and it still refreshes the
+        // reference slots below. Reading it would be work for a picture nothing will ever look at.
+        let (frame_out, convert) = match frame.show() {
+            true => {
+                let (convert, f) = self.readback(surface)?;
+                (Some(f), convert)
+            }
+            false => (None, Duration::ZERO),
+        };
+        // The reference buffer moves **after** the driver rendered the picture, never before: a
+        // record describes the buffer as it was before its own frame, and a decode that failed must
+        // not have moved it. `commit` refuses a re-show, which cannot reach here.
+        self.vp9.commit(&frame, surface)?;
+        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame: frame_out })
+    }
+
+    /// A VP9 frame that re-shows a picture an earlier frame left in a reference slot: copy that
+    /// picture out again, with nothing submitted to the driver.
+    ///
+    /// This is the one path in the backend that reads a surface it did not just decode into, so it
+    /// says what makes that safe rather than leaving it implied. The surface is one this backend
+    /// rendered and read back itself, in the call that decoded the frame it now holds, and nothing
+    /// has been decoded into it since — a live reference is never the one a new picture is decoded
+    /// into, which is what `take_unreferenced` above guarantees. The picture in it is therefore
+    /// settled, and the readiness query is the same gate a decoded picture gets; it is asked rather
+    /// than assumed because "settled" is the driver's claim, not ours.
+    ///
+    /// The timings say what happened: no decode, and a readback that is only a copy.
+    fn re_show(&mut self, slot: usize, surface: u32) -> std::result::Result<Decoded, String> {
+        let readback0 = Instant::now();
+        if !self.session.surface_ready(surface)? {
+            return Err(format!("surface {surface}, which reference slot {slot} re-shows, is not ready to read"));
+        }
+        let (convert, frame) = self.readback(surface)?;
+        Ok(Decoded { decode: Duration::ZERO, readback: readback0.elapsed().saturating_sub(convert), convert, frame: Some(frame) })
+    }
+
+    /// A VP9 frame's own size and depth, against the surfaces this session was created at and the
+    /// rectangle the readback copies.
+    ///
+    /// **Why both.** `frame_width` / `frame_height` in the record are the frame's own dimensions
+    /// (`va_dec_vp9.h:60-68`), and a driver renders into a surface created at `Plan.size` — so a
+    /// frame larger than that surface is a record asking for a write past the end of it, and the
+    /// surfaces cannot be resized under a live context. And the readback copies the rectangle
+    /// `self.geometry` names, which `Stream::declared_picture` updates from each VP9 key frame: a
+    /// frame of a different size would be read out at a rectangle it does not fill, which
+    /// `biplanar::to_frame` cannot detect — the surface is big enough, it just does not contain that
+    /// picture there.
+    ///
+    /// A key frame that changes either is caught earlier and more cheaply by the hybrid decoder
+    /// (`FrameStreamInfo::parameters_changed`, which compares a key frame against the sample entry).
+    /// This is the check for the frames *between* key frames, and for a stream whose container
+    /// description was right about its first key frame and wrong about a later one.
+    fn check_vp9_shape(&self, header: &filmcraft_vp9::header::FrameHeader) -> std::result::Result<(), String> {
+        let size = (header.width, header.height);
+        let (surface_w, surface_h) = self.session.size();
+        if size.0 > surface_w || size.1 > surface_h {
+            return Err(format!("a {}x{} VP9 frame does not fit the {surface_w}x{surface_h} surfaces this session was created at", size.0, size.1));
+        }
+        let (_, _, crop_w, crop_h) = self.geometry.crop;
+        if size != (crop_w, crop_h) {
+            return Err(format!("a {}x{} VP9 frame, where this run reads back {crop_w}x{crop_h} pictures", size.0, size.1));
+        }
+        let depth = u32::from(header.color.bit_depth);
+        if depth != self.bits {
+            return Err(format!("a VP9 frame at {depth} bits, where this session's surfaces hold {}", self.bits));
+        }
+        Ok(())
+    }
+
+    /// The buffers a VP9 decode submits: its picture-parameter record and the frame's own bytes.
+    ///
+    /// Split out for the same reason [`Self::submission`] is: the list is a value a test can read
+    /// rather than a sequence of calls only a driver can observe. **Two buffers and no more** — VP9
+    /// has no slice headers and no scaling lists, so a slice record or an IQ matrix buffer here would
+    /// be a record the driver does not read (and, for the matrix, one it would read as the VP9
+    /// segmentation probabilities).
+    fn vp9_submission<'p>(record: &'p [u8], sample: &'p [u8]) -> Vec<(i32, &'p [u8])> {
+        vec![(PICTURE_PARAMETER_BUFFER, record), (SLICE_DATA_BUFFER, sample)]
     }
 }
 
@@ -506,7 +731,10 @@ struct Decoded {
     /// The conversion of the driver's planes into FilmCraft's own, which is CPU work inside the
     /// readback and reported apart from it.
     convert: Duration,
-    frame: VideoFrame,
+    /// The picture to hand back, or `None` for a frame the stream decodes but does not show (VP9 6.2's
+    /// `show_frame` clear). **Not** for a failure: a frame this backend could not decode is an
+    /// `Err`, and an error latches `refused` — see `Self::refused`.
+    frame: Option<VideoFrame>,
 }
 
 /// A decoded picture, as a `VideoFrame`.
@@ -525,21 +753,57 @@ mod tests {
     ///
     /// The invariant is what makes it safe rather than a number that happens to fit today's fixtures:
     /// the decoded picture buffer can never hold more entries than the record has slots for them (the
-    /// marking functions trim to it), so a pool one larger than that always has one free surface.
+    /// marking functions trim to it, and a VP9 frame moves only the slots its `refresh_frame_flags`
+    /// names), so a pool one larger than that always has one free surface.
+    ///
+    /// **All three codecs this backend decodes are in the table.** Leaving VP9 out would leave the
+    /// invariant untested for exactly the codec whose slot count is fixed by its record
+    /// (`reference_frames[8]`), which is the one where a wrong number is a plausible-looking wrong
+    /// picture rather than an allocation failure.
     #[test]
     fn the_surface_pool_is_always_larger_than_the_picture_buffer() {
-        // Both codecs' bounds are the record's own slot count, and the pool is that plus one.
-        for (codec, slots, pool) in [(NalCodec::H264, 16usize, 17usize), (NalCodec::Hevc, 15usize, 16usize)] {
-            assert!(pool > slots, "{codec:?}: a pool of {pool} does not exceed a buffer of {slots} plus one");
+        // Each codec's bound is its record's own slot count, and the pool is that plus one. VP9's
+        // number is read out of production code so it cannot drift from the pool that is allocated.
+        for (codec, slots, pool) in [("H.264", 16usize, 17usize), ("HEVC", 15, 16), ("VP9", 8, vp9_surface_pool())] {
+            assert!(pool > slots, "{codec}: a pool of {pool} does not exceed a buffer of {slots} plus one");
             // And a ring of that size, filled to the brim, still has a free surface to decode into.
             let ids: Vec<u32> = (0..pool as u32).collect();
             let mut ring = Ring::from_surfaces(&ids);
             let live: Vec<u32> = ids[..slots].to_vec();
-            assert!(ring.take_unreferenced(&live).is_some(), "{codec:?}: a full buffer still leaves a surface");
+            assert!(ring.take_unreferenced(&live).is_some(), "{codec}: a full buffer still leaves a surface");
             // With the pool entirely live there is nothing, and that is an error rather than a
             // reference being overwritten.
-            assert_eq!(ring.take_unreferenced(&ids), None, "{codec:?}: nothing free means an error");
+            assert_eq!(ring.take_unreferenced(&ids), None, "{codec}: nothing free means an error");
         }
+        // And the bound VP9's pool comes from is its record's own array rather than a number typed
+        // here: eight slots is `reference_frames[8]` in `va_dec_vp9.h:70-77`.
+        assert_eq!(vp9_surface_pool(), 8 + 1, "VP9's pool is its eight reference slots and the one being written");
+    }
+
+    /// The buffers a VP9 frame is submitted as: its picture-parameter record and the frame's bytes,
+    /// **and nothing else**.
+    ///
+    /// VP9 has no slice headers (`va_dec_vp9.h` declares no `VASliceParameterBufferVP9`) and no
+    /// scaling lists, so a slice record or an IQ matrix buffer here would be a record the driver does
+    /// not read — and the matrix is worse than useless, because a driver that did read it would take
+    /// the bytes as something else. This is the same reasoning as
+    /// `an_h264_picture_submits_its_scaling_lists_and_one_record_per_slice` on the other side, and it
+    /// is asserted without a driver because the list is a value.
+    #[test]
+    fn a_vp9_picture_submits_one_record_and_the_frame_and_nothing_else() {
+        let record = vec![0x5au8; 92];
+        let frame = vec![0xc3u8; 4000];
+        let bufs = VaDecoder::vp9_submission(&record, &frame);
+        let kinds: Vec<i32> = bufs.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, vec![PICTURE_PARAMETER_BUFFER, SLICE_DATA_BUFFER], "the picture record, then the frame's own bytes");
+        // Both are the bytes they claim to be, read back through `ffi`'s own safe reader rather than
+        // re-derived here.
+        assert!(ffi::picture_params_vp9(bufs[0].1).is_some(), "92 bytes the driver reads as a VP9 picture record");
+        assert_eq!(bufs[0].1, record.as_slice());
+        // The frame goes in whole, un-copied and un-relayed: the record's `frame_header_length_in_bytes`
+        // and `first_partition_size` are how the driver finds the two headers inside these bytes, so
+        // re-laying them out here would be a second, wrong answer to the same question.
+        assert_eq!(bufs[1].1, frame.as_slice(), "the slice data buffer is the frame itself");
     }
 
     /// A `Picture` whose records are recognisable lengths, for checking the submission list without a

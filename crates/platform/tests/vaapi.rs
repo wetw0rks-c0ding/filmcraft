@@ -2,8 +2,10 @@
 //! can describe must be the software decoder's — bit-exact planes, colour, pixel aspect, draft flag and
 //! picture — also after `reset` + reseek and a mid-stream `flush`; a forced mid-stream failure must
 //! continue in software with the software decoder's exact output; damaged samples and parameter sets
-//! must give errors or fall back, never crash or hang; a VP9 or AV1 stream must be declined while it is
-//! still a description, with a reason; and an H.264 stream whose B slices are implicitly weighted must
+//! must give errors or fall back, never crash or hang; a VP9 stream this backend can decode must **not**
+//! be declined while it is still a description and one it cannot must be, with a reason naming the
+//! chroma format or the reserved profile; an AV1 stream must still be declined, with the reason that it
+//! has no reachable per-frame header; and an H.264 stream whose B slices are implicitly weighted must
 //! be declined rather than decoded with weights that are wrong. Skips without ffmpeg (fixture
 //! generator) or without a VA-API driver.
 //!
@@ -666,51 +668,145 @@ fn in_band_parameter_sets_are_not_confused_with_the_config_record() {
     assert_same_by_pts("in-band sets that differ from the sample entry", &out, &decode_all(software(&plain).as_mut(), &differing));
 }
 
-/// A VP9 or AV1 sample entry yields no VA-API decoder, and the reason names what is missing.
+/// **A VP9 sample entry is no longer declined for being a frame codec**, and the two halves of that
+/// are asserted separately because they are different claims.
 ///
-/// `plan_frame` declines every frame-coded stream while it is still a description, because libva
-/// wants each frame's uncompressed header as a picture-parameter record and neither
-/// `filmcraft-vp9` nor `filmcraft-av1` exposes it. That decline is what is tested here: it is a real
-/// behaviour of this backend, and it is why there are no VP9 or AV1 *parity* fixtures in this file —
-/// a parity test over them could only ever print SKIPPED.
+/// - **Profile 0 at 8 bits is planned.** `plan_frame` returns a `Plan` for it, so the only reasons
+///   `VaDecoder::new` can still decline are the machine's: no libva, no render node, or a driver that
+///   does not offer VP9 8-bit 4:2:0. The test asserts that whatever happens is one of those and
+///   **not** a "picture parameters" decline — because that sentence used to be the answer here and
+///   would now be a false claim about this backend. A machine that *does* take it is checked for
+///   real against ffmpeg by Task 5's parity fixture; what this test owns is that the decline is gone.
+/// - **Profiles 1, 3 and 4 are still declined**, and as *that*: a 4:2:2 / 4:4:4 / reserved stream is
+///   refused for its chroma format or its reserved profile number, before any driver is asked. This
+///   is the half that would otherwise be lost by editing the old test's expectations.
+///
+/// **AV1 keeps its own decline**, in its own test below, because its reason is a different fact: its
+/// per-frame header is not exposed, so there is no record to build.
 #[test]
-fn a_frame_codec_is_declined_before_a_context_exists() {
+fn a_vp9_stream_this_backend_can_decode_is_not_declined_and_one_it_cannot_is_declined_as_such() {
     let ff = filmcraft_testkit::require_ffmpeg!();
     let src = "testsrc2=s=640x360:r=24:d=1";
-    let cases: [(&str, Vec<&str>, &str); 2] = [
-        (
-            "vp9_p0.mp4",
-            vec!["-f", "lavfi", "-i", src, "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "40", "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p"],
-            "filmcraft-vp9",
-        ),
-        (
-            "av1_p0.mp4",
-            vec!["-f", "lavfi", "-i", src, "-c:v", "libaom-av1", "-crf", "50", "-b:v", "0", "-cpu-used", "8", "-pix_fmt", "yuv420p"],
-            "filmcraft-av1",
-        ),
-    ];
-    let mut checked = 0;
-    for (name, args, crate_name) in cases {
-        let Some(path) = fixture(&ff, name, &args) else {
-            eprintln!("SKIPPED: ffmpeg cannot encode {name}");
+    // Profile 0 at 8 bits: 4:2:0, which is the whole of what this backend decodes.
+    let Some(path) = fixture(
+        &ff,
+        "vp9_p0.mp4",
+        &["-f", "lavfi", "-i", src, "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "40", "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p"],
+    ) else {
+        eprintln!("SKIPPED: ffmpeg cannot encode libvpx-vp9");
+        return;
+    };
+    let s = read_stream(&path);
+    let info = filmcraft_platform::vaapi::stream_info(&s.entry).unwrap_or_else(|| panic!("vp9_p0.mp4: not recognised as a vpcC stream"));
+    match VaDecoder::new(info) {
+        // This machine has a VA-API driver that takes VP9: the factory hands it over, and the
+        // fixture is then this backend's problem (Task 5 compares it with ffmpeg).
+        Ok(_) => assert!(filmcraft_platform::vaapi_factory(&s.entry).is_some(), "the decoder was built, so the factory hands it over too"),
+        // It was declined — which is fine on a machine with no VP9 decoder, as long as the reason is
+        // the machine and not the codec.
+        Err(why) => {
+            assert!(!why.contains("picture parameters"), "VP9 profile 0 is planned, so a picture-parameters decline would be false: {why}");
+            assert!(
+                !why.contains("filmcraft-vp9") || why.contains("does not offer"),
+                "the old 'the parser is unreachable' reason is no longer true of VP9: {why}"
+            );
+            assert!(filmcraft_platform::vaapi_factory(&s.entry).is_none(), "and the factory declines it, so a user gets FilmCraft's own decoder");
+        }
+    }
+    // …and FilmCraft's own decoder can play it whatever this machine could, which is the point of
+    // declining rather than failing.
+    assert!(!decode_all(software(&s).as_mut(), &s.samples).is_empty(), "vp9_p0.mp4: the software decoder produced no pictures");
+
+    // The profiles this backend has no surface for, each still declined *as itself*.
+    //
+    // **Two wordings are accepted for the same fact, and both name the chroma format.** A `vpcC` that
+    // says 4:2:2 or 4:4:4 is caught by `plan_frame`'s `chroma subsampling` check, which runs before
+    // the profile table — so in practice that is the message a real 4:2:2 stream gets, and it is the
+    // more specific one (the container states the format outright). The profile table's own `4:2:2`
+    // sentence is what a stream whose *frames* disagree with its container gets. Asserting one
+    // wording exactly would pin an ordering that is a choice rather than a promise, so what is
+    // asserted is the fact: the decline is about the chroma format, and never about the parser.
+    // The pixel formats are the codec's own, not a guess: per VP9 6.2's `color_config`, profile 1 is
+    // 8-bit 4:2:2 / 4:4:0 and profile 3 is 10-bit 4:4:4, and libvpx refuses the other pairings
+    // outright ("Codec bit-depth 8 not supported in profile > 1", "high bit-depth not supported in
+    // profile < 2") — so a fixture generated with the wrong one is an ffmpeg error, not a decline.
+    for (profile, pix_fmt) in [(1u32, "yuv422p"), (3, "yuv444p10le")] {
+        let name = format!("vp9_p{profile}.mp4");
+        let Some(path) = fixture(
+            &ff,
+            &name,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                src,
+                "-c:v",
+                "libvpx-vp9",
+                "-profile:v",
+                &profile.to_string(),
+                "-b:v",
+                "0",
+                "-crf",
+                "40",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "8",
+                "-pix_fmt",
+                pix_fmt,
+            ],
+        ) else {
+            eprintln!("SKIPPED: ffmpeg cannot encode a profile {profile} libvpx-vp9");
             continue;
         };
         let s = read_stream(&path);
-        // The entry is recognised as a frame-coded stream…
-        let info = filmcraft_platform::vaapi::stream_info(&s.entry).unwrap_or_else(|| panic!("{name}: not recognised as a vpcC / av1C stream"));
+        let info = filmcraft_platform::vaapi::stream_info(&s.entry).unwrap_or_else(|| panic!("{name}: not recognised as a vpcC stream"));
         assert!(matches!(info, StreamInfo::Frame(_)), "{name}: recognised as {info:?}");
-        // …and declined with a reason that names the missing record, not the driver.
-        let why = VaDecoder::new(info).err().unwrap_or_else(|| panic!("{name}: this backend took a frame-coded stream"));
-        assert!(why.contains("picture parameters"), "{name}: {why}");
-        assert!(why.contains("frame header"), "{name}: {why}");
-        assert!(why.contains(crate_name), "{name}: {why}");
-        // The factory declines it too, so a user gets FilmCraft's own decoder and never sees this.
-        assert!(filmcraft_platform::vaapi_factory(&s.entry).is_none(), "{name}: the factory handed a frame-coded stream to a VA-API decoder");
-        // …and FilmCraft's own decoder can still play it, which is the point of declining.
-        assert!(!decode_all(software(&s).as_mut(), &s.samples).is_empty(), "{name}: the software decoder produced no pictures");
-        checked += 1;
+        let why_declined = VaDecoder::new(info).err().unwrap_or_else(|| panic!("{name}: this backend took a {pix_fmt} VP9 stream"));
+        assert!(
+            why_declined.contains("chroma subsampling") || why_declined.contains("4:2:2"),
+            "{name}: refused for its chroma format, not for something else: {why_declined}"
+        );
+        assert!(!why_declined.contains("filmcraft-vp9"), "{name}: VP9's header is reachable, so the parser is not the reason: {why_declined}");
+        assert!(filmcraft_platform::vaapi_factory(&s.entry).is_none(), "{name}: the factory handed a {pix_fmt} VP9 stream to a VA-API decoder");
     }
-    assert!(checked > 0, "no VP9 or AV1 fixture could be generated");
+    // **Profile 4 is reserved by the specification**, so no encoder can be asked for one and this
+    // half of the claim is a unit test rather than a fixture: `vp9_decline_reason` is what
+    // `plan_frame` and the record builder both call, and
+    // `vaapi::stream::tests::the_frame_codecs_are_planned_or_declined_for_their_own_reason` walks it.
+}
+
+/// **An AV1 stream is still declined before a context exists, and the reason names what is missing.**
+///
+/// This is the half of the old `a_frame_codec_is_declined_before_a_context_exists` that VP9 has left
+/// behind, and it is a *separate* test because AV1's reason is a different fact from VP9's former
+/// one: `filmcraft_av1` does not expose the per-frame header libva wants as a record, so an invented
+/// record would be one a driver reads as a valid picture. A test that lumped the two codecs together
+/// could not have said which of them was true, and would have failed when VP9 was enabled — which is
+/// exactly what happened.
+#[test]
+fn an_av1_stream_is_declined_before_a_context_exists() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    let src = "testsrc2=s=640x360:r=24:d=1";
+    let Some(path) =
+        fixture(&ff, "av1_p0.mp4", &["-f", "lavfi", "-i", src, "-c:v", "libaom-av1", "-crf", "50", "-b:v", "0", "-cpu-used", "8", "-pix_fmt", "yuv420p"])
+    else {
+        eprintln!("SKIPPED: ffmpeg cannot encode libaom-av1");
+        return;
+    };
+    let s = read_stream(&path);
+    // The entry is recognised as a frame-coded stream…
+    let info = filmcraft_platform::vaapi::stream_info(&s.entry).unwrap_or_else(|| panic!("av1_p0.mp4: not recognised as a vpcC / av1C stream"));
+    assert!(matches!(info, StreamInfo::Frame(_)), "recognised as {info:?}");
+    // …and declined with a reason that names the missing record, not the driver.
+    let why = VaDecoder::new(info).err().unwrap_or_else(|| panic!("av1_p0.mp4: this backend took a frame-coded stream"));
+    assert!(why.contains("picture parameters"), "av1_p0.mp4: {why}");
+    assert!(why.contains("frame header"), "av1_p0.mp4: {why}");
+    assert!(why.contains("filmcraft-av1"), "av1_p0.mp4: {why}");
+    // The factory declines it too, so a user gets FilmCraft's own decoder and never sees this.
+    assert!(filmcraft_platform::vaapi_factory(&s.entry).is_none(), "av1_p0.mp4: the factory handed a frame-coded stream to a VA-API decoder");
+    // …and FilmCraft's own decoder can still play it, which is the point of declining.
+    assert!(!decode_all(software(&s).as_mut(), &s.samples).is_empty(), "av1_p0.mp4: the software decoder produced no pictures");
 }
 
 /// How many of `out`'s pictures are ffmpeg's, and the presentation time of the first that is not.

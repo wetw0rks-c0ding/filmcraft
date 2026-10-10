@@ -91,12 +91,21 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
     here), HEVC profiles other than Main / Main Still Picture / Main 10, an in-band parameter set
     that differs from the sample entry's, a libva older than 2.x, and no libva, render node or
     video decoder for the profile.
-  - *VP9 and AV1 are declined while still a stream description* (`vaapi/stream.rs`, `plan_frame`):
-    libva wants their per-frame header as a record (`VADecPictureParameterBufferVP9` /
-    `VADecPictureParameterBufferAV1`), and neither codec crate exposes one — `filmcraft_vp9`'s
-    header module is private and `filmcraft_av1::FrameHeader::parse` is `pub(crate)` over private
-    types, so a record could only be filled with invented values. Exporting those parsers is a
-    change in those crates and needs its own review (`vaapi/picture.rs`, `FRAME_HEADER_MISSING`).
+  - *VP9 is decoded*: profiles 0 and 2 at 4:2:0, 8- and 10-bit — the same scope the Windows backend
+    takes (`vaapi/picture.rs`, `vp9_decline_reason`). libva wants each frame's uncompressed header as
+    a `VADecPictureParameterBufferVP9`, and `filmcraft_vp9::header` exposes exactly that, so the record
+    is built from our own parser. **VP9 profiles 1 and 3** (4:2:2 / 4:4:0 / 4:4:4) and **profile 4**
+    (which the specification reserves and does not define) are declined, as is 12-bit: every surface
+    this backend creates is 4:2:0 at 8 or 10 bits. The record is the *whole* `reference_frames[8]`
+    set rather than a per-slice list, so `Vp9State` carries the eight reference slots and one parse
+    state across a run, and a frame's `refresh_frame_flags` decides which slots its picture becomes —
+    applied only after the driver has rendered it (`vaapi/decoder.rs`, `picture_frame`).
+  - *AV1 is still declined while it is a stream description* (`vaapi/stream.rs`, `plan_frame`):
+    libva wants AV1's per-frame header as a `VADecPictureParameterBufferAV1`, and `filmcraft_av1`
+    does not expose one — `FrameHeader::parse` is `pub(crate)` over private types, so a record could
+    only be filled with invented values, which is the one answer this backend must never give
+    (`vaapi/picture.rs`, `FRAME_HEADER_MISSING`). Exposing that parser is a change in `crates/av1`
+    and needs its own review.
   - *H.264 whose B slices are implicitly weighted is declined* (`weighted_bipred_idc == 2`, which
     is x264's default for High profile with B frames, so most H.264). The backend computes the
     implicit weight of every `(ref0, ref1)` pair the slice's own reference lists could use: if all
@@ -203,7 +212,7 @@ level and flags are the encoder's own. If it is missing the export stops with th
 | test | what |
 |---|---|
 | `tests/videotoolbox.rs` (macOS) | H.264 High, HEVC Main (open GOP: CRA + RASL) and HEVC Main 10, 640×360 (coded 368: cropping) with B-frames: every picture **bit-exact** with our software decoder, same pts order, count, colour and aspect, also after `reset` + reseek to every later sync sample, mid-stream `flush`, and a full pass after resets; forced mid-stream failures (`VtDecoder::fail_after`) at five points continue with the software decoder's exact output; seeded mutation of samples and parameter sets (bit flips, truncation, corrupt length prefixes) never panics or hangs; HEVC 4:2:2 10-bit is bit-exact with ffmpeg's decode |
-| `tests/vaapi.rs` (Linux) | H.264 High with `weightb=0`, HEVC Main, HEVC Main 10 and a two-slice-segment HEVC stream: every picture **bit-exact** with our software decoder, matched by presentation time (a VA-API decode is synchronous, so it returns pictures in decode order and the software decoders' are in presentation order), also after `reset` + reseek, a mid-stream `flush` and a full pass after resets. H.264 High **with** x264's default weighted B slices is asserted to be **declined** at the first such slice, with every picture before it bit-exact against ffmpeg's own decode and the rest of the run finished in software; a VP9 and an AV1 sample entry are asserted to be declined while still a description, and to still play in software; forced mid-stream failures continue in software with the software decoder's exact output; seeded mutation of samples and configuration records never panics or hangs. Two branches rest on unit tests alone, named here rather than left implied: the default weight table submitted when every implicit `(ref0, ref1)` pair resolves to 1.0 (no fixture reaches it), and the per-slice-segment HEVC reference lists (no encoder-produced fixture gives one picture's segments different `num_ref_idx`, so handing a segment the previous segment's lists would pass this test too; the mechanism is proved in `vaapi::picture`'s own tests and the gap stated at `build_hevc`) |
+| `tests/vaapi.rs` (Linux) | H.264 High with `weightb=0`, HEVC Main, HEVC Main 10 and a two-slice-segment HEVC stream: every picture **bit-exact** with our software decoder, matched by presentation time (a VA-API decode is synchronous, so it returns pictures in decode order and the software decoders' are in presentation order), also after `reset` + reseek, a mid-stream `flush` and a full pass after resets. H.264 High **with** x264's default weighted B slices is asserted to be **declined** at the first such slice, with every picture before it bit-exact against ffmpeg's own decode and the rest of the run finished in software; a VP9 and an AV1 sample entry are asserted to be declined while still a description, and to still play in software; forced mid-stream failures continue in software with the software decoder's exact output; seeded mutation of samples and configuration records never panics or hangs. A VP9 sample entry is asserted **not** to be declined — anything that stops it must be the machine's own limits, never a "picture parameters" decline — while VP9 profiles 1 and 3 are asserted to be declined for their chroma format, and an AV1 sample entry is asserted to be declined while still a description and to still play in software. Two branches rest on unit tests alone, named here rather than left implied: the default weight table submitted when every implicit `(ref0, ref1)` pair resolves to 1.0 (no fixture reaches it), and the per-slice-segment HEVC reference lists (no encoder-produced fixture gives one picture's segments different `num_ref_idx`, so handing a segment the previous segment's lists would pass this test too; the mechanism is proved in `vaapi::picture`'s own tests and the gap stated at `build_hevc`) |
 | `tests/fallback.rs` (every OS) | `HybridDecoder` with a stand-in hardware decoder failing after N samples (every sync sample ± a few, first / last sample, after a seek): output identical to the software decoder; in-band parameter sets identical to the sample entry's stay in hardware, different ones switch to software |
 | `tests/setting.rs` | Hardware decoding Off gives the software decoder through `make_video_decoder` and the media stack (no hardware frames); Auto gives the registered backend's decoder where available (VideoToolbox, Media Foundation or VA-API); the VA-API factory on its own on Linux |
 | `tests/hardware_encode.rs` (macOS) | what the hardware path takes and declines; round trip through our software decoder (every picture, in order, luma PSNR above 30 dB, keyframes no further apart than asked, no composition offsets); an export through `filmcraft_export` that decodes in our decoder and in ffmpeg / ffprobe (profile, size, frame count, BT.709); the built-in encoder still exporting everything hardware declines; exact output size at sizes that are not multiples of 16; hostile configurations (zero, huge, odd sizes, frame rates, bitrates, keyframe intervals, wrong planes) give errors and never panic; encoders dropped at any point do not crash or hang. The same for **HEVC**: Main profile, 8-bit 4:2:0, `hvc1` entry with VPS / SPS / PPS and 4-byte lengths, MP4 and QuickTime, AAC audio, two-pass refused, the format list agreeing with the probe, ffprobe reading `codec_name=hevc`, `profile=Main`, `codec_tag_string=hvc1`, `pix_fmt=yuv420p`, BT.709 |
@@ -237,8 +246,9 @@ playback with no dropped frames at Full, 1/2 and 1/4. Details in
 
 Zero-copy upload of decoded pictures into wgpu textures (`CVPixelBuffer`s on macOS, Direct3D 11
 textures on Windows, libva surfaces on Linux); B-frames and 10-bit / HDR HEVC (Main 10) in hardware
-encoding; VP9 and AV1 decoding on Linux (neither codec crate exposes the per-frame header libva
-wants as a record, so `vaapi/stream.rs` declines every frame-coded stream); hardware **encoding**
+encoding; **AV1** decoding on Linux (`filmcraft_av1` does not expose the per-frame header libva wants
+as a record, so `vaapi/stream.rs` still declines it) and VP9 outside profiles 0 / 2 at 4:2:0 8/10-bit;
+hardware **encoding**
 on Linux; H.264 hardware decode for streams that weight their B slices implicitly
 (`weighted_bipred_idc == 2`), which a `VASliceParameterBufferH264` cannot express and which is
 x264's default for High profile with B frames, and HEVC with

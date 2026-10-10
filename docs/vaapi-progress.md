@@ -5,13 +5,15 @@ commits. Everything here has been measured on the development machine (Intel Arc
 libva 1.24, iHD 26.3.5); nothing is carried over from another platform unverified.
 
 Two milestones are in flight: **decode**, essentially complete, and **encode**, mid-way through its
-feasibility work. A third, **VP9 decode**, is scoped but not started.
+feasibility work. A third, **VP9 decode**, is wired into the decode path; the picture-for-picture
+oracle tests are the next step.
 
 ---
 
 ## 1. Hardware decode — working
 
-A decode backend in `crates/platform/src/vaapi/`. H.264 and HEVC at 4:2:0, 8- and 10-bit.
+A decode backend in `crates/platform/src/vaapi/`. H.264 and HEVC at 4:2:0, 8- and 10-bit, plus VP9
+profiles 0 and 2 at the same depths (§4).
 
 **Reached through the application, not only a test harness.** `apps/filmcraft/src/main.rs:247` calls
 `filmcraft_platform::register()` at startup; `register()` puts the VA-API factory in front of the software
@@ -61,7 +63,8 @@ reason.
 | declined | why |
 |---|---|
 | H.264 with implicit weighted biprediction | See below. `weighted_bipred_idc == 2` is x264's default for High profile with B frames, so this is **most H.264**. |
-| VP9, AV1 | A repo visibility boundary, not a capability one — see §5. |
+| AV1 | A repo visibility boundary, not a capability one: `filmcraft_av1` does not expose the per-frame header libva wants as a record. See §5. |
+| VP9 outside profiles 0 / 2 | 4:2:2 / 4:4:0 / 4:4:4 (profiles 1, 3), the reserved profile 4, and 12-bit. Every surface this backend creates is 4:2:0 at 8 or 10 bits, so there is nowhere to put them. |
 | 10-bit H.264 | Matches the Windows backend's own decision (`media_foundation/stream.rs:279`); no fixture would prove a hardware path here. |
 | HEVC with `scaling_list_enabled_flag` | Needs `VAIQMatrixBufferHEVC`, which this backend does not build. `va_dec_hevc.h` sends that buffer only when the flag is 1, so a driver default would decode a picture the stream does not contain. |
 | 4:2:2, 4:4:4 | Out of scope by decision. |
@@ -139,35 +142,59 @@ platform tests unoptimised as well, so a profile divergence cannot hide a bug ag
 
 ---
 
-## 4. VP9 decode — scoped, not started
+## 4. VP9 decode — wired, not yet proven against hardware
 
-`docs/superpowers/plans/2026-10-09-vaapi-linux-vp9-decode.md`.
+Plan: `docs/superpowers/plans/2026-10-09-vaapi-linux-vp9-decode.md`.
 
-**The enabling change is one line.** `crates/vp9/src/header.rs` already holds
+**The enabling change was one line.** `crates/vp9/src/header.rs` already held
 `VADecPictureParameterBufferVP9`'s inputs field for field, and `parse_uncompressed` already takes
 `refs: &[Option<RefInfo>; 8]` — the shape of the record's `reference_frames[8]`. Every field is already `pub`.
-Only `crates/vp9/src/lib.rs:27`, `mod header;`, is in the way.
+Only `crates/vp9/src/lib.rs:27`, `mod header;`, was in the way. `crates/vp9` itself is **unchanged** by
+this work: it is green and bit-exact with ffmpeg, and the software path depends on it.
 
-VP9 is the cheap codec here for three reasons that are properties of the codec: no slice headers, references
-in a fixed eight-slot array rather than a per-slice list, and **no weighted prediction in either mode** — so
-the class of bug that cost the H.264 milestone most of its budget cannot occur. Scope is profiles 0 and 2;
-profiles 1 and 3 decline on chroma, profile 4 is reserved.
+**What the record needs beyond the frame header** is the part the first draft of the plan got wrong.
+It is not only the fields: the record also needs `frame_header_length_in_bytes` (the *uncompressed*
+header's length), `first_partition_size` (the compressed header's), and the two segmentation
+probability arrays — which the header itself says "should be parsed directly from bitstream by
+application" (`va_dec_vp9.h:172-177`), so they are this backend's job rather than the driver's. The
+92-byte record is pinned three ways against a C compile, including a byte-for-byte literal.
+
+**The state is the risky part, and it is named.** `reference_frames[8]` is **the whole decoded picture
+buffer addressed by slot**, not a per-slice list: build the record against the wrong slot map and the
+driver reads some other picture as a reference, without complaint. `Vp9State` threads one `HeaderState`
+across a run and owns the eight slots, and a frame's `refresh_frame_flags` is applied only after the
+driver has rendered it, so a record describes the buffer *before* its own frame. Two cases have no
+H.264 / HEVC analogue and are decided explicitly rather than left to fall out of the code:
+`show_existing_frame` is **decoded** (VP9 8.2.2: output the picture that slot holds, decode nothing),
+and `show_frame` clear is rendered but produces no picture.
+
+VP9 is the cheap codec here for three reasons that are properties of the codec: no slice headers,
+references in a fixed eight-slot array rather than a per-slice list, and **no weighted prediction in
+either mode** — so the class of bug that cost the H.264 milestone most of its budget cannot occur. Scope
+is profiles 0 and 2; profiles 1 and 3 decline on chroma, profile 4 is reserved.
+
+**Not yet proven on hardware.** The wiring, the decline tables and the record are in place and unit-
+tested; the picture-for-picture comparison against ffmpeg is the next task, and it is the task that
+would catch a record that is valid but wrong.
 
 ---
 
-## 5. Why VP9 and AV1 are not decoded yet
+## 5. Why AV1 is not decoded yet
 
-Not a hardware limit — the driver advertises `VLD: true` for all four VP9 profiles and AV1 Main here.
+Not a hardware limit — the driver advertises `VLD: true` for AV1 Main here.
 
-`crates/vp9/src/lib.rs:27` declares `mod header;` privately, and `crates/av1/src/header.rs:478` has
-`pub(crate) fn parse` taking private types. Both parsers are already written, correct, and bit-exact with
-ffmpeg in software; they are simply unreachable.
+`crates/av1/src/header.rs:478` declares `pub(crate) fn parse` over private types, so the per-frame
+header libva wants as a `VADecPictureParameterBufferAV1` is unreachable. The parser is already written
+and bit-exact with ffmpeg in software; it is simply not exposed — and exposing it is a change in
+`crates/av1` with its own review, which is why it is a separate milestone from VP9's rather than part
+of it. VP9 had the identical wall (`mod header;` in `crates/vp9/src/lib.rs`) and clearing it is what
+this milestone did.
 
-This is an architectural asymmetry worth understanding: the Windows backend decodes VP9 and AV1 today by
+The architectural asymmetry is worth understanding: the Windows backend decodes VP9 and AV1 today by
 mapping them to fourcc and DXGI profiles (`MFVideoFormat_VP90`, `D3D11_DECODER_PROFILE_AV1_VLD_*`) and
-**never parses the bitstream**. Media Foundation and VideoToolbox delegate header parsing to the OS. VA-API
-requires the application to parse headers and build every picture record, which is why this project needs
-FilmCraft's own parsers for VA-API at all — and why it meets their visibility.
+**never parses the bitstream**. Media Foundation and VideoToolbox delegate header parsing to the OS.
+VA-API requires the application to parse headers and build every picture record, which is why this
+project needs FilmCraft's own parsers for VA-API at all — and why it meets their visibility.
 
 ---
 
@@ -219,7 +246,8 @@ test from three failures to one.
 ## 8. Open
 
 - **ffmpeg's H.264 implicit weighting** — unexplained; §2.
-- **VP9 and AV1 hardware decode on Linux** — scoped, one-line enabler; §4.
+- **VP9 on real hardware** — wired and unit-tested; the picture-for-picture oracle is the next task; §4.
+- **AV1 hardware decode on Linux** — its own milestone; §5.
 - **Encode** — `VideoEncoder`/`EncoderFactory` implementation, `sample_entry` from the driver's parameter
   sets, the frame loop driven by settings, and the docs. Also: reference depth > 1, multi-slice pictures
   (a second coded segment is refused), and five syscalls per encoded frame.

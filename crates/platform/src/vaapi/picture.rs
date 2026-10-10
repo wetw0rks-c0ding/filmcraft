@@ -259,6 +259,18 @@ pub fn surface_pool(info: &NalStreamInfo) -> usize {
     }
 }
 
+/// How many surfaces a VP9 decode must have: the same bound, from the same place.
+///
+/// VP9 has no picture buffer declaration to read, so this cannot be the argument [`surface_pool`] makes
+/// about H.264 and HEVC — it is the *identical* argument applied to VP9's own shape. A
+/// `VADecPictureParameterBufferVP9`'s `reference_frames` is all eight slots
+/// (`va_dec_vp9.h:70-77`), and [`Vp9State`] puts a picture in a slot only while that frame's
+/// `refresh_frame_flags` says the slot becomes it — so at most eight surfaces ever hold a live
+/// reference, and the ninth is the one a new picture may be decoded into.
+pub fn vp9_surface_pool() -> usize {
+    VP9_REF_SLOTS + 1
+}
+
 impl Picture {
     /// The size of the slice data buffer this picture's records address: the end of its last slice.
     /// The caller assembles the picture's slices into a buffer of this size, laid out as
@@ -875,6 +887,42 @@ pub fn vp9_decline(profile: u8, bit_depth: u32) -> Option<String> {
     vp9_decline_reason(profile, bit_depth).map(|why| format!("VP9 profile {profile} at {bit_depth} bits: {why}"))
 }
 
+/// The container's own description and a frame header must agree about the VP9 **profile** and the
+/// **bit depth**, and this is where that is checked — the one site, so the decode loop and
+/// [`build_frame`] cannot disagree about it.
+///
+/// **Why it has to be somewhere both can reach.** The two places that read a VP9 frame are
+/// [`Vp9State::frame`], which has the frame header but no container, and the decode loop, which has
+/// both. `Vp9State` itself cannot hold a `FrameStreamInfo` — its whole subject is the state of *one
+/// run*, and a container description is a property of the stream, not of a run — so the check is a
+/// function over the two rather than a method on either.
+///
+/// The disagreement is worth catching before a record reaches a driver: the surfaces were created
+/// for the profile and depth the container said, and the record would carry the frame's, so a
+/// driver would be asked to decode a picture of one format into a surface of another.
+///
+/// - **The profile** is spelled in every frame — 6.2 reads it before the `show_existing_frame` bit
+///   (`crates/vp9/src/header.rs:226-228`) — so it is compared for every frame, including one that
+///   re-shows an earlier picture.
+/// - **The depth** is spelled only where `color_config` was read: 6.2 reads it for a key frame
+///   (`header.rs:249`) and for an intra-only frame (`header.rs:252`), and a true inter frame
+///   *inherits* it (`header.rs:265`). Comparing it on an inter frame would compare the container's
+///   depth against the previous frame's, which is a claim about the wrong frame — and, against a
+///   fresh parse state, an 8-bit default that a 10-bit stream never said. So it is gated on
+///   [`FrameHeader::frame_is_intra`], exactly the condition under which the header carries one.
+pub fn vp9_entry_disagreement(info: &FrameStreamInfo, h: &FrameHeader) -> Option<String> {
+    if h.profile != info.profile {
+        return Some(format!("VP9 picture parameters: the sample entry says profile {}, the frame header says profile {}", info.profile, h.profile));
+    }
+    if h.frame_is_intra && u32::from(h.color.bit_depth) != info.bit_depth {
+        return Some(format!(
+            "VP9 picture parameters: the sample entry says {} bits, the frame header's colour configuration says {} bits",
+            info.bit_depth, h.color.bit_depth
+        ));
+    }
+    None
+}
+
 /// The eight reference slots of a `VADecPictureParameterBufferVP9`, as surfaces.
 ///
 /// **`reference_frames` is the whole decoded picture buffer, not a list of the references this frame
@@ -1092,9 +1140,12 @@ pub fn vp9_picture_record(h: &FrameHeader, st: &HeaderState, data: &[u8], surfac
     // record's fields describe it: no size, no loop filter level, no reference indices. VP9 6.2 returns
     // from the header parse as soon as `frame_to_show_map_idx` is read, which is why this has to be
     // checked here — the parse *succeeds*, with almost nothing set, and a record built from it would
-    // be a zero-width picture of a frame that was never decoded. Whether such a frame should be shown
-    // at all (by re-showing the surface it names, with no decode) is the decode loop's decision and is
-    // left to it; what is refused here is describing it as a frame of its own.
+    // be a zero-width picture of a frame that was never decoded. Whether such a frame is shown at all
+    // is *not* left open here: [`Vp9State::frame`] decides it, and the decision is **decoded** — the
+    // surface the named slot holds is re-shown with no decode at all (VP9 8.2.2), which is why
+    // `VaDecoder::picture_frame` reads the frame *before* it takes a surface from the ring. What is
+    // refused here is only describing such a frame as a frame of its own, which is a fact about the
+    // record rather than about the stream.
     if h.show_existing_frame {
         return Err("a VP9 frame that re-shows an earlier one carries no picture parameters of its own".into());
     }
@@ -1270,53 +1321,50 @@ fn vp9_frame_entry_error(info: &FrameStreamInfo, sample: &[u8]) -> String {
     if sample.is_empty() {
         return "VP9 picture parameters: an empty frame".into();
     }
-    match filmcraft_vp9::header::parse_uncompressed(sample, &mut HeaderState::default(), &[None; 8]) {
+    // Parsed into a fresh `HeaderState` because this arm's whole subject is what a *stream
+    // description* can say about a sample on its own; see the note above for why the depth half of
+    // the cross-check has to be gated.
+    let header = match filmcraft_vp9::header::parse_uncompressed(sample, &mut HeaderState::default(), &[None; 8]) {
+        Ok(h) => h,
         // A reference slot the header wanted a size from, and this arm has no surface for any of them.
         // See the note above: this is the missing state, not a fault in the header.
-        Err(filmcraft_vp9::Error::MissingReference(_)) => MISSING_REFERENCE_STATE.into(),
+        Err(filmcraft_vp9::Error::MissingReference(_)) => return MISSING_REFERENCE_STATE.into(),
         // Every other parse failure really is the header's: truncated, or a syntax element out of
         // range. Those are actionable in the sample, so they are reported as what they are.
-        Err(why) => format!("VP9 picture parameters: uncompressed frame header: {why}"),
-        // The profile is spelled in every frame, so this half of the cross-check is not gated: a
-        // container whose `vpcC` says one profile and whose frames say another describes a stream this
-        // backend will not hand to a driver — the surfaces were created for one profile and the record
-        // would say another. It comes before the next arm because `show_existing_frame` reads its
-        // profile too (6.2 reads it before the `show_existing_frame` bit), so a disagreement there is
-        // as real as anywhere else.
-        Ok(h) if h.profile != info.profile => {
-            format!("VP9 picture parameters: the sample entry says profile {}, the frame header says profile {}", info.profile, h.profile)
-        }
-        // **A frame that carries no picture parameters of its own is told that**, in the same words
-        // `vp9_picture_record` refuses it in. This arm used to fall through to the missing-state
-        // sentence, which names the reference surfaces — and the reference state is exactly what such
-        // a frame does *not* need: 6.2 returns from the header parse as soon as
-        // `frame_to_show_map_idx` is read, so handing it a fully populated slot map would not make it
-        // describable. The two sites disagreed about one frame, which is the disagreement this module
-        // treats as a bug (see `the_vp9_decline_is_the_same_sentence_wherever_it_is_decided`).
-        //
-        // What the decode loop *does* with it is a separate question and it is answered, not
-        // defaulted: `Vp9State` re-shows the slot the header names, with no decode. The sentence says
-        // so, because a caller reading only this message should not conclude the frame was dropped.
-        Ok(h) if !vp9_is_new_frame(&h) => match h.show_existing_frame {
+        Err(why) => return format!("VP9 picture parameters: uncompressed frame header: {why}"),
+    };
+    // The container/frame cross-check, in one place and shared with the decode loop: see
+    // `vp9_entry_disagreement`, which says why the depth half is gated on `frame_is_intra` and the
+    // profile half is not. It is asked **before** the arms about what kind of frame this is, because a
+    // disagreement is a fact about the stream whatever the frame is — 6.2 reads the profile before the
+    // `show_existing_frame` bit, so a re-show names one too, and answering "this frame is a re-show"
+    // first would leave a container that disagrees with every frame of it unchecked.
+    if let Some(why) = vp9_entry_disagreement(info, &header) {
+        return why;
+    }
+    // **A frame that carries no picture parameters of its own is told that**, in the same words
+    // `vp9_picture_record` refuses it in. This arm used to fall through to the missing-state
+    // sentence, which names the reference surfaces — and the reference state is exactly what such
+    // a frame does *not* need: 6.2 returns from the header parse as soon as
+    // `frame_to_show_map_idx` is read, so handing it a fully populated slot map would not make it
+    // describable. The two sites disagreed about one frame, which is the disagreement this module
+    // treats as a bug (see `the_vp9_decline_is_the_same_sentence_wherever_it_is_decided`).
+    //
+    // What the decode loop *does* with it is a separate question and it is answered, not
+    // defaulted: `Vp9State` re-shows the slot the header names, with no decode. The sentence says
+    // so, because a caller reading only this message should not conclude the frame was dropped.
+    if !vp9_is_new_frame(&header) {
+        return match header.show_existing_frame {
             true => format!(
                 "VP9 picture parameters: a frame that re-shows reference slot {} carries none of its own — the decode loop \
                  re-shows that slot's picture with no decode",
-                h.frame_to_show_map_idx
+                header.frame_to_show_map_idx
             ),
-            false => format!("VP9 picture parameters: frame_type {}, which VP9 does not define", h.frame_type),
-        },
-        // The depth is spelled **only** where `color_config` was read. `frame_is_intra` is true for a
-        // key frame (`header.rs:249`) and for an intra-only frame (`header.rs:252`), which are the two
-        // cases that read it, and false for a true inter frame, which inherits it.
-        Ok(h) if h.frame_is_intra && u32::from(h.color.bit_depth) != info.bit_depth => {
-            format!(
-                "VP9 picture parameters: the sample entry says {} bits, the frame header's colour configuration says {} bits",
-                info.bit_depth, h.color.bit_depth
-            )
-        }
-        // Otherwise the state.
-        Ok(_) => MISSING_REFERENCE_STATE.into(),
+            false => format!("VP9 picture parameters: frame_type {}, which VP9 does not define", header.frame_type),
+        };
     }
+    // Otherwise the state.
+    MISSING_REFERENCE_STATE.into()
 }
 
 /// Whether `h` is a VP9 frame that carries a picture of its own, i.e. one a record can describe.
@@ -1492,8 +1540,18 @@ impl Vp9State {
     ///
     /// This is the VP9 half of what `NalPoc::live_surfaces` is for the NAL codecs: the surface ring
     /// is a pool and cannot tell a live reference from a free surface, and only this state knows
-    /// which surfaces are still referred to. It is asked **before** a surface is taken, because
-    /// taking one and then parsing the frame is the same order `build_nal` uses.
+    /// which surfaces are still referred to.
+    ///
+    /// **The decode loop asks it *after* [`Self::frame`] has run, which is the opposite of the NAL
+    /// order and is not an oversight.** `build_nal` adds a picture to the buffer as it builds, so its
+    /// surfaces must be chosen first; a VP9 frame may code no picture at all (a re-show), so whether
+    /// a surface is needed is not known until the frame has been read. Reading this *before* the
+    /// parse would take a surface for a frame that decodes nothing.
+    ///
+    /// The answer does not depend on the order, and that is worth stating: [`Self::frame`] reads the
+    /// header and builds the record, and moves a slot only in [`Self::commit`] — which runs after the
+    /// driver has rendered. So the live set is the same before and after, and the ordering is about
+    /// *not taking a surface*, not about which surfaces are excluded.
     pub fn live_surfaces(&self) -> Vec<u32> {
         self.slots.iter().filter_map(|slot| slot.map(|r| r.surface)).collect()
     }
@@ -1518,14 +1576,19 @@ impl Vp9State {
     /// ## An `Err` here may have advanced the parse state — and that is deliberate
     ///
     /// The guarantee above is about the **slots**. It is not, and cannot be, a guarantee about
-    /// `headers`: `parse_uncompressed` writes `st.frame_type` before most of its reads
-    /// (`crates/vp9/src/header.rs:239-240`) and `st.lf`, `st.seg` and `st.color` before it returns
-    /// (`header.rs:317-399`), so the three refusals *below* — the frame type, an empty reference
-    /// slot, and everything [`vp9_picture_record`] refuses — all happen **after** a parse that has
-    /// already committed this frame's loop filter level, sharpness, segmentation probabilities and
-    /// colour configuration to the state. A later frame that does not spell those itself inherits
-    /// the refused frame's values, which is the Ruling-7 shape reached by the back door: still a
-    /// valid record, still a plausible picture.
+    /// `headers`: `parse_uncompressed` writes `st.last_frame_type` before it has read anything past
+    /// the profile bits (`crates/vp9/src/header.rs:239` — `:240` *reads* `frame_type`, and
+    /// `st.frame_type` itself is written at the very end, `:400`), and it writes `st.lf` and `st.seg`
+    /// as it goes and `st.color` on the way out (`header.rs:317-399`). So the three refusals *below* —
+    /// the frame type, an empty reference slot, and everything [`vp9_picture_record`] refuses — all
+    /// happen **after** a parse that has already committed this frame's loop filter level, sharpness
+    /// and segmentation probabilities, and, for a frame that spells a `color_config`, its colour
+    /// configuration too. **The empty-reference-slot refusal is necessarily an inter frame** — an
+    /// intra frame names no references — and a true inter frame *reads* `st.color` rather than
+    /// writing it (`header.rs:265`), so that refusal commits `lf` and `seg` and leaves the colour
+    /// alone. A later frame that does not spell those itself inherits the refused frame's values,
+    /// which is the Ruling-7 shape reached by the back door: still a valid record, still a plausible
+    /// picture.
     ///
     /// **Nothing here rolls that back, and that is a choice.** FilmCraft's own software decoder
     /// behaves identically — it parses into `self.st` and only then makes the same checks
@@ -1540,8 +1603,8 @@ impl Vp9State {
     /// the parse state to its *initial* values — it is not a rollback of one frame — which is
     /// exactly right for a seek, where nothing before it should be inherited.
     ///
-    /// The one exception is a **re-show**, which returns before line 239 and therefore leaves the
-    /// parse state untouched whatever it names.
+    /// The one exception is a **re-show**, which returns at `header.rs:237` — before any of those writes —
+    /// and therefore leaves the parse state untouched whatever it names.
     ///
     /// ## The one VP9 case with no H.264 or HEVC analogue here
     ///
@@ -4382,6 +4445,13 @@ mod tests {
     /// cannot do from a stream description alone is name the eight reference surfaces, which is state
     /// the caller must have. The old test asserted the shared constant for both codecs, which asserted
     /// something false about VP9, so it is split here into what each arm actually claims.
+    ///
+    /// **`build_frame` is still a refusal for a VP9 profile this backend decodes, and that is now a
+    /// statement about this function rather than about VP9.** `plan_frame` *plans* such a stream and
+    /// the decode loop decodes it, through [`Vp9State`]. What is still true is narrower and is what
+    /// the last arm asserts: from a stream description and a sample, with no run's state, there is
+    /// no reference set to name, so this function cannot build a record. It says so rather than
+    /// inventing one.
     #[test]
     fn the_frame_codec_declines_say_what_each_one_is_missing() {
         // A profile this backend takes, with a sample that is not a VP9 frame at all: refused as an
@@ -4413,17 +4483,64 @@ mod tests {
             let e = super::build_frame(&info, &[]).expect_err("VP9 profile {profile}");
             assert!(e.contains(why), "VP9 profile {profile} at {bits} bits: {e}");
         }
-        // And a profile this backend *would* decode says what is missing, which is the state — for a
-        // sample that parses as well, so the message cannot be about the sample.
+        // And a profile this backend *does* decode says what *this* function is missing, which is the
+        // state — for a sample that parses as well, so the message cannot be about the sample.
         let (frame, _, _) = vp9_key_frame();
         let ok = FrameStreamInfo::for_tests(FrameCodec::Vp9, 0, 8, (1, 1), (1920, 1080));
-        let e = super::build_frame(&ok, &frame).expect_err("a decodable VP9 profile");
+        let e = super::build_frame(&ok, &frame).expect_err("a decodable VP9 profile, but no state to name its references in");
         assert!(e.contains("reference surfaces"), "{e}");
-        // And `plan_frame` says the same thing, in words that do *not* claim the header is missing.
-        let planned = crate::vaapi::stream::plan_frame(&ok).expect_err("plan_frame declines a VP9 stream at this level");
-        assert!(planned.contains("reference surface"), "VP9: {planned}");
-        assert!(planned.contains("filmcraft-vp9"), "VP9: {planned}");
-        assert!(!planned.contains(super::FRAME_HEADER_MISSING), "VP9's frame header IS exposed: {planned}");
+        // The two sites no longer say the same thing about VP9, and that is now the point: `plan_frame`
+        // plans this stream and the decode loop decodes it, while this function — which has no run to
+        // read a reference set from — still refuses. So what is pinned is that **neither** claims the
+        // per-frame header is missing, which is the sentence they once shared.
+        let planned = crate::vaapi::stream::plan_frame(&ok).unwrap_or_else(|e| panic!("plan_frame plans a decodable VP9 profile: {e}"));
+        assert_eq!(planned.profile, crate::vaapi::ffi::Profile::Vp9(0), "planned as the profile the record carries");
+        assert!(!e.contains(super::FRAME_HEADER_MISSING), "VP9's frame header IS exposed: {e}");
+    }
+
+    /// The container/frame cross-check is **one function**, reached from both places that can see both
+    /// halves: `build_frame`'s backstop and the decode loop. This is what keeps them from drifting,
+    /// and it is why the function exists rather than being inlined at each site.
+    ///
+    /// The two halves behave differently on purpose, and the difference is the interesting part:
+    ///
+    /// - the **profile** is spelled in every frame, including a re-show, so a container that disagrees
+    ///   is refused for every frame of it;
+    /// - the **depth** is spelled only where `color_config` was read, so it is compared only for a key
+    ///   frame or an intra-only frame. Comparing it on an inter frame would compare the container's
+    ///   depth against the *previous* frame's inherited one — and, for a state parsed from scratch,
+    ///   against `ColorConfig::default()`'s 8 bits, which a 10-bit stream never said.
+    #[test]
+    fn the_sample_entry_cross_check_is_asked_of_every_frame_and_the_depth_only_where_it_is_spelled() {
+        let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, 2, 10, (1, 1), (1920, 1080));
+        let good = |mut h: FrameHeader| {
+            h.profile = 2;
+            h.frame_is_intra = true;
+            h.color.bit_depth = 10;
+            h
+        };
+        assert_eq!(super::vp9_entry_disagreement(&info, &good(FrameHeader::default())), None, "an intra frame that agrees");
+
+        // A profile disagreement is refused whatever the frame is — including a re-show, whose header
+        // 6.2 fills in with the profile and nothing else.
+        let mut re_show = FrameHeader { profile: 0, show_existing_frame: true, frame_to_show_map_idx: 3, ..FrameHeader::default() };
+        re_show.frame_is_intra = false;
+        let why = super::vp9_entry_disagreement(&info, &re_show).expect("a re-show spells its profile, so it is checked too");
+        assert!(why.contains("says profile 2"), "{why}");
+        assert!(why.contains("says profile 0"), "{why}");
+
+        // A depth disagreement is refused where `color_config` was read.
+        let mut shallow_key = good(FrameHeader::default());
+        shallow_key.color.bit_depth = 8;
+        let why = super::vp9_entry_disagreement(&info, &shallow_key).expect("a key frame spells its colour configuration");
+        assert!(why.contains("says 10 bits"), "{why}");
+        assert!(why.contains("says 8 bits"), "{why}");
+
+        // …and **not** where it was inherited, which is the half that would otherwise blame an inter
+        // frame for a colour configuration it never carried.
+        let mut inter = FrameHeader { profile: 2, frame_is_intra: false, color: filmcraft_vp9::header::ColorConfig::default(), ..FrameHeader::default() };
+        inter.color.bit_depth = 8;
+        assert_eq!(super::vp9_entry_disagreement(&info, &inter), None, "an inter frame inherits its colour, so this is not a disagreement");
     }
 
     /// A VP9 record is built from the frame's *own* uncompressed header, which libva wants as a
@@ -5422,11 +5539,18 @@ mod tests {
     /// below is what a caller does instead.
     ///
     /// **A structural fact the first claim depends on, and it is why this test needs a fresh state.**
-    /// A frame can only be refused for an *empty reference slot* when the state holds **nothing**:
-    /// the only frame an empty state can describe is a key frame, and a key frame refreshes all eight
-    /// slots, so there is no state this API can build in which a later reference is empty while an
-    /// earlier frame's parse state is behind it. The refusal under test therefore happens on a fresh
-    /// state, and what survived it is read back by the next frame that inherits.
+    /// A frame can only be refused for an *empty reference slot* when the state holds **nothing**, and
+    /// the only frame **this builder** can write for an empty state is a key frame — which refreshes
+    /// all eight slots. So there is no state this test can build in which a later reference is empty
+    /// while an earlier frame's parse state is behind it. The refusal under test therefore happens on a
+    /// fresh state, and what survived it is read back by the next frame that inherits.
+    ///
+    /// The scoping is not pedantry. VP9 itself has another such frame: an `intra_only == 1` frame needs
+    /// no references and may carry `refresh_frame_flags == 0`, which is exactly the state called
+    /// unbuildable here. What rules it out is a property of **this** builder — it hardcodes
+    /// `intra_only = 0` for every inter frame (`vp9_inter_frame_full`, below) — not a property of the
+    /// codec, and a comment claiming the stronger thing would be wrong the moment that builder grew
+    /// the flag.
     #[test]
     fn a_refused_frame_may_have_advanced_the_parse_state_and_reset_is_the_way_back() {
         // --- 1. A refused frame that *updates* segmentation changes what the next frame inherits -------
@@ -5501,11 +5625,11 @@ mod tests {
         // are what shows. A reset forgets the whole previous run; it is **not** a way to put back the
         // one frame before the last.
         let mut run = super::Vp9State::new();
-        let f = run
+        let e = run
             .frame(&vp9_inter_frame_updating_segmentation(0, 0xff, [0, 1, 2], [201, 202, 203, 204, 205, 206, 207], [208, 209, 210]))
             .map(|_| ())
             .expect_err("nothing is held");
-        let _ = f;
+        assert!(e.contains("last_ref_frame is reference slot 0"), "refused again, on the state that is about to be reset");
         let f = run.frame(&inherits).expect("a key frame names no references");
         let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
         assert_eq!((r.mb_segment_tree_probs, r.segment_pred_probs), ([201, 202, 203, 204, 205, 206, 207], [208, 209, 210]), "the refused frame's, again");
