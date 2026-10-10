@@ -1515,6 +1515,34 @@ impl Vp9State {
     /// actually rendered the picture, so that a decode that failed cannot have moved the buffer and
     /// a record always describes the buffer *before* its own frame.
     ///
+    /// ## An `Err` here may have advanced the parse state — and that is deliberate
+    ///
+    /// The guarantee above is about the **slots**. It is not, and cannot be, a guarantee about
+    /// `headers`: `parse_uncompressed` writes `st.frame_type` before most of its reads
+    /// (`crates/vp9/src/header.rs:239-240`) and `st.lf`, `st.seg` and `st.color` before it returns
+    /// (`header.rs:317-399`), so the three refusals *below* — the frame type, an empty reference
+    /// slot, and everything [`vp9_picture_record`] refuses — all happen **after** a parse that has
+    /// already committed this frame's loop filter level, sharpness, segmentation probabilities and
+    /// colour configuration to the state. A later frame that does not spell those itself inherits
+    /// the refused frame's values, which is the Ruling-7 shape reached by the back door: still a
+    /// valid record, still a plausible picture.
+    ///
+    /// **Nothing here rolls that back, and that is a choice.** FilmCraft's own software decoder
+    /// behaves identically — it parses into `self.st` and only then makes the same checks
+    /// (`crates/vp9/src/decoder.rs:247`, then 250-252 and 291) — so restoring a snapshot here would
+    /// make the hardware and software paths of one bitstream disagree about what the frame after a
+    /// refusal inherits, which is a new class of wrong rather than the removal of one.
+    ///
+    /// What keeps it harmless is that **no caller continues after an `Err`**: `VaDecoder::decode`
+    /// latches `self.refused` until `reset()` (`decoder.rs:376`), and the software decoder returns
+    /// the error to its caller. So the rule for a caller of this method is: **an `Err` ends the run,
+    /// and [`Self::reset`] is the way back to a state that describes the next one.** `reset` returns
+    /// the parse state to its *initial* values — it is not a rollback of one frame — which is
+    /// exactly right for a seek, where nothing before it should be inherited.
+    ///
+    /// The one exception is a **re-show**, which returns before line 239 and therefore leaves the
+    /// parse state untouched whatever it names.
+    ///
     /// ## The one VP9 case with no H.264 or HEVC analogue here
     ///
     /// `show_existing_frame` re-shows an earlier picture instead of coding one: 6.2 returns from the
@@ -4554,6 +4582,29 @@ mod tests {
     /// reads no extra bit below profile 2 — so the byte-pinning test's fixture, and the 92 bytes it
     /// pins, are untouched by taking the arguments.
     fn vp9_key_frame_at(profile: u8, ten_bit: bool) -> (Vec<u8>, filmcraft_vp9::header::HeaderState, filmcraft_vp9::header::FrameHeader) {
+        vp9_key_frame_full(profile, ten_bit, Some(([7, 11, 13, 17, 19, 23, 29], [31, 37, 41])))
+    }
+
+    /// A key frame that does **not** update the segmentation map: `segmentation_enabled` is clear, so
+    /// 6.2.11 reads none of the probabilities and the frame's record carries whatever the **state**
+    /// holds.
+    ///
+    /// Every other key frame here updates them, which makes them a way of *writing* the state rather
+    /// than of reading it. This one is the instrument for the other direction: feed a frame that writes
+    /// probabilities, then feed this, and the record says whether the write survived.
+    fn vp9_key_frame_inheriting_segmentation() -> (Vec<u8>, filmcraft_vp9::header::HeaderState, filmcraft_vp9::header::FrameHeader) {
+        vp9_key_frame_full(0, false, None)
+    }
+
+    /// The key-frame builder with its segmentation parameters as a parameter. `None` is
+    /// `segmentation_enabled` clear; `Some((tree, pred))` is 6.2.11 with `update_map` and
+    /// `temporal_update` set and both arrays written — which is what the byte-pinning test's fixture
+    /// uses, and what the inheriting variant above does without.
+    fn vp9_key_frame_full(
+        profile: u8,
+        ten_bit: bool,
+        segmentation: Option<([u8; 7], [u8; 3])>,
+    ) -> (Vec<u8>, filmcraft_vp9::header::HeaderState, filmcraft_vp9::header::FrameHeader) {
         const WIDTH: u32 = 320;
         const HEIGHT: u32 = 180;
         /// How long the frame's compressed header **claims** to be, as 6.3's `header_size_in_bytes`
@@ -4606,22 +4657,27 @@ mod tests {
         w.put(0, 1); // delta_q_y_dc_present
         w.put(0, 1); // delta_q_uv_dc_present
         w.put(0, 1); // delta_q_uv_ac_present
-        // 6.2.11 segmentation_params, **with an update**, so the tree probabilities are actually read.
-        // They are the two arrays the header says the application must parse itself
-        // (`va_dec_vp9.h:172-177`), and a frame that does not update them leaves the defaults in
-        // place — which is a different property, and one the state carries, not the header.
-        w.put(1, 1); // segmentation_enabled
-        w.put(1, 1); // segmentation_update_map
-        for p in [7u32, 11, 13, 17, 19, 23, 29] {
-            w.put(1, 1); // mb_segment_tree_prob's update flag
-            w.put(p, 8); // mb_segment_tree_prob — distinct primes, so a permuted array shows
+        // 6.2.11 segmentation_params. These are the two arrays the header says the application
+        // must parse itself (`va_dec_vp9.h:172-177`), and the only inter-frame syntax elements the
+        // record takes from the **state** rather than from the header: a frame that does not update
+        // them submits the values in force, so both arms matter and both are exercised.
+        match segmentation {
+            None => w.put(0, 1), // segmentation_enabled — off, so no update_map and no update_data
+            Some((tree, pred)) => {
+                w.put(1, 1); // segmentation_enabled
+                w.put(1, 1); // segmentation_update_map
+                for p in tree {
+                    w.put(1, 1); // mb_segment_tree_prob's update flag
+                    w.put(u32::from(p), 8); // mb_segment_tree_prob — distinct primes, so a permuted array shows
+                }
+                w.put(1, 1); // segmentation_temporal_update — so the pred probs are read rather than defaulted
+                for p in pred {
+                    w.put(1, 1); // segment_pred_prob's update flag
+                    w.put(u32::from(p), 8); // segment_pred_prob
+                }
+                w.put(0, 1); // segmentation_update_data
+            }
         }
-        w.put(1, 1); // segmentation_temporal_update — so the pred probs are read rather than defaulted
-        for p in [31u32, 37, 41] {
-            w.put(1, 1); // segment_pred_prob's update flag
-            w.put(p, 8); // segment_pred_prob
-        }
-        w.put(0, 1); // segmentation_update_data
         // 6.2.13 tile_info: 320x180 is a single superblock column, so the tile-width loop does not run
         // and `tile_cols_log2` is 0 — the correct answer for this size rather than a default.
         //
@@ -4686,7 +4742,18 @@ mod tests {
     /// forced clear, `frame_parallel_decoding_mode` is forced set, and 6.2.5's context reset wipes
     /// every one of the four probability contexts.
     fn vp9_inter_frame_refreshing(profile: u8, size_from_ref: bool, refresh: u8, refs: [u32; 3]) -> Vec<u8> {
-        vp9_inter_frame_full(profile, size_from_ref, refresh, refs, true, false, 0, 3)
+        vp9_inter_frame_full(profile, size_from_ref, refresh, refs, true, false, 0, 3, None)
+    }
+
+    /// An inter frame that **updates the segmentation map**, writing its own two probability arrays.
+    ///
+    /// The other inter frames all set `segmentation_enabled` clear, which means they *inherit* the
+    /// probabilities from the state. That is the common case and the one most records exercise, but it
+    /// means no such frame can change the state's probabilities — so a test about whether a **refused**
+    /// frame changed them has nothing to observe unless one frame writes them and the next inherits.
+    /// This is that frame: `update_map` set, `temporal_update` set, both arrays written.
+    fn vp9_inter_frame_updating_segmentation(profile: u8, refresh: u8, refs: [u32; 3], tree: [u8; 7], pred: [u8; 3]) -> Vec<u8> {
+        vp9_inter_frame_full(profile, false, refresh, refs, true, false, 0, 3, Some((tree, pred)))
     }
 
     /// Every field the inter-frame tests need to vary, spelled out. See
@@ -4703,6 +4770,7 @@ mod tests {
         error_resilient: bool,
         reset_frame_context: u32,
         frame_context_idx: u32,
+        segmentation: Option<([u8; 7], [u8; 3])>,
     ) -> Vec<u8> {
         const WIDTH: u32 = 1920;
         const HEIGHT: u32 = 1080;
@@ -4764,7 +4832,28 @@ mod tests {
         for _ in 0..3 {
             w.put(0, 1); // delta_q_{y_dc,uv_dc,uv_ac}_present
         }
-        w.put(0, 1); // segmentation_enabled — off, so no update_map and no update_data
+        // 6.2.11 segmentation_params. `None` is `segmentation_enabled` clear — the common case, where the
+        // state keeps whatever the frames before this one set. `Some((tree, pred))` is the frame that
+        // **updates** the map and writes both probability arrays, which is what 6.2.11 reads into the
+        // state and what the record then submits (`va_dec_vp9.h:172-177`). Only one of these is ever
+        // needed at a time: a test that wants to change the state's probabilities changes them once.
+        match segmentation {
+            None => w.put(0, 1), // segmentation_enabled — off, so no update_map and no update_data
+            Some((tree, pred)) => {
+                w.put(1, 1); // segmentation_enabled
+                w.put(1, 1); // segmentation_update_map
+                for p in tree {
+                    w.put(1, 1); // mb_segment_tree_prob's update flag
+                    w.put(u32::from(p), 8); // mb_segment_tree_prob
+                }
+                w.put(1, 1); // segmentation_temporal_update — so the pred probs are read rather than defaulted
+                for p in pred {
+                    w.put(1, 1); // segment_pred_prob's update flag
+                    w.put(u32::from(p), 8); // segment_pred_prob
+                }
+                w.put(0, 1); // segmentation_update_data
+            }
+        }
         // 6.2.13 tile_info at 1920x1080: 30 superblock columns, so the tile-width loop runs twice
         // (min 0, max 2 — `header.rs:373-389`) and both flags are set.
         w.put(1, 1); // tile_cols_log2 — up to 1
@@ -5313,6 +5402,123 @@ mod tests {
         }
     }
 
+    /// **A refused frame may have advanced the parse state, and `reset()` is the way back.**
+    ///
+    /// The two-phase promise — "a decode that failed cannot have moved the buffer" — is about the
+    /// **slots**, and it is true of them. It says nothing about `headers`, and the refusals in
+    /// [`super::Vp9State::frame`] that come *after* a successful parse leave that half advanced:
+    /// `parse_uncompressed` writes `st.lf`, `st.seg` and `st.color`
+    /// (`crates/vp9/src/header.rs:317-399`) before it returns, so a frame refused for naming an empty
+    /// reference slot has already written its loop filter level, its segmentation probabilities and its
+    /// colour configuration into the state the **next** frame inherits from.
+    ///
+    /// **Nothing here rolls that back, and that is a choice this test pins rather than hides.**
+    /// FilmCraft's own software decoder behaves identically — it parses into `self.st` and only then
+    /// makes the same checks (`crates/vp9/src/decoder.rs:247`, then 250-252 and 291) — so a
+    /// snapshot-and-restore here would make the hardware and software paths of one bitstream disagree
+    /// about what the frame after a refusal inherits, which is a new class of wrong rather than the
+    /// removal of one. What keeps it harmless is that no caller continues after an `Err`:
+    /// `VaDecoder::decode` latches `self.refused` until `reset()` (`decoder.rs:376`). The last claim
+    /// below is what a caller does instead.
+    ///
+    /// **A structural fact the first claim depends on, and it is why this test needs a fresh state.**
+    /// A frame can only be refused for an *empty reference slot* when the state holds **nothing**:
+    /// the only frame an empty state can describe is a key frame, and a key frame refreshes all eight
+    /// slots, so there is no state this API can build in which a later reference is empty while an
+    /// earlier frame's parse state is behind it. The refusal under test therefore happens on a fresh
+    /// state, and what survived it is read back by the next frame that inherits.
+    #[test]
+    fn a_refused_frame_may_have_advanced_the_parse_state_and_reset_is_the_way_back() {
+        // --- 1. A refused frame that *updates* segmentation changes what the next frame inherits -------
+        // The scenario under review, made non-vacuous: the frame writes its own probabilities, so if the
+        // refusal undid the parse they would not be here.
+        let mut fresh = super::Vp9State::new();
+        let e = fresh
+            .frame(&vp9_inter_frame_updating_segmentation(0, 0xff, [0, 1, 2], [201, 202, 203, 204, 205, 206, 207], [208, 209, 210]))
+            .map(|_| ())
+            .expect_err("no slot is held, so this frame is refused");
+        assert!(e.contains("last_ref_frame is reference slot 0"), "refused for the reason under test: {e}");
+        // Read the state back with a key frame that does **not** update segmentation: 6.2.11 then reads
+        // none of the probabilities, so its record is whatever the state holds.
+        let (inherits, _, _) = vp9_key_frame_inheriting_segmentation();
+        let f = fresh.frame(&inherits).expect("a key frame names no references, so an empty state describes it");
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!(
+            (r.mb_segment_tree_probs, r.segment_pred_probs),
+            ([201, 202, 203, 204, 205, 206, 207], [208, 209, 210]),
+            "the refused frame's probabilities are what the next frame inherits: `parse_uncompressed` wrote them at \
+             header.rs:346-352, before `Vp9State::frame` refused, and nothing undoes that"
+        );
+
+        // --- 2. A refused frame that does *not* update segmentation leaves them alone --------------------
+        // This is the form a "a refused frame does not change the next frame's inherited segmentation
+        // probabilities" test can assert, and it holds — **but only because the frame wrote nothing.**
+        // It is asserted so the weaker claim sits next to the stronger one instead of standing alone,
+        // where it would read as a guarantee it is not.
+        let (key, _, _) = vp9_key_frame();
+        let mut seeded = super::Vp9State::new();
+        let f = seeded.frame(&key).expect("the key frame sets the probabilities");
+        seeded.commit(&f, 100).expect("it commits");
+        // The inheriting key frame with its compressed header cut off: it parses in full — writing
+        // `lf.level` and `lf.sharpness` — and is then refused by `vp9_picture_record` for having no room
+        // for a compressed header. So this refusal is *after* a complete parse, on a state that already
+        // held probabilities.
+        let (inherits, _, inherits_header) = vp9_key_frame_inheriting_segmentation();
+        let e = seeded.frame(&inherits[..inherits_header.uncompressed_size]).map(|_| ()).expect_err("a frame with no compressed header");
+        assert!(e.contains("no room"), "{e}");
+        let f = seeded.frame(&vp9_inter_frame_refreshing(0, false, 0xff, [0, 1, 2])).expect("references are all held");
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!(
+            (r.mb_segment_tree_probs, r.segment_pred_probs),
+            ([7, 11, 13, 17, 19, 23, 29], [31, 37, 41]),
+            "unchanged — because that frame set `segmentation_enabled` clear, not because the refusal undid a write"
+        );
+
+        // --- 3. The consequence, in the field Ruling 7 is about -----------------------------------------
+        // The same shape through `color_config`, and the most damaging one: a refused 12-bit frame
+        // leaves `st.color` at 12 bits, so a perfectly good profile 0 frame after it inherits 12 and is
+        // refused in turn. This is what "the record stays valid and the picture stays plausible" looks
+        // like when the run does continue — and note that the slots are *fine* here, which is exactly
+        // why the hazard is easy to miss: the decode could go on, and the next record would be wrong.
+        let mut twelve = super::Vp9State::new();
+        let (k, _, _) = vp9_key_frame();
+        let f = twelve.frame(&k).expect("the key frame");
+        twelve.commit(&f, 100).expect("it commits, so every reference below is held");
+        let e = twelve.frame(&vp9_key_frame_at(2, true).0).expect_err("a 12-bit profile 2 frame is declined");
+        assert!(e.contains("12-bit"), "{e}");
+        assert_eq!(state_slots(&twelve), [100; 8], "and the refusal moved no slot at all");
+        let e = twelve.frame(&vp9_inter_frame_refreshing(0, false, 0b0000_0001, [0, 1, 2])).map(|_| ()).expect_err("and it took the state's colour with it");
+        assert!(e.contains("12-bit"), "the next frame inherits the refused frame's colour configuration: {e}");
+
+        // --- 4. `reset()` is the way back, and it is not a rollback of one frame -------------------------
+        twelve.reset();
+        let f = twelve.frame(&k).expect("the key frame after a reset");
+        twelve.commit(&f, 100).expect("it commits");
+        let f = twelve.frame(&vp9_inter_frame_refreshing(0, false, 0b0000_0001, [0, 1, 2])).expect("a profile 0 frame after a reset");
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!(r.bit_depth, 8, "after a reset the state holds its own initial values again");
+        // The probabilities too — read by a key frame that inherits them, so a reset state's own values
+        // are what shows. A reset forgets the whole previous run; it is **not** a way to put back the
+        // one frame before the last.
+        let mut run = super::Vp9State::new();
+        let f = run
+            .frame(&vp9_inter_frame_updating_segmentation(0, 0xff, [0, 1, 2], [201, 202, 203, 204, 205, 206, 207], [208, 209, 210]))
+            .map(|_| ())
+            .expect_err("nothing is held");
+        let _ = f;
+        let f = run.frame(&inherits).expect("a key frame names no references");
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!((r.mb_segment_tree_probs, r.segment_pred_probs), ([201, 202, 203, 204, 205, 206, 207], [208, 209, 210]), "the refused frame's, again");
+        run.reset();
+        let f = run.frame(&inherits).expect("a key frame names no references");
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!(
+            (r.mb_segment_tree_probs, r.segment_pred_probs),
+            ([0; 7], [0; 3]),
+            "a reset state holds the defaults: it forgets the whole previous run, it does not restore the frame before the last one"
+        );
+    }
+
     /// A re-show of a slot that holds no picture is an **`Err` naming the slot**, not a surface
     /// guessed at.
     ///
@@ -5428,7 +5634,7 @@ mod tests {
 
         // A plain inter frame with a non-zero `reset_frame_context` and `frame_context_idx = 3`: both
         // reach the record as read.
-        let f = state.frame(&vp9_inter_frame_full(0, false, 0xff, [3, 1, 5], true, false, 2, 3)).expect("an inter frame");
+        let f = state.frame(&vp9_inter_frame_full(0, false, 0xff, [3, 1, 5], true, false, 2, 3, None)).expect("an inter frame");
         assert_eq!((f.header().reset_frame_context, f.header().frame_context_idx), (2, 3), "6.2.5 leaves both alone on a resilient-mode-clear inter frame");
         let word = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes").pic_fields;
         assert_eq!((word >> 11) & 0b11, 2, "reset_frame_context at bits 11..12");
@@ -5438,7 +5644,7 @@ mod tests {
         // context is reset, `refresh_frame_context` is clear, `frame_parallel_decoding_mode` is set,
         // and `frame_context_idx` is 0 whatever the bitstream said. The fixture writes no bits for
         // the two flags at all, so this is the parser's doing and not the writer's.
-        let f = state.frame(&vp9_inter_frame_full(0, false, 0xff, [3, 1, 5], true, true, 0, 3)).expect("an error-resilient inter frame");
+        let f = state.frame(&vp9_inter_frame_full(0, false, 0xff, [3, 1, 5], true, true, 0, 3, None)).expect("an error-resilient inter frame");
         assert!(f.header().error_resilient_mode);
         assert_eq!(f.header().frame_context_idx, 0, "6.2.5 forces the context index to 0 for a frame that resets its context");
         assert!(!f.header().refresh_frame_context, "and refresh_frame_context is forced clear");
@@ -5557,7 +5763,7 @@ mod tests {
         let f = state.frame(&key).expect("the key frame");
         state.commit(&f, 100).expect("it commits");
 
-        let f = state.frame(&vp9_inter_frame_full(0, false, 0b0000_0100, [0, 1, 2], false, false, 0, 1)).expect("a hidden inter frame");
+        let f = state.frame(&vp9_inter_frame_full(0, false, 0b0000_0100, [0, 1, 2], false, false, 0, 1, None)).expect("a hidden inter frame");
         assert!(!f.show(), "6.2's show_frame is clear, so the caller produces no picture");
         assert!(f.is_new(), "but it is a frame of its own, with a record");
         assert!(f.record().is_some(), "a hidden frame is still submitted");
@@ -5626,7 +5832,13 @@ mod tests {
             let e = state.frame(bad).expect_err("a frame that is not there is an error");
             assert!(!e.is_empty(), "the error says why: {e:?}");
         }
-        assert_eq!(state_slots(&state), [crate::vaapi::ffi::INVALID_SURFACE; 8], "and none of that moved the state");
+        // **The slots, and only the slots.** This used to read "and none of that moved the state", which
+        // claimed the whole of `Vp9State` and checked one array of it — and it was true by luck, because
+        // every input above is refused at the frame-marker check (`crates/vp9/src/header.rs:225`), before
+        // `parse_uncompressed` has written anything at all. Two of the refusals *below* do parse in full
+        // and do advance the other half; see `a_refused_frame_may_have_advanced_the_parse_state_and_reset_
+        // is_the_way_back`, which pins that and says what a caller does about it.
+        assert_eq!(state_slots(&state), [crate::vaapi::ffi::INVALID_SURFACE; 8], "and none of that moved a reference slot");
 
         // A well-formed header with its compressed header cut off: the record needs
         // `first_partition_size` and there is nothing to give it.
@@ -5642,7 +5854,7 @@ mod tests {
         assert!(e.contains("12-bit"), "{e}");
         assert!(e.contains("profile 2 at 12 bits"), "{e}");
 
-        // And the state is still usable afterwards: a refusal does not corrupt what it holds.
+        // And a refusal leaves the slots usable: no commit ran, so all eight are still free.
         let f = state.frame(&frame).expect("a profile 0 key frame is still described after the refusals");
         state.commit(&f, 100).expect("it commits");
         assert_eq!(state_slots(&state), [100; 8]);
