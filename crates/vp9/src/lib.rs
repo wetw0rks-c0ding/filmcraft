@@ -24,7 +24,7 @@ mod boolcoder;
 mod decoder;
 mod error;
 mod frame;
-mod header;
+pub mod header;
 mod inter;
 mod intra;
 mod loopfilter;
@@ -40,6 +40,17 @@ mod transform;
 mod transform_gen;
 
 pub use decoder::{DecodeStats, Decoder};
+/// The per-frame header a hardware backend needs to fill its picture-parameter records, re-exported
+/// so a backend reads one description of a VP9 stream instead of parsing the header a second time.
+///
+/// These are the items such a backend names — the uncompressed-header parser and the types it reads
+/// and carries between frames. They are listed one by one rather than globbed so that adding a
+/// helper to [`header`] does not silently widen this crate's public API. `header` is public in its
+/// own right, so `filmcraft_vp9::header::…` paths remain valid.
+///
+/// What is deliberately *not* reachable from outside: [`header::parse_compressed`] takes a
+/// `FrameContext`, which stays crate-private, so the compressed-header parser remains internal.
+pub use header::{ColorConfig, FrameHeader, HeaderState, LoopFilterParams, RefInfo, Segmentation, parse_uncompressed};
 
 /// Stream parameters read from a key frame's uncompressed header (see [`keyframe_info`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

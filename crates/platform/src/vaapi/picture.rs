@@ -3577,6 +3577,111 @@ mod tests {
         }
     }
 
+    /// A VP9 record is built from the frame's *own* uncompressed header, which libva wants as a
+    /// `VADecPictureParameterBufferVP9`. That header is parsed by `filmcraft_vp9`, so the record has
+    /// to be derived from that parse rather than invented: an invented record is one a driver reads
+    /// as a valid picture, which is why the AV1 half above is still declined.
+    ///
+    /// This test is the guard the dependency needs, and it is deliberately a *compile-time* one. It
+    /// names the exact paths the picture builder is written against, so a dropped `filmcraft-vp9`
+    /// dependency or a `header` module that went back to private fails here — at the test, with the
+    /// reason attached — instead of surfacing later as an unresolved import in the middle of the
+    /// record builder, where the error says nothing about which dependency went missing.
+    #[test]
+    fn the_vp9_frame_header_is_reachable_through_our_own_parser() {
+        // The parse, with its whole signature spelled out. Naming it this way pins the types it
+        // takes and returns too, so a change to any of them is caught here rather than at the call
+        // site that will build the record.
+        let parse: fn(
+            &[u8],
+            &mut filmcraft_vp9::header::HeaderState,
+            &[Option<filmcraft_vp9::header::RefInfo>; 8],
+        ) -> Result<filmcraft_vp9::header::FrameHeader, filmcraft_vp9::Error> = filmcraft_vp9::header::parse_uncompressed;
+
+        // A profile 0 key frame's uncompressed header (VP9 6.2), the shortest one that still says
+        // everything a picture-parameter record is derived from: coded size, render size and colour.
+        // Written out here rather than taken from a fixture so the test needs no encoder and cannot
+        // fail because a fixture is missing.
+        struct Bits(Vec<bool>);
+        impl Bits {
+            fn put(&mut self, v: u32, n: usize) {
+                for i in (0..n).rev() {
+                    self.0.push((v >> i) & 1 == 1);
+                }
+            }
+            fn bytes(&self) -> Vec<u8> {
+                let mut out = vec![0u8; self.0.len().div_ceil(8)];
+                for (i, &b) in self.0.iter().enumerate() {
+                    if b {
+                        out[i / 8] |= 0x80 >> (i % 8);
+                    }
+                }
+                out
+            }
+        }
+        const WIDTH: u32 = 320;
+        const HEIGHT: u32 = 180;
+        let mut w = Bits(Vec::new());
+        w.put(2, 2); // frame_marker
+        w.put(0, 1); // profile_low_bit
+        w.put(0, 1); // profile_high_bit — profile 0
+        w.put(0, 1); // show_existing_frame
+        w.put(0, 1); // frame_type — KEY_FRAME
+        w.put(1, 1); // show_frame
+        w.put(0, 1); // error_resilient_mode
+        w.put(0x49_83_42, 24); // frame_sync_code
+        w.put(1, 3); // color_space — BT.601
+        w.put(0, 1); // color_range — studio swing
+        w.put(WIDTH - 1, 16); // frame_width_minus_1
+        w.put(HEIGHT - 1, 16); // frame_height_minus_1
+        w.put(0, 1); // render_and_frame_size_different
+        w.put(0, 1); // refresh_frame_context
+        w.put(0, 1); // frame_parallel_decoding_mode
+        w.put(0, 2); // frame_context_idx
+        w.put(0, 6); // loop_filter_level
+        w.put(0, 3); // loop_filter_sharpness
+        w.put(0, 1); // loop_filter_delta_enabled
+        w.put(128, 8); // base_q_idx
+        w.put(0, 1); // delta_q_y_dc_present
+        w.put(0, 1); // delta_q_uv_dc_present
+        w.put(0, 1); // delta_q_uv_ac_present
+        w.put(0, 1); // segmentation_enabled
+        // tile_info: 320x180 is one superblock column, so neither tile width nor the extra tile
+        // row bit is present and only tile_rows_log2 is read.
+        w.put(0, 1); // tile_rows_log2
+        // header_size_in_bytes. Its value is the size of the *compressed* header, which
+        // `parse_compressed` reads and this test does not exercise; all the parse requires of it
+        // is that it is non-zero, so it says how long this header is.
+        w.put(14, 16); // header_size_in_bytes
+
+        let bytes = w.bytes();
+        let mut state = filmcraft_vp9::header::HeaderState::default();
+        let header = parse(&bytes, &mut state, &[None; 8]).expect("a well-formed key frame header parses");
+
+        // Every field the record will be derived from, read back off the returned header — which
+        // is also the proof that the fields are `pub` and not just the type.
+        assert_eq!(header.profile, 0);
+        assert_eq!(header.frame_type, filmcraft_vp9::header::KEY_FRAME);
+        assert!(header.frame_is_intra, "a key frame is intra");
+        assert_eq!((header.width, header.height), (WIDTH, HEIGHT));
+        assert_eq!((header.render_width, header.render_height), (WIDTH, HEIGHT), "no render size of its own");
+        assert_eq!(header.color.bit_depth, 8);
+        assert_eq!(header.color.color_space, 1);
+        assert!(!header.color.color_range, "studio swing");
+        assert_eq!((header.color.subsampling_x, header.color.subsampling_y), (true, true), "4:2:0");
+        assert_eq!(header.uncompressed_size, bytes.len(), "the header is `bytes` long");
+        // And the state carries between frames, which is how an inter frame is parsed later.
+        assert_eq!(state.color, header.color, "a key frame's colour is remembered for the frames after it");
+
+        // Hostile input is an `Err` from our own parser, never a panic: a truncated or garbage
+        // frame must not take the UI down on the way to becoming a picture-parameter record.
+        for bad in [&[][..], &[0x00][..], &[0xff; 7][..], &bytes[..bytes.len() - 1]] {
+            let mut state = filmcraft_vp9::header::HeaderState::default();
+            let e = parse(bad, &mut state, &[None; 8]).expect_err("a header that is not there is an error, not a default");
+            assert!(!e.to_string().is_empty(), "the error says why: {e:?}");
+        }
+    }
+
     // --- fixtures -------------------------------------------------------------------------------
 
     fn h264_info(length_size: usize) -> NalStreamInfo {
