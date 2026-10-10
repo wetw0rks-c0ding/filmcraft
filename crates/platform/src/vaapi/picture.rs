@@ -815,9 +815,10 @@ pub fn build_nal(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface:
 /// their message from this, so a caller that hits either is told the same thing.
 ///
 /// **VP9 does not use this any more, and that is the point of the split.** Its uncompressed frame
-/// header *is* exposed (`filmcraft_vp9::header`) and [`vp9_picture_record`] builds the record from
-/// it; what is missing there is the reference state, which has its own message. The wording is kept
-/// as one constant rather than inlined so the two AV1 sites cannot drift.
+/// header *is* exposed (`filmcraft_vp9::header`), and [`Vp9State`] reads it and builds the record
+/// with [`vp9_picture_record`]; what is missing at this level is the reference state, which has its
+/// own message. The wording is kept as one constant rather than inlined so the two AV1 sites cannot
+/// drift.
 pub(crate) const FRAME_HEADER_MISSING: &str = "does not expose the uncompressed frame header";
 
 /// The reason this backend does not decode a VP9 frame of this profile at this depth, or `None` for
@@ -1206,12 +1207,13 @@ fn vp9_byte_field(what: &str, value: u32) -> Result<(), String> {
 /// **AV1 remains declined**: `filmcraft_av1` exposes a sequence header, not the per-frame header a
 /// record needs, so an invented AV1 record would be one a driver reads as a valid picture.
 ///
-/// **VP9's record *is* built**, by [`vp9_picture_record`]. What this function cannot do from a stream
-/// description alone is name the eight reference surfaces, because those are state: which surface
-/// holds which decoded picture is something only the pictures decoded before this one know. A caller
-/// that has a `HeaderState` and a surface set calls `vp9_picture_record` directly; `build_frame` has
-/// no way to be given them without the signature changing, and a signature that looks like it takes
-/// everything it needs is worse than one that says so.
+/// **VP9's record *is* built**, by [`Vp9State`] — which is the object that holds the state this
+/// function cannot be given. What [`build_frame`] cannot do from a stream description alone is the
+/// eight reference surfaces, because those are the pictures decoded before this one: a stream
+/// description is the stream, not the decode. A caller decoding VP9 keeps a [`Vp9State`] and calls
+/// [`Vp9State::frame`]; `build_frame` has no way to be given that object without the signature
+/// changing, and a signature that looks like it takes everything it needs is worse than one that
+/// says so.
 pub fn build_frame(info: &FrameStreamInfo, sample: &[u8]) -> Result<Picture, String> {
     match info.codec {
         FrameCodec::Vp9 => Err(vp9_frame_entry_error(info, sample)),
@@ -1223,8 +1225,8 @@ pub fn build_frame(info: &FrameStreamInfo, sample: &[u8]) -> Result<Picture, Str
 /// what [`build_frame`] can do for VP9 today.
 ///
 /// This is the honest boundary of the function, and **every sentence it can return has to name
-/// something the caller can act on.** Two of the three ways it used to be untruthful are worth
-/// recording, because both looked like faults in the frame and were not:
+/// something the caller can act on.** Three of the four ways it used to be untruthful are worth
+/// recording, because each looked like a fault in the frame and was not:
 ///
 /// - **A non-intra frame does not spell its colour configuration.** 6.2 reads `color_config` only for
 ///   a key frame and for an intra-only frame; a true inter frame *inherits* it
@@ -1239,6 +1241,14 @@ pub fn build_frame(info: &FrameStreamInfo, sample: &[u8]) -> Result<Picture, Str
 ///   header names, and this arm passes `[None; 8]` because it has no surfaces. That comes back as
 ///   `Error::MissingReference`, which is **the missing state itself**, not a malformed header — so it
 ///   gets the missing-state sentence rather than a parse error the caller cannot fix.
+/// - **A frame that re-shows an earlier one carries no picture parameters at all.** It used to get
+///   the missing-state sentence, which names the reference surfaces — and the reference state is
+///   precisely what it does *not* need: 6.2 returns from the parse as soon as
+///   `frame_to_show_map_idx` is read (`header.rs:232-238`), so a fully populated slot map would not
+///   make it describable. It now gets the same sentence [`vp9_picture_record`] refuses it in, and
+///   says what the decode loop does with it. `Vp9State` is the one place that decides, and it
+///   **decodes** such a frame: 8.2.2 has the decoder output the picture the named slot holds and
+///   decode nothing.
 ///
 /// The order of the checks matters and is worth stating: a profile this backend does not decode is
 /// refused **before the sample is looked at**, so a 4:2:2 frame is declined as 4:2:2 rather than as a
@@ -1247,9 +1257,9 @@ fn vp9_frame_entry_error(info: &FrameStreamInfo, sample: &[u8]) -> String {
     // The missing state, named as what it is: the boundary between a record that can be built and one
     // that would have to be invented. One constant, because two different paths reach it and a user
     // shown two wordings for one problem cannot tell whether they are one problem or two.
-    const MISSING_REFERENCE_STATE: &str = "VP9 picture parameters: VADecPictureParameterBufferVP9 is built from the frame header by \
-        `vp9_picture_record`, which also needs the reference surfaces of the pictures decoded before this one; a stream description \
-        alone carries none";
+    const MISSING_REFERENCE_STATE: &str = "VP9 picture parameters: a VADecPictureParameterBufferVP9 is built by `Vp9State`, which \
+        reads the frame header with `vp9_picture_record` and also needs the reference surfaces of the pictures decoded before this \
+        one; a stream description alone carries none";
     // **The profile first, before the sample is looked at at all.** Same table and same words as
     // `plan_frame` and as `vp9_picture_record`.
     if let Some(why) = vp9_decline(info.profile, info.bit_depth) {
@@ -1270,10 +1280,31 @@ fn vp9_frame_entry_error(info: &FrameStreamInfo, sample: &[u8]) -> String {
         // The profile is spelled in every frame, so this half of the cross-check is not gated: a
         // container whose `vpcC` says one profile and whose frames say another describes a stream this
         // backend will not hand to a driver — the surfaces were created for one profile and the record
-        // would say another.
+        // would say another. It comes before the next arm because `show_existing_frame` reads its
+        // profile too (6.2 reads it before the `show_existing_frame` bit), so a disagreement there is
+        // as real as anywhere else.
         Ok(h) if h.profile != info.profile => {
             format!("VP9 picture parameters: the sample entry says profile {}, the frame header says profile {}", info.profile, h.profile)
         }
+        // **A frame that carries no picture parameters of its own is told that**, in the same words
+        // `vp9_picture_record` refuses it in. This arm used to fall through to the missing-state
+        // sentence, which names the reference surfaces — and the reference state is exactly what such
+        // a frame does *not* need: 6.2 returns from the header parse as soon as
+        // `frame_to_show_map_idx` is read, so handing it a fully populated slot map would not make it
+        // describable. The two sites disagreed about one frame, which is the disagreement this module
+        // treats as a bug (see `the_vp9_decline_is_the_same_sentence_wherever_it_is_decided`).
+        //
+        // What the decode loop *does* with it is a separate question and it is answered, not
+        // defaulted: `Vp9State` re-shows the slot the header names, with no decode. The sentence says
+        // so, because a caller reading only this message should not conclude the frame was dropped.
+        Ok(h) if !vp9_is_new_frame(&h) => match h.show_existing_frame {
+            true => format!(
+                "VP9 picture parameters: a frame that re-shows reference slot {} carries none of its own — the decode loop \
+                 re-shows that slot's picture with no decode",
+                h.frame_to_show_map_idx
+            ),
+            false => format!("VP9 picture parameters: frame_type {}, which VP9 does not define", h.frame_type),
+        },
         // The depth is spelled **only** where `color_config` was read. `frame_is_intra` is true for a
         // key frame (`header.rs:249`) and for an intra-only frame (`header.rs:252`), which are the two
         // cases that read it, and false for a true inter frame, which inherits it.
@@ -1293,10 +1324,304 @@ fn vp9_frame_entry_error(info: &FrameStreamInfo, sample: &[u8]) -> String {
 /// A key frame and an inter frame both do; a `show_existing_frame` does not (see
 /// [`vp9_picture_record`]). Exposed for the decode loop, which has to make the same decision about
 /// whether the current sample produces a new surface at all — a frame that only re-shows one is
-/// submitted without a picture record and no decode, which is a decision Task 3 has to make
+/// submitted without a picture record and no decode, which is a decision [`Vp9State`] makes
 /// explicitly rather than let fall out of the code.
+///
+/// The `frame_type` arm cannot fail on a header `parse_uncompressed` produced: 6.2 reads
+/// `frame_type` in one bit, so it is always 0 or 1. It is here because this takes a `FrameHeader`,
+/// which a caller can assemble, and a header nobody parsed is not one this backend can reason about.
 pub fn vp9_is_new_frame(h: &FrameHeader) -> bool {
     !h.show_existing_frame && (h.frame_type == KEY_FRAME || h.frame_type == INTER_FRAME)
+}
+
+// ---------------------------------------------------------------------------------------------
+// VP9 frame context and reference refresh
+//
+// A `VADecPictureParameterBufferVP9` is half of a VP9 decode. The other half is its
+// `reference_frames[8]`, which is **the whole decoded picture buffer addressed by reference slot**,
+// and which the record does not contain: it is the pictures decoded before this one. Build the
+// record against the wrong slot map and the driver reads a surface that holds a different picture,
+// without complaint — the plausible-looking wrong answer this backend must not produce. That is the
+// same class as the H.264 milestone's `[3, 3]` index collision, and it is why the state lives in a
+// named object rather than being rebuilt per picture.
+//
+// Three things are in it, and all three are the stateful part of the header:
+//
+// - **One `HeaderState` for the whole stream.** 6.2 reads `color_config` only for a key frame and
+//   an intra-only frame; an inter frame *inherits* it (`crates/vp9/src/header.rs:265`). Parse the
+//   next frame against a fresh state and every inter frame of a 10-bit profile 2 stream reports 8
+//   bits — and **nothing refuses that**, because `vp9_decline(2, 8)` is `None`: the result is a
+//   valid record of the wrong depth, and a driver decodes it. The same object carries what the
+//   record's loop filter level, sharpness and segmentation probability arrays are read from (6.2.8
+//   and 6.2.11 update them conditionally, so a frame that does not update them submits the values in
+//   force), and the probability contexts `reset_frame_context` and `frame_context_idx` name.
+// - **The eight reference slots**, each a surface and the coded size of the picture in it. The size
+//   is not decoration: 6.2.5's `frame_size_with_refs` asks for the size of a named slot to decide
+//   whether the frame codes its own, and a slot nobody holds is an `Err` there rather than a
+//   guessed size — which is exactly `filmcraft_vp9`'s own software path at
+//   `crates/vp9/src/decoder.rs:246`.
+// - **`refresh_frame_flags`**, applied when the driver has rendered the picture and not before, so
+//   that a record describes the buffer *before* its own frame and the next record describes the
+//   buffer after it.
+// ---------------------------------------------------------------------------------------------
+
+/// The reference slots a VP9 decode has: `REFS_PER_FRAME`, which is both the length of a
+/// `VADecPictureParameterBufferVP9`'s `reference_frames` and the width of `refresh_frame_flags`.
+const VP9_REF_SLOTS: usize = 8;
+
+/// One of those slots: the surface its picture is in, and that picture's coded size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vp9Reference {
+    /// The VA surface holding this slot's picture.
+    pub surface: u32,
+    /// The picture's coded size, which 6.2.5's `frame_size_with_refs` reads out of the slot.
+    pub size: (u32, u32),
+}
+
+/// The reference state of one VP9 decode: the parse state that carries across the stream, and the
+/// eight reference slots.
+///
+/// **One of these per decode, kept for the life of the run.** A per-picture state is the defect
+/// [`Vp9State::frame`] exists to make impossible: see the module note above for what goes wrong.
+#[derive(Default)]
+pub struct Vp9State {
+    /// The one parse state, for the whole decode. Threaded into every frame's
+    /// [`vp9_picture_record`] call as well as into every [`filmcraft_vp9::header::parse_uncompressed`]
+    /// call, because a record built against a different state than the one the header was parsed
+    /// into is a record whose inherited fields are not this frame's.
+    headers: HeaderState,
+    /// Indexed by reference *slot*, `0..8`, `None` for a slot no picture is in. A key frame puts its
+    /// picture in all eight; from there each frame's `refresh_frame_flags` decides which slots
+    /// become it.
+    slots: [Option<Vp9Reference>; VP9_REF_SLOTS],
+}
+
+/// What one VP9 frame is: a picture it codes, or a re-show of a picture a slot already holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Vp9FrameKind {
+    /// A frame of its own. Its record is built, it is submitted, and the picture is decoded into a
+    /// surface the caller chooses and then passes to [`Vp9State::commit`].
+    New,
+    /// A frame that re-shows an earlier picture: `slot` is the reference slot its header named and
+    /// `surface` the surface that slot holds. **No record is built and no decode is submitted** —
+    /// see [`Vp9State::frame`] for why that is derived from the stream rather than declined.
+    ReShow { slot: usize, surface: u32 },
+}
+
+/// One VP9 frame, read into a [`Vp9State`]: what it is, its header, and the record to submit.
+#[derive(Clone, Debug)]
+pub struct Vp9Frame {
+    kind: Vp9FrameKind,
+    header: FrameHeader,
+    /// The `VADecPictureParameterBufferVP9` bytes, empty for a re-show.
+    record: Vec<u8>,
+    /// `refresh_frame_flags`: bit *i* set means this picture becomes slot *i*.
+    refresh: u8,
+}
+
+impl Vp9Frame {
+    /// The frame's own uncompressed header, as `filmcraft_vp9` parsed it into the stream's state.
+    pub fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    /// Whether this frame codes a picture of its own, as opposed to re-showing an earlier one.
+    pub fn is_new(&self) -> bool {
+        self.kind == Vp9FrameKind::New
+    }
+
+    /// The `VADecPictureParameterBufferVP9` bytes to submit, or `None` for a frame that re-shows an
+    /// earlier picture — there is nothing to submit for it, and a record built from its (empty)
+    /// header would describe a frame the stream never coded.
+    pub fn record(&self) -> Option<&[u8]> {
+        if self.is_new() { Some(&self.record) } else { None }
+    }
+
+    /// Whether this frame's picture is shown. 6.2's `show_frame`: a clear one is a hidden frame —
+    /// decoded, and it may still refresh references, but the caller produces no picture from it.
+    pub fn show(&self) -> bool {
+        self.header.show_frame
+    }
+
+    /// The reference slot and surface this frame re-shows, or `None` for a frame of its own.
+    pub fn re_show(&self) -> Option<(usize, u32)> {
+        match self.kind {
+            Vp9FrameKind::ReShow { slot, surface } => Some((slot, surface)),
+            Vp9FrameKind::New => None,
+        }
+    }
+
+    /// The frame's `refresh_frame_flags`: bit *i* set means this picture becomes reference slot *i*.
+    pub fn refresh_flags(&self) -> u8 {
+        self.refresh
+    }
+}
+
+impl Vp9State {
+    /// The state a VP9 decode starts in: eight empty slots and a parse state that has seen no
+    /// frame.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget every picture decoded so far, as a seek or a flush does.
+    ///
+    /// **Both halves have to go.** The slots, because the next frame would otherwise find a
+    /// reference in a surface left over from the run before the seek — a plausible picture predicted
+    /// from the wrong place, which is the failure this whole object exists to prevent. And the parse
+    /// state, because `color_config` and the loop filter deltas are inherited by every frame that
+    /// does not spell them: keeping them would describe the first frame of the new run in the
+    /// previous run's colour.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// The reference set as a record wants it: eight surface ids, indexed by slot, an empty slot as
+    /// `VA_INVALID_SURFACE`.
+    pub fn references(&self) -> Vp9ReferenceSet {
+        Vp9ReferenceSet { slots: std::array::from_fn(|i| self.slot(i).map(|r| r.surface)) }
+    }
+
+    /// What is in reference slot `index`, or `None` for a slot no picture is in.
+    pub fn slot(&self, index: usize) -> Option<Vp9Reference> {
+        self.slots.get(index).copied().flatten()
+    }
+
+    /// The surfaces the slots hold — the ones a new picture may **not** be decoded into, because the
+    /// driver would read the new picture as the reference that slot is.
+    ///
+    /// This is the VP9 half of what `NalPoc::live_surfaces` is for the NAL codecs: the surface ring
+    /// is a pool and cannot tell a live reference from a free surface, and only this state knows
+    /// which surfaces are still referred to. It is asked **before** a surface is taken, because
+    /// taking one and then parsing the frame is the same order `build_nal` uses.
+    pub fn live_surfaces(&self) -> Vec<u32> {
+        self.slots.iter().filter_map(|slot| slot.map(|r| r.surface)).collect()
+    }
+
+    /// The slots as 6.2.5's `frame_size_with_refs` reads them: the coded size of each slot's
+    /// picture, `None` for a slot that holds none.
+    fn ref_infos(&self) -> [Option<filmcraft_vp9::header::RefInfo>; VP9_REF_SLOTS] {
+        std::array::from_fn(|i| self.slot(i).map(|r| filmcraft_vp9::header::RefInfo { width: r.size.0, height: r.size.1 }))
+    }
+
+    /// Read one frame's uncompressed header into this state and build its picture-parameter record.
+    ///
+    /// The two halves are here together, because the record is only right if both came from the
+    /// same state: [`filmcraft_vp9::header::parse_uncompressed`] is what carries the inherited
+    /// colour configuration, the loop filter level and the segmentation probabilities forward from
+    /// the frames before this one, and the record is built out of them immediately afterwards.
+    ///
+    /// **Nothing is refreshed here.** The slots move in [`Self::commit`], once the driver has
+    /// actually rendered the picture, so that a decode that failed cannot have moved the buffer and
+    /// a record always describes the buffer *before* its own frame.
+    ///
+    /// ## The one VP9 case with no H.264 or HEVC analogue here
+    ///
+    /// `show_existing_frame` re-shows an earlier picture instead of coding one: 6.2 returns from the
+    /// header parse as soon as `frame_to_show_map_idx` is read, and VP9 8.2.2's answer is that the
+    /// decoder outputs the picture that slot holds and decodes nothing. **So it is decoded, not
+    /// declined** — and the decision is stated here rather than left to fall out of the code:
+    ///
+    /// - it is derivable in full from the state this object threads, because the slot the header
+    ///   names is exactly a slot of [`Self::slots`] and the surface in it is exactly what the
+    ///   caller is asked to re-show. Nothing is inferred;
+    /// - declining it would put a hole in the picture list at a point the stream *requires* a
+    ///   picture — the blank-timeline outcome, which this backend exists to prevent (see
+    ///   `VaDecoder::decode`: a decode that produced nothing is an error, not an empty list);
+    /// - it is what FilmCraft's own software decoder already does for the same bitstream
+    ///   (`crates/vp9/src/decoder.rs:248-255`), so declining it here would make the two paths of
+    ///   the same stream disagree about how many pictures it has.
+    ///
+    /// What is refused is only the *record*: there are no picture parameters for such a frame, and
+    /// [`vp9_picture_record`] says so. A slot that holds no picture is also an `Err` here rather
+    /// than a surface guessed at — the same missing reference the software decoder reports
+    /// (`crates/vp9/src/decoder.rs:250-252`).
+    pub fn frame(&mut self, sample: &[u8]) -> Result<Vp9Frame, String> {
+        if sample.is_empty() {
+            return Err("an empty frame".into());
+        }
+        // Taken before the parse, from this object, and not rebuilt per frame: 6.2.5 asks the parse
+        // for the size of the slot a header names, and only the slots know it.
+        let refs = self.ref_infos();
+        let header = filmcraft_vp9::header::parse_uncompressed(sample, &mut self.headers, &refs).map_err(|e| format!("uncompressed frame header: {e}"))?;
+        if header.show_existing_frame {
+            return self.re_show(header);
+        }
+        // Unreachable from a parsed header — 6.2 reads `frame_type` in one bit — and kept because
+        // this is reached with whatever `parse_uncompressed` returned and a refusal is cheaper
+        // than a record describing a frame type VP9 does not have.
+        if header.frame_type != KEY_FRAME && header.frame_type != INTER_FRAME {
+            return Err(format!("VP9 frame_type {}, which the specification does not define", header.frame_type));
+        }
+        // An inter frame predicts from three slots, and every one of them has to hold a picture.
+        // One that does not cannot be described: the record would name `VA_INVALID_SURFACE` for it
+        // and the driver would have nothing to read — or, worse, whatever the surface id happens to
+        // be. This is the software decoder's own check (`crates/vp9/src/decoder.rs:288-291`) and it
+        // is the *state's* to make, because the state is the only thing that knows what is in a
+        // slot. An intra frame names no references, so it is not checked: `ref_frame_idx` is zero
+        // in a `FrameHeader` for it, and slot 0 is not required to hold a picture.
+        if !header.frame_is_intra {
+            for (name, at) in [("last_ref_frame", 0usize), ("golden_ref_frame", 1), ("alt_ref_frame", 2)] {
+                let Some(index) = header.ref_frame_idx.get(at).copied() else { continue };
+                if self.slot(usize::from(index)).is_none() {
+                    return Err(format!("{name} is reference slot {index}, which holds no picture"));
+                }
+            }
+        }
+        let record = vp9_picture_record(&header, &self.headers, sample, &self.references())?;
+        let refresh = header.refresh_frame_flags;
+        Ok(Vp9Frame { kind: Vp9FrameKind::New, header, record, refresh })
+    }
+
+    /// A `show_existing_frame`: the picture the header's `frame_to_show_map_idx` names, and nothing
+    /// else. See [`Self::frame`] for why it is decoded rather than declined.
+    fn re_show(&self, header: FrameHeader) -> Result<Vp9Frame, String> {
+        let slot = usize::from(header.frame_to_show_map_idx);
+        let Some(reference) = self.slot(slot) else {
+            return Err(format!("a frame that re-shows reference slot {slot}, which holds no picture"));
+        };
+        Ok(Vp9Frame {
+            kind: Vp9FrameKind::ReShow { slot, surface: reference.surface },
+            header,
+            record: Vec::new(),
+            // 6.2 returns from the header parse before this frame has a `refresh_frame_flags` at
+            // all, and 8.2.2 decodes nothing: a re-show neither refreshes a reference slot nor
+            // refreshes a frame context. Zero is that answer, not a filler for a missing value.
+            refresh: 0,
+        })
+    }
+
+    /// Record that the driver rendered `frame`'s picture into `surface`, and apply `frame`'s refresh.
+    ///
+    /// Called **after** the decode, never before: a frame whose decode failed must not have moved
+    /// the reference buffer, and the record it was submitted with describes the buffer as it was
+    /// before it. The next frame's record then describes the buffer this call leaves.
+    ///
+    /// `refresh_frame_flags` is one bit per slot — bit *i* says "this picture becomes slot *i*" —
+    /// which is the same rule FilmCraft's own software decoder applies
+    /// (`crates/vp9/src/decoder.rs:439-443`) and what `va_dec_vp9.h:68-75` means by "update this
+    /// list based on the refreshing information from VP9 bitstream". A key frame's is `0xff`
+    /// (`crates/vp9/src/header.rs:248`), so a key frame really does replace all eight.
+    ///
+    /// A frame that re-shows an earlier picture is refused rather than ignored: it decodes nothing,
+    /// so there is no picture to put in a slot, and a caller that committed one was handed a
+    /// surface that holds the *previous* occupant of that slot.
+    pub fn commit(&mut self, frame: &Vp9Frame, surface: u32) -> Result<(), String> {
+        if let Vp9FrameKind::ReShow { slot, .. } = frame.kind {
+            return Err(format!("a frame that re-shows reference slot {slot} decodes nothing, so it refreshes no reference slot"));
+        }
+        // The size stored is the *new* picture's, because the next frame that takes its coded size
+        // from this slot must be given this frame's size and not the one it replaced.
+        let reference = Vp9Reference { surface, size: (frame.header.width, frame.header.height) };
+        // `enumerate` over the eight slots, so the shift count cannot leave the byte and there is no
+        // index arithmetic anywhere near `refresh_frame_flags` to be wrong in a way a test misses.
+        for (slot, at) in self.slots.iter_mut().enumerate() {
+            if (frame.refresh >> slot) & 1 == 1 {
+                *at = Some(reference);
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4344,6 +4669,41 @@ mod tests {
     /// the loop breaks on it — `header.rs:273-283`), `false` writes all three flags clear and then an
     /// explicit `frame_size`.
     fn vp9_inter_frame(profile: u8, size_from_ref: bool) -> Vec<u8> {
+        vp9_inter_frame_refreshing(profile, size_from_ref, 0xa5, [5, 2, 7])
+    }
+
+    /// The same inter frame with its `refresh_frame_flags` and its three `ref_frame_idx` given.
+    ///
+    /// The reference tests need frames that refresh **particular** slots and name **particular**
+    /// references, because the state is only pinned by a sequence in which those two differ from
+    /// each other: a frame that refreshes all eight and names slot 5 cannot tell a slot map from a
+    /// surface list, and cannot tell bit *i* from bit *j*. `refresh` is the eight-bit value of
+    /// 6.2's `refresh_frame_flags` — bit *i* means "this picture becomes slot *i*".
+    ///
+    /// `show` is 6.2's `show_frame`: a hidden frame is decoded and may still refresh references, but
+    /// the caller produces no picture from it, which is the case where the two must not be confused.
+    /// `error_resilient` takes the branch at `header.rs:296-302`, where `refresh_frame_context` is
+    /// forced clear, `frame_parallel_decoding_mode` is forced set, and 6.2.5's context reset wipes
+    /// every one of the four probability contexts.
+    fn vp9_inter_frame_refreshing(profile: u8, size_from_ref: bool, refresh: u8, refs: [u32; 3]) -> Vec<u8> {
+        vp9_inter_frame_full(profile, size_from_ref, refresh, refs, true, false, 0, 3)
+    }
+
+    /// Every field the inter-frame tests need to vary, spelled out. See
+    /// [`vp9_inter_frame_refreshing`] for why the refresh flags and the reference indices have to be
+    /// parameters rather than constants.
+    ///
+    /// The last three are `error_resilient`, `reset_frame_context` and `frame_context_idx`.
+    fn vp9_inter_frame_full(
+        profile: u8,
+        size_from_ref: bool,
+        refresh: u8,
+        refs: [u32; 3],
+        show: bool,
+        error_resilient: bool,
+        reset_frame_context: u32,
+        frame_context_idx: u32,
+    ) -> Vec<u8> {
         const WIDTH: u32 = 1920;
         const HEIGHT: u32 = 1080;
         let mut w = Bits(Vec::new());
@@ -4352,15 +4712,23 @@ mod tests {
         w.put(u32::from((profile >> 1) & 1), 1); // profile_high_bit
         w.put(0, 1); // show_existing_frame
         w.put(1, 1); // frame_type — INTER_FRAME
-        w.put(1, 1); // show_frame
-        w.put(0, 1); // error_resilient_mode — off, so reset_frame_context and both flags are read
-        // `show_frame` is set, so `intra_only` is not present (`header.rs:251`).
-        w.put(0, 2); // reset_frame_context
+        w.put(u32::from(show), 1); // show_frame
+        w.put(u32::from(error_resilient), 1); // error_resilient_mode
+        // `show_frame` clear means `intra_only` is present (`header.rs:251`); a hidden frame that is
+        // not intra-only therefore writes the bit. A shown frame does not write it at all.
+        if !show {
+            w.put(0, 1); // intra_only
+        }
+        // Under `error_resilient_mode` 6.2 reads no `reset_frame_context` either — it is 0 by definition
+        // (`header.rs:253`) — so the two bits are written only when they are read.
+        if !error_resilient {
+            w.put(reset_frame_context, 2); // reset_frame_context
+        }
         // An inter frame spells **none** of the following: no frame_sync_code, no color_config.
-        w.put(0xa5, 8); // refresh_frame_flags
-        for (idx, bias) in [(5u32, 1u32), (2, 0), (7, 1)] {
+        w.put(u32::from(refresh), 8); // refresh_frame_flags
+        for idx in refs {
             w.put(idx, 3); // ref_frame_idx[i]
-            w.put(bias, 1); // ref_frame_sign_bias[i]
+            w.put(1, 1); // ref_frame_sign_bias[i]
         }
         // 6.2.5 frame_size_with_refs. The loop breaks on the first set flag, so `true` writes one bit
         // and `false` writes all three clear and then the size itself.
@@ -4377,9 +4745,18 @@ mod tests {
         w.put(1, 1); // allow_high_precision_mv
         w.put(0, 1); // is_filter_switchable — off, so a literal filter type follows
         w.put(2, 2); // raw_filter_type — LITERAL_TO_TYPE[2] = 2 (SMOOTH)
-        w.put(1, 1); // refresh_frame_context
-        w.put(1, 1); // frame_parallel_decoding_mode
-        w.put(3, 2); // frame_context_idx — non-zero, so it is not the value a key frame forces
+        // Under `error_resilient_mode` 6.2 reads neither of these two flags: it forces
+        // `refresh_frame_context` clear and `frame_parallel_decoding_mode` set (`header.rs:296-302`).
+        // Writing them here would shift every field after them, so the resilient frame writes
+        // `error_resilient_mode` **and then nothing for this span**.
+        //
+        // `frame_context_idx` is *not* in that span: 6.2 reads it in every frame and only then
+        // forces it to 0 for a frame that resets its context, so the two bits are always written.
+        if !error_resilient {
+            w.put(1, 1); // refresh_frame_context
+            w.put(1, 1); // frame_parallel_decoding_mode
+        }
+        w.put(frame_context_idx, 2); // frame_context_idx — 3 unless a test says otherwise, so it is not the value a key frame forces
         w.put(21, 6); // loop_filter_level
         w.put(3, 3); // loop_filter_sharpness
         w.put(0, 1); // loop_filter_delta_enabled — off, so no delta update block
@@ -4405,6 +4782,19 @@ mod tests {
                 assert!(!h.frame_is_intra, "a true inter frame is not intra, which is what gates the colour cross-check");
                 assert_eq!(h.profile, profile, "the header spells its profile, inherited or not");
                 assert_eq!(h.size_from_ref, size_from_ref);
+                assert_eq!(h.show_frame, show, "6.2's show_frame is what was written");
+                // 6.2.4: `error_resilient_mode` forces these two, and 6.2.5 forces
+                // `frame_context_idx` to 0 — all three are what the parser does with the state, and a
+                // fixture that stopped exercising them would stop being able to.
+                assert_eq!(h.error_resilient_mode, error_resilient);
+                if error_resilient {
+                    assert!(!h.refresh_frame_context, "6.2.5 forces refresh_frame_context clear under error_resilience");
+                    assert!(h.frame_parallel_decoding_mode, "and frame_parallel_decoding_mode set");
+                    assert_eq!(h.frame_context_idx, 0, "and the context index back to 0");
+                } else {
+                    assert_eq!(h.reset_frame_context, reset_frame_context as u8);
+                    assert_eq!(h.frame_context_idx, frame_context_idx as u8);
+                }
                 // The whole point: against a **fresh** state, this is 8 whatever the profile is,
                 // because `header.rs:265` copies `HeaderState::default().color`.
                 assert_eq!(h.color, filmcraft_vp9::header::ColorConfig::default(), "an inter frame inherits the state's colour configuration");
@@ -4416,6 +4806,34 @@ mod tests {
         }
         let mut frame = header_bytes.clone();
         frame.extend(std::iter::repeat_n(0u8, 6));
+        frame
+    }
+
+    /// A `show_existing_frame` naming reference slot `slot`, as 6.2 writes one: a marker, a
+    /// profile, the flag and three bits of slot number, and **nothing else**.
+    ///
+    /// `header.rs:232-238` returns from the parse there, so this is the whole header — there is no
+    /// size, no loop filter level and no reference index in it, which is exactly why a record built
+    /// from one describes nothing. The trailing byte is padding so the slice is not empty; nothing
+    /// reads it.
+    fn vp9_show_existing_frame(profile: u8, slot: u32) -> Vec<u8> {
+        let mut w = Bits(Vec::new());
+        w.put(2, 2); // frame_marker
+        w.put(u32::from(profile & 1), 1); // profile_low_bit
+        w.put(u32::from((profile >> 1) & 1), 1); // profile_high_bit
+        w.put(1, 1); // show_existing_frame
+        w.put(slot, 3); // frame_to_show_map_idx
+        let mut frame = w.bytes();
+        frame.push(0);
+        let mut state = filmcraft_vp9::header::HeaderState::default();
+        let h = filmcraft_vp9::header::parse_uncompressed(&frame, &mut state, &[None; 8]).expect("a show_existing_frame header parses");
+        assert!(h.show_existing_frame, "the fixture really does re-show");
+        assert_eq!(h.frame_to_show_map_idx, slot as u8);
+        // And nothing of a frame: these are all zero because 6.2 never read them, which is the whole
+        // reason the record builder has to refuse this frame rather than take its zeros for a frame's
+        // own values.
+        assert_eq!((h.width, h.height), (0, 0), "no coded size is spelled");
+        assert!(!h.frame_is_intra && h.profile == profile, "but the profile and the flag are, because 6.2 reads both before the return");
         frame
     }
 
@@ -4709,9 +5127,10 @@ mod tests {
     /// exactly why this has to be refused in the record builder — a `FrameHeader` alone cannot be
     /// trusted to mean "a frame was described".
     ///
-    /// Whether such a frame should be *decoded* at all is a separate question the decode loop has to
-    /// answer explicitly (by re-showing the surface it names, with no decode) rather than let fall out
-    /// of the code. What is refused here is describing it as a frame of its own.
+    /// Whether such a frame should be *decoded* at all is a separate question, and
+    /// [`super::Vp9State::frame`] answers it: **decoded** — the picture in the named slot is
+    /// re-shown with no decode. What is refused here is describing it as a frame of its own, and
+    /// [`super::Vp9State`] is where the two answers live side by side.
     #[test]
     fn a_frame_that_re_shows_an_earlier_one_is_refused() {
         let (frame, state, mut header) = vp9_key_frame();
@@ -4727,6 +5146,506 @@ mod tests {
         // And a `frame_type` that is neither is not a frame at all.
         header.frame_type = 2;
         assert!(!super::vp9_is_new_frame(&header), "a frame_type VP9 does not define");
+
+        // The two sites now **agree**, which is the point of `Vp9FrameKind::ReShow`. `build_frame`
+        // used to hand this frame the *missing reference state* sentence, which named the reference
+        // surfaces — the one thing this frame does not need, since it names no reference at all.
+        let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, 0, 8, (1, 1), (1920, 1080));
+        let e = super::build_frame(&info, &vp9_show_existing_frame(0, 5)).expect_err("a show_existing_frame");
+        assert!(e.contains("carries none of its own"), "`build_frame` says the same thing the record builder does: {e}");
+        assert!(!e.contains("reference surfaces"), "and specifically not the missing-state sentence it used to give: {e}");
+    }
+
+    // --- the reference state, pinned by a sequence ------------------------------------------------
+    //
+    // What is pinned here is the *mapping*, not the pictures: for a known sequence of frame headers,
+    // which surface each of the eight reference slots holds after each frame, and which the record
+    // for the next frame names. This is the deliverable of the task, because a wrong mapping
+    // produces plausible pictures from the wrong references rather than an error, and a parity test
+    // against ffmpeg is not a substitute: it fails on the pictures it happened to be given, and says
+    // nothing about a mapping that is right for those and wrong for the next sequence.
+
+    /// The surfaces a state holds, as the record's own array: `VA_INVALID_SURFACE` for an empty slot.
+    fn state_slots(state: &super::Vp9State) -> [u32; 8] {
+        let mut out = [crate::vaapi::ffi::INVALID_SURFACE; 8];
+        for (i, slot) in state.references().slots.iter().enumerate() {
+            out[i] = slot.unwrap_or(crate::vaapi::ffi::INVALID_SURFACE);
+        }
+        out
+    }
+
+    /// **The reference mapping, frame by frame, for a sequence with deliberately mixed refreshes.**
+    ///
+    /// The sequence is: a key frame, then inter frames whose `refresh_frame_flags` are
+    /// `0b1010_0100`, `0b0000_0011` and `0b1111_1111`, then a re-show of slot 3. Each picture is
+    /// decoded into a **distinguishable** surface, so a slot that ends up holding the wrong picture
+    /// shows as a different number rather than as a plausible-looking surface that happens to decode.
+    ///
+    /// Three things are asserted per frame, and they are three different claims:
+    ///
+    /// 1. **The record the driver is given names the slots as they are *before* this frame.** A
+    ///    refresh applied before the record is built submits the new picture as its own reference.
+    /// 2. **After the commit, exactly the slots this frame's flags name hold its surface** and the
+    ///    others still hold what they held. A refresh applied to the wrong bit is invisible in the
+    ///    record of *this* frame and shows up here.
+    /// 3. **The two differ**, so (1) is not passing vacuously because the flags happened to be zero.
+    ///
+    /// The last frame is the one a wrong implementation cannot recover from by luck: after
+    /// `0b1111_1111` every slot holds the newest picture, so a state that had drifted by one slot
+    /// anywhere in the sequence is visibly out of step rather than accidentally aligned.
+    #[test]
+    fn the_reference_slots_follow_refresh_frame_flags_bit_by_bit() {
+        let mut state = super::Vp9State::new();
+        assert_eq!(state_slots(&state), [crate::vaapi::ffi::INVALID_SURFACE; 8], "a new state holds nothing");
+
+        // A key frame refreshes every slot (6.2.4 sets `refresh_frame_flags = 0xff` for it), so after
+        // it all eight hold the key picture and there is nothing left to distinguish.
+        let (key, _, _) = vp9_key_frame();
+        let f = state.frame(&key).expect("the key frame");
+        assert_eq!(f.refresh_flags(), 0xff, "6.2.4 gives a key frame a 0xff refresh, so all eight slots become it");
+        assert_eq!(state_slots(&state), [crate::vaapi::ffi::INVALID_SURFACE; 8], "reading a frame refreshes nothing: only commit does");
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!(r.reference_frames, [crate::vaapi::ffi::INVALID_SURFACE; 8], "and its record names an empty buffer, which is true");
+        state.commit(&f, 100).expect("the key frame commits");
+        assert_eq!(state_slots(&state), [100; 8], "a key frame puts its picture in all eight");
+
+        // Three inter frames, each refreshing a different non-obvious pattern into a new surface.
+        // `refs` name slots that are occupied at that point, which is what `Vp9State::frame` checks.
+        //
+        // Each entry is `(refresh_frame_flags, the surface it decodes into, the slots before, the
+        // slots after)`. The two column pair is the whole test: they differ exactly in the bits the
+        // flags name, and nothing else moves.
+        let sequence: [(u8, u32, [u32; 8], [u32; 8]); 4] = [
+            // 0b1010_0100 = 164: slots 7, 5 and 2. The rest keep the key frame's picture.
+            (0b1010_0100, 200, [100; 8], [100, 100, 200, 100, 100, 200, 100, 200]),
+            // 0b0000_0011: slots 0 and 1 only — the two that were still the key frame.
+            (0b0000_0011, 300, [100, 100, 200, 100, 100, 200, 100, 200], [300, 300, 200, 100, 100, 200, 100, 200]),
+            // 0b0000_0100: slot 2 alone, which held surface 200.
+            (0b0000_0100, 400, [300, 300, 200, 100, 100, 200, 100, 200], [300, 300, 400, 100, 100, 200, 100, 200]),
+            // 0b1111_1111: every slot becomes this picture, so the four frames that preceded it are
+            // what the surface values 100..400 have distinguished — and are now all overwritten.
+            (0b1111_1111, 500, [300, 300, 400, 100, 100, 200, 100, 200], [500; 8]),
+        ];
+        let mut carried = [100u32; 8];
+        for (flags, surface, before, after) in sequence {
+            // The references name slots 3, 1 and 5, all occupied at every step of this sequence.
+            let frame = vp9_inter_frame_refreshing(0, false, flags, [3, 1, 5]);
+            let f = state.frame(&frame).expect("an inter frame whose references are all held");
+            assert_eq!(f.refresh_flags(), flags, "6.2.4's refresh_frame_flags is read from the bitstream");
+            assert!(f.is_new(), "an inter frame is a frame of its own");
+
+            // (0) The table's "before" is the previous frame's "after", and the state agrees. That is
+            // what makes the sequence a *chain*: the driver is told, at each step, exactly the buffer
+            // the previous step left.
+            assert_eq!(carried, before, "this frame's starting map is the one the previous frame left");
+            // (1) The record the driver is given names the buffer *before* this frame.
+            let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+            assert_eq!(r.reference_frames, before, "the record names the slots as they are BEFORE this frame");
+            // (3) The commit really does change the map, so (1) is not passing vacuously.
+            assert_ne!(before, after, "the flags must change something, or this step proves nothing");
+
+            state.commit(&f, surface).expect("the frame commits");
+            // (2) Exactly the flagged slots changed, to exactly this surface.
+            assert_eq!(state_slots(&state), after, "after the commit: exactly the slots the flags name hold {surface}");
+            carried = after;
+            // The surfaces a new picture may not be decoded into are exactly the occupied slots'.
+            assert_eq!(state.live_surfaces().len(), 8, "all eight slots hold a picture, so none of the surfaces is free");
+        }
+
+        // The end state is reached by the last frame's own flags and nothing else. A state that had
+        // drifted by one slot anywhere above would be out of step here rather than accidentally
+        // aligned, because the last refresh replaces all eight.
+        assert_eq!(state_slots(&state), [500; 8], "the last frame refreshed every slot");
+    }
+
+    /// **The `show_existing_frame` decision: decoded, and it refreshes nothing.**
+    ///
+    /// This is the VP9 case with no H.264 or HEVC analogue in this backend — neither codec has a
+    /// picture that is not decoded — so the decision has to be made explicitly and cannot be left
+    /// to fall out of the code. [`super::Vp9State`] **decodes** it, and this is what that means at
+    /// the state boundary:
+    ///
+    /// - the frame names the surface its slot holds, and the caller re-shows it with no decode;
+    /// - it builds **no record** (`record()` is `None`), because 6.2 read no picture parameters —
+    ///   a record built from its header would be a 92-byte picture of a frame the stream never coded;
+    /// - it refreshes **no slot** (`refresh_flags()` is 0 and `commit` refuses it), because 8.2.2
+    ///   decodes nothing, so there is no new picture to put anywhere.
+    ///
+    /// The last of those is the one a wrong implementation gets wrong silently: committing a
+    /// re-show into a slot would overwrite a live reference with a surface holding the *previous*
+    /// picture, and every frame after it would predict from that. So `commit` refuses it rather
+    /// than ignoring the call.
+    #[test]
+    fn a_frame_that_re_shows_an_earlier_picture_re_shows_its_slot_and_refreshes_nothing() {
+        let mut state = super::Vp9State::new();
+        let (key, _, _) = vp9_key_frame();
+        let f = state.frame(&key).expect("the key frame");
+        state.commit(&f, 100).expect("the key frame commits");
+        assert_eq!(state_slots(&state), [100; 8]);
+
+        // Slot 3 holds surface 100, and so does every other — so this cannot tell "named the right
+        // slot" from "named any slot". A second frame moves slot 4 first.
+        let f = state.frame(&vp9_inter_frame_refreshing(0, false, 0b0001_0000, [3, 1, 5])).expect("an inter frame");
+        state.commit(&f, 200).expect("it commits");
+        assert_eq!(state_slots(&state), [100, 100, 100, 100, 200, 100, 100, 100]);
+
+        // Re-show slot 4, which holds 200 and no other slot does.
+        let f = state.frame(&vp9_show_existing_frame(0, 4)).expect("a re-show of a held slot");
+        assert!(!f.is_new(), "it is not a frame of its own");
+        assert_eq!(f.record(), None, "there are no picture parameters for it, so nothing is submitted");
+        assert_eq!(f.re_show(), Some((4, 200)), "and it names the slot its header named, and that slot's surface");
+        assert_eq!(f.refresh_flags(), 0, "8.2.2: a re-show decodes nothing, so it refreshes nothing");
+        assert!(f.show(), "6.2 sets show_frame for a re-show, so a picture comes out");
+
+        // Nothing has moved — reading it changes nothing.
+        assert_eq!(state_slots(&state), [100, 100, 100, 100, 200, 100, 100, 100], "reading a re-show refreshes nothing");
+
+        // And committing it is **refused**, not ignored.
+        let e = state.commit(&f, 999).expect_err("a re-show has nothing to commit");
+        assert!(e.contains("decodes nothing"), "{e}");
+        assert_eq!(state_slots(&state), [100, 100, 100, 100, 200, 100, 100, 100], "a refused commit left the state alone");
+
+        // Every held slot re-shows as itself, and only that slot.
+        for slot in 0..8 {
+            let f = state.frame(&vp9_show_existing_frame(0, slot as u32)).expect("slot {slot} is held");
+            let want = if slot == 4 { 200 } else { 100 };
+            assert_eq!(f.re_show(), Some((slot, want)), "slot {slot} re-shows surface {want}");
+        }
+    }
+
+    /// A re-show of a slot that holds no picture is an **`Err` naming the slot**, not a surface
+    /// guessed at.
+    ///
+    /// This is the shape a corrupt stream or a mis-seeked decode takes, and it is the same reference
+    /// the software decoder refuses (`crates/vp9/src/decoder.rs:250-252`). Guessing would hand the
+    /// caller a surface holding *some other* picture, which is then shown as though it were this
+    /// slot's — a plausible wrong picture rather than an error, which is the answer this backend
+    /// never gives.
+    #[test]
+    fn a_frame_that_re_shows_an_empty_slot_is_an_error_not_a_guess() {
+        let mut state = super::Vp9State::new();
+        // Nothing decoded yet, so every slot is empty.
+        let e = state.frame(&vp9_show_existing_frame(0, 5)).expect_err("an empty state re-shows nothing");
+        assert!(e.contains("slot 5"), "the message names the slot: {e}");
+        assert!(e.contains("holds no picture"), "{e}");
+        assert_eq!(e, "a frame that re-shows reference slot 5, which holds no picture", "and says exactly what is missing");
+
+        // After a partial decode, only the slots the frames filled are re-showable.
+        let (key, _, _) = vp9_key_frame();
+        let f = state.frame(&key).expect("the key frame");
+        state.commit(&f, 100).expect("it commits");
+        // A key frame fills all eight, so this one re-shows; a state that had been narrowed would
+        // not, and that is the same check with a different number of slots behind it.
+        assert_eq!(state.frame(&vp9_show_existing_frame(0, 7)).expect("slot 7 is filled by a key frame").re_show(), Some((7, 100)));
+    }
+
+    /// **The one `HeaderState` is threaded across the stream, and the record for a 10-bit profile 2
+    /// inter frame says 10 bits.**
+    ///
+    /// This is the test that would fail if the state were per-picture, and it fails *silently
+    /// otherwise*: VP9 6.2 reads `color_config` only for a key frame and an intra-only frame, so an
+    /// inter frame **inherits** it from the parse state (`crates/vp9/src/header.rs:265`). Parse the
+    /// inter frame against a fresh state and its `color.bit_depth` is `ColorConfig::default()`'s 8
+    /// whatever the stream is — and `vp9_decline(2, 8)` is `None`, so **nothing refuses it**: the
+    /// result is a valid 92-byte record claiming 8 bits, submitted to a decoder that was configured
+    /// for 10-bit surfaces. That is a wrong *record*, not a wrong message, and no error anywhere.
+    ///
+    /// So the test asserts the record's own `bit_depth` byte for an inter frame in a stream whose
+    /// key frame says 10. A per-picture state yields 8 here; the one threaded state yields 10.
+    #[test]
+    fn one_header_state_is_threaded_so_an_inter_frame_is_still_ten_bit() {
+        // A profile 2, 10-bit key frame spells its own colour configuration, so the state learns it.
+        let (key, _, key_header) = vp9_key_frame_at(2, false);
+        assert_eq!(key_header.color.bit_depth, 10, "the fixture's key frame really is 10-bit");
+
+        let mut state = super::Vp9State::new();
+        let f = state.frame(&key).expect("the 10-bit key frame");
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!((r.profile, r.bit_depth), (2, 10), "the key frame's own record says 10 bits");
+        state.commit(&f, 100).expect("it commits");
+
+        // Now an inter frame of the same stream, which spells **no** colour configuration at all.
+        let inter = vp9_inter_frame_refreshing(2, false, 0b1111_1111, [3, 1, 5]);
+        let f = state.frame(&inter).expect("an inter frame whose references are all held");
+        assert!(!f.header().frame_is_intra, "the fixture is a true inter frame, which is the case that inherits");
+
+        // The whole point: the record says 10 bits, because the state carried it from the key frame.
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!((r.profile, r.bit_depth), (2, 10), "the inter frame's record says 10 bits — inherited, not spelled");
+
+        // **And the control, which is what makes the assertion above mean something.** The very same
+        // frame, parsed against a fresh state, produces a record that claims 8 bits and that
+        // *nothing refuses* — the failure this threading prevents, reproduced deliberately.
+        let mut per_picture = filmcraft_vp9::header::HeaderState::default();
+        let lone = filmcraft_vp9::header::parse_uncompressed(
+            &inter,
+            &mut per_picture,
+            &std::array::from_fn(|i| (i == 3).then_some(filmcraft_vp9::header::RefInfo { width: 320, height: 180 })),
+        )
+        .expect("it parses against a fresh state too — that is the problem");
+        assert_eq!(lone.color.bit_depth, 8, "against a fresh state an inter frame is 8 whatever the stream is");
+        assert_eq!(
+            super::vp9_decline(lone.profile, u32::from(lone.color.bit_depth)),
+            None,
+            "and no decline catches that: profile 2 at 8 bits is a legal pair this backend takes"
+        );
+        let wrong = super::vp9_picture_record(&lone, &per_picture, &inter, &state.references()).expect("a record — built, and wrong");
+        let wrong = crate::vaapi::ffi::picture_params_vp9(&wrong).expect("92 bytes");
+        assert_eq!(wrong.bit_depth, 8, "the per-picture state yields a valid record claiming 8 bits: a wrong record, not an error");
+
+        // The threaded state is also what carries the two segmentation probability arrays forward:
+        // 6.2.11 updates them **conditionally**, and the inter fixture sets `segmentation_enabled`
+        // clear, so its record must carry the **key frame's** values rather than defaults. A
+        // `HeaderState::default()` here would give 255s, which a driver reads as valid probabilities.
+        assert_eq!(r.mb_segment_tree_probs, [7, 11, 13, 17, 19, 23, 29], "6.2.11's tree probabilities, inherited from the key frame");
+        assert_eq!(r.segment_pred_probs, [31, 37, 41], "and its prediction probabilities");
+        // 6.2.8's `loop_filter_level` and `loop_filter_sharpness` are read in **every** frame, so
+        // here they are the inter frame's own — which is what makes them worth asserting: they would
+        // be the key frame's 37/5 if the state had not been written for this frame, so a state that
+        // parsed into one object and recorded from another would show a mixture.
+        assert_eq!((r.filter_level, r.sharpness_level), (21, 3), "6.2.8's level and sharpness are this frame's own");
+
+        // The control again, for the arrays: a per-picture state would zero them.
+        assert_eq!(wrong.mb_segment_tree_probs, [0; 7], "and the per-picture state would hand a driver zeros — a valid record, and the wrong one");
+        assert_eq!(wrong.segment_pred_probs, [0; 3]);
+    }
+
+    /// `frame_context_idx` and `reset_frame_context` reach the record, and `error_resilience` does
+    /// what 6.2.5 says with them.
+    ///
+    /// These are the other two of the stateful three, and they are the pair a per-frame caller gets
+    /// wrong most easily: the parser **forces `frame_context_idx` to 0** for a frame that resets its
+    /// context (`crates/vp9/src/header.rs:314`), so a caller that read the index off the bitstream
+    /// instead of off the parsed header would submit an index 6.2.5 never meant — and the driver
+    /// would update the wrong probability context. Asserting the *record's* bits, rather than the
+    /// header's fields, is what makes it a test of what is submitted.
+    #[test]
+    fn the_frame_context_reaches_the_record_as_6_2_5_resolved_it() {
+        let mut state = super::Vp9State::new();
+        let (key, _, _) = vp9_key_frame();
+        let f = state.frame(&key).expect("the key frame");
+        state.commit(&f, 100).expect("it commits");
+
+        // A plain inter frame with a non-zero `reset_frame_context` and `frame_context_idx = 3`: both
+        // reach the record as read.
+        let f = state.frame(&vp9_inter_frame_full(0, false, 0xff, [3, 1, 5], true, false, 2, 3)).expect("an inter frame");
+        assert_eq!((f.header().reset_frame_context, f.header().frame_context_idx), (2, 3), "6.2.5 leaves both alone on a resilient-mode-clear inter frame");
+        let word = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes").pic_fields;
+        assert_eq!((word >> 11) & 0b11, 2, "reset_frame_context at bits 11..12");
+        assert_eq!((word >> 14) & 0b11, 3, "frame_context_idx at bits 14..15");
+
+        // Under `error_resilient_mode`, 6.2.5 reads neither flag and forces the other two: the
+        // context is reset, `refresh_frame_context` is clear, `frame_parallel_decoding_mode` is set,
+        // and `frame_context_idx` is 0 whatever the bitstream said. The fixture writes no bits for
+        // the two flags at all, so this is the parser's doing and not the writer's.
+        let f = state.frame(&vp9_inter_frame_full(0, false, 0xff, [3, 1, 5], true, true, 0, 3)).expect("an error-resilient inter frame");
+        assert!(f.header().error_resilient_mode);
+        assert_eq!(f.header().frame_context_idx, 0, "6.2.5 forces the context index to 0 for a frame that resets its context");
+        assert!(!f.header().refresh_frame_context, "and refresh_frame_context is forced clear");
+        assert!(f.header().frame_parallel_decoding_mode, "and frame_parallel_decoding_mode is forced set");
+        let word = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes").pic_fields;
+        assert_eq!((word >> 11) & 0b11, 0, "reset_frame_context is 0 — the resilient frame reads no reset value");
+        assert_eq!((word >> 13) & 1, 0, "refresh_frame_context is clear at bit 13");
+        assert_eq!((word >> 14) & 0b11, 0, "frame_context_idx is 0 at bits 14..15, not the 3 the bitstream carried");
+        assert_eq!((word >> 10) & 1, 1, "frame_parallel_decoding_mode is set at bit 10");
+    }
+
+    /// **A frame that names a reference slot nothing holds is refused**, naming the slot.
+    ///
+    /// `Vp9State` is the only thing that knows what is in a slot, so this check is the state's to
+    /// make. The record would otherwise carry `VA_INVALID_SURFACE` at that index — and a driver
+    /// handed a record with a reference it cannot read does not necessarily fail: the alternative is
+    /// a picture predicted from nothing, which is the plausible wrong answer this backend must not
+    /// produce. An **intra** frame names no references and is not checked, which is why the key
+    /// frame above parses against a state that holds nothing at all.
+    #[test]
+    fn an_inter_frame_naming_an_empty_slot_is_refused() {
+        // A **new** state holds nothing, so every reference a frame names is empty. The three
+        // positions are checked in the order 6.2.3 numbers them, and the refusal names the first one
+        // that is empty — so a frame whose *golden* or *alt-ref* is missing is refused by the same
+        // check, one that only ever looked at `ref_frame_idx[0]` would not reach.
+        //
+        // Only the first position can be *demonstrated* here, and the reason is worth stating: the
+        // only frame an empty state can describe is a key frame, and a key frame refreshes **all
+        // eight** slots. So there is no state this API can build in which a later reference is empty
+        // while an earlier one is held — which is why the other two positions are checked through the
+        // record below rather than through a refusal.
+        let mut state = super::Vp9State::new();
+        for refs in [[1u32, 1, 1], [3, 1, 1], [0, 1, 6]] {
+            let e = state
+                .frame(&vp9_inter_frame_refreshing(0, false, 0b0000_0001, refs))
+                .map(|_| ())
+                .expect_err("an inter frame referring to a slot nothing holds");
+            assert!(e.contains("last_ref_frame"), "the first empty reference is the one named: {e}");
+            assert!(e.contains(&format!("reference slot {}", refs[0])), "and the slot: {e}");
+            assert!(e.contains("holds no picture"), "{e}");
+        }
+        assert_eq!(state_slots(&state), [crate::vaapi::ffi::INVALID_SURFACE; 8], "a refusal moved nothing");
+
+        // A key frame names no references, so an empty state describes it. Slot 0 need not hold a
+        // picture for it, which is why the check is gated on `frame_is_intra`: 6.2 reads no
+        // `ref_frame_idx` at all for an intra frame, so those zeros are the header's, not a request.
+        let (key, _, _) = vp9_key_frame();
+        let f = state.frame(&key).expect("a key frame names no references, so an empty state describes it");
+        state.commit(&f, 100).expect("it commits");
+
+        // And **all three** positions reach the record as the header's own indices, each naming a
+        // different slot so a reordering is visible: 19, 20, 22.
+        let f = state.frame(&vp9_inter_frame_refreshing(0, false, 0xff, [3, 6, 7])).expect("all three references held");
+        let word = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes").pic_fields;
+        assert_eq!((word >> 19) & 0b111, 3, "last_ref_frame at bits 19..21 is slot 3");
+        assert_eq!((word >> 23) & 0b111, 6, "golden_ref_frame at bits 23..25 is slot 6");
+        assert_eq!((word >> 27) & 0b111, 7, "alt_ref_frame at bits 27..29 is slot 7");
+        // ...and the record names the surface each of those slots holds, so the index and the array
+        // agree — the `[3, 3]` collision's shape, which is why both are asserted here.
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!((r.reference_frames[3], r.reference_frames[6], r.reference_frames[7]), (100, 100, 100));
+    }
+
+    /// A reset clears **both** halves of the state, and each half is checked for the reason it
+    /// matters.
+    ///
+    /// The slots, because a frame after a seek would otherwise find a reference in a surface from
+    /// the run before it. And the parse state, because `color_config` is inherited: without the
+    /// reset, the first inter frame of the new run would be built at the *previous* run's depth.
+    #[test]
+    fn a_reset_forgets_the_slots_and_the_parse_state() {
+        let mut state = super::Vp9State::new();
+        // A 10-bit stream, decoded as far as one inter frame.
+        let (key, _, _) = vp9_key_frame_at(2, false);
+        let f = state.frame(&key).expect("the 10-bit key frame");
+        state.commit(&f, 100).expect("it commits");
+        let f = state.frame(&vp9_inter_frame_refreshing(2, false, 0xff, [0, 1, 2])).expect("an inter frame");
+        assert_eq!(crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes").bit_depth, 10);
+        state.commit(&f, 200).expect("it commits");
+        assert_eq!(state_slots(&state), [200; 8]);
+
+        state.reset();
+
+        // The slots are gone, so the next frame describes an empty buffer rather than surfaces
+        // holding pictures from before the seek.
+        assert_eq!(state_slots(&state), [crate::vaapi::ffi::INVALID_SURFACE; 8], "a reset forgets every surface");
+        assert_eq!(state.live_surfaces(), Vec::<u32>::new());
+        // A frame that names a reference is now refused rather than described from a stale surface.
+        let e = state.frame(&vp9_inter_frame_refreshing(2, false, 0xff, [0, 1, 2])).map(|_| ()).expect_err("nothing is held after a reset");
+        assert!(e.contains("holds no picture"), "{e}");
+
+        // And the parse state is gone: a key frame of an **8-bit** stream now, where before the
+        // reset the 10-bit colour would have been inherited by the first inter frame of it.
+        let (eight, _, _) = vp9_key_frame();
+        let f = state.frame(&eight).expect("a profile 0 key frame");
+        assert_eq!(crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes").bit_depth, 8);
+        state.commit(&f, 300).expect("it commits");
+        let f = state.frame(&vp9_inter_frame(0, false)).expect("an 8-bit inter frame");
+        assert_eq!(
+            crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes").bit_depth,
+            8,
+            "the previous run's 10-bit colour did not survive the reset"
+        );
+    }
+
+    /// A hidden frame (`show_frame` clear) still refreshes its slots and is still described in full —
+    /// only the caller's output decision changes.
+    ///
+    /// The two are separate properties and conflating them costs either a hole in the reference buffer
+    /// (skipping the refresh) or a picture from the stream (showing it). The state gets it right and
+    /// exposes both: `show()` is false, `refresh_flags()` is not.
+    #[test]
+    fn a_hidden_frame_refreshes_its_slots_and_says_it_is_not_shown() {
+        let mut state = super::Vp9State::new();
+        let (key, _, _) = vp9_key_frame();
+        let f = state.frame(&key).expect("the key frame");
+        state.commit(&f, 100).expect("it commits");
+
+        let f = state.frame(&vp9_inter_frame_full(0, false, 0b0000_0100, [0, 1, 2], false, false, 0, 1)).expect("a hidden inter frame");
+        assert!(!f.show(), "6.2's show_frame is clear, so the caller produces no picture");
+        assert!(f.is_new(), "but it is a frame of its own, with a record");
+        assert!(f.record().is_some(), "a hidden frame is still submitted");
+        assert_eq!(f.refresh_flags(), 0b0000_0100, "and it still says which slots it refreshes");
+        // The record's `show_frame` bit is clear, so the driver knows too.
+        let word = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes").pic_fields;
+        assert_eq!((word >> 3) & 1, 0, "show_frame at bit 3 is clear in the record");
+        state.commit(&f, 200).expect("it commits");
+        assert_eq!(state_slots(&state), [100, 100, 200, 100, 100, 100, 100, 100], "a hidden frame still refreshes");
+    }
+
+    /// A frame that takes its coded size from a reference slot gets **that slot's** size — which is
+    /// why the state keeps a size per slot and not just a surface.
+    ///
+    /// 6.2.5's `frame_size_with_refs` (`crates/vp9/src/header.rs:271-284`) asks for the size of the
+    /// slot the header names and reuses it, and it takes the size of the **first** slot whose
+    /// `found_ref` flag is set. A state that stored only surfaces could not answer it at all, and one
+    /// that answered it with the *new* frame's size would be guessing. So the recorded size is the
+    /// size the picture in that slot was decoded at, and a refresh replaces it with the new frame's.
+    #[test]
+    fn a_frame_that_takes_its_size_from_a_reference_gets_that_slots_own_size() {
+        let mut state = super::Vp9State::new();
+        // Slot 5 gets a 1920x1080 picture; the key frame fills every slot at 320x180 first.
+        let (key, _, _) = vp9_key_frame();
+        let f = state.frame(&key).expect("the key frame");
+        state.commit(&f, 100).expect("it commits");
+        assert_eq!(state.slot(5).expect("slot 5").size, (320, 180), "the key frame's picture is 320x180 in every slot");
+        // An inter frame at 1920x1080 that refreshes only slot 5.
+        let f = state.frame(&vp9_inter_frame_refreshing(0, false, 0b0010_0000, [0, 1, 2])).expect("an inter frame");
+        assert_eq!((f.header().width, f.header().height), (1920, 1080), "this frame spells its own size");
+        state.commit(&f, 200).expect("it commits");
+        assert_eq!(state.slot(5).expect("slot 5").size, (1920, 1080), "slot 5 now holds the 1920x1080 picture");
+        assert_eq!(state.slot(4).expect("slot 4").size, (320, 180), "and slot 4 still holds the key frame's");
+
+        // Now a frame that takes its size from a reference. `frame_size_with_refs` breaks on the **first**
+        // `found_ref` flag, which belongs to `ref_frame_idx[0]` (`header.rs:273-283`), so the slot
+        // asked about is the first reference and the other two are only there to be named.
+        let f = state.frame(&vp9_inter_frame_refreshing(0, true, 0xff, [5, 1, 2])).expect("a frame that takes its size from slot 5");
+        assert!(f.header().size_from_ref, "6.2.5 took the size from a reference rather than from the bitstream");
+        assert_eq!((f.header().width, f.header().height), (1920, 1080), "the size is slot 5's own, which is the picture in it");
+        let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
+        assert_eq!((r.frame_width, r.frame_height), (1920, 1080), "and the record says it");
+
+        // A frame naming a slot whose picture is a *different* size must not get the wrong one. Slot 4
+        // holds 320x180, so a frame taking its size from slot 4 is 320x180 — a size no zero or no
+        // single "the last decoded frame" default could imitate.
+        let f = state.frame(&vp9_inter_frame_refreshing(0, true, 0b0000_0001, [4, 1, 2])).expect("a frame that takes its size from slot 4");
+        assert!(
+            (f.header().width, f.header().height) == (320, 180),
+            "slot 4's own size, not slot 5's: {width}x{height}",
+            width = f.header().width,
+            height = f.header().height
+        );
+    }
+
+    /// Hostile input to the state is an `Err`, never a panic and never a default.
+    ///
+    /// Every number here is bitstream-derived, and the state is the first place a VP9 frame is read
+    /// on the hardware path, so the checks belong here rather than at the record builder alone: an
+    /// empty sample, a truncated header, a header that claims an empty compressed header, and the
+    /// sizes and members the record cannot hold.
+    #[test]
+    fn a_state_refuses_frames_rather_than_panicking_or_defaulting() {
+        let mut state = super::Vp9State::new();
+        for bad in [&[][..], &[0x00][..], &[0xff; 7][..], &[0x0a, 0x00, 0x00][..]] {
+            let e = state.frame(bad).expect_err("a frame that is not there is an error");
+            assert!(!e.is_empty(), "the error says why: {e:?}");
+        }
+        assert_eq!(state_slots(&state), [crate::vaapi::ffi::INVALID_SURFACE; 8], "and none of that moved the state");
+
+        // A well-formed header with its compressed header cut off: the record needs
+        // `first_partition_size` and there is nothing to give it.
+        let (frame, _, header) = vp9_key_frame();
+        let header_only = &frame[..header.uncompressed_size];
+        let e = state.frame(header_only).expect_err("a frame that ends at its own header");
+        assert!(e.contains("no room"), "{e}");
+
+        // A depth this backend does not decode is refused by the record the state builds, with the
+        // profile table's own reason — so a decline is reachable through the state too, not only
+        // through `plan_frame`.
+        let e = state.frame(&vp9_key_frame_at(2, true).0).expect_err("a 12-bit profile 2 frame");
+        assert!(e.contains("12-bit"), "{e}");
+        assert!(e.contains("profile 2 at 12 bits"), "{e}");
+
+        // And the state is still usable afterwards: a refusal does not corrupt what it holds.
+        let f = state.frame(&frame).expect("a profile 0 key frame is still described after the refusals");
+        state.commit(&f, 100).expect("it commits");
+        assert_eq!(state_slots(&state), [100; 8]);
     }
 
     /// A frame whose header claims more than its own bytes hold is refused, and so is one whose

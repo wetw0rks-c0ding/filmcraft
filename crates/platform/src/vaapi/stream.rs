@@ -140,14 +140,16 @@ pub fn plan_nal(info: &NalStreamInfo) -> Result<Plan, String> {
 /// record (`VADecPictureParameterBufferAV1`), so a record of invented values would be one a driver
 /// reads as a valid picture. Unchanged by the VP9 work below.
 ///
-/// **VP9**: the *record* is built — `super::picture::vp9_picture_record` lays out a
-/// `VADecPictureParameterBufferVP9` from the frame's own uncompressed header, which `filmcraft_vp9`
-/// parses — but a record is one of two things a VP9 decode needs, and the other is **which surface
-/// each of the eight reference slots holds**, which is state carried from the pictures decoded
-/// before this one. A `FrameStreamInfo` describes the stream, not the stream's decoded pictures, so
-/// this function cannot build the record and declines rather than filling `reference_frames` with
-/// invented surfaces. The profile table below is that record's table, called from here so the two
-/// cannot disagree about which VP9 this backend takes.
+/// **VP9**: the *record* is built, and the *state* it is built against exists —
+/// `super::picture::Vp9State` threads one `filmcraft_vp9::header::HeaderState` across the stream and
+/// owns the eight reference slots, and `vp9_picture_record` lays the `VADecPictureParameterBufferVP9`
+/// out from the frame's uncompressed header. What `plan_frame` cannot have is **that state**: a
+/// `FrameStreamInfo` describes the stream, not the pictures decoded out of it, and the state is per
+/// run rather than per stream description. So this still declines, and says which object a decode
+/// would need — not because a record cannot be built, but because the half that says *which surface
+/// each reference slot holds* is the pictures before this one. The profile table below is the record
+/// builder's own table, called from here so the two cannot disagree about which VP9 this backend
+/// takes.
 pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
     if info.mono || info.subsampling != (1, 1) {
         return Err(format!("chroma subsampling {:?}{}", info.subsampling, if info.mono { " (monochrome)" } else { "" }));
@@ -177,14 +179,14 @@ pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
         (FrameCodec::Av1, p, b) => return Err(format!("AV1 profile {p} at {b} bits")),
     };
     // Both codecs are declined here, and each says what is actually missing — see the note above.
-    // The VP9 arm names the reference state rather than the frame header, because the record *is*
-    // built from the header (`picture::vp9_picture_record`); what is missing is the half that has to
-    // come from the pictures already decoded.
+    // The VP9 arm names the reference **state**, not the frame header, because both the header and
+    // the record builder exist: `Vp9State` is the object that carries the state across a run, and a
+    // stream description is not a run.
     Err(match info.codec {
         FrameCodec::Vp9 => format!(
             "VP9 picture parameters, which would be planned as {profile:?} at {format:?} in {} bits: filmcraft-vp9 exposes the \
-             uncompressed frame header and `vp9_picture_record` builds the record from it, but the eight reference surfaces a \
-             record names are state this description does not carry",
+             uncompressed frame header, `Vp9State` carries the reference state across a run and `vp9_picture_record` builds the \
+             record from both, but the eight reference surfaces a record names are state this description does not carry",
             info.bit_depth
         ),
         FrameCodec::Av1 => format!(
@@ -352,10 +354,10 @@ mod tests {
     /// the two codecs are declined for **different** reasons, which is the point of this test.
     ///
     /// AV1 is declined because its per-frame header is not exposed (`FRAME_HEADER_MISSING`, which is
-    /// still true). VP9 is declined because the *record* is built — `vp9_picture_record` lays a
-    /// `VADecPictureParameterBufferVP9` out from the header `filmcraft_vp9` parses — but a record
-    /// also names the eight reference surfaces, which are state a stream description does not carry.
-    /// Asserting the old shared constant for VP9 would assert something false about the code.
+    /// still true). VP9 is declined because a record also names the eight reference surfaces, which
+    /// are state a stream description does not carry — `Vp9State` is the object that carries it, and
+    /// it is per run rather than per description. Asserting the old shared constant for VP9 would
+    /// assert something false about the code.
     #[test]
     fn every_frame_codec_is_declined_before_a_context_exists() {
         // `for_tests` is the crate's own hand-built description (hw_frame.rs:195)
