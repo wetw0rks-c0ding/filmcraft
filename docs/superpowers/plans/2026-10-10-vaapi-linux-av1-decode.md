@@ -184,9 +184,12 @@ It has **six compiler holes** and a trailing pad — none visible to `sizeof` al
 | 706..708 | `qmatrix_fields` (704) and `mode_control_fields` (708) | `mode_control_fields` is 4-aligned |
 | 1156..1160 | after `va_reserved` (1124, 32 bytes) to the 8-byte alignment | struct alignment |
 
-Sub-record sizes (all measured): `VASegmentationStructAV1` = 156 (one hole, 148..152, before
-`va_reserved`); `VAFilmGrainStructAV1` = 176 (one hole, 153..154, before `cb_offset`); and
-`VAWarpedMotionParamsAV1` = 56 (one hole, 37..40, before `va_reserved`).
+Sub-record sizes (all measured): `VASegmentationStructAV1` = 156 — **with no hole at all**: `feature_mask` is
+`uint8_t[8]` at 132..140 and `va_reserved` is `uint32_t[4]` at 140, which is already 4-aligned. An earlier draft of
+this plan claimed a 4-byte hole at 148..152 here; it was wrong, and `cargo xtask` measuring it is what caught it.
+Belt and braces: `abi_guard.rs` now asserts it as a **zero-width** gap, so a declaration that reintroduced padding
+would go red. `VAFilmGrainStructAV1` = 176 (one hole, 153, before `cb_offset`); `VAWarpedMotionParamsAV1` = 56 (one
+hole, 37..40, before `va_reserved`).
 
 `VASliceParameterBufferAV1` (`va_dec_av1.h:647-686`) is **40 bytes** with one hole (21..22, before
 `tile_idx_in_tile_list`). Its `tg_start`/`tg_end` are `va_deprecated`; they still occupy bytes and are

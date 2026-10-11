@@ -156,8 +156,23 @@ headers found **three further mismatches, all the same shape — a declaration s
 
 Entry points are now declared once in a macro that derives arity mechanically, with tests that check it
 against the installed headers (one counts the header's parameters, one has the C compiler static-assert every
-record's `sizeof`). Both were verified to fail on the exact historical bugs. `cargo xtask ci` now runs the
+record's `sizeof`). `cargo xtask ci` now runs the
 platform tests unoptimised as well, so a profile divergence cannot hide a bug again.
+
+**What that sentence got wrong, and how it stands now.** When this was first written the guard covered two of the
+three historical ABI defects. `struct drm_prime_handle` — the one whose missing third field made the ioctl number
+wrong, so the call *succeeded* while leaking a dma-buf per encoded picture and double-closing a descriptor libva
+owns — was checked only by two hand-typed literals, and §6 of this file is the record of that style of verification
+reading as rigorous and being wrong. It is now a `_Static_assert` against a real compile of `<drm/drm.h>`, like every
+other record, and its four failure modes are demonstrated rather than asserted: widening the record, reordering
+fields at the correct size (invisible to the old literals), a wrong request number, and a missing field.
+
+**The guard has since grown a blind spot of its own, which is worth stating because `sizeof` cannot see it.** A
+compiler hole changes no size, so `sizeof` passes over one. `VASegmentParameterVP9` decoded 24/24 bit-exact for five
+commits while handing the driver two uninitialised bytes per record, and it was found by construction rather than by
+symptom. Every record submitted to a driver is now also checked for unnamed holes, pinned as *gaps* rather than
+sizes, each named as a `padding_*` field of the C-measured width. Shrinking a gap does not always move `sizeof` —
+the compiler re-inserts the byte — which is why the pins ask for the gap and not the size.
 
 ---
 
