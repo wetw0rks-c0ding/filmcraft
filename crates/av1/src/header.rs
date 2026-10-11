@@ -465,6 +465,31 @@ pub struct HeaderState<'a> {
     pub current_frame_id: u32,
 }
 
+impl<'a> HeaderState<'a> {
+    /// A state seeded exactly as [`crate::Decoder`] seeds its own, so a caller that reads a frame
+    /// header itself — the VA-API backend, building `VADecPictureParameterBufferAV1` from the frame
+    /// — parses against the same starting point the software decoder does.
+    ///
+    /// **The seed is not a convenience: a different one is a different decode.** `lf_deltas` starts
+    /// at the specification's default reference deltas (`LoopFilterDeltas::defaults()`),
+    /// `seg_features` with no segment enabled, `prev_gm_params` at the identity translation
+    /// (`default_gm_params()`) and `current_frame_id` at 0 — the four values `Decoder::new` writes.
+    /// [`crate::Decoder`] is unchanged and still builds this state by hand at `decoder.rs`; this
+    /// constructor exists so that a second caller cannot seed a *different* one, and
+    /// `the_av1_frame_header_parser_is_reachable` in `crates/platform` pins two of the four from
+    /// outside the crate, which is the only place a change to them would be visible.
+    pub fn new(seq: &'a SequenceHeader, refs: &'a mut [RefInfo; NUM_REF_FRAMES]) -> Self {
+        HeaderState {
+            seq,
+            refs,
+            lf_deltas: LoopFilterDeltas::defaults(),
+            seg_features: SegmentationFeatures::default(),
+            prev_gm_params: default_gm_params(),
+            current_frame_id: 0,
+        }
+    }
+}
+
 fn tile_log2(blk: u32, target: u32) -> u32 {
     let mut k = 0;
     while (blk << k) < target {
@@ -475,7 +500,13 @@ fn tile_log2(blk: u32, target: u32) -> u32 {
 
 impl FrameHeader {
     /// uncompressed_header( ). `st` holds the cross-frame state.
-    pub(crate) fn parse(r: &mut BitReader, st: &mut HeaderState, temporal_id: u32, spatial_id: u32) -> Result<FrameHeader> {
+    ///
+    /// `pub` because the VA-API backend builds `VADecPictureParameterBufferAV1` from this parse —
+    /// libva wants AV1's frame-level syntax as a record rather than as a parameter set — and because
+    /// the signature names [`BitReader`], which is `pub` for the same reason. **Nothing about the
+    /// parse changed when it was widened**: `cargo test -p filmcraft-av1` (the `oracle_intra` and
+    /// `conformance` suites, which compare bit-exact against libdav1d) is the gate that says so.
+    pub fn parse(r: &mut BitReader, st: &mut HeaderState, temporal_id: u32, spatial_id: u32) -> Result<FrameHeader> {
         let seq = st.seq;
         let mut h = FrameHeader { temporal_id, spatial_id, ..Default::default() };
         let id_len = if seq.frame_id_numbers_present { seq.additional_frame_id_length_minus_1 + seq.delta_frame_id_length_minus_2 + 3 } else { 0 };

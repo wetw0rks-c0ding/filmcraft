@@ -1004,6 +1004,482 @@ pub struct VaSliceParameterBufferVp9 {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The AV1 decode records (`va_dec_av1.h`). They sit with the other decode records above rather
+// than with the encode records below, because they are built by the same thing: a picture's
+// *parsed* header, submitted once per picture beside the frame's bytes.
+//
+// **Every number below was measured by a C compiler reading `/usr/include/va/va_dec_av1.h`, not read
+// off the header's field list and not copied from the plan that describes them.** The two are not
+// always the same and where they were not this declaration follows the compiler:
+//
+//   cc -I /usr/include/va -o measure measure.c && ./measure      (GCC 16.2.1, x86-64-pc-linux-gnu)
+//     sizeof(VADecPictureParameterBufferAV1) = 1160   alignof = 8
+//     sizeof(VASegmentationStructAV1)        =  156   alignof = 4
+//     sizeof(VAFilmGrainStructAV1)           =  176   alignof = 4
+//     sizeof(VAWarpedMotionParamsAV1)        =   56   alignof = 4
+//     sizeof(VASliceParameterBufferAV1)      =   40   alignof = 4
+//
+// The bitfield unions are declared as their raw `value` member and their bit positions measured the
+// same way — by setting one member and reading the word back, because a C bitfield's layout is
+// target-dependent and declaration order is not evidence of it. Each union's members are listed with
+// their measured bits below.
+//
+// **Seven holes.** This is the `VASegmentParameterVP9` shape at ten times the size: 1160 bytes of
+// which 1147 are named fields, and the other 13 are alignment padding a C compiler inserts and
+// nothing else names — five interior gaps, plus a four-byte tail to the struct's own 8-byte
+// alignment. `sizeof` is blind to every one of them, because a hole changes no size: that is exactly
+// how `VASegmentParameterVP9` agreed with C on every size and every offset and still handed the
+// driver two uninitialised bytes per record, eight records a picture, and decoded bit-exact anyway
+// **because this driver ignores those bytes**. Each hole here is a named `padding_*` field of its
+// C-measured width, zeroed by `Default`, and each is pinned by
+// `no_submitted_record_has_a_byte_the_header_does_not_account_for`, which asks the C compiler for the
+// *gap* between two members rather than for a member's offset.
+// ---------------------------------------------------------------------------------------------
+
+/// `VASegmentationStructAV1` (`va_dec_av1.h:80`): AV1 5.9.19's segmentation parameters. **156 bytes,
+/// and it has no hole** — measured, not assumed.
+///
+/// The plan for this milestone records a four-byte hole at 148-152 before `va_reserved`, and a C
+/// compiler says otherwise: `feature_mask` is a `uint8_t[8]` at 132-139, `va_reserved` is a
+/// `uint32_t[4]` and so 4-aligned, and 140 is already 4-aligned. The gap is **zero**. That matters
+/// for the same reason the holes that do exist matter: a declaration written from a plan that believed
+/// in a hole would put four `padding_*` bytes here, make this struct 160 bytes, move every field
+/// after it four bytes along in [`VaPictureParameterBufferAv1`] and hand the driver a record at
+/// offsets it did not compile against — while `sizeof` on the wrong declaration *also* said 160. The
+/// C compiler's disagreement is the only thing that catches it, so `abi_guard` asserts this gap is
+/// zero, which makes "no hole" a measurement rather than an absence of one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaSegmentationStructAv1 {
+    /// `segment_info_fields`: the four segmentation-map flags, packed into the union's `value`
+    /// member. Measured bits: `enabled` 0, `update_map` 1, `temporal_update` 2, `update_data` 3,
+    /// `reserved` 4:32 (`va_dec_av1.h:90-111`).
+    pub segment_info_fields: u32,
+    /// `feature_data[8][8]`: "feature_data[segment_id][feature_id]" (`va_dec_av1.h:137`), which the
+    /// header states "is equivalent to variable FeatureData[][] in spec, which is after clip3()
+    /// operation" — so the parser's already-clipped values are copied across rather than clipped
+    /// again here, and `data` is narrowed to `i16` because that is what this array is.
+    pub feature_data: [[i16; 8]; 8],
+    /// `feature_mask[8]`: "Each bit field itself is the feature_id. Index is segment_id"
+    /// (`va_dec_av1.h:144`).
+    pub feature_mask: [u8; 8],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAFilmGrainStructAV1` (`va_dec_av1.h:153`): AV1 5.9.18's film grain parameters. **176 bytes with
+/// one hole, one byte wide, at offset 153** — `cb_luma_mult` is a `uint8_t` ending at 153 and
+/// `cb_offset` is a `uint16_t`, so the C layout puts a byte in front of it that `#[derive(Default)]`
+/// would not.
+///
+/// This backend **declines** a stream that applies grain: it reads pictures back with `vaDeriveImage`
+/// and `vaMapBuffer` and never applies grain itself, so submitting the parameters would have the
+/// driver render grain into `current_display_picture`, which nothing reads back, and the picture
+/// would then disagree with the software path on exactly the frames grain touches. The record is
+/// declared in full anyway, because a decline must be a decision made from the whole record rather
+/// than from its absence.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaFilmGrainStructAv1 {
+    /// `film_grain_info_fields`, packed into the union's `value` member. Measured bits:
+    /// `apply_grain` 0, `chroma_scaling_from_luma` 1, `grain_scaling_minus_8` 2:3, `ar_coeff_lag`
+    /// 4:5, `ar_coeff_shift_minus_6` 6:7, `grain_scale_shift` 8:9, `overlap_flag` 10,
+    /// `clip_to_restricted_range` 11, `reserved` 12:32 (`va_dec_av1.h:160-169`).
+    pub film_grain_info_fields: u32,
+    pub grain_seed: u16,
+    pub num_y_points: u8,
+    pub point_y_value: [u8; 14],
+    pub point_y_scaling: [u8; 14],
+    pub num_cb_points: u8,
+    pub point_cb_value: [u8; 10],
+    pub point_cb_scaling: [u8; 10],
+    pub num_cr_points: u8,
+    pub point_cr_value: [u8; 10],
+    pub point_cr_scaling: [u8; 10],
+    pub ar_coeffs_y: [i8; 24],
+    pub ar_coeffs_cb: [i8; 25],
+    pub ar_coeffs_cr: [i8; 25],
+    pub cb_mult: u8,
+    pub cb_luma_mult: u8,
+    /// **The C layout's one-byte hole, at offset 153**: `cb_offset` is a `uint16_t` and so 2-aligned.
+    pub padding_before_cb_offset: [u8; 1],
+    pub cb_offset: u16,
+    pub cr_mult: u8,
+    pub cr_luma_mult: u8,
+    pub cr_offset: u16,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAWarpedMotionParamsAV1` (`va_dec_av1.h:216`): one frame reference's global motion. **56 bytes
+/// with one hole, three bytes wide, at offsets 37-39** — `invalid` is a `uint8_t` ending at 37 and
+/// `va_reserved` is a `uint32_t[4]`, which is 4-aligned and so starts at 40.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaWarpedMotionParamsAv1 {
+    /// `VAAV1TransformationType` (`va_dec_av1.h:203-214`), an enum the C compiler measures as 4
+    /// bytes: `VAAV1TransformationIdentity` 0, `…Translation` 1, `…Rotzoom` 2, `…Affine` 3. AV1
+    /// 5.9.24's own `gm_type[i]` is numbered the same way (0 none, 1 translational, 2 rotzoom,
+    /// 3 affine), so the parser's value is this field's value with no remapping.
+    pub wmtype: u32,
+    /// `wmmat[8]`. The header says "`wm.wmmat[]` corresponds to gm_params[][] in spec"
+    /// (`va_dec_av1.h:222`), and the specification's array is **six** parameters, so the last two
+    /// entries are zero. Each element is at `WARPEDMODEL_PREC_BITS` (16) fractional bits, which is
+    /// the scale `filmcraft-av1` carries `gm_params` at.
+    pub wmmat: [i32; 8],
+    /// "valid or invalid on affine set" (`va_dec_av1.h:228`).
+    pub invalid: u8,
+    /// **The C layout's three-byte hole, at offsets 37-39.**
+    pub padding_before_va_reserved: [u8; 3],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VADecPictureParameterBufferAV1` (`va_dec_av1.h:243`): AV1's picture-parameter record, submitted
+/// **once per frame**. **1160 bytes with seven holes** — five interior gaps and a four-byte tail.
+///
+/// ## The references are three levels deep, which is where the wrong pictures come from
+///
+/// `ref_frame_map` is the **whole** decoded picture buffer addressed by slot, *not* a list of the
+/// frames this one references; `ref_frame_idx[7]` is a second level of indirection into it; and
+/// `primary_ref_frame` says which of those entries the propagated loop-filter deltas, segmentation
+/// features and global motion are loaded from. VP9 has one of those levels and H.264's `[3, 3]`
+/// index collision — a picture record and a slice record disagreeing about the same frame — cost 60
+/// of 72 wrong pictures. **A zero in `ref_frame_map` is not "no reference"**: surface ids come from
+/// `vaCreateSurfaces` and are not guaranteed to avoid any value, so a zero names *some* surface and
+/// the driver reads it as a reference. An empty slot is [`INVALID_SURFACE`].
+///
+/// ## The seven holes, and what puts each one there
+///
+/// | bytes | between | why |
+/// |---|---|---|
+/// | 17-23 (7) | `anchor_frames_num`, `anchor_frames_list` | the C field is a `VASurfaceID *`, so it is 8-aligned |
+/// | 81-83 (3) | `order_hint`, `seg_info` | `VASegmentationStructAV1` is 4-aligned |
+/// | 674-675 (2) | `context_update_tile_id`, `pic_info_fields` | that union's `value` is a `uint32_t` |
+/// | 703 (1) | `v_ac_delta_q`, `qmatrix_fields` | that union's `value` is a `uint16_t` |
+/// | 706-707 (2) | `qmatrix_fields`, `mode_control_fields` | that union's `value` is a `uint32_t` |
+/// | 1156-1159 (4) | `va_reserved`, end of struct | the struct's alignment is 8, for that pointer |
+///
+/// Not one of them changes `sizeof`, so no `sizeof` check can see any of them and a driver that
+/// ignored them would still hand back a right-looking picture. See the note above these records.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaPictureParameterBufferAv1 {
+    /// "AV1 bit stream profile" (`va_dec_av1.h:251`) — the specification's `seq_profile`.
+    pub profile: u8,
+    /// The header calls this `order_hint_bits_minus_1` (`va_dec_av1.h:253`) and AV1's sequence header
+    /// carries `order_hint_bits`, so the record is the header's value minus one.
+    pub order_hint_bits_minus_1: u8,
+    /// "bit depth index … 0 - bit depth 8; 1 - bit depth 10; 2 - bit depth 12" (`va_dec_av1.h:261`).
+    /// The sequence header's `color_config.bit_depth` is 8/10/12, so this is a **table**, not a
+    /// subtraction, and a value outside it is a refusal rather than a clamp.
+    pub bit_depth_idx: u8,
+    /// "corresponds to AV1 spec variable of the same name" (`va_dec_av1.h:264`).
+    pub matrix_coefficients: u8,
+    /// `seq_info_fields`: the sequence header's flags, packed into the union's `value` member.
+    /// Measured bits: `still_picture` 0, `use_128x128_superblock` 1, `enable_filter_intra` 2,
+    /// `enable_intra_edge_filter` 3, `enable_interintra_compound` 4, `enable_masked_compound` 5,
+    /// `enable_dual_filter` 6, `enable_order_hint` 7, `enable_jnt_comp` 8, `enable_cdef` 9,
+    /// `mono_chrome` 10, `color_range` 11, `subsampling_x` 12, `subsampling_y` 13,
+    /// `chroma_sample_position` 14, `film_grain_params_present` 15, `reserved` 16:32
+    /// (`va_dec_av1.h:268-288`).
+    ///
+    /// `chroma_sample_position` is `va_deprecated` (`va_dec_av1.h:285`), which is
+    /// `__attribute__((deprecated))` and **not** a "leave it out": it still occupies bit 14 of a word
+    /// the driver reads, so it is zeroed rather than left stale.
+    pub seq_info_fields: u32,
+    /// "buffer description of decoded current picture" (`va_dec_av1.h:298`).
+    pub current_frame: VASurfaceID,
+    /// "display buffer of current picture … Used for film grain applied decoded picture. Valid only
+    /// when apply_grain equals 1" (`va_dec_av1.h:300-303`). Film grain is declined, so nothing reads
+    /// this; it is set equal to `current_frame` rather than left at whatever it held, because a stale
+    /// surface id in a field the driver may still look at is the same failure mode as a stale entry in
+    /// `ref_frame_map`.
+    pub current_display_picture: VASurfaceID,
+    /// "number of anchor frames for large scale tile … Value range [0..128]" (`va_dec_av1.h:310`).
+    /// Large-scale tile is declined, so this is zero.
+    pub anchor_frames_num: u8,
+    /// **The C layout's seven-byte hole, at offsets 17-23.** `anchor_frames_list` is a pointer in C
+    /// and so 8-aligned; 17 is not.
+    pub padding_after_anchor_frames_num: [u8; 7],
+    /// `anchor_frames_list`: the C field is a `VASurfaceID *` (`va_dec_av1.h:330`), **eight bytes
+    /// wide**, declared here as the address itself so that the record stays `Copy` and every byte of
+    /// it is initialised. It is a pointer into a list the **application** owns and populates
+    /// (`va_dec_av1.h:312-329`), so an address is meaningless to a record that is built once and
+    /// copied into a libva buffer; large-scale tile is declined and this is zero. The width is
+    /// pinned against C's `sizeof` of the pointer, so a platform where it is not eight is a red
+    /// build rather than a silent misdeclaration.
+    pub anchor_frames_list: u64,
+    /// "Picture resolution minus 1. Picture original resolution. **If SuperRes is enabled, this is
+    /// the upscaled resolution**" (`va_dec_av1.h:332-336`). Upscaled, not coded — which is why a
+    /// superres stream is not declined for its size, and why only a size that contradicts the
+    /// session surface is.
+    pub frame_width_minus1: u16,
+    /// The upscaled height, as `frame_width_minus1` is the upscaled width.
+    pub frame_height_minus1: u16,
+    /// "Output frame buffer size in unit of tiles … Valid only when large_scale_tile equals 1"
+    /// (`va_dec_av1.h:340-342`). Declined with large-scale tile.
+    pub output_frame_width_in_tiles_minus_1: u16,
+    /// `output_frame_height_in_tiles_minus_1`, as above.
+    pub output_frame_height_in_tiles_minus_1: u16,
+    /// "Surface indices of reference frames in DPB … Contains a list of uncompressed frame buffer
+    /// surface indices as references" (`va_dec_av1.h:347-356`): the whole decoded picture buffer,
+    /// addressed by slot. See the note above this struct.
+    pub ref_frame_map: [VASurfaceID; 8],
+    /// "Reference frame indices … Contains a list of indices into `ref_frame_map[8]`"
+    /// (`va_dec_av1.h:358-368`). The header states the order itself: "The indices of the array are
+    /// defined as [LAST_FRAME - LAST_FRAME, LAST2_FRAME - LAST_FRAME, …, ALTREF_FRAME -
+    /// LAST_FRAME]", which is the specification's `ref_frame_idx` with `LAST_FRAME` (1) subtracted —
+    /// and is exactly what `filmcraft-av1`'s `FrameHeader::ref_frame_idx` already holds.
+    pub ref_frame_idx: [u8; 7],
+    /// "primary reference frame index … Index into `ref_frame_idx[]`, specifying which reference
+    /// frame contains propagated info that should be loaded at the start of the frame. When value
+    /// equals PRIMARY_REF_NONE (7), it indicates there is no primary reference frame"
+    /// (`va_dec_av1.h:370-377`). A record that wrote `0` here loads the LAST frame's deltas,
+    /// segmentation features and global motion instead of loading none, which is a plausible picture
+    /// built from the wrong reference.
+    pub primary_ref_frame: u8,
+    pub order_hint: u8,
+    /// **The C layout's three-byte hole, at offsets 81-83**: `seg_info` is 4-aligned and `order_hint`
+    /// ends at 81.
+    pub padding_after_order_hint: [u8; 3],
+    pub seg_info: VaSegmentationStructAv1,
+    pub film_grain_info: VaFilmGrainStructAv1,
+    /// A **count**, not a log2, and the two are not interchangeable: "When uniform_tile_spacing_flag
+    /// == 1, width_in_sbs_minus_1[] and height_in_sbs_minus_1[] should be ignored, which will be
+    /// generated by driver based on tile_cols and tile_rows" (`va_dec_av1.h:385-389`).
+    pub tile_cols: u8,
+    /// `tile_rows`, as `tile_cols`.
+    pub tile_rows: u8,
+    /// "The width/height of a tile minus 1 in units of superblocks … Though the maximum number of
+    /// tiles is 64, since ones of the last tile are computed from ones of the other tiles and
+    /// frame_width/height, they are not necessarily specified" (`va_dec_av1.h:392-397`). Consulted only
+    /// when `uniform_tile_spacing_flag == 0`, and 63 rather than 64 because the last tile's extent is
+    /// the one the header declines to specify.
+    pub width_in_sbs_minus_1: [u16; 63],
+    /// `height_in_sbs_minus_1`, as above.
+    pub height_in_sbs_minus_1: [u16; 63],
+    /// "number of tiles minus 1 in large scale tile list … Valid only when large_scale_tiles == 1"
+    /// (`va_dec_av1.h:400-403`). Declined with large-scale tile.
+    pub tile_count_minus_1: u16,
+    /// "specify the tile index for context updating" (`va_dec_av1.h:406`).
+    pub context_update_tile_id: u16,
+    /// **The C layout's two-byte hole, at offsets 674-675**: `pic_info_fields`'s `value` member is a
+    /// `uint32_t` and `context_update_tile_id` ends at 674.
+    pub padding_after_context_update_tile_id: [u8; 2],
+    /// `pic_info_fields`: the uncompressed header's picture-level flags, packed into the union's
+    /// `value` member. Measured bits: `frame_type` 0:2, `show_frame` 2, `showable_frame` 3,
+    /// `error_resilient_mode` 4, `disable_cdf_update` 5, `allow_screen_content_tools` 6,
+    /// `force_integer_mv` 7, `allow_intrabc` 8, `use_superres` 9, `allow_high_precision_mv` 10,
+    /// `is_motion_mode_switchable` 11, `use_ref_frame_mvs` 12, `disable_frame_end_update_cdf` 13,
+    /// `uniform_tile_spacing_flag` 14, `allow_warped_motion` 15, `large_scale_tile` 16,
+    /// `reserved` 17:32 (`va_dec_av1.h:424-444`).
+    ///
+    /// `frame_type`'s encoding is the header's own (`va_dec_av1.h:416-419`: "0: KEY_FRAME; 1:
+    /// INTER_FRAME; 2: INTRA_ONLY_FRAME; 3: SWITCH_FRAME"), which is the specification's enum in its
+    /// own order, so `FrameHeader::frame_type` goes in unchanged.
+    pub pic_info_fields: u32,
+    /// "When use_superres=1, superres_scale_denominator must be in the range [9..16]. When
+    /// use_superres=0, superres_scale_denominator must be 8" (`va_dec_av1.h:449-452`).
+    pub superres_scale_denominator: u8,
+    /// "Interpolation filter. value range [0..4]" (`va_dec_av1.h:455-457`). **It is read from the
+    /// bitstream only for inter frames** — AV1 5.9.14 sits inside the non-intra branch — so an intra
+    /// frame's parsed header leaves it at 0, which is `EIGHTTAP`. That is the specification's own
+    /// state for the case, not a default this crate invented, and it is asserted on a real fixture
+    /// rather than assumed inert.
+    pub interp_filter: u8,
+    /// "luma loop filter levels … value range [0..63]" (`va_dec_av1.h:460-463`).
+    pub filter_level: [u8; 2],
+    /// "chroma loop filter levels … value range [0..63]" (`va_dec_av1.h:465-467`).
+    pub filter_level_u: u8,
+    pub filter_level_v: u8,
+    /// `loop_filter_info_fields`, packed into the union's `value` member. Measured bits:
+    /// `sharpness_level` 0:3, `mode_ref_delta_enabled` 3, `mode_ref_delta_update` 4, `reserved` 5:8
+    /// (`va_dec_av1.h:476-481`).
+    pub loop_filter_info_fields: u8,
+    /// "The adjustment needed for the filter level based on the chosen reference frame … value range
+    /// [-64..63]" (`va_dec_av1.h:486-490`): AV1 7.20's `ref_deltas` as `setup_past_independence`
+    /// resolved them, which is the *primary reference's* value wherever this header does not
+    /// override it.
+    pub ref_deltas: [i8; 8],
+    /// The same, for `mode_deltas` (`va_dec_av1.h:491-496`).
+    pub mode_deltas: [i8; 2],
+    /// "base_qindex … value range [0..255]" (`va_dec_av1.h:497-503`) — AV1 5.9.16's `base_q_idx`.
+    pub base_qindex: u8,
+    /// "Y DC delta from Y AC … value range [-64..63]" (`va_dec_av1.h:504-508`).
+    pub y_dc_delta_q: i8,
+    /// "U DC delta from Y AC" (`va_dec_av1.h:509-512`).
+    pub u_dc_delta_q: i8,
+    /// "U AC delta from Y AC" (`va_dec_av1.h:513-516`).
+    pub u_ac_delta_q: i8,
+    /// "V DC delta from Y AC" (`va_dec_av1.h:517-520`).
+    pub v_dc_delta_q: i8,
+    /// "V AC delta from Y AC" (`va_dec_av1.h:521-523`).
+    pub v_ac_delta_q: i8,
+    /// **The C layout's one-byte hole, at offset 703**: `qmatrix_fields`'s `value` member is a
+    /// `uint16_t` and `v_ac_delta_q` ends at 703.
+    pub padding_after_v_ac_delta_q: [u8; 1],
+    /// `qmatrix_fields`, packed into the union's `value` member. Measured bits: `using_qmatrix` 0,
+    /// `qm_y` 1:5, `qm_u` 5:9, `qm_v` 9:13, `reserved` 13:16 (`va_dec_av1.h:529-539`).
+    pub qmatrix_fields: u16,
+    /// **The C layout's two-byte hole, at offsets 706-707**: `mode_control_fields`'s `value` member
+    /// is a `uint32_t` and `qmatrix_fields` ends at 706.
+    pub padding_after_qmatrix_fields: [u8; 2],
+    /// `mode_control_fields`: AV1 5.9.16's delta-q, 5.9.17's delta-lf and tx-mode and 5.9.20's
+    /// reference-select syntax, packed into the union's `value` member. Measured bits:
+    /// `delta_q_present_flag` 0, `log2_delta_q_res` 1:3, `delta_lf_present_flag` 3,
+    /// `log2_delta_lf_res` 4:6, `delta_lf_multi` 6, `tx_mode` 7:9, `reference_select` 9,
+    /// `reduced_tx_set_used` 10, `skip_mode_present` 11, `reserved` 12:32 (`va_dec_av1.h:548-573`).
+    pub mode_control_fields: u32,
+    /// CDEF's `damping`, and the record stores it **minus three** (`va_dec_av1.h:578-581`).
+    pub cdef_damping_minus_3: u8,
+    /// CDEF's `bits` (`va_dec_av1.h:582-583`).
+    pub cdef_bits: u8,
+    /// `cdef_y_strengths[8]`, "expected to be packed with both primary and secondary strength …
+    /// (cdef_y_strengths[]) = (cdef_y_pri_strength[] << 2) | (cdef_y_sec_strength[] & 0x03)"
+    /// (`va_dec_av1.h:585-599`) — AV1 5.9.19's `cdef_y_pri_strength[i]` and `cdef_y_sec_strength[i]`.
+    pub cdef_y_strengths: [u8; 8],
+    /// `cdef_uv_strengths[8]`, packed the same way from `cdef_uv_pri_strength[i]` and
+    /// `cdef_uv_sec_strength[i]`.
+    pub cdef_uv_strengths: [u8; 8],
+    /// `loop_restoration_fields`, packed into the union's `value` member. Measured bits:
+    /// `yframe_restoration_type` 0:2, `cbframe_restoration_type` 2:4, `crframe_restoration_type` 4:6,
+    /// `lr_unit_shift` 6:8, `lr_uv_shift` 8, `reserved` 9:16 (`va_dec_av1.h:608-615`).
+    pub loop_restoration_fields: u16,
+    /// "global motion" (`va_dec_av1.h:622`): seven entries. AV1 has **eight** reference slots and
+    /// **seven** global-motion parameter sets, and the reason is worth stating because the two
+    /// numbers differ: `PRIMARY_REF_NONE` is 7, so the specification's `gm_params[0]` is the identity
+    /// and `gm_params[i + 1]` belongs to `LAST_FRAME + i` — which is the same seven `ref_frame_idx`
+    /// entries the record's indirection already names.
+    pub wm: [VaWarpedMotionParamsAv1; 7],
+    pub va_reserved: [u32; VA_PADDING_MEDIUM],
+    /// **The C layout's four-byte tail, at offsets 1156-1159.** The struct's alignment is 8 — for the
+    /// pointer at 24 — and `va_reserved[VA_PADDING_MEDIUM]` ends at 1156. It is a tail rather than an
+    /// interior gap, and the only way a C compiler can be asked for one is as
+    /// `sizeof(R) - offsetof(R, va_reserved) - sizeof(va_reserved)`, which is what `abi_guard`
+    /// generates; a trailing pad has no member either side of it for a gap to be measured against.
+    pub padding_after_va_reserved: [u8; 4],
+}
+
+/// Every byte of [`VaPictureParameterBufferAv1`] zero — written out rather than derived.
+///
+/// **`#[derive(Default)]` cannot be used for this record, and the reason is worth recording**: the
+/// standard library implements `Default` for `[T; N]` only up to `N == 32`
+/// (`rust-lang/rust#68594`), and this record carries `width_in_sbs_minus_1[63]` and
+/// `height_in_sbs_minus_1[63]` — 63, because libva sizes them for the maximum tile count and drops
+/// the last tile's unspecified entry (`va_dec_av1.h:392-397`). A derive is a compile error here.
+///
+/// The hand-written impl is not a workaround but an improvement over the derive it replaces:
+/// `#[derive(Default)]` infers "zero" from each field's own `Default`, and this one *states* it. That
+/// matters because [`record_bytes`]'s whole safety argument is that **every byte of a submitted
+/// record is an initialised field** — it casts `&T` to `&[u8]`, so a byte this impl forgot would be
+/// indeterminate memory handed to a driver. Listing all 55 fields makes a forgotten one a compile
+/// error rather than an uninitialised byte, and the `padding_*` fields are in the list like any
+/// other: a compiler-inserted hole that `derive` skipped is exactly the hole `VASegmentParameterVP9`
+/// shipped.
+impl Default for VaPictureParameterBufferAv1 {
+    fn default() -> Self {
+        VaPictureParameterBufferAv1 {
+            profile: 0,
+            order_hint_bits_minus_1: 0,
+            bit_depth_idx: 0,
+            matrix_coefficients: 0,
+            seq_info_fields: 0,
+            current_frame: 0,
+            current_display_picture: 0,
+            anchor_frames_num: 0,
+            padding_after_anchor_frames_num: [0; 7],
+            anchor_frames_list: 0,
+            frame_width_minus1: 0,
+            frame_height_minus1: 0,
+            output_frame_width_in_tiles_minus_1: 0,
+            output_frame_height_in_tiles_minus_1: 0,
+            ref_frame_map: [0; 8],
+            ref_frame_idx: [0; 7],
+            primary_ref_frame: 0,
+            order_hint: 0,
+            padding_after_order_hint: [0; 3],
+            seg_info: VaSegmentationStructAv1::default(),
+            film_grain_info: VaFilmGrainStructAv1::default(),
+            tile_cols: 0,
+            tile_rows: 0,
+            width_in_sbs_minus_1: [0; 63],
+            height_in_sbs_minus_1: [0; 63],
+            tile_count_minus_1: 0,
+            context_update_tile_id: 0,
+            padding_after_context_update_tile_id: [0; 2],
+            pic_info_fields: 0,
+            superres_scale_denominator: 0,
+            interp_filter: 0,
+            filter_level: [0; 2],
+            filter_level_u: 0,
+            filter_level_v: 0,
+            loop_filter_info_fields: 0,
+            ref_deltas: [0; 8],
+            mode_deltas: [0; 2],
+            base_qindex: 0,
+            y_dc_delta_q: 0,
+            u_dc_delta_q: 0,
+            u_ac_delta_q: 0,
+            v_dc_delta_q: 0,
+            v_ac_delta_q: 0,
+            padding_after_v_ac_delta_q: [0; 1],
+            qmatrix_fields: 0,
+            padding_after_qmatrix_fields: [0; 2],
+            mode_control_fields: 0,
+            cdef_damping_minus_3: 0,
+            cdef_bits: 0,
+            cdef_y_strengths: [0; 8],
+            cdef_uv_strengths: [0; 8],
+            loop_restoration_fields: 0,
+            wm: [VaWarpedMotionParamsAv1::default(); 7],
+            va_reserved: [0; VA_PADDING_MEDIUM],
+            padding_after_va_reserved: [0; 4],
+        }
+    }
+}
+
+/// `VASliceParameterBufferAV1` (`va_dec_av1.h:647`): **one record per tile**, 40 bytes, one hole.
+///
+/// ## This is the substantive difference from VP9, and the header says it plainly
+///
+/// *"This structure conveys parameters related to bit stream data and should be sent once per tile …
+/// But actually means VATileParameterBufferAV1 … Please note that host decoder is responsible to
+/// parse out the per tile information. And the bit stream in sent to driver in per tile
+/// granularity"* (`va_dec_av1.h:634-645`). VP9's counterpart is a **per-frame** buffer
+/// (`va_dec_vp9.h:279`, "The byte count of current frame"), so an AV1 submission carries one of
+/// these per tile and the per-tile byte extents are this backend's job rather than the driver's —
+/// which is the same class of derived value as VP9's `first_partition_size`, and the same reason it is
+/// computed from the frame's own bytes instead of asked of the driver.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaSliceParameterBufferAv1 {
+    /// "The byte count of current tile in the bitstream buffer … It uses the name slice_data_size to
+    /// be consistent with other codec, but actually means tile_data_size" (`va_dec_av1.h:649-653`).
+    pub slice_data_size: u32,
+    /// "offset to the first byte of the data buffer" (`va_dec_av1.h:655-658`).
+    pub slice_data_offset: u32,
+    /// "see VA_SLICE_DATA_FLAG_XXX definitions" (`va_dec_av1.h:659-662`) — [`SLICE_DATA_FLAG_ALL`],
+    /// since each tile is submitted whole.
+    pub slice_data_flag: u32,
+    pub tile_row: u16,
+    pub tile_column: u16,
+    /// `va_deprecated` (`va_dec_av1.h:667`): four bytes of the record, still read, so it is declared
+    /// under its C name and left zero. **Deprecated is not absent** — without these two fields the
+    /// record would be 38 bytes rather than 40 and every offset after them would move.
+    pub tg_start: u16,
+    /// `va_deprecated` (`va_dec_av1.h:668`), as `tg_start`.
+    pub tg_end: u16,
+    /// "anchor frame index for large scale tile … valid only when large_scale_tile equals 1"
+    /// (`va_dec_av1.h:669-673`). Declined with large-scale tile.
+    pub anchor_frame_idx: u8,
+    /// **The C layout's one-byte hole, at offset 21**: `tile_idx_in_tile_list` is a `uint16_t` and
+    /// `anchor_frame_idx` ends at 21.
+    pub padding_before_tile_idx_in_tile_list: [u8; 1],
+    /// "tile index in the tile list … Valid only when large_scale_tile is enabled"
+    /// (`va_dec_av1.h:676-679`).
+    pub tile_idx_in_tile_list: u16,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+// ---------------------------------------------------------------------------------------------
 // The encode records. Encode is the mirror image of decode (the plan's "decisive difference"): the
 // app hands the driver a picture and the driver writes the slice headers, so these are the records
 // that *describe* what to encode rather than what was parsed out of a bitstream. They are built by
@@ -1121,6 +1597,16 @@ impl VaBufferInfo {
     /// The all-zero struct `va.h:4086` requires on input to `vaAcquireBufferHandle`.
     pub const ZEROED: Self = Self { handle: 0, buffer_type: 0, mem_type: 0, mem_size: 0, va_reserved: [0; VA_PADDING_LOW] };
 }
+
+/// `H264_LAST_PICTURE_EOSTREAM` (`va_enc_h264.h:64`): the picture record's `last_picture` value
+/// that tells the driver this is the last picture of the stream, so it appends an `end_of_stream()`
+/// NAL.
+///
+/// **Its sibling `H264_LAST_PICTURE_EOSEQ` (`va_enc_h264.h:58`) is deliberately not declared here.**
+/// It marks the end of a *sequence* within a stream, which is a distinction this backend's encoder
+/// has no way to express — its picture stream is one sequence from end to end — and declaring a
+/// constant nothing could set honestly is how a constant gets set anyway.
+pub const LAST_PICTURE_EOSTREAM: u8 = 0x02;
 
 /// `VAEncSequenceParameterBufferH264` (`va_enc_h264.h:148`): what to encode — the sequence
 /// parameter set's own syntax elements, the periods, and the picture geometry in macroblocks.
@@ -1496,6 +1982,30 @@ pub fn picture_params_vp9(bytes: &[u8]) -> Option<VaPictureParameterBufferVp9> {
 pub fn slice_params_vp9(bytes: &[u8]) -> Option<VaSliceParameterBufferVp9> {
     // SAFETY: `VaSliceParameterBufferVp9` is a `#[repr(C)]` struct declared above.
     unsafe { record_of::<VaSliceParameterBufferVp9>(bytes) }
+}
+
+/// The AV1 picture parameter record `bytes` carries, or `None` if it is not one long enough.
+///
+/// Reads back what `record_bytes` wrote, which is the only way a bit position inside a 1160-byte
+/// record can be verified: the builder produces bytes, and a driver reading them wrong produces a
+/// *picture*, not an error.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn picture_params_av1(bytes: &[u8]) -> Option<VaPictureParameterBufferAv1> {
+    // SAFETY: `VaPictureParameterBufferAv1` is a `#[repr(C)]` struct declared above, and the length
+    // check is inside `record_of`.
+    unsafe { record_of::<VaPictureParameterBufferAv1>(bytes) }
+}
+
+/// The AV1 slice parameter record `bytes` carries, or `None` if it is not one long enough.
+///
+/// The counterpart of [`picture_params_av1`] on the other side of the same submission, and it is a
+/// *different* record: AV1 sends **one per tile**, where VP9's is one per frame. A test that read
+/// only the picture record back would not notice a tile record that was never built at all.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn slice_params_av1(bytes: &[u8]) -> Option<VaSliceParameterBufferAv1> {
+    // SAFETY: `VaSliceParameterBufferAv1` is a `#[repr(C)]` struct declared above, and the length
+    // check is inside `record_of`.
+    unsafe { record_of::<VaSliceParameterBufferAv1>(bytes) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4077,6 +4587,397 @@ mod tests {
         assert_eq!(offset_of!(VaSliceParameterBufferVp9, slice_data_flag), 8);
         assert_eq!(offset_of!(VaSliceParameterBufferVp9, seg_param), 12, "eight 36-byte segments from offset 12");
         assert_eq!(offset_of!(VaSliceParameterBufferVp9, va_reserved), 300, "12 + 8 * 36");
+    }
+
+    /// **Every AV1 record is the size and the offsets a C compiler measures**, and the offsets a
+    /// plausible reading of the header's field list gets wrong are the ones named.
+    ///
+    /// Measured on this machine by
+    /// `cc -I /usr/include/va -o measure measure.c && ./measure` over
+    /// `/usr/include/va/va_dec_av1.h` (GCC 16.2.1, x86-64-pc-linux-gnu), asking for `sizeof`,
+    /// `_Alignof` and `offsetof` on every member. `every_declaration_matches_what_a_c_compiler_measures`
+    /// and `no_submitted_record_has_a_byte_the_header_does_not_account_for` in `abi_guard` ask the same
+    /// compiler the same questions again, from the Rust side's numbers — so these assertions cannot
+    /// drift away from the header without one of the three going red.
+    ///
+    /// **1160 bytes with seven holes.** Five interior gaps and a four-byte tail, none of which any
+    /// `sizeof` can see:
+    ///
+    /// | bytes | between | why |
+    /// |---|---|---|
+    /// | 17-23 (7) | `anchor_frames_num`, `anchor_frames_list` | the C field is a `VASurfaceID *`: 8-aligned |
+    /// | 81-83 (3) | `order_hint`, `seg_info` | `VASegmentationStructAV1` is 4-aligned |
+    /// | 674-675 (2) | `context_update_tile_id`, `pic_info_fields` | that union's `value` is a `uint32_t` |
+    /// | 703 (1) | `v_ac_delta_q`, `qmatrix_fields` | that union's `value` is a `uint16_t` |
+    /// | 706-707 (2) | `qmatrix_fields`, `mode_control_fields` | that union's `value` is a `uint32_t` |
+    /// | 1156-1159 (4) | `va_reserved`, end of struct | the struct's alignment is 8, for that pointer |
+    #[test]
+    fn the_av1_records_are_the_sizes_and_offsets_the_header_declares() {
+        // The picture record (va_dec_av1.h:243).
+        assert_eq!(size_of::<VaPictureParameterBufferAv1>(), 1160, "VADecPictureParameterBufferAV1 (va_dec_av1.h:243)");
+        assert_eq!(align_of::<VaPictureParameterBufferAv1>(), 8, "8 for the VASurfaceID * at offset 24");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, profile), 0);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, order_hint_bits_minus_1), 1);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, bit_depth_idx), 2);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, matrix_coefficients), 3);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, seq_info_fields), 4);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, current_frame), 8);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, current_display_picture), 12);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, anchor_frames_num), 16);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, padding_after_anchor_frames_num), 17, "the seven-byte hole: the pointer is 8-aligned and 17 is not");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, anchor_frames_list), 24, "the pointer is 8-aligned, so it skips 17-23");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, frame_width_minus1), 32);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, frame_height_minus1), 34);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, output_frame_width_in_tiles_minus_1), 36);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, output_frame_height_in_tiles_minus_1), 38);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, ref_frame_map), 40, "eight VASurfaceIDs, 32 bytes");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, ref_frame_idx), 72);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, primary_ref_frame), 79);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, order_hint), 80);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, padding_after_order_hint), 81, "the three-byte hole before the 4-aligned sub-record");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, seg_info), 84);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, film_grain_info), 240, "84 + 156");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, tile_cols), 416, "240 + 176");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, tile_rows), 417);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, width_in_sbs_minus_1), 418, "the uint16_t[] is 2-aligned, which 418 already is");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, height_in_sbs_minus_1), 544, "418 + 63 * 2");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, tile_count_minus_1), 670, "544 + 63 * 2");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, context_update_tile_id), 672);
+        assert_eq!(
+            offset_of!(VaPictureParameterBufferAv1, padding_after_context_update_tile_id),
+            674,
+            "the two-byte hole: pic_info_fields' value is a uint32_t"
+        );
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, pic_info_fields), 676);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, superres_scale_denominator), 680);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, interp_filter), 681);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, filter_level), 682);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, filter_level_u), 684);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, filter_level_v), 685);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, loop_filter_info_fields), 686);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, ref_deltas), 687);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, mode_deltas), 695);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, base_qindex), 697);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, y_dc_delta_q), 698);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, u_dc_delta_q), 699);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, u_ac_delta_q), 700);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, v_dc_delta_q), 701);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, v_ac_delta_q), 702);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, padding_after_v_ac_delta_q), 703, "the one-byte hole: qmatrix_fields' value is a uint16_t");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, qmatrix_fields), 704);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, padding_after_qmatrix_fields), 706, "the two-byte hole: mode_control_fields' value is a uint32_t");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, mode_control_fields), 708);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, cdef_damping_minus_3), 712);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, cdef_bits), 713);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, cdef_y_strengths), 714);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, cdef_uv_strengths), 722);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, loop_restoration_fields), 730);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, wm), 732, "seven 56-byte global-motion entries");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, va_reserved), 1124, "732 + 7 * 56");
+        assert_eq!(
+            offset_of!(VaPictureParameterBufferAv1, padding_after_va_reserved),
+            1156,
+            "1124 + 32, and the record is 4 bytes short of its own 8-byte alignment"
+        );
+
+        // The segmentation sub-record (va_dec_av1.h:80). **156 bytes with NO hole** — the plan for
+        // this milestone records a 4-byte hole at 148-152 and a C compiler says the gap is zero:
+        // `feature_mask` ends at 140 and `va_reserved` is a `uint32_t[4]`, and 140 is 4-aligned. So
+        // this offset is asserted precisely because the two readings disagree.
+        assert_eq!(size_of::<VaSegmentationStructAv1>(), 156, "VASegmentationStructAV1 (va_dec_av1.h:80)");
+        assert_eq!(offset_of!(VaSegmentationStructAv1, segment_info_fields), 0);
+        assert_eq!(offset_of!(VaSegmentationStructAv1, feature_data), 4);
+        assert_eq!(offset_of!(VaSegmentationStructAv1, feature_mask), 132, "4 + 8 * 8 * 2");
+        assert_eq!(offset_of!(VaSegmentationStructAv1, va_reserved), 140, "feature_mask ends at 140, which is already 4-aligned: no hole");
+
+        // The film grain sub-record (va_dec_av1.h:153): one hole, at 153.
+        assert_eq!(size_of::<VaFilmGrainStructAv1>(), 176, "VAFilmGrainStructAV1 (va_dec_av1.h:153)");
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, film_grain_info_fields), 0);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, grain_seed), 4);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, num_y_points), 6);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, point_y_value), 7);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, point_y_scaling), 21);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, num_cb_points), 35);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, point_cb_value), 36);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, point_cb_scaling), 46);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, num_cr_points), 56);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, point_cr_value), 57);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, point_cr_scaling), 67);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, ar_coeffs_y), 77);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, ar_coeffs_cb), 101);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, ar_coeffs_cr), 126);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, cb_mult), 151);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, cb_luma_mult), 152);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, padding_before_cb_offset), 153, "the one-byte hole: cb_offset is a uint16_t");
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, cb_offset), 154);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, cr_mult), 156);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, cr_luma_mult), 157);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, cr_offset), 158);
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, va_reserved), 160);
+
+        // The global-motion sub-record (va_dec_av1.h:216): one hole, three bytes at 37-39.
+        assert_eq!(size_of::<VaWarpedMotionParamsAv1>(), 56, "VAWarpedMotionParamsAV1 (va_dec_av1.h:216)");
+        assert_eq!(offset_of!(VaWarpedMotionParamsAv1, wmtype), 0, "the VAAV1TransformationType enum measures 4 bytes");
+        assert_eq!(offset_of!(VaWarpedMotionParamsAv1, wmmat), 4);
+        assert_eq!(offset_of!(VaWarpedMotionParamsAv1, invalid), 36);
+        assert_eq!(offset_of!(VaWarpedMotionParamsAv1, padding_before_va_reserved), 37, "the three-byte hole: the uint32_t tail is 4-aligned");
+        assert_eq!(offset_of!(VaWarpedMotionParamsAv1, va_reserved), 40);
+
+        // The tile record (va_dec_av1.h:647): one per tile, one hole at 21.
+        assert_eq!(size_of::<VaSliceParameterBufferAv1>(), 40, "VASliceParameterBufferAV1 (va_dec_av1.h:647)");
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, slice_data_size), 0);
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, slice_data_offset), 4);
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, slice_data_flag), 8);
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, tile_row), 12);
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, tile_column), 14);
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, tg_start), 16, "va_deprecated, and still four bytes of the record");
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, tg_end), 18, "va_deprecated, and still four bytes of the record");
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, anchor_frame_idx), 20);
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, padding_before_tile_idx_in_tile_list), 21, "the one-byte hole: tile_idx_in_tile_list is a uint16_t");
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, tile_idx_in_tile_list), 22);
+        assert_eq!(offset_of!(VaSliceParameterBufferAv1, va_reserved), 24);
+    }
+
+    /// **The AV1 bitfield words are declared at the width the C compiler measures, and the member
+    /// table the builders pack against tiles its word end to end.**
+    ///
+    /// Two separate claims, and it matters which is which:
+    ///
+    /// - *That these members are where the header puts them* is **not** proved here. A table of
+    ///   positions compared only with itself proves nothing about the header — it is the shape of pin
+    ///   that passes whatever is written in it. That claim is
+    ///   `the_av1_bitfield_words_are_the_bits_the_c_compiler_measures` in `abi_guard`, which sets each
+    ///   member in a C program and reads the union's `value` back, and fails when the two disagree.
+    /// - *That the table is complete and does not overlap* is proved here: the members below are
+    ///   consecutive from bit 0 to the width of their word, so a member added or widened upstream
+    ///   fails here rather than overwriting its neighbour in a packed record.
+    ///
+    /// A C bitfield's layout is target-dependent and declaration order is not evidence of it: the
+    /// header lists members in an order that happens to be right on the target that compiled it and
+    /// says nothing about any other.
+    #[test]
+    fn the_av1_bitfield_words_are_the_widths_the_header_declares() {
+        /// Member name, bit it starts at, how many bits wide — all measured by the C compiler.
+        const PIC_INFO: &[(&str, u32, u32)] = &[
+            ("frame_type", 0, 2),
+            ("show_frame", 2, 1),
+            ("showable_frame", 3, 1),
+            ("error_resilient_mode", 4, 1),
+            ("disable_cdf_update", 5, 1),
+            ("allow_screen_content_tools", 6, 1),
+            ("force_integer_mv", 7, 1),
+            ("allow_intrabc", 8, 1),
+            ("use_superres", 9, 1),
+            ("allow_high_precision_mv", 10, 1),
+            ("is_motion_mode_switchable", 11, 1),
+            ("use_ref_frame_mvs", 12, 1),
+            ("disable_frame_end_update_cdf", 13, 1),
+            ("uniform_tile_spacing_flag", 14, 1),
+            ("allow_warped_motion", 15, 1),
+            ("large_scale_tile", 16, 1),
+            ("reserved", 17, 15),
+        ];
+        const SEQ_INFO: &[(&str, u32, u32)] = &[
+            ("still_picture", 0, 1),
+            ("use_128x128_superblock", 1, 1),
+            ("enable_filter_intra", 2, 1),
+            ("enable_intra_edge_filter", 3, 1),
+            ("enable_interintra_compound", 4, 1),
+            ("enable_masked_compound", 5, 1),
+            ("enable_dual_filter", 6, 1),
+            ("enable_order_hint", 7, 1),
+            ("enable_jnt_comp", 8, 1),
+            ("enable_cdef", 9, 1),
+            ("mono_chrome", 10, 1),
+            ("color_range", 11, 1),
+            ("subsampling_x", 12, 1),
+            ("subsampling_y", 13, 1),
+            ("chroma_sample_position", 14, 1),
+            ("film_grain_params_present", 15, 1),
+            ("reserved", 16, 16),
+        ];
+        const SEGMENT_INFO: &[(&str, u32, u32)] =
+            &[("enabled", 0, 1), ("update_map", 1, 1), ("temporal_update", 2, 1), ("update_data", 3, 1), ("reserved", 4, 28)];
+        const MODE_CONTROL: &[(&str, u32, u32)] = &[
+            ("delta_q_present_flag", 0, 1),
+            ("log2_delta_q_res", 1, 2),
+            ("delta_lf_present_flag", 3, 1),
+            ("log2_delta_lf_res", 4, 2),
+            ("delta_lf_multi", 6, 1),
+            ("tx_mode", 7, 2),
+            ("reference_select", 9, 1),
+            ("reduced_tx_set_used", 10, 1),
+            ("skip_mode_present", 11, 1),
+            ("reserved", 12, 20),
+        ];
+        const QMATRIX: &[(&str, u32, u32)] = &[("using_qmatrix", 0, 1), ("qm_y", 1, 4), ("qm_u", 5, 4), ("qm_v", 9, 4), ("reserved", 13, 3)];
+        const LOOP_RESTORATION: &[(&str, u32, u32)] = &[
+            ("yframe_restoration_type", 0, 2),
+            ("cbframe_restoration_type", 2, 2),
+            ("crframe_restoration_type", 4, 2),
+            ("lr_unit_shift", 6, 2),
+            ("lr_uv_shift", 8, 1),
+            ("reserved", 9, 7),
+        ];
+        const LOOP_FILTER: &[(&str, u32, u32)] =
+            &[("sharpness_level", 0, 3), ("mode_ref_delta_enabled", 3, 1), ("mode_ref_delta_update", 4, 1), ("reserved", 5, 3)];
+        const FILM_GRAIN: &[(&str, u32, u32)] = &[
+            ("apply_grain", 0, 1),
+            ("chroma_scaling_from_luma", 1, 1),
+            ("grain_scaling_minus_8", 2, 2),
+            ("ar_coeff_lag", 4, 2),
+            ("ar_coeff_shift_minus_6", 6, 2),
+            ("grain_scale_shift", 8, 2),
+            ("overlap_flag", 10, 1),
+            ("clip_to_restricted_range", 11, 1),
+            ("reserved", 12, 20),
+        ];
+
+        /// The members must tile their union's word end to end, from bit 0, with nothing overlapping
+        /// and nothing past the end — so "these are the measured positions" is a statement about the
+        /// whole union rather than about members that happen to be listed.
+        fn tiles(uname: &str, word: &str, members: &[(&str, u32, u32)], width: u32) {
+            let mut at = 0u32;
+            for (name, bit, size) in members {
+                assert_eq!(*bit, at, "{uname}.{name}: measured at bit {bit}, and the member before it ends at {at}");
+                assert!(*size > 0, "{uname}.{name} is {size} bits wide");
+                at += *size;
+            }
+            assert_eq!(at, width, "{uname}: the members end at bit {at} and the word is {width} bits");
+            // and the widths this test pins are the ones the declaration documents, so a member that
+            // is renamed or re-ordered upstream is caught here rather than in a packed record
+            let _ = word;
+        }
+        tiles("pic_info_fields", "uint32_t", PIC_INFO, 32);
+        tiles("seq_info_fields", "uint32_t", SEQ_INFO, 32);
+        tiles("segment_info_fields", "uint32_t", SEGMENT_INFO, 32);
+        tiles("mode_control_fields", "uint32_t", MODE_CONTROL, 32);
+        tiles("qmatrix_fields", "uint16_t", QMATRIX, 16);
+        tiles("loop_restoration_fields", "uint16_t", LOOP_RESTORATION, 16);
+        tiles("loop_filter_info_fields", "uint8_t", LOOP_FILTER, 8);
+        tiles("film_grain_info_fields", "uint32_t", FILM_GRAIN, 32);
+
+        // The words themselves are the header's `value` members, at the widths C measures for them:
+        // a `uint32_t`, a `uint16_t` and a `uint8_t` are not interchangeable, and a word declared
+        // `u32` where the header says `uint16_t` would put the next field four bytes out.
+        assert_eq!(size_of::<u32>(), 4);
+        assert_eq!(size_of::<u16>(), 2);
+        assert_eq!(size_of::<u8>(), 1);
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, pic_info_fields), 676, "the 32-bit word");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, seq_info_fields), 4, "the 32-bit word");
+        assert_eq!(offset_of!(VaSegmentationStructAv1, segment_info_fields), 0, "the 32-bit word");
+        assert_eq!(offset_of!(VaFilmGrainStructAv1, film_grain_info_fields), 0, "the 32-bit word");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, qmatrix_fields), 704, "the 16-bit word");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, loop_restoration_fields), 730, "the 16-bit word");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, loop_filter_info_fields), 686, "the 8-bit word");
+        assert_eq!(offset_of!(VaPictureParameterBufferAv1, mode_control_fields), 708, "the 32-bit word");
+    }
+
+    /// **Every AV1 record round-trips through the bytes a driver actually reads**, field at a field,
+    /// at the offset it claims.
+    ///
+    /// `offset_of!` proves where a field sits in a *Rust* struct and the C compiler proves where it
+    /// sits in the *C* one; neither proves that [`record_bytes`] puts that field at that byte and
+    /// that [`picture_params_av1`] reads it back from there. That round trip is what the record
+    /// builders are written against and the only way a one-byte shift anywhere in 1160 would show up
+    /// as a value rather than as nothing at all.
+    ///
+    /// It also pins the hand-written [`Default`] — which exists because `#[derive(Default)]` cannot
+    /// be used for a record carrying a 63-element array — against the property the derive would have
+    /// given: **every byte zero**, holes included.
+    #[test]
+    fn the_av1_records_round_trip_through_their_bytes() {
+        /// `PRIMARY_REF_NONE` is 7 (`va_dec_av1.h:373`); spelled out here because the round trip is
+        /// about the *bytes*, so the number has to be written rather than imported.
+        const PRIMARY_REF_NONE: u8 = 7;
+        // A default picture record is 1160 zero bytes. `record_bytes` casts `&T` to `&[u8]`, so an
+        // unnamed hole would be indeterminate memory handed to a driver — which is the whole reason
+        // the seven holes are fields rather than the compiler's.
+        let bytes = record_bytes(&VaPictureParameterBufferAv1::default());
+        assert_eq!(bytes.len(), 1160);
+        assert!(bytes.iter().all(|&b| b == 0), "a default AV1 picture record has a non-zero byte at {:?}", bytes.iter().position(|&b| b != 0));
+
+        // A field set high in the record comes back from the offset it claims, not from one shifted.
+        // `pic.profile` is 0 (`KEY_FRAME`) and `superres_scale_denominator` is 8 with `use_superres` 0
+        // (`va_dec_av1.h:449-452`), so setting either would be a no-op that only claims to test
+        // something. Every field written below is written because its default differs from it.
+        let mut pic = VaPictureParameterBufferAv1 {
+            order_hint_bits_minus_1: 6,
+            anchor_frames_list: 0x1122_3344_5566_7788,
+            ref_frame_map: [INVALID_SURFACE; 8],
+            primary_ref_frame: PRIMARY_REF_NONE,
+            ..VaPictureParameterBufferAv1::default()
+        };
+        pic.ref_frame_map[3] = 42;
+        pic.seg_info.feature_data[2][0] = -7;
+        pic.seg_info.feature_mask[2] = 0b0000_1001;
+        // `frame_type` 0:2 = 3, `use_superres` 9, `allow_warped_motion` 15 — three measured bit
+        // positions from `va_dec_av1.h:424-444`, and a packed word that means something.
+        pic.pic_info_fields = 3 | (1 << 9) | (1 << 15);
+        pic.qmatrix_fields = 1 | (0xf << 1) | (0x7 << 5) | (0x2 << 9);
+        pic.loop_filter_info_fields = 7;
+        pic.loop_restoration_fields = 3 | (2 << 2) | (1 << 4) | (3 << 6) | (1 << 8);
+        pic.wm[6].wmtype = 3;
+        pic.wm[6].wmmat = [1, -2, 3, -4, 5, -6, 0, 0];
+        let raw = record_bytes(&pic);
+        let back = picture_params_av1(&raw).expect("1160 bytes is an AV1 picture record");
+        assert_eq!(back.profile, pic.profile);
+        assert_eq!(back.order_hint_bits_minus_1, 6);
+        assert_eq!(back.anchor_frames_list, pic.anchor_frames_list, "the pointer field round-trips as an address");
+        assert_eq!(back.ref_frame_map[3], 42, "a slot with a picture in it");
+        assert_eq!(back.ref_frame_map[0], INVALID_SURFACE, "an empty slot is VA_INVALID_SURFACE, never a zero");
+        assert_eq!(back.primary_ref_frame, PRIMARY_REF_NONE);
+        assert_eq!(back.seg_info.feature_data[2][0], -7);
+        assert_eq!(back.seg_info.feature_mask[2], 0b0000_1001);
+        assert_eq!(back.pic_info_fields, pic.pic_info_fields);
+        assert_eq!(back.qmatrix_fields, pic.qmatrix_fields);
+        assert_eq!(back.loop_filter_info_fields, 7);
+        assert_eq!(back.loop_restoration_fields, pic.loop_restoration_fields);
+        assert_eq!(back.wm[6].wmtype, 3, "the seventh global-motion entry is at 732 + 6 * 56");
+        assert_eq!(back.wm[6].wmmat, pic.wm[6].wmmat);
+        assert_eq!(back, pic, "and the whole record survives the round trip unchanged");
+
+        // The holes are named *and* zero: every one of the seven is written by `Default`, which is
+        // what makes them bytes rather than stack contents. Checked at the offsets the C compiler
+        // measured, so a hole that moved is caught here too.
+        for (at, width, what) in [
+            (17usize, 7usize, "before anchor_frames_list"),
+            (81, 3, "before seg_info"),
+            (674, 2, "before pic_info_fields"),
+            (703, 1, "before qmatrix_fields"),
+            (706, 2, "before mode_control_fields"),
+            (1156, 4, "after va_reserved"),
+        ] {
+            let slice = raw.get(at..at + width).unwrap_or_else(|| panic!("{what}: {at}..{} is inside a 1160-byte record", at + width));
+            assert!(slice.iter().all(|&b| b == 0), "the hole {what} at {at} is not a zeroed field: {slice:?}");
+        }
+
+        // The tile record is a *separate* record, sent once per tile — a test that read back only
+        // the picture record would not notice a tile record that was never built at all.
+        assert!(record_bytes(&VaSliceParameterBufferAv1::default()).iter().all(|&b| b == 0), "a default AV1 tile record has a non-zero byte");
+        let tile = VaSliceParameterBufferAv1 {
+            slice_data_size: 4096,
+            slice_data_offset: 12,
+            slice_data_flag: SLICE_DATA_FLAG_ALL,
+            tile_row: 3,
+            tile_column: 5,
+            tile_idx_in_tile_list: 17,
+            ..VaSliceParameterBufferAv1::default()
+        };
+        let tile_bytes = record_bytes(&tile);
+        assert_eq!(tile_bytes.len(), 40);
+        let back = slice_params_av1(&tile_bytes).expect("40 bytes is an AV1 tile record");
+        assert_eq!(back.slice_data_size, 4096);
+        assert_eq!(back.slice_data_flag, SLICE_DATA_FLAG_ALL, "and the flag is the whole-frame one, 0x7");
+        assert_eq!(back.tile_row, 3);
+        assert_eq!(back.tile_column, 5);
+        assert_eq!(back.tile_idx_in_tile_list, 17);
+        assert_eq!(back, tile);
+        // the tile record's own hole, at 21, is a zeroed field like every other
+        assert_eq!(tile_bytes.get(21..22), Some([0u8].as_slice()), "the hole before tile_idx_in_tile_list is a zeroed field");
+        // and a buffer too short for either record is refused rather than read past its end
+        assert!(slice_params_av1(&tile_bytes[..39]).is_none(), "39 bytes is not a 40-byte record");
+        assert!(picture_params_av1(&tile_bytes[..39]).is_none(), "39 bytes is not a 1160-byte picture record");
     }
 
     /// **Every byte of every VP9 record belongs to a named field**, which is the property

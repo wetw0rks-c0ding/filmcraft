@@ -2,8 +2,14 @@
 
 use crate::{Error, Result};
 
+/// MSB-first bit reader for OBU headers and the uncompressed frame header (spec 4.10 descriptors).
+///
+/// `pub` because the VA-API backend reads an AV1 frame header out of a frame's own bytes to build
+/// `VADecPictureParameterBufferAV1`, and [`crate::header::FrameHeader::parse`] — which takes one of
+/// these — cannot be callable from outside this crate while the type is not. Nothing about the
+/// reader's *behaviour* changed when it was widened; see the crate-level note in `lib.rs`.
 #[derive(Clone)]
-pub(crate) struct BitReader<'a> {
+pub struct BitReader<'a> {
     data: &'a [u8],
     /// Position in bits.
     pos: usize,

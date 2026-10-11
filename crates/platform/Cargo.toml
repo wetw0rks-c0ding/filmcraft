@@ -38,9 +38,11 @@ filmcraft-hevc = { workspace = true }
 # derived from the same parse the software decoder runs rather than guessed; only the header
 # module (`filmcraft_vp9::header`) is used — not the pixel decoder, which the fallback already has.
 filmcraft-vp9 = { workspace = true }
-# `filmcraft-av1` is deliberately still absent: nothing here parses an AV1 sequence header or
-# temporal unit, and an AV1 record built from invented values is one a driver reads as a valid
-# picture. `src/vaapi/stream.rs` declines the AV1 record for the same reason it still declines VP9.
+# AV1, for the same reason as VP9 and one step further: an AV1 picture-parameter record is built
+# from the *frame's own* uncompressed header, which `filmcraft-av1` parses from the AV1 Bitstream &
+# Decoding Process Specification v1.0.0 with Errata 1. Only `filmcraft_av1::header` (and the
+# `BitReader` it reads through) is used — not the pixel decoder, which the fallback already has.
+filmcraft-av1 = { workspace = true }
 filmcraft-time = { workspace = true }
 log = { workspace = true }
 

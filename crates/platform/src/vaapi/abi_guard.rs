@@ -233,6 +233,193 @@ fn the_vp9_records_are_the_sizes_the_header_declares() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The AV1 bitfield unions, measured by *running* a C program rather than by reading the header.
+//
+// Every other check in this module is a `_Static_assert`, which works because `sizeof` and
+// `offsetof` are compile-time constants. A bitfield's position is not: nothing in C can ask "where
+// does member `x` of this union start" without setting it and reading the word back, which is a
+// runtime operation. So this one compiles and **runs**, and compares what the C compiler produced
+// with a table written here — two independent sides, either of which can be wrong.
+//
+// Why it is not a table compared with itself: the header declares each union's members in an order
+// that happens to be right on the target that compiled it and says nothing about any other, so
+// "I read the order off the header and wrote it down" is not a measurement. Every entry below was
+// produced by `printf("%u %u", __builtin_ctz(v), 31 - __builtin_clz(v))` after setting that member to
+// all ones — the low set bit is where the member starts and the high set bit is where it ends.
+//
+// This matters because a bit position in these records is invisible to every other gate: a union has
+// one `offsetof`, so a member packed one bit too high agrees with the C compiler on the record's
+// size, on every field offset and on every hole, and produces a *picture*.
+// ---------------------------------------------------------------------------------------------
+
+/// One union member of an AV1 record: which struct, which union, **which member of the anonymous
+/// struct inside that union** (libva calls it `bits` in seven of the eight and `fields` in
+/// `seq_info_fields`, `va_dec_av1.h:289` — so it is carried per row rather than assumed), the
+/// member's own C name, and the bit range a C compiler puts it at.
+const AV1_BITFIELDS: &[(&str, &str, &str, &str, u32, u32)] = &[
+    // VADecPictureParameterBufferAV1.seq_info_fields (va_dec_av1.h:266-291), uint32_t
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "still_picture", 0, 0),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "use_128x128_superblock", 1, 1),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "enable_filter_intra", 2, 2),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "enable_intra_edge_filter", 3, 3),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "enable_interintra_compound", 4, 4),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "enable_masked_compound", 5, 5),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "enable_dual_filter", 6, 6),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "enable_order_hint", 7, 7),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "enable_jnt_comp", 8, 8),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "enable_cdef", 9, 9),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "mono_chrome", 10, 10),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "color_range", 11, 11),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "subsampling_x", 12, 12),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "subsampling_y", 13, 13),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "chroma_sample_position", 14, 14),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "film_grain_params_present", 15, 15),
+    ("VADecPictureParameterBufferAV1", "seq_info_fields", "fields", "reserved", 16, 31),
+    // VADecPictureParameterBufferAV1.pic_info_fields (va_dec_av1.h:409-447), uint32_t
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "frame_type", 0, 1),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "show_frame", 2, 2),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "showable_frame", 3, 3),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "error_resilient_mode", 4, 4),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "disable_cdf_update", 5, 5),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "allow_screen_content_tools", 6, 6),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "force_integer_mv", 7, 7),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "allow_intrabc", 8, 8),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "use_superres", 9, 9),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "allow_high_precision_mv", 10, 10),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "is_motion_mode_switchable", 11, 11),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "use_ref_frame_mvs", 12, 12),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "disable_frame_end_update_cdf", 13, 13),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "uniform_tile_spacing_flag", 14, 14),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "allow_warped_motion", 15, 15),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "large_scale_tile", 16, 16),
+    ("VADecPictureParameterBufferAV1", "pic_info_fields", "bits", "reserved", 17, 31),
+    // VADecPictureParameterBufferAV1.mode_control_fields (va_dec_av1.h:544-576), uint32_t
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "delta_q_present_flag", 0, 0),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "log2_delta_q_res", 1, 2),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "delta_lf_present_flag", 3, 3),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "log2_delta_lf_res", 4, 5),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "delta_lf_multi", 6, 6),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "tx_mode", 7, 8),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "reference_select", 9, 9),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "reduced_tx_set_used", 10, 10),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "skip_mode_present", 11, 11),
+    ("VADecPictureParameterBufferAV1", "mode_control_fields", "bits", "reserved", 12, 31),
+    // VADecPictureParameterBufferAV1.qmatrix_fields (va_dec_av1.h:527-542), uint16_t
+    ("VADecPictureParameterBufferAV1", "qmatrix_fields", "bits", "using_qmatrix", 0, 0),
+    ("VADecPictureParameterBufferAV1", "qmatrix_fields", "bits", "qm_y", 1, 4),
+    ("VADecPictureParameterBufferAV1", "qmatrix_fields", "bits", "qm_u", 5, 8),
+    ("VADecPictureParameterBufferAV1", "qmatrix_fields", "bits", "qm_v", 9, 12),
+    ("VADecPictureParameterBufferAV1", "qmatrix_fields", "bits", "reserved", 13, 15),
+    // VADecPictureParameterBufferAV1.loop_restoration_fields (va_dec_av1.h:606-618), uint16_t
+    ("VADecPictureParameterBufferAV1", "loop_restoration_fields", "bits", "yframe_restoration_type", 0, 1),
+    ("VADecPictureParameterBufferAV1", "loop_restoration_fields", "bits", "cbframe_restoration_type", 2, 3),
+    ("VADecPictureParameterBufferAV1", "loop_restoration_fields", "bits", "crframe_restoration_type", 4, 5),
+    ("VADecPictureParameterBufferAV1", "loop_restoration_fields", "bits", "lr_unit_shift", 6, 7),
+    ("VADecPictureParameterBufferAV1", "loop_restoration_fields", "bits", "lr_uv_shift", 8, 8),
+    ("VADecPictureParameterBufferAV1", "loop_restoration_fields", "bits", "reserved", 9, 15),
+    // VADecPictureParameterBufferAV1.loop_filter_info_fields (va_dec_av1.h:471-484), uint8_t
+    ("VADecPictureParameterBufferAV1", "loop_filter_info_fields", "bits", "sharpness_level", 0, 2),
+    ("VADecPictureParameterBufferAV1", "loop_filter_info_fields", "bits", "mode_ref_delta_enabled", 3, 3),
+    ("VADecPictureParameterBufferAV1", "loop_filter_info_fields", "bits", "mode_ref_delta_update", 4, 4),
+    ("VADecPictureParameterBufferAV1", "loop_filter_info_fields", "bits", "reserved", 5, 7),
+    // VASegmentationStructAV1.segment_info_fields (va_dec_av1.h:81-114), uint32_t
+    ("VASegmentationStructAV1", "segment_info_fields", "bits", "enabled", 0, 0),
+    ("VASegmentationStructAV1", "segment_info_fields", "bits", "update_map", 1, 1),
+    ("VASegmentationStructAV1", "segment_info_fields", "bits", "temporal_update", 2, 2),
+    ("VASegmentationStructAV1", "segment_info_fields", "bits", "update_data", 3, 3),
+    ("VASegmentationStructAV1", "segment_info_fields", "bits", "reserved", 4, 31),
+    // VAFilmGrainStructAV1.film_grain_info_fields (va_dec_av1.h:155-172), uint32_t
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "apply_grain", 0, 0),
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "chroma_scaling_from_luma", 1, 1),
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "grain_scaling_minus_8", 2, 3),
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "ar_coeff_lag", 4, 5),
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "ar_coeff_shift_minus_6", 6, 7),
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "grain_scale_shift", 8, 9),
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "overlap_flag", 10, 10),
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "clip_to_restricted_range", 11, 11),
+    ("VAFilmGrainStructAV1", "film_grain_info_fields", "bits", "reserved", 12, 31),
+];
+
+/// **Every AV1 bitfield union member is at the bit a C compiler puts it at, and its width is the
+/// width the C compiler gives it** — measured by *running* the C, not by reading the header.
+///
+/// The failure this exists for is not visible to any other check in this module. A union has one
+/// `offsetof`, so a member packed one bit too high agrees with the C compiler on the record's
+/// `sizeof`, on every field offset and on every hole width, and the result of submitting it is a
+/// **picture** rather than an error. Nor can the header be read for it: the members are declared in
+/// an order that is right on the target that compiled it and carries no information about any other.
+///
+/// The comparison has two independent sides — a C program that sets one member to all ones and prints
+/// `__builtin_ctz(value)` and `31 - __builtin_clz(value)`, and [`AV1_BITFIELDS`] above — so a member
+/// that moves, or a table entry that drifts, fails here naming the union and the member.
+#[test]
+fn the_av1_bitfield_words_are_the_bits_the_c_compiler_measures() {
+    if !std::path::Path::new(LIBVA_HEADERS).join("va_dec_av1.h").is_file() {
+        eprintln!("SKIPPED: no {LIBVA_HEADERS}/va_dec_av1.h");
+        return;
+    }
+    let Some(cc) = ["cc", "gcc", "clang"].into_iter().find_map(which) else {
+        eprintln!("SKIPPED: no C compiler to measure the headers with");
+        return;
+    };
+    // Every member is set to all ones of its width. `__builtin_ctz` then names the bit it starts at
+    // and `31 - __builtin_clz` the bit it ends at. The two are computed by the compiler that lays
+    // the union out, which is the whole point: nothing here reads the header's text.
+    let mut source = String::from(
+        "#include <stdio.h>\n#include <string.h>\n#include <stdint.h>\n#include <va/va.h>\n#include <va/va_dec_av1.h>\n\n\
+         static void report(const char *u, const char *m, unsigned v) {\n\
+         \x20   if (v == 0) { printf(\"%s %s NONE\\n\", u, m); return; }\n\
+         \x20   printf(\"%s %s %u %u\\n\", u, m, (unsigned)__builtin_ctz(v), 31u - (unsigned)__builtin_clz(v));\n\
+         }\n\n\
+         int main(void) {\n",
+    );
+    for (record, union, sfield, member, _, _) in AV1_BITFIELDS {
+        // `~0u` is all ones for any width up to 32, which is every member here; the assignment
+        // truncates to the member's own width, so a member narrower than a word cannot spill into its
+        // neighbour — and `report` reading the whole word back is what would show it if it did.
+        source.push_str(&format!(
+            "\x20 {{ {record} r; memset(&r, 0, sizeof r); r.{union}.{sfield}.{member} = ~0u; report(\"{union}\", \"{member}\", (unsigned)r.{union}.value); }}\n"
+        ));
+    }
+    source.push_str("\x20 return 0;\n}\n");
+    let dir = std::env::temp_dir().join(format!("filmcraft-va-av1-bits-{}", std::process::id()));
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("SKIPPED: no writable temporary directory");
+        return;
+    }
+    let path = dir.join("av1bits.c");
+    let written = std::fs::write(&path, source.as_bytes()).is_ok();
+    let exe = dir.join("av1bits");
+    let built = if written {
+        std::process::Command::new(&cc).args(["-w", "-o", exe.to_str().unwrap_or_default(), path.to_str().unwrap_or_default()]).output()
+    } else {
+        eprintln!("SKIPPED: cannot write {}", path.display());
+        return;
+    };
+    let built = built.unwrap_or_else(|e| panic!("running {cc} failed: {e}"));
+    assert!(built.status.success(), "{cc} rejected the AV1 bitfield probe against the headers:\n{}", String::from_utf8_lossy(&built.stderr));
+    // **Run before the directory goes.** The probe *is* the executable just written into it, so
+    // removing the directory first is how this test would skip itself without noticing: every
+    // comparison below would then be against an empty string and the `find` would panic anyway —
+    // but with a message about a missing file rather than about a wrong bit.
+    let run = std::process::Command::new(exe.to_str().unwrap_or_default()).output().unwrap_or_else(|e| panic!("running the AV1 bitfield probe failed: {e}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let printed = String::from_utf8_lossy(&run.stdout).to_string();
+
+    let mut seen = 0usize;
+    for (record, union, _, member, low, high) in AV1_BITFIELDS {
+        let want = format!("{union} {member} {low} {high}");
+        let line = printed
+            .lines()
+            .find(|l| l.starts_with(&format!("{union} {member} ")))
+            .unwrap_or_else(|| panic!("{cc} printed nothing for {record}.{union}.{member}:\n{printed}"));
+        assert_eq!(line, want, "{record}: {union}.{member} — {cc} says `{line}`, our table says `{want}`");
+        seen += 1;
+    }
+    assert_eq!(seen, AV1_BITFIELDS.len(), "every member in the table was checked");
+}
+
+// ---------------------------------------------------------------------------------------------
 // Every record this backend hands to a driver, and every field in it, written out once.
 //
 // The list is by hand on purpose. A record gains a field far more often than it loses one, and a
@@ -532,6 +719,131 @@ static SUBMITTED_RECORDS: &[SubmittedRecord] = submitted_records![
         ("seg_param", seg_param, size_of::<[VaSegmentParameterVp9; 8]>()),
         ("va_reserved", va_reserved, VA_PADDING_LOW * size_of::<u32>()),
     ],
+    // AV1 (va_dec_av1.h). **This is the record with seven holes**, and each one is written here as
+    // the `padding_*` field that covers it rather than left to the compiler, so that
+    // `every_record_the_backend_submits_tiles_byte_for_byte` proves the fields cover the record and
+    // `no_submitted_record_has_a_byte_the_header_does_not_account_for` can ask C for each gap's width
+    // as a difference between two `offsetof`s. Six interior gaps plus a trailing pad:
+    //
+    //   17-23  after anchor_frames_num      7   the VASurfaceID * is 8-aligned
+    //   81-83  after order_hint              3   VASegmentationStructAV1 is 4-aligned
+    //   674-675 after context_update_tile_id 2   pic_info_fields' value is a uint32_t
+    //   703    after v_ac_delta_q            1   qmatrix_fields' value is a uint16_t
+    //   706-707 after qmatrix_fields         2   mode_control_fields' value is a uint32_t
+    //   1156-1159 after va_reserved          4   the struct's alignment is 8, for that pointer
+    //
+    // And one place where a hole was *claimed* and is not there: `VASegmentationStructAV1` has none.
+    // The plan for this milestone records a 4-byte hole at 148-152 before its `va_reserved`, and
+    // `feature_mask` ends at 140 with `va_reserved` a `uint32_t[4]` at 140 — measured, gap zero. It
+    // is listed with no `padding_*` row so that "no hole" is asserted as a gap of zero rather than
+    // left unchecked, which is what would happen if the record were simply absent from this table.
+    "VADecPictureParameterBufferAV1": size_of::<VaPictureParameterBufferAv1>() => [
+        ("profile", profile, size_of::<u8>()),
+        ("order_hint_bits_minus_1", order_hint_bits_minus_1, size_of::<u8>()),
+        ("bit_depth_idx", bit_depth_idx, size_of::<u8>()),
+        ("matrix_coefficients", matrix_coefficients, size_of::<u8>()),
+        ("seq_info_fields", seq_info_fields, size_of::<u32>()),
+        ("current_frame", current_frame, size_of::<VASurfaceID>()),
+        ("current_display_picture", current_display_picture, size_of::<VASurfaceID>()),
+        ("anchor_frames_num", anchor_frames_num, size_of::<u8>()),
+        ("-", padding_after_anchor_frames_num, size_of::<[u8; 7]>()),
+        ("anchor_frames_list", anchor_frames_list, size_of::<u64>()),
+        ("frame_width_minus1", frame_width_minus1, size_of::<u16>()),
+        ("frame_height_minus1", frame_height_minus1, size_of::<u16>()),
+        ("output_frame_width_in_tiles_minus_1", output_frame_width_in_tiles_minus_1, size_of::<u16>()),
+        ("output_frame_height_in_tiles_minus_1", output_frame_height_in_tiles_minus_1, size_of::<u16>()),
+        ("ref_frame_map", ref_frame_map, size_of::<[VASurfaceID; 8]>()),
+        ("ref_frame_idx", ref_frame_idx, size_of::<[u8; 7]>()),
+        ("primary_ref_frame", primary_ref_frame, size_of::<u8>()),
+        ("order_hint", order_hint, size_of::<u8>()),
+        ("-", padding_after_order_hint, size_of::<[u8; 3]>()),
+        ("seg_info", seg_info, size_of::<VaSegmentationStructAv1>()),
+        ("film_grain_info", film_grain_info, size_of::<VaFilmGrainStructAv1>()),
+        ("tile_cols", tile_cols, size_of::<u8>()),
+        ("tile_rows", tile_rows, size_of::<u8>()),
+        ("width_in_sbs_minus_1", width_in_sbs_minus_1, size_of::<[u16; 63]>()),
+        ("height_in_sbs_minus_1", height_in_sbs_minus_1, size_of::<[u16; 63]>()),
+        ("tile_count_minus_1", tile_count_minus_1, size_of::<u16>()),
+        ("context_update_tile_id", context_update_tile_id, size_of::<u16>()),
+        ("-", padding_after_context_update_tile_id, size_of::<[u8; 2]>()),
+        ("pic_info_fields", pic_info_fields, size_of::<u32>()),
+        ("superres_scale_denominator", superres_scale_denominator, size_of::<u8>()),
+        ("interp_filter", interp_filter, size_of::<u8>()),
+        ("filter_level", filter_level, size_of::<[u8; 2]>()),
+        ("filter_level_u", filter_level_u, size_of::<u8>()),
+        ("filter_level_v", filter_level_v, size_of::<u8>()),
+        ("loop_filter_info_fields", loop_filter_info_fields, size_of::<u8>()),
+        ("ref_deltas", ref_deltas, size_of::<[i8; 8]>()),
+        ("mode_deltas", mode_deltas, size_of::<[i8; 2]>()),
+        ("base_qindex", base_qindex, size_of::<u8>()),
+        ("y_dc_delta_q", y_dc_delta_q, size_of::<i8>()),
+        ("u_dc_delta_q", u_dc_delta_q, size_of::<i8>()),
+        ("u_ac_delta_q", u_ac_delta_q, size_of::<i8>()),
+        ("v_dc_delta_q", v_dc_delta_q, size_of::<i8>()),
+        ("v_ac_delta_q", v_ac_delta_q, size_of::<i8>()),
+        ("-", padding_after_v_ac_delta_q, size_of::<[u8; 1]>()),
+        ("qmatrix_fields", qmatrix_fields, size_of::<u16>()),
+        ("-", padding_after_qmatrix_fields, size_of::<[u8; 2]>()),
+        ("mode_control_fields", mode_control_fields, size_of::<u32>()),
+        ("cdef_damping_minus_3", cdef_damping_minus_3, size_of::<u8>()),
+        ("cdef_bits", cdef_bits, size_of::<u8>()),
+        ("cdef_y_strengths", cdef_y_strengths, size_of::<[u8; 8]>()),
+        ("cdef_uv_strengths", cdef_uv_strengths, size_of::<[u8; 8]>()),
+        ("loop_restoration_fields", loop_restoration_fields, size_of::<u16>()),
+        ("wm", wm, size_of::<[VaWarpedMotionParamsAv1; 7]>()),
+        ("va_reserved", va_reserved, VA_PADDING_MEDIUM * size_of::<u32>()),
+        ("-", padding_after_va_reserved, size_of::<[u8; 4]>()),
+    ],
+    "VASegmentationStructAV1": size_of::<VaSegmentationStructAv1>() => [
+        ("segment_info_fields", segment_info_fields, size_of::<u32>()),
+        ("feature_data", feature_data, size_of::<[[i16; 8]; 8]>()),
+        ("feature_mask", feature_mask, size_of::<[u8; 8]>()),
+        ("va_reserved", va_reserved, VA_PADDING_LOW * size_of::<u32>()),
+    ],
+    "VAFilmGrainStructAV1": size_of::<VaFilmGrainStructAv1>() => [
+        ("film_grain_info_fields", film_grain_info_fields, size_of::<u32>()),
+        ("grain_seed", grain_seed, size_of::<u16>()),
+        ("num_y_points", num_y_points, size_of::<u8>()),
+        ("point_y_value", point_y_value, size_of::<[u8; 14]>()),
+        ("point_y_scaling", point_y_scaling, size_of::<[u8; 14]>()),
+        ("num_cb_points", num_cb_points, size_of::<u8>()),
+        ("point_cb_value", point_cb_value, size_of::<[u8; 10]>()),
+        ("point_cb_scaling", point_cb_scaling, size_of::<[u8; 10]>()),
+        ("num_cr_points", num_cr_points, size_of::<u8>()),
+        ("point_cr_value", point_cr_value, size_of::<[u8; 10]>()),
+        ("point_cr_scaling", point_cr_scaling, size_of::<[u8; 10]>()),
+        ("ar_coeffs_y", ar_coeffs_y, size_of::<[i8; 24]>()),
+        ("ar_coeffs_cb", ar_coeffs_cb, size_of::<[i8; 25]>()),
+        ("ar_coeffs_cr", ar_coeffs_cr, size_of::<[i8; 25]>()),
+        ("cb_mult", cb_mult, size_of::<u8>()),
+        ("cb_luma_mult", cb_luma_mult, size_of::<u8>()),
+        ("-", padding_before_cb_offset, size_of::<[u8; 1]>()),
+        ("cb_offset", cb_offset, size_of::<u16>()),
+        ("cr_mult", cr_mult, size_of::<u8>()),
+        ("cr_luma_mult", cr_luma_mult, size_of::<u8>()),
+        ("cr_offset", cr_offset, size_of::<u16>()),
+        ("va_reserved", va_reserved, VA_PADDING_LOW * size_of::<u32>()),
+    ],
+    "VAWarpedMotionParamsAV1": size_of::<VaWarpedMotionParamsAv1>() => [
+        ("wmtype", wmtype, size_of::<u32>()),
+        ("wmmat", wmmat, size_of::<[i32; 8]>()),
+        ("invalid", invalid, size_of::<u8>()),
+        ("-", padding_before_va_reserved, size_of::<[u8; 3]>()),
+        ("va_reserved", va_reserved, VA_PADDING_LOW * size_of::<u32>()),
+    ],
+    "VASliceParameterBufferAV1": size_of::<VaSliceParameterBufferAv1>() => [
+        ("slice_data_size", slice_data_size, size_of::<u32>()),
+        ("slice_data_offset", slice_data_offset, size_of::<u32>()),
+        ("slice_data_flag", slice_data_flag, size_of::<u32>()),
+        ("tile_row", tile_row, size_of::<u16>()),
+        ("tile_column", tile_column, size_of::<u16>()),
+        ("tg_start", tg_start, size_of::<u16>()),
+        ("tg_end", tg_end, size_of::<u16>()),
+        ("anchor_frame_idx", anchor_frame_idx, size_of::<u8>()),
+        ("-", padding_before_tile_idx_in_tile_list, size_of::<[u8; 1]>()),
+        ("tile_idx_in_tile_list", tile_idx_in_tile_list, size_of::<u16>()),
+        ("va_reserved", va_reserved, VA_PADDING_LOW * size_of::<u32>()),
+    ],
     "VACodedBufferSegment": size_of::<VaCodedBufferSegment>() => [
         ("size", size, size_of::<u32>()),
         ("bit_offset", bit_offset, size_of::<u32>()),
@@ -738,7 +1050,7 @@ fn no_submitted_record_has_a_byte_the_header_does_not_account_for() {
     // machine that can run this backend at all (libva's own DRM backend includes it), so its absence
     // is a machine with no DRM headers rather than a machine where the check could not be asked.
     let mut source = String::from(
-        "#include <stdint.h>\n#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n#include <drm/drm.h>\n",
+        "#include <stdint.h>\n#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_av1.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n#include <drm/drm.h>\n",
     );
     for record in SUBMITTED_RECORDS {
         source.push_str(&format!("\n/* {} */\n", record.c_name));
@@ -843,6 +1155,11 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
         ("VADecPictureParameterBufferVP9", size_of::<VaPictureParameterBufferVp9>()),
         ("VASegmentParameterVP9", size_of::<VaSegmentParameterVp9>()),
         ("VASliceParameterBufferVP9", size_of::<VaSliceParameterBufferVp9>()),
+        ("VADecPictureParameterBufferAV1", size_of::<VaPictureParameterBufferAv1>()),
+        ("VASegmentationStructAV1", size_of::<VaSegmentationStructAv1>()),
+        ("VAFilmGrainStructAV1", size_of::<VaFilmGrainStructAv1>()),
+        ("VAWarpedMotionParamsAV1", size_of::<VaWarpedMotionParamsAv1>()),
+        ("VASliceParameterBufferAV1", size_of::<VaSliceParameterBufferAv1>()),
         ("VACodedBufferSegment", size_of::<VaCodedBufferSegment>()),
         ("VABufferInfo", size_of::<VaBufferInfo>()),
         ("VAEncSequenceParameterBufferH264", size_of::<VaEncSequenceParameterBufferH264>()),
@@ -853,7 +1170,7 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
         ("struct drm_prime_handle", size_of::<drm::DrmPrimeHandle>()),
     ];
     let mut source = String::from(
-        "#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n#include <drm/drm.h>\n",
+        "#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_av1.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n#include <drm/drm.h>\n",
     );
     source.push_str(
         "/* One line per entry point, exactly as ffi.rs declares it. A redeclaration\n   that disagrees with the header is an error, not a warning. */\n",

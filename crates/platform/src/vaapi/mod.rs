@@ -417,4 +417,49 @@ mod tests {
         img.data_size = 1280 * 360 + 640 * 180;
         assert!(validate_image(&img).is_err(), "and a luma pitch the chroma does not share");
     }
+
+    /// **Every item an AV1 picture-parameter record is built out of is reachable from outside
+    /// `filmcraft-av1`**, and this test is what holds that.
+    ///
+    /// The failure it guards against is not a wrong number but a *missing name*: the record builder
+    /// cannot be written until the uncompressed frame header is, and `FrameHeader::parse` used to be
+    /// `pub(crate)` over a `pub(crate)` `BitReader`, so the only way to reach a frame header was to
+    /// reach into the crate. Every item below is named *here*, from another crate, so a change to
+    /// `crates/av1`'s visibility fails to **compile in this file** rather than surfacing later as a
+    /// confusing error part way through the builder.
+    ///
+    /// Each item is named for the record field it fills, which is why this list exists at all: an item
+    /// that is reachable but not named by any caller is surface nobody has asked for, and nothing in
+    /// the build can tell the difference.
+    #[test]
+    fn the_av1_frame_header_parser_is_reachable() {
+        // `BitReader` reads the uncompressed header out of the frame's own bytes, so the record is
+        // derived from the frame rather than from a parameter set.
+        let mut r = filmcraft_av1::BitReader::new(&[0x80, 0x00, 0x00, 0x00]);
+        assert_eq!(r.f(1), Ok(1), "the first bit of a key frame's uncompressed header");
+        assert_eq!(r.position(), 1);
+        // `FrameHeader::parse` is the parse the software decoder runs; the record reads its result.
+        // The signature is named rather than called, because calling it needs a parsed sequence header.
+        let _parse: fn(&mut filmcraft_av1::BitReader, &mut filmcraft_av1::header::HeaderState, u32, u32) -> filmcraft_av1::Result<filmcraft_av1::FrameHeader> =
+            filmcraft_av1::FrameHeader::parse;
+        // `HeaderState::new` seeds the cross-frame state exactly as `filmcraft_av1::Decoder::new`
+        // does, so the record is built against the state the software decode runs.
+        let mut refs: [filmcraft_av1::header::RefInfo; filmcraft_av1::NUM_REF_FRAMES] = std::array::from_fn(|_| filmcraft_av1::header::RefInfo::default());
+        let seq = filmcraft_av1::SequenceHeader::parse(&[0x0a, 0x00, 0x00, 0x00, 0x24, 0xcf, 0x7f, 0x0d, 0xbf, 0xff, 0x30, 0x08])
+            .unwrap_or_else(|e| panic!("a sequence header: {e}"));
+        let st = filmcraft_av1::header::HeaderState::new(&seq, &mut refs);
+        assert_eq!(st.current_frame_id, 0, "a fresh state has decoded no frame");
+        assert_eq!(st.prev_gm_params[0][2], 1 << filmcraft_av1::WARPEDMODEL_PREC_BITS, "global motion starts at the identity translation scale");
+        // The array bounds the record's own arrays, so they are named rather than written twice.
+        assert_eq!([(); filmcraft_av1::REFS_PER_FRAME].len(), 7, "ref_frame_idx[]");
+        assert_eq!([(); filmcraft_av1::NUM_REF_FRAMES].len(), 8, "ref_frame_map[]");
+        assert_eq!([(); filmcraft_av1::MAX_SEGMENTS].len(), 8, "feature_data[][]");
+        assert_eq!([(); filmcraft_av1::SEG_LVL_MAX].len(), 8, "a feature row");
+        // `primary_ref_frame` is 7 when there is no primary reference; a record that wrote 0 there
+        // would load propagated info from the LAST slot instead of loading none.
+        assert_eq!(filmcraft_av1::PRIMARY_REF_NONE, 7, "PRIMARY_REF_NONE");
+        // The frame types the record's `frame_type` field names, in the header's own order
+        // (`va_dec_av1.h:416-419`), so a packed bit can be read back as a name.
+        assert_eq!([filmcraft_av1::KEY_FRAME, filmcraft_av1::INTER_FRAME, filmcraft_av1::INTRA_ONLY_FRAME, filmcraft_av1::SWITCH_FRAME], [0, 1, 2, 3]);
+    }
 }

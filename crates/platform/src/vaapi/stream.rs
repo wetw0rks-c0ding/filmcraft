@@ -134,7 +134,7 @@ pub fn plan_nal(info: &NalStreamInfo) -> Result<Plan, String> {
 /// that stream" and takes the software decoder, rather than a mid-stream failure once a context
 /// exists.
 ///
-/// **VP9 is planned here; AV1 is still declined, and says why.**
+/// **VP9 is planned here; AV1 is declined for a reason that is now true, and it is not the old one.**
 ///
 /// **VP9**: the record and the state it is built against both exist — `super::picture::Vp9State`
 /// threads one `filmcraft_vp9::header::HeaderState` across the stream and owns the eight reference
@@ -146,9 +146,17 @@ pub fn plan_nal(info: &NalStreamInfo) -> Result<Plan, String> {
 /// profile table below is the record builder's own table, called from here so the two cannot disagree
 /// about which VP9 this backend takes.
 ///
-/// **AV1**: `filmcraft_av1` exposes a sequence header, not the per-frame header libva wants as a
-/// record (`VADecPictureParameterBufferAV1`), so a record of invented values would be one a driver
-/// reads as a valid picture. That is still true, and it is the whole of AV1's decline.
+/// **AV1**: the uncompressed frame header **is** exposed now — `filmcraft_av1::FrameHeader::parse` is
+/// reachable, with `BitReader` and a `HeaderState` beside it — so the decline this used to give
+/// ("filmcraft-av1 does not expose the uncompressed frame header") is no longer a statement of fact
+/// and is not repeated here. What is missing is the `VADecPictureParameterBufferAV1` built from that
+/// header, and until it is built an AV1 stream is refused **as a stream description**, which is the
+/// clean fall back to the software decoder rather than a mid-stream failure once a context exists.
+///
+/// The profile table below already refuses the AV1 this backend cannot put a surface for — profile 1,
+/// profile 2 and 12-bit — as *that profile*, with `va_dec_av1.h:44`'s own sentence, so the arm below
+/// is only ever reached by a profile 0 AV1 at 8 or 10 bits: the two this backend has surfaces for and
+/// the one it cannot decode yet.
 pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
     if info.mono || info.subsampling != (1, 1) {
         return Err(format!("chroma subsampling {:?}{}", info.subsampling, if info.mono { " (monochrome)" } else { "" }));
@@ -172,20 +180,42 @@ pub fn plan_frame(info: &FrameStreamInfo) -> Result<Plan, String> {
             }
             (Profile::Vp9(p), if b == 10 { RtFormat::Yuv420_10 } else { RtFormat::Nv12 })
         }
-        // AV1 main profile, at either depth (`VAProfileAV1Profile0`)
-        (FrameCodec::Av1, 0, 8) => (Profile::Av1Main, RtFormat::Nv12),
-        (FrameCodec::Av1, 0, 10) => (Profile::Av1Main, RtFormat::Yuv420_10),
-        (FrameCodec::Av1, p, b) => return Err(format!("AV1 profile {p} at {b} bits")),
+        // AV1's own table, for the same reason and in the same shape: a profile or depth this backend
+        // cannot put a surface for is declined as *that*, with the codec's reason, before the fact that
+        // no record is built yet can be mistaken for the reason. `va_dec_av1.h:44` — "This AV1 decoding
+        // API supports 8-bit/10bit 420 format only" — is where profile 1 (4:4:4), profile 2 (4:2:2 at
+        // 12 bits) and 12-bit come from, and `va_dec_av1.h:44` is a header line rather than this
+        // backend's opinion.
+        (FrameCodec::Av1, p, b) => {
+            if let Some(why) = super::picture::av1_decline(p, b) {
+                return Err(why);
+            }
+            (Profile::Av1Main, if b == 10 { RtFormat::Yuv420_10 } else { RtFormat::Nv12 })
+        }
     };
     // One codec is planned and one is declined, and each arm says what is actually true — see the
-    // note above. The VP9 arms above have already refused every profile and depth this backend does
+    // note above. The VP9 arm above has already refused every profile and depth this backend does
     // not decode, so reaching `Ok` here means a record the backend can build for every frame.
     match info.codec {
         FrameCodec::Vp9 => Ok(Plan { profile, entrypoint: Entrypoint::Vld, format, size: info.size }),
+        // AV1 profile 0 at 8 or 10 bits passes the table above and is still refused here, and the
+        // reason is now a statement about what exists rather than about what does not:
+        // `filmcraft_av1::FrameHeader::parse` **is** reachable and is what this record would be built
+        // from, so "does not expose the uncompressed frame header" stopped being true the moment
+        // `BitReader` became `pub` and is not said here. What is missing is the record, and it is
+        // refused as a **stream** because that is what this function describes — a stream whose only
+        // frame parameters cannot be built is not decodable, and refusing it now is a clean fall back
+        // to the software decoder rather than a mid-stream failure once a context exists.
+        //
+        // This is the same line VP9 walked, and VP9 is *not* walked yet: `plan_frame` plans a frame
+        // codec only when its record and the state behind it both exist (`Vp9State` and
+        // `vp9_picture_record` above), because a plan here is a claim that the stream can be decoded
+        // and this backend keeps that claim and the decode in one place. Plan it when the record is
+        // built, not before.
         FrameCodec::Av1 => Err(format!(
             "AV1 picture parameters, which would be planned as {profile:?} at {format:?} in {} bits: filmcraft-av1 {}",
             info.bit_depth,
-            super::picture::FRAME_HEADER_MISSING
+            super::picture::AV1_RECORD_MISSING
         )),
     }
 }
@@ -353,9 +383,10 @@ mod tests {
     /// below. Asserting a decline for profile 0 or 2 here would assert that the decoder cannot decode
     /// VP9, which is now false.
     ///
-    /// **AV1 is declined**, because its per-frame header is not exposed
-    /// (`FRAME_HEADER_MISSING`, which is still true) and an invented record would be one a driver
-    /// reads as a valid picture.
+    /// **AV1 is declined**, and the reason it gives is *checked against the header* rather than
+    /// restated: the profile and depth table below refuses profile 1, profile 2 and 12-bit as the
+    /// codec's own 4:4:4 / 4:2:2 / 12-bit cases, and only a profile 0 stream at 8 or 10 bits reaches
+    /// the arm that says no record is built from it yet.
     #[test]
     fn the_frame_codecs_are_planned_or_declined_for_their_own_reason() {
         // `for_tests` is the crate's own hand-built description (hw_frame.rs:195)
@@ -373,9 +404,12 @@ mod tests {
         }
         for (codec, profile, bits) in [(FrameCodec::Av1, 0, 8u32), (FrameCodec::Av1, 0, 10)] {
             let info = FrameStreamInfo::for_tests(codec, profile, bits, (1, 1), (1920, 1080));
-            let e = plan_frame(&info).expect_err("AV1 has no per-frame header to build a record from");
-            assert!(e.contains("frame header"), "{codec:?} profile {profile} at {bits}: {e}");
-            assert!(e.contains(crate::vaapi::picture::FRAME_HEADER_MISSING), "{codec:?} profile {profile} at {bits}: {e}");
+            let e = plan_frame(&info).expect_err("AV1 has no picture-parameter record built from its frame header yet");
+            // The decline names what is missing — and what is **not** missing, because saying "no frame
+            // header" would now be false: `filmcraft_av1::FrameHeader::parse` is reachable.
+            assert!(e.contains(crate::vaapi::picture::AV1_RECORD_MISSING), "{codec:?} profile {profile} at {bits}: {e}");
+            assert!(e.contains("uncompressed frame header"), "{codec:?} profile {profile} at {bits}: {e}");
+            assert!(!e.contains("does not expose"), "the frame header IS exposed now: {e}");
             assert!(Stream::from(info).plan().is_err(), "{codec:?} through Stream::plan");
         }
         // VP9 profiles this backend has no surface for are still declined, and as *that*: a 4:2:2 stream
@@ -384,7 +418,7 @@ mod tests {
             let info = FrameStreamInfo::for_tests(FrameCodec::Vp9, profile, bits, (1, 1), (1920, 1080));
             let e = plan_frame(&info).expect_err("VP9 profile {profile} at {bits} bits");
             assert!(e.contains(why), "VP9 profile {profile} at {bits} bits: {e}");
-            assert!(!e.contains(crate::vaapi::picture::FRAME_HEADER_MISSING), "VP9's frame header IS exposed: {e}");
+            assert!(!e.contains(crate::vaapi::picture::AV1_RECORD_MISSING), "VP9's record IS built, so it is not declined for a missing one: {e}");
             assert!(Stream::from(info).plan().is_err(), "VP9 profile {profile} at {bits} bits through Stream::plan");
         }
     }
@@ -441,6 +475,8 @@ mod tests {
     fn declines_frame_codecs_vaapi_would_not_take_anyway() {
         for (codec, profile, bits, why) in [
             (FrameCodec::Av1, 1u8, 8u32, "AV1 profile 1"),
+            (FrameCodec::Av1, 2, 10, "AV1 profile 2"),
+            (FrameCodec::Av1, 0, 12, "AV1 profile 0 at 12 bits"),
             // VP9's reasons come from its own table now, and each says *why* rather than restating the
             // numbers — the numbers are already in the sentence's prefix, so a bare "VP9 profile 1 at
             // 8 bits" no longer tells a user what was wrong with it.
