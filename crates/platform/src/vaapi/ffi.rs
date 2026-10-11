@@ -874,6 +874,13 @@ pub struct VaPictureParameterBufferVp9 {
 /// `VASegmentParameterVP9` (`va_dec_vp9.h:204`): one segment's parameters. **36 bytes**, eight of
 /// them in every [`VaSliceParameterBufferVp9`].
 ///
+/// **36 is 34 bytes of fields plus a 2-byte hole**, and the hole is the header's as much as the C
+/// compiler's: the four `int16_t` quant scales end at 18 and the `uint32_t[4]` reserved tail is
+/// 4-aligned, so `va_reserved` starts at 20. The hole is named below
+/// (`padding_before_va_reserved`) rather than left to the compiler to insert, because a record this
+/// crate hands to a driver is turned into bytes by [`record_bytes`], and an unnamed hole is a pair of
+/// bytes nothing wrote. See the note above this file's structures.
+///
 /// The record is thin for a reason worth stating, because "thin" is what makes it look optional:
 /// **VP9 has no slice headers** — 6.2 returns from `frame_header()` after the tile and quantizer
 /// syntax, and there is no slice layer at all — so none of H.264's or HEVC's per-slice parsing
@@ -908,6 +915,23 @@ pub struct VaSegmentParameterVp9 {
     pub chroma_ac_quant_scale: i16,
     /// "Specifies per segment Chroma DC quantization scale" (`va_dec_vp9.h:250-254`).
     pub chroma_dc_quant_scale: i16,
+    /// The C layout's hole at offsets 18-19, before `va_reserved` — **the header has one too, and a
+    /// declaration that did not name it handed uninitialised bytes to the driver.**
+    ///
+    /// The four quant scales end at 18 and `va_reserved` is a `uint32_t[4]`, which is 4-aligned and
+    /// therefore starts at 20; C inserts two bytes of padding between them and `sizeof` is 36 rather
+    /// than the 34 the fields add up to. Both halves of that are measured against
+    /// `/usr/include/va/va_dec_vp9.h` by a C compiler (`the_vp9_records_are_the_sizes_the_header_declares`),
+    /// not read off the field list.
+    ///
+    /// It is named, and given a width of exactly 2, for the reason the note above this file's
+    /// structures gives and for no other: **`#[derive(Default)]` and a struct literal initialise
+    /// named fields only, so an unnamed hole is indeterminate memory**, `record_bytes` would hand the
+    /// driver whatever was on the stack in its place, and eight of these records are submitted for
+    /// every VP9 picture. It decoded correctly anyway, because the driver ignores those bytes — which
+    /// is a fact about this driver, not about the record. `[u8; 2]` fills 18-19 and aligns to 1, so
+    /// `va_reserved` stays 4-aligned at 20 and every offset after it is still the header's.
+    pub padding_before_va_reserved: [u8; 2],
     pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
@@ -3920,10 +3944,13 @@ mod tests {
         // The VP9 slice record (va_dec_vp9.h:204, :279). **316 bytes, made of eight 36-byte segments,
         // and every one of those numbers is measured, not read off the field list.** The header's
         // `VASegmentParameterVP9` is `uint16_t`, `uint8_t[4][2]`, four `int16_t` and a
-        // `uint32_t[4]` — 2 + 8 + 8 + 16 = 34, so the struct is 36 only because the tail is
-        // 4-aligned and the next member is 4-aligned; a declaration that packed the quantizers into
-        // an array or dropped the reserved tail would shift all eight segments and every field in
-        // them. The eight are 288 bytes at offset 12, and the reserved tail is 16 more.
+        // `uint32_t[4]` — 2 + 8 + 8 + 16 = 34, so the struct is 36 because the four quant scales end
+        // at 18, the `uint32_t` tail is 4-aligned and so begins at 20, and the **2 bytes the compiler
+        // inserts at 18-19 are the header's alignment padding as much as ours** — which is why they
+        // are named `padding_before_va_reserved` rather than left implicit. A declaration that packed
+        // the quantizers into an array or dropped the reserved tail would shift all eight segments
+        // and every field in them. The eight are 288 bytes at offset 12, and the reserved tail is 16
+        // more.
         assert_eq!(size_of::<VaSegmentParameterVp9>(), 36, "VASegmentParameterVP9 (va_dec_vp9.h:204)");
         assert_eq!(offset_of!(VaSegmentParameterVp9, segment_flags), 0);
         assert_eq!(offset_of!(VaSegmentParameterVp9, filter_level), 2, "the uint16_t union leaves no hole");
@@ -3931,6 +3958,12 @@ mod tests {
         assert_eq!(offset_of!(VaSegmentParameterVp9, luma_dc_quant_scale), 12);
         assert_eq!(offset_of!(VaSegmentParameterVp9, chroma_ac_quant_scale), 14);
         assert_eq!(offset_of!(VaSegmentParameterVp9, chroma_dc_quant_scale), 16);
+        assert_eq!(offset_of!(VaSegmentParameterVp9, padding_before_va_reserved), 18, "chroma_dc_quant_scale ends at 18, and the uint32_t tail is 4-aligned");
+        assert_eq!(
+            size_of::<[u8; 2]>(),
+            offset_of!(VaSegmentParameterVp9, va_reserved) - offset_of!(VaSegmentParameterVp9, padding_before_va_reserved),
+            "the hole is exactly as wide as the padding that has to cover it — two bytes, not one"
+        );
         assert_eq!(
             offset_of!(VaSegmentParameterVp9, va_reserved),
             20,
@@ -3942,6 +3975,83 @@ mod tests {
         assert_eq!(offset_of!(VaSliceParameterBufferVp9, slice_data_flag), 8);
         assert_eq!(offset_of!(VaSliceParameterBufferVp9, seg_param), 12, "eight 36-byte segments from offset 12");
         assert_eq!(offset_of!(VaSliceParameterBufferVp9, va_reserved), 300, "12 + 8 * 36");
+    }
+
+    /// **Every byte of every VP9 record belongs to a named field**, which is the property
+    /// [`record_bytes`]'s safety argument rests on and the one no offset assertion above can see.
+    ///
+    /// The offsets above all agreed, byte for byte, with what a C compiler measures — and the record
+    /// still had a hole. `chroma_dc_quant_scale` is an `i16` at 16 and `va_reserved` is a `[u32; 4]`
+    /// at 20, so bytes 18-19 were alignment padding the *compiler* inserted and no field named: the
+    /// sizes were right, the offsets were right, the C compiler agreed, and `#[derive(Default)]` and
+    /// a struct literal both left those two bytes whatever was on the stack. Eight of those records
+    /// are submitted for every VP9 picture, and the decode came out bit-exact on 24 of 24 —
+    /// **because this driver ignores those bytes**, which is a fact about the driver and not about
+    /// the record.
+    ///
+    /// So this test does not compare offsets against numbers. It lays the fields end to end and
+    /// asserts they **tile the record**: no gap between two fields, no field starting inside the one
+    /// before it, and no byte past the last field. A gap *is* the defect, named where it is, because a
+    /// `padding_*` field is a named field like any other and is zeroed by `Default`.
+    #[test]
+    fn no_vp9_record_has_a_byte_no_field_names() {
+        /// `fields` is `(name, offset, size)` in declaration order; `size` is `size_of::<T>()`.
+        fn tiles_every_byte(record: &str, fields: &[(&str, usize, usize)], size: usize) {
+            let mut at = 0usize;
+            for (name, offset, width) in fields {
+                assert_eq!(*offset, at, "{record}: {name} starts at {offset}, and the field before it ends at {at}");
+                assert!(*width > 0, "{record}: {name} is {width} bytes wide");
+                at += *width;
+            }
+            assert_eq!(at, size, "{record}: the named fields end at {at} and the record is {size} bytes");
+        }
+        tiles_every_byte(
+            "VADecPictureParameterBufferVP9",
+            &[
+                ("frame_width", offset_of!(VaPictureParameterBufferVp9, frame_width), size_of::<u16>()),
+                ("frame_height", offset_of!(VaPictureParameterBufferVp9, frame_height), size_of::<u16>()),
+                ("reference_frames", offset_of!(VaPictureParameterBufferVp9, reference_frames), size_of::<[VASurfaceID; 8]>()),
+                ("pic_fields", offset_of!(VaPictureParameterBufferVp9, pic_fields), size_of::<u32>()),
+                ("filter_level", offset_of!(VaPictureParameterBufferVp9, filter_level), size_of::<u8>()),
+                ("sharpness_level", offset_of!(VaPictureParameterBufferVp9, sharpness_level), size_of::<u8>()),
+                ("log2_tile_rows", offset_of!(VaPictureParameterBufferVp9, log2_tile_rows), size_of::<u8>()),
+                ("log2_tile_columns", offset_of!(VaPictureParameterBufferVp9, log2_tile_columns), size_of::<u8>()),
+                ("frame_header_length_in_bytes", offset_of!(VaPictureParameterBufferVp9, frame_header_length_in_bytes), size_of::<u8>()),
+                ("padding_before_first_partition_size", offset_of!(VaPictureParameterBufferVp9, padding_before_first_partition_size), size_of::<u8>()),
+                ("first_partition_size", offset_of!(VaPictureParameterBufferVp9, first_partition_size), size_of::<u16>()),
+                ("mb_segment_tree_probs", offset_of!(VaPictureParameterBufferVp9, mb_segment_tree_probs), 7),
+                ("segment_pred_probs", offset_of!(VaPictureParameterBufferVp9, segment_pred_probs), 3),
+                ("profile", offset_of!(VaPictureParameterBufferVp9, profile), size_of::<u8>()),
+                ("bit_depth", offset_of!(VaPictureParameterBufferVp9, bit_depth), size_of::<u8>()),
+                ("va_reserved", offset_of!(VaPictureParameterBufferVp9, va_reserved), VA_PADDING_MEDIUM * size_of::<u32>()),
+            ],
+            size_of::<VaPictureParameterBufferVp9>(),
+        );
+        tiles_every_byte(
+            "VASegmentParameterVP9",
+            &[
+                ("segment_flags", offset_of!(VaSegmentParameterVp9, segment_flags), size_of::<u16>()),
+                ("filter_level", offset_of!(VaSegmentParameterVp9, filter_level), 4 * 2),
+                ("luma_ac_quant_scale", offset_of!(VaSegmentParameterVp9, luma_ac_quant_scale), size_of::<i16>()),
+                ("luma_dc_quant_scale", offset_of!(VaSegmentParameterVp9, luma_dc_quant_scale), size_of::<i16>()),
+                ("chroma_ac_quant_scale", offset_of!(VaSegmentParameterVp9, chroma_ac_quant_scale), size_of::<i16>()),
+                ("chroma_dc_quant_scale", offset_of!(VaSegmentParameterVp9, chroma_dc_quant_scale), size_of::<i16>()),
+                ("padding_before_va_reserved", offset_of!(VaSegmentParameterVp9, padding_before_va_reserved), size_of::<[u8; 2]>()),
+                ("va_reserved", offset_of!(VaSegmentParameterVp9, va_reserved), VA_PADDING_LOW * size_of::<u32>()),
+            ],
+            size_of::<VaSegmentParameterVp9>(),
+        );
+        tiles_every_byte(
+            "VASliceParameterBufferVP9",
+            &[
+                ("slice_data_size", offset_of!(VaSliceParameterBufferVp9, slice_data_size), size_of::<u32>()),
+                ("slice_data_offset", offset_of!(VaSliceParameterBufferVp9, slice_data_offset), size_of::<u32>()),
+                ("slice_data_flag", offset_of!(VaSliceParameterBufferVp9, slice_data_flag), size_of::<u32>()),
+                ("seg_param", offset_of!(VaSliceParameterBufferVp9, seg_param), 8 * size_of::<VaSegmentParameterVp9>()),
+                ("va_reserved", offset_of!(VaSliceParameterBufferVp9, va_reserved), VA_PADDING_LOW * size_of::<u32>()),
+            ],
+            size_of::<VaSliceParameterBufferVp9>(),
+        );
     }
 
     /// The `pic_fields` word is a C bitfield, and its layout is not a choice this crate makes: the

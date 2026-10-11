@@ -241,6 +241,14 @@ struct Picture {
     /// FNV-1a/64 over the whole luma plane's bytes, one byte per 8-bit sample and two per 10-bit one
     /// — **the same measure `vaprobe` prints**, so the two agree and so a number from either is
     /// comparable with a number from the other.
+    ///
+    /// That sentence is an obligation, not a description, and it was false until it was checked: the
+    /// hash used to fold a 10-bit sample's `u32` form, four bytes of which are two bytes of sample and
+    /// two bytes of zero, so **the same picture hashed differently here and in `vaprobe`** and the
+    /// cross-tool comparison this harness exists to enable could not be made. Comparing hardware
+    /// against software inside the harness was unaffected — both sides used the same function — which
+    /// is why a broken claim survived a run that passed. `measure` now folds the plane's own bytes,
+    /// one byte per 8-bit sample and two per 16-bit one.
     hash: u64,
     /// `SAMPLES` luma values spread across the plane, as `u32` so an 8- and a 10-bit picture compare
     /// the same way.
@@ -306,13 +314,21 @@ fn measure(frame: &filmcraft_frame::VideoFrame) -> Picture {
         _ => Vec::new(),
     };
     match &frame.data {
-        filmcraft_frame::PixelData::Yuv8 { .. } => {
-            for &v in &values {
-                fold(&mut hash, v as u8);
+        filmcraft_frame::PixelData::Yuv8 { planes, .. } => {
+            for &v in planes[0].iter() {
+                fold(&mut hash, v);
             }
         }
-        filmcraft_frame::PixelData::Yuv16 { .. } => {
-            for &v in &values {
+        filmcraft_frame::PixelData::Yuv16 { planes, .. } => {
+            // **Two bytes per sample — the 16-bit word as the plane stores it, and not four.**
+            // `values` holds every sample as a `u32` so that 8- and 10-bit pictures sample the same
+            // way, and `u32::to_le_bytes` would fold the two bytes that conversion zeroed along
+            // with the sample: the hash of a 10-bit picture then differs from `vaprobe`'s hash of the
+            // *same picture*, so the documented equivalence below did not hold and two numbers that
+            // were supposed to be comparable were not. `vaprobe` folds `u16::to_le_bytes`
+            // (`vaprobe.rs:134`) and this folds the same two bytes, one sample at a time, from the
+            // plane rather than from the widened copy.
+            for &v in planes[0].iter() {
                 for b in v.to_le_bytes() {
                     fold(&mut hash, b);
                 }

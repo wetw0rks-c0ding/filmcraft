@@ -1441,6 +1441,9 @@ fn vp9_segment_param(h: &FrameHeader, st: &HeaderState, seg_id: u8) -> Result<Va
         luma_dc_quant_scale: vp9_quant(h, bd, &DC_QLOOKUP, qindex, i32::from(h.delta_q_y_dc))?,
         chroma_ac_quant_scale: vp9_quant(h, bd, &AC_QLOOKUP, qindex, i32::from(h.delta_q_uv_ac))?,
         chroma_dc_quant_scale: vp9_quant(h, bd, &DC_QLOOKUP, qindex, i32::from(h.delta_q_uv_dc))?,
+        // Named so it is *written*: the C layout's hole at 18-19, zeroed like the reserved tail
+        // rather than left to whatever the compiler leaves in the record.
+        padding_before_va_reserved: [0; 2],
         va_reserved: [0; VA_PADDING_LOW],
     })
 }
@@ -5674,6 +5677,36 @@ mod tests {
             // the next one's bits even where the next one's own width happens to hide it.
             let changed = word ^ base_word;
             assert_eq!(changed & !(mask << bit), 0, "{name} changed bits outside its own {bit}..{bit}+{width}: the whole difference is {changed:#010x}");
+        }
+    }
+
+    /// The bytes at 18-19 of every one of the eight segments are the header's alignment padding, and
+    /// **this backend writes zeros into them** rather than letting the compiler leave them alone.
+    ///
+    /// The picture record's own hole is checked in the byte-pinning test above (offset 45, submitted
+    /// as zero). This is the other hole, and it is the one that reached the driver eight times a
+    /// picture: `VASegmentParameterVP9` has no field between `chroma_dc_quant_scale` (an `i16` at 16,
+    /// ending at 18) and `va_reserved` (a `uint32_t[4]`, 4-aligned, at 20), so the two bytes at 18-19
+    /// were alignment padding no field named — and `#[derive(Default)]` and a struct literal both
+    /// write named fields only. Every `sizeof` and every `offsetof` agreed with what a C compiler
+    /// measures, and the decode was bit-exact on 24 of 24, **because this driver ignores those
+    /// bytes**. That is a fact about the driver, not about the record: `record_bytes` copies
+    /// `size_of::<T>()` bytes of it, so a byte no field wrote is a byte the driver was handed
+    /// whatever the stack held.
+    ///
+    /// So this checks the *bytes*, not the offsets: the two must be zero in every segment, in the
+    /// record the builder actually produces.
+    #[test]
+    fn the_hole_in_every_vp9_segment_is_submitted_as_zero() {
+        let (frame, state, header) = vp9_key_frame();
+        let bytes = super::vp9_slice_record(&header, &state, &frame).expect("a key frame is described");
+        assert_eq!(bytes.len(), std::mem::size_of::<crate::vaapi::ffi::VaSliceParameterBufferVp9>(), "VASliceParameterBufferVP9 is 316 bytes");
+        let seg = std::mem::size_of::<crate::vaapi::ffi::VaSegmentParameterVp9>();
+        let at_seg = std::mem::offset_of!(crate::vaapi::ffi::VaSliceParameterBufferVp9, seg_param);
+        for i in 0..8 {
+            let at = at_seg + i * seg;
+            assert!(bytes.len() >= at + 20, "segment {i}: the record is {} bytes, too short for the hole at {}", bytes.len(), at + 18);
+            assert_eq!(&bytes[at + 18..at + 20], &[0u8, 0], "segment {i}: the C layout's hole at {}..{} is submitted as zero, not as stack", at + 18, at + 20);
         }
     }
 

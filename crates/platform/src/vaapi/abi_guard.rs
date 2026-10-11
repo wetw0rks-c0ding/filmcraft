@@ -144,10 +144,18 @@ fn every_entry_point_has_the_arity_the_header_declares() {
 /// worth: `VADecPictureParameterBufferVP9` (`va_dec_vp9.h:58`) has a structural difference from
 /// H.264 — its `first_partition_size` is a `uint16_t` behind a one-byte hole (offset 46, not 45) —
 /// and `VASliceParameterBufferVP9` (`va_dec_vp9.h:279`) is eight `VASegmentParameterVP9`s, each of
-/// which is only 36 bytes rather than the 34 its fields add up to because of a `uint32_t` tail's
-/// alignment. Both are the shapes where a declaration that reads the header's field list as its
-/// byte order is a record at offsets the driver did not compile against, and both are **submitted
-/// for every VP9 picture**, so there is no "only the interesting codec" discount to apply.
+/// which is 36 bytes where its fields add up to 34, because `chroma_dc_quant_scale` ends at 18 and
+/// the `uint32_t` tail is 4-aligned and so starts at 20. Both are the shapes where a declaration that
+/// reads the header's field list as its byte order is a record at offsets the driver did not compile
+/// against, and both are **submitted for every VP9 picture**, so there is no "only the interesting
+/// codec" discount to apply.
+///
+/// The two bytes at 18-19 are also asked of the C compiler **as a gap**, because C gives that padding
+/// no name and no `sizeof` can see one: the hole is where the compiler puts `va_reserved` minus where
+/// `chroma_dc_quant_scale` ends, and that difference is compared with the width of the
+/// `padding_before_va_reserved` field our declaration uses to cover it. A record that left those two
+/// bytes to the compiler agrees with every `sizeof` and every `offsetof` above and still hands two
+/// uninitialised bytes to the driver, eight records a picture.
 #[test]
 fn the_vp9_records_are_the_sizes_the_header_declares() {
     if !std::path::Path::new(LIBVA_HEADERS).join("va_dec_vp9.h").is_file() {
@@ -169,8 +177,10 @@ fn the_vp9_records_are_the_sizes_the_header_declares() {
          _Static_assert(sizeof(VASegmentParameterVP9) == {seg_size}, \"sizeof\");\n\
          _Static_assert(__builtin_offsetof(VASegmentParameterVP9, filter_level) == {seg_filter}, \"filter_level\");\n\
          _Static_assert(__builtin_offsetof(VASegmentParameterVP9, luma_ac_quant_scale) == {seg_ac}, \"luma_ac_quant_scale\");\n\
+         _Static_assert(__builtin_offsetof(VASegmentParameterVP9, chroma_ac_quant_scale) == {seg_uv_ac}, \"chroma_ac_quant_scale\");\n\
          _Static_assert(__builtin_offsetof(VASegmentParameterVP9, chroma_dc_quant_scale) == {seg_uv_dc}, \"chroma_dc_quant_scale\");\n\
          _Static_assert(__builtin_offsetof(VASegmentParameterVP9, va_reserved) == {seg_reserved}, \"va_reserved\");\n\
+         _Static_assert(__builtin_offsetof(VASegmentParameterVP9, va_reserved) - __builtin_offsetof(VASegmentParameterVP9, chroma_dc_quant_scale) - sizeof(int16_t) == {seg_hole}, \"the hole before va_reserved\");\n\
          _Static_assert(sizeof(VASliceParameterBufferVP9) == {slice_size}, \"sizeof\");\n\
          _Static_assert(__builtin_offsetof(VASliceParameterBufferVP9, seg_param) == {slice_seg}, \"seg_param\");\n\
          _Static_assert(__builtin_offsetof(VASliceParameterBufferVP9, va_reserved) == {slice_reserved}, \"va_reserved\");\n",
@@ -180,8 +190,16 @@ fn the_vp9_records_are_the_sizes_the_header_declares() {
         seg_size = size_of::<VaSegmentParameterVp9>(),
         seg_filter = offset_of!(VaSegmentParameterVp9, filter_level),
         seg_ac = offset_of!(VaSegmentParameterVp9, luma_ac_quant_scale),
+        seg_uv_ac = offset_of!(VaSegmentParameterVp9, chroma_ac_quant_scale),
         seg_uv_dc = offset_of!(VaSegmentParameterVp9, chroma_dc_quant_scale),
         seg_reserved = offset_of!(VaSegmentParameterVp9, va_reserved),
+        // **The hole is pinned from the C side as well, as a gap and not as a member.** C has no name
+        // for the padding between `chroma_dc_quant_scale` and `va_reserved`, so the only way a C
+        // compiler can be asked "how wide is it" is as the difference between the two offsets minus
+        // the field's own width — and that difference is then compared with the width of the
+        // `padding_before_va_reserved` field that declares it on our side. A declaration that left the
+        // hole implicit, or gave it the wrong width, fails here.
+        seg_hole = size_of::<[u8; 2]>(),
         slice_size = size_of::<VaSliceParameterBufferVp9>(),
         slice_seg = offset_of!(VaSliceParameterBufferVp9, seg_param),
         slice_reserved = offset_of!(VaSliceParameterBufferVp9, va_reserved),
