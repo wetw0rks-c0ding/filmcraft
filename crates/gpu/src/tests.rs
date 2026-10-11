@@ -3,26 +3,9 @@ use filmcraft_geom::{Affine, Vec2};
 use filmcraft_render::Blend;
 use filmcraft_render::plan::execute_cpu;
 
-fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
-}
-
-fn yuv_frame(w: u32, h: u32) -> Arc<VideoFrame> {
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let y: Vec<u8> = (0..w * h).map(|i| (16 + ((i % w) * 219 / w)) as u8).collect();
-    let u: Vec<u8> = (0..cw * ch).map(|i| (64 + (i / cw) * 128 / ch) as u8).collect();
-    let v: Vec<u8> = (0..cw * ch).map(|i| (200 - (i % cw) * 100 / cw) as u8).collect();
-    Arc::new(VideoFrame {
-        width: w,
-        height: h,
-        data: PixelData::Yuv8 { planes: [Arc::new(y), Arc::new(u), Arc::new(v)], chroma: Chroma::C420, alpha: None },
-        color: filmcraft_color::ColorInfo::REC709,
-        par: (1, 1),
-        pts: Default::default(),
-    })
-}
+// The one process-wide GPU device, shared with the other test modules — see `blend_tests::device`
+// for why there is exactly one.
+use super::blend_tests::{device, yuv_frame};
 
 #[test]
 fn gpu_matches_cpu_plan() {
@@ -30,7 +13,7 @@ fn gpu_matches_cpu_plan() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let pixels = filmcraft_media::generators::render(
         &filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::OceanSunset),
         320,
@@ -121,10 +104,10 @@ fn prepared_upload_matches_inline_conversion() {
     };
     let image = FramePlan::Image(filmcraft_render::Image { w: w as usize, h: h as usize, px: f32_layer });
     for plan in [layers, image] {
-        let mut a = GpuCompositor::new(&dev, &q);
+        let mut a = GpuCompositor::new(dev, q);
         a.composite(&plan);
         let inline = a.read_output().expect("readback");
-        let mut b = GpuCompositor::new(&dev, &q);
+        let mut b = GpuCompositor::new(dev, q);
         let prep = prepare(&plan);
         assert!(prep.bytes() > 0);
         b.composite_prepared(&plan, Some(&prep));
@@ -142,7 +125,7 @@ fn upload_cache_keeps_buffers_alive() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let px = Arc::new(vec![200u8; 16 * 8 * 4]);
     let frame = Arc::new(VideoFrame { width: 16, height: 8, data: PixelData::Rgba8(px.clone()), ..(*yuv_frame(16, 8)).clone() });
     let plan =
@@ -159,7 +142,7 @@ fn gpu_lut_matches_cpu_tetrahedral() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let g = GpuLut::new(&dev, &q);
+    let g = GpuLut::new(dev, q);
     for size in [2usize, 17, 33, 65] {
         let mut lut = filmcraft_color::Lut3d::from_fn(size, |c| {
             [(c[0] * c[1] + c[2] * c[2]).sin(), c[1].powf(0.45) * (1.0 - 0.3 * c[0]), (c[0] - c[2]).abs() + 0.1 * c[1]]
@@ -214,7 +197,7 @@ fn gpu_mask_coverage_matches_cpu() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let g = crate::GpuMask::new(&dev, &q);
+    let g = crate::GpuMask::new(dev, q);
     for scale in [1.0f32, 0.5] {
         let masks = test_masks(scale);
         let (w, h) = ((320.0 * scale) as usize, (180.0 * scale) as usize);
@@ -233,7 +216,7 @@ fn gpu_masked_mix_matches_cpu() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let g = crate::GpuMask::new(&dev, &q);
+    let g = crate::GpuMask::new(dev, q);
     let masks = test_masks(1.0);
     let (w, h) = (320usize, 180usize);
     let original = filmcraft_render::Image { w, h, px: (0..w * h * 4).map(|i| ((i * 37) % 101) as f32 / 100.0).collect() };
@@ -290,7 +273,7 @@ fn gpu_draws_yuv_alpha_plane_like_the_cpu() {
     );
     let background = Arc::new(VideoFrame::rgba8(320, 180, pixels));
     for bits in [8, 10, 12] {
-        let mut c = GpuCompositor::new(&dev, &q);
+        let mut c = GpuCompositor::new(dev, q);
         let plan = FramePlan::Layers {
             width: w,
             height: h,

@@ -10,10 +10,40 @@ use super::*;
 use filmcraft_geom::{Affine, Vec2};
 use filmcraft_render::plan::execute_cpu;
 
-pub(crate) fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+/// The process-wide GPU instance, adapter device and queue every test shares.
+///
+/// Each test used to build its own `wgpu::Instance` and request its own device on the same
+/// physical GPU, and the `Instance` was dropped at the end of `device()`. Running the suite
+/// threaded, **two or more tests doing that at once segfaulted every time** (5/5 runs at
+/// `--test-threads=6`, 3/3 at every thread count ≥ 2; `--test-threads=1` never). It is not our
+/// code and not a resource limit: the fault is inside `wgpu::Instance::default()` itself, with
+/// one thread sitting in `libvulkan`'s `vkEnumerateInstanceExtensionProperties` while the
+/// crashing thread jumps to address 0 from
+/// `wgpu_hal::vulkan::Instance::desired_extensions(entry=0x0)` — concurrent Vulkan instance
+/// creation on this driver, before a single line of ours runs.
+///
+/// One instance and one device for the whole process removes the race and lets the tests run in
+/// parallel again. The `Instance` is kept alive beside the device rather than dropped, so the
+/// device's instance cannot be torn down under it.
+///
+/// `None` when there is no adapter, keeping the "no GPU: say so and skip" shape every test
+/// already handles.
+/// The process-wide `wgpu::Instance`.  Created once and kept for the life of the process: the
+/// device below outlives every test, so the instance that made it must outlive it too.
+static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+
+/// The process-wide device and queue every test shares.  `None` when there is no adapter, keeping
+/// the "no GPU: say so and skip" shape every test already handles.
+static DEVICE: std::sync::OnceLock<Option<(wgpu::Device, wgpu::Queue)>> = std::sync::OnceLock::new();
+
+pub(crate) fn device() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
+    let instance = INSTANCE.get_or_init(wgpu::Instance::default);
+    DEVICE
+        .get_or_init(|| {
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+        })
+        .as_ref()
 }
 
 pub(crate) fn yuv_frame(w: u32, h: u32) -> Arc<VideoFrame> {
@@ -142,7 +172,7 @@ fn gpu_blend_modes_match_cpu() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let (w, h) = (320usize, 180usize);
     let pixels = filmcraft_media::generators::render(
         &filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::Dunes),
@@ -228,7 +258,7 @@ fn gpu_blend_edge_cases_match_cpu() {
         Arc::new(VideoFrame::rgba_f32(n as u32, n as u32, px))
     };
     let (back, src) = (make(true), make(false));
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     for mode in Blend::ALL {
         for opacity in [1.0f32, 0.5] {
             let plan = FramePlan::Layers {
@@ -270,7 +300,7 @@ fn gpu_dissolve_pattern_is_exact() {
     let (w, h) = (257usize, 131usize);
     let white = Arc::new(VideoFrame::rgba_f32(1, 1, vec![1.0; 4]));
     let red = Arc::new(VideoFrame::rgba_f32(1, 1, vec![1.0, 0.0, 0.0, 1.0]));
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     for op in [0.1f32, 0.5, 0.9] {
         let plan = FramePlan::Layers {
             width: w,
@@ -301,7 +331,7 @@ fn normal_fast_path_and_blend_layers_off_output() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let grey = Arc::new(VideoFrame::rgba_f32(4, 4, vec![0.2; 64]));
     let layer = |m: Affine, blend: Blend| PlanLayer { frame: grey.clone(), matrix: m, opacity: 1.0, blend, fx: None };
     let normal = FramePlan::Layers { width: 32, height: 16, layers: vec![layer(Affine::scale(8.0, 4.0), Blend::Normal)] };

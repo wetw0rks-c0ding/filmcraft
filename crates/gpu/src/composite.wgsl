@@ -43,11 +43,65 @@ fn vs(@builtin(vertex_index) vi: u32) -> VOut {
     return out;
 }
 
+// Bilinear tap at source position `p`, with the sample snapped to the texel centre when the sample
+// is within a rounding error of one.
+//
+// The vertex stage hands `sp` to the rasteriser, which interpolates it across the triangle in its
+// own precision. On a 1:1 draw — every sample mathematically on a texel centre — the interpolated
+// `sp` lands a few ULPs off, so `f` is a small nonzero number instead of 0 and `mix` blends in
+// that fraction of the *neighbouring* texel. It is a sample-coordinate residual, not a
+// texture-format loss: the leak is the same *fraction* of neighbours 1000x apart, and the source
+// is Rgba16Float while this working image is Rgba32Float.
+//
+// A sample that close to a texel centre *is* that centre, so round it: a draw that does not
+// resample must copy its source exactly. Left unsnapped, a fully transparent pixel picks up a few
+// ULPs of alpha, and an effect that divides by alpha (Invert on Alpha) divides that straight back
+// out into the neighbour's full colour.
+//
+// **What the window is measured against: the source extent, not this pixel's coordinate.** The
+// rasteriser interpolates `sp` across the whole triangle, so the error is set by the magnitude of
+// the attribute endpoints and does *not* shrink towards the origin. Scaling the window by `|q|`
+// made it collapse there: at the left edge `e` fell to ~2*EPSILON while the residual was still
+// bounded by the extent, so wide draws snapped near the origin and leaked further right.
+//
+// Measured on an Intel Arc B580 (iHD 26.3.5) by having `load4` return its raw fraction, over 17
+// configurations (1:1 from 48x32 to 4096x4096, minifying and magnifying draws, and rotations of
+// 13/30/45 degrees, where the source span along an axis exceeds its width):
+//
+//     worst residual / (f32::EPSILON * source extent) = 0.853   (300x200; both axes agree)
+//     i.e. 1.25 ULP of the extent, with ULP(x) = 2^-23 * 2^floor(log2 x)
+//
+// It is exactly **zero** at every power-of-two extent, where `vs`'s `o.y / out_h` and the `1.0 -`
+// are exact — so the residual is the interpolation, not the division alone.
+//
+// **The constant: 2^-22 = 2 * f32::EPSILON.** `ULP(x) = 2^-23 * 2^floor(log2 x) <= 2^-23 * x`, so
+// the residual is bounded by `EPSILON * extent`, a bound that is tight (attained at the bottom of
+// a binade); the measurement is 0.853 of it. Two ULP leaves a 2.3x margin over the worst
+// measurement and still covers a single interpolation round-off. `EPSILON` on its own would *not*
+// fire at a power-of-two extent, where the bound is attained exactly and the strict `<` fails —
+// so the factor of 2 is load-bearing, not slack.
+//
+// It costs at most 9.2e-4 of a texel (0.09% of a pixel at 4K) on a genuine resample. Measured
+// before and after: a non-integer downscale, a 1/3 downscale, a 2.4x upscale, rotations of 30 and
+// 45 degrees, a shear, and half- and quarter-pixel offsets all produce a **bit-identical**
+// accumulator; only draws that do not resample at all change.
+//
+// Snapping `q` to `round(q)` rather than testing the fraction is what makes the window two-sided.
+// The residual is signed, and on the above GPU **5.7%** of the samples of a 1920x1080 1:1 draw
+// (2384 of 41472) land on the *far* side of a centre, where `f` wraps to ~1: a one-sided `f < e`
+// test misses those and blends in almost the whole *previous* texel. Comparing against the
+// distance to the nearest centre catches both sides and keeps the index in step with `f`.
+const CENTRE_SNAP: f32 = 2.3841858e-7; // 2^-22 = 2 * f32::EPSILON; WGSL has no EPSILON constant
 fn load4(t: texture_2d<f32>, p: vec2<f32>) -> vec4<f32> {
     let d = vec2<i32>(textureDimensions(t));
     let q = p - 0.5;
-    let i = vec2<i32>(floor(q));
-    let f = q - floor(q);
+    // `d` is this plane's own extent, which is the quantity the bound above is stated against: the
+    // chroma planes are sampled at `p * chroma / luma`, so their residual is proportional to the
+    // chroma extent, not the luma one.
+    let e = vec2<f32>(CENTRE_SNAP * vec2<f32>(d));
+    let snapped = select(q, round(q), abs(q - round(q)) < e);
+    let i = vec2<i32>(floor(snapped));
+    let f = snapped - floor(snapped);
     let a = textureLoad(t, clamp(i, vec2(0), d - 1), 0);
     let b = textureLoad(t, clamp(i + vec2(1, 0), vec2(0), d - 1), 0);
     let cc = textureLoad(t, clamp(i + vec2(0, 1), vec2(0), d - 1), 0);

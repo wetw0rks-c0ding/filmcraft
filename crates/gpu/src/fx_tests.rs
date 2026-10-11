@@ -130,6 +130,78 @@ fn compare(cpu: &[f32], gpu: &[f32]) -> (f32, f64) {
     (worst, flips as f64 / cpu.len() as f64)
 }
 
+/// Black and white vertical stripes: every texel differs from **both** its horizontal neighbours,
+/// so any nonzero bilinear weight changes the drawn value. A 1:1 draw, which resamples nothing,
+/// must therefore reproduce this image bit for bit — which is exactly the statement "the
+/// fractional coordinate is 0", and not merely "within tolerance".
+fn stripes(w: u32, h: u32) -> Vec<f32> {
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
+    for _ in 0..h {
+        for x in 0..w {
+            let v = if x % 2 == 0 { 1.0f32 } else { 0.0 };
+            px.extend_from_slice(&[v, v, v, v]);
+        }
+    }
+    px
+}
+
+/// A 1:1 draw reproduces its source exactly, at the sizes this suite draws at and at both
+/// power-of-two and non-power-of-two sizes.
+///
+/// This is the guard on the texel-centre snap in `composite.wgsl`'s `load4`. The rasteriser
+/// interpolates `sp` a few ULPs off each centre, `f` becomes a small nonzero number, and a fully
+/// transparent pixel picks up that fraction of its neighbour — which `Invert` on Alpha then
+/// divides straight back out into the neighbour's full colour (the smallest diverging input is a
+/// single transparent texel beside an opaque one; see `gpu_effects_match_cpu_exactly`, case
+/// `invert [("channel", Choice(4)), ("blend", Float(20.0))]`, which allows **no** flipped value).
+///
+/// **Without the snap this fails** at every non-power-of-two size (measured: 24 of 10988 values at
+/// 67x41, 9 of 245760 at 1920x32) and passes at the power-of-two ones, which pin the other half
+/// of the window. So this test cannot pass vacuously: it is red without the change and green with
+/// it, at both kinds of size.
+#[test]
+fn one_to_one_draw_copies_the_source_exactly() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let sizes = [
+        (48u32, 32u32), // keyframed_effects_follow_time
+        (67, 41),       // gpu_effects_match_cpu_exactly
+        (96, 54),       // gpu_effect_chains_match_cpu
+        (64, 64),       // power of two
+        (128, 128),     // power of two
+        (256, 256),     // power of two
+        (1920, 32),
+        (1919, 33),
+        (1920, 1080),
+        (1921, 1081),
+    ];
+    let mut failures = Vec::new();
+    for (w, h) in sizes {
+        let px = stripes(w, h);
+        let frame = VideoFrame::rgba_f32(w, h, px.clone());
+        let mut c = GpuCompositor::new(dev, q);
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![] }).expect("1:1 draw");
+        let mut off = Vec::new();
+        for (t, (src, got)) in px.iter().zip(&gpu).enumerate() {
+            if src.to_bits() != got.to_bits() {
+                off.push(format!("({},{}) ch{}", (t / 4) as u32 % w, (t / 4) as u32 / w, t % 4));
+            }
+        }
+        if !off.is_empty() {
+            failures.push(format!(
+                "{w}x{h} (power of two: {}): {} of {} values differ, first {}",
+                w.is_power_of_two() && h.is_power_of_two(),
+                off.len(),
+                px.len(),
+                off[0]
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "a 1:1 draw must copy its source exactly:\n{}", failures.join("\n"));
+}
+
 /// Effect cases: (effect id, parameters, whether a threshold may flip pixels).
 fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>, bool)> {
     vec![
@@ -230,7 +302,7 @@ fn gpu_effects_match_cpu_exactly() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let (w, h) = (67u32, 41u32);
     let px = picture(w, h);
     let frame = VideoFrame::rgba_f32(w, h, px.clone());
@@ -259,7 +331,7 @@ fn gpu_effect_chains_match_cpu() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let (w, h) = (96u32, 54u32);
     let px = picture(w, h);
     let frame = VideoFrame::rgba_f32(w, h, px.clone());
@@ -307,7 +379,7 @@ fn keyframed_effects_follow_time() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let (w, h) = (48u32, 32u32);
     let px = picture(w, h);
     let frame = VideoFrame::rgba_f32(w, h, px.clone());
@@ -375,7 +447,7 @@ fn hostile_parameters_are_bounded() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let frame = VideoFrame::rgba_f32(w as u32, h as u32, picture(w as u32, h as u32));
     let ops = vec![
         FxOp::eval(&effect("gaussian_blur", &[("blurriness", fl(1e30))]), &cx(Tick::ZERO, 1.0), w, h).expect("op"),
@@ -399,7 +471,7 @@ fn gpu_effect_layers_match_cpu_plan() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let (w, h) = (320usize, 180usize);
     let ops = |list: &[EffectInstance], lw: u32, lh: u32, px_scale: f32| -> Vec<FxOp> {
         list.iter().filter_map(|e| FxOp::eval(e, &cx(Tick::ZERO, px_scale), lw as usize, lh as usize)).collect()
@@ -464,7 +536,7 @@ fn plain_layers_skip_the_effect_stage() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let mut c = GpuCompositor::new(&dev, &q);
+    let mut c = GpuCompositor::new(dev, q);
     let plan = FramePlan::Layers { width: 64, height: 36, layers: vec![PlanLayer::new(yuv_frame(64, 36), Affine::IDENTITY, 1.0, Blend::Normal)] };
     c.composite(&plan);
     assert!(c.fx.as_ref().is_some_and(fx::FxStage::is_idle));
@@ -511,7 +583,7 @@ fn layers_with_effects_fall_back_to_the_cpu_without_a_stage() {
     };
     let cpu = execute_cpu(&plan).over_black_rgba8();
     for stage in [true, false] {
-        let mut c = GpuCompositor::new(&dev, &q);
+        let mut c = GpuCompositor::new(dev, q);
         if !stage {
             c.fx = None;
         }
