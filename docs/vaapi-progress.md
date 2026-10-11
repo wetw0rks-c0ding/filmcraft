@@ -5,8 +5,14 @@ commits. Everything here has been measured on the development machine (Intel Arc
 libva 1.24, iHD 26.3.5); nothing is carried over from another platform unverified.
 
 Two milestones are in flight: **decode**, essentially complete, and **encode**, mid-way through its
-feasibility work. A third, **VP9 decode**, is wired into the decode path; the picture-for-picture
-oracle tests are the next step.
+feasibility work. A third, **VP9 decode**, is wired into the decode path *and* measured against
+ffmpeg's own decode — §4.
+
+Every number below is produced by a committed test, and each one names the fixture it came from:
+`cargo test -p filmcraft-platform --test vaapi -- --nocapture` prints one line per fixture with its
+tier and its picture count, and `cargo run -p filmcraft-platform --example vaparity` prints the
+same numbers for a single file. **Nothing here came from a report file that is not in the
+repository**, because a claim a fresh clone cannot regenerate is a claim nobody can check.
 
 ---
 
@@ -32,12 +38,25 @@ that asserts it does *not* when hardware decoding is switched off.
 | `hevc_multi_segment.mp4` | 72/72 |
 | `hevc_weightp.mp4` | 50/50 (weighted prediction, hardware path) |
 | `hevc_weightp_main10.mp4` | 50/50 (weighted prediction, 10-bit) |
+| `vp9_p0_parity.mp4` | 96/96 (profile 0, 8-bit) |
+| `vp9_p2_parity.mp4` | 96/96 (profile 2, **10-bit**) |
+| `vp9_p0_segmented.mp4` | 96/96 (`SEG_LVL_ALT_Q` on all 96 frames) |
+
+Each row is one `tests/common::FIXTURES` entry at `Tier::EveryPicture`, so
+`cargo xtask fixtures platform` regenerates the file and `bit_exact_with_the_software_decoder` decodes
+it, after a `reset` and reseek to every later sync sample and again after all the resets.
 
 The last two exist because every earlier HEVC fixture coded a prediction weight table whose every flag was
 0 — so the weight record's delta recovery had only ever run with delta 0, *on hardware*. The new fixtures
 drive 35 and 28 non-default luma weights, 35 and 29 non-zero luma offsets and denominators spanning 0–7
 through the record. (`fade=in` is what makes x265 emit a non-default weight at all; plain `testsrc2` does
 not, at any encoder effort setting.)
+
+`vp9_p0_segmented.mp4` exists because of the same shape of gap: it is `vp9_p0_parity.mp4` plus
+`-aq-mode 2` and nothing else, and it is the only fixture in this repository whose frames carry
+`segmentation_enabled`. On every other VP9 fixture `SegParam[1..7]` are zero by rule, so the eight-entry
+branch that `va_dec_vp9.h:270-272` describes had never been taken on hardware — a regression that copied
+`SegParam[0]` into all eight entries would have passed every other test in the branch.
 
 **Measured acceleration**, from `cargo xtask bench --sections decode`:
 
@@ -142,7 +161,7 @@ platform tests unoptimised as well, so a profile divergence cannot hide a bug ag
 
 ---
 
-## 4. VP9 decode — wired, not yet proven against hardware
+## 4. VP9 decode — wired, and measured against hardware
 
 Plan: `docs/superpowers/plans/2026-10-09-vaapi-linux-vp9-decode.md`.
 
@@ -173,9 +192,35 @@ references in a fixed eight-slot array rather than a per-slice list, and **no we
 either mode** — so the class of bug that cost the H.264 milestone most of its budget cannot occur. Scope
 is profiles 0 and 2; profiles 1 and 3 decline on chroma, profile 4 is reserved.
 
-**Not yet proven on hardware.** The wiring, the decline tables and the record are in place and unit-
-tested; the picture-for-picture comparison against ffmpeg is the next task, and it is the task that
-would catch a record that is valid but wrong.
+**Proven on hardware, picture for picture, at both depths.** Three fixtures, all
+`Tier::EveryPicture`, all bit-exact against FilmCraft's own decoder, which is itself bit-exact against
+ffmpeg: `vp9_p0_parity.mp4` (profile 0, 8-bit) 96/96, `vp9_p2_parity.mp4` (profile 2, **10-bit**) 96/96
+and `vp9_p0_segmented.mp4` 96/96. Each is a `tests/common::FIXTURES` entry, so
+`cargo xtask fixtures platform` regenerates it from the committed table and
+`bit_exact_with_the_software_decoder` decodes it — whole run, a `reset` and reseek to every later sync
+sample, and a full pass again after all the resets. **The 10-bit claim is the one five documents
+(`README.md`, `ROADMAP.md`, `crates/platform/README.md`, `docs/architecture.md`,
+`docs/adr/0001-platform-ffi.md`) make and that no committed test used to check**; it is now a
+`FIXTURES` row asserted *by name* in that test, so dropping the fixture fails the suite rather than
+quietly weakening five sentences.
+
+**The segmented fixture is the one that was missing, and it was missing in a way that mattered.** All
+twenty-four pictures of the first VP9 run had `segmentation_enabled == 0`, so the eight-entry branch of
+`va_dec_vp9.h:270-272` — *"otherwise, all eight entries should be valid"* — was never taken; only the
+degenerate one was. A regression that carried the frame's own quantizer into `SegParam[1..7]` would have
+passed every other test and produced a plausible wrong picture.
+`vp9_p0_segmented.mp4` is `vp9_p0_parity.mp4` plus `-aq-mode 2`, and all 96 of its frames carry
+`SEG_LVL_ALT_Q` on segments 0, 1, 2 and 4 with four distinct deltas
+(`a_vp9_fixture_that_really_uses_segmentation`). The 316-byte `VASliceParameterBufferVP9` is then pinned
+on both arms — every `segment_flags`, every `filter_level[4][2]` transcribed from VP9 8.8.1, and all
+four quant scales read out of 8.6.1 — by
+`vaapi::picture::tests::the_vp9_slice_record_carries_every_segment_it_should`.
+
+**What is *not* claimed.** The segmentation deltas were checked against an independent implementation of
+6.2.11 (GStreamer's `GstVp9Parser`) rather than against ffmpeg, because ffmpeg 9 no longer exposes VP9
+segmentation as frame side data — `AV_FRAME_DATA_SEGMENTATION_PARAMS` is gone from `libavutil/frame.h`.
+That is a change in the oracle, not in the claim: both decoders agree picture for picture on the same
+files, which is the property that matters for this table.
 
 ---
 
@@ -246,7 +291,13 @@ test from three failures to one.
 ## 8. Open
 
 - **ffmpeg's H.264 implicit weighting** — unexplained; §2.
-- **VP9 on real hardware** — wired and unit-tested; the picture-for-picture oracle is the next task; §4.
+- **VP9 segmentation beyond `SEG_LVL_ALT_Q`** — every frame of every fixture available here sets
+  `SEG_LVL_ALT_L`, `SEG_LVL_REF_FRAME` or `SEG_LVL_SKIP`; no libvpx invocation reachable from this
+  machine's libvpx produces them. `segment_flags` and the per-segment `filter_level` arms are pinned
+  with those three features **clear**, and their active paths are covered by unit tests that build a
+  header directly (`a_vp9_profile_this_backend_does_not_decode_is_an_error_not_a_record` and the
+  `vp9_segment_param` tests in `vaapi::picture`). A real-world stream with any of the three would be
+  the fixture that closes this; §4.
 - **AV1 hardware decode on Linux** — its own milestone; §5.
 - **Encode** — `VideoEncoder`/`EncoderFactory` implementation, `sample_entry` from the driver's parameter
   sets, the frame loop driven by settings, and the docs. Also: reference depth > 1, multi-slice pictures

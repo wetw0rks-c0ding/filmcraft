@@ -196,7 +196,7 @@ impl Mark {
             return invalid_hevc_picture();
         }
         // `used` is the `VA_PICTURE_HEVC_RPS_*` bit saying the current picture refers to this one,
-        // which is exclusive of the long-term bit (va.h:5325).
+        // which is exclusive of the long-term bit (va.h:5321).
         let flags = match (used, self) {
             (Some(bit), _) => bit,
             (None, Mark::Long(_)) => PICTURE_HEVC_LONG_TERM_REFERENCE,
@@ -1432,11 +1432,20 @@ fn vp9_segment_param(h: &FrameHeader, st: &HeaderState, seg_id: u8) -> Result<Va
         // (`va_dec_vp9.h:236-254`), which is not a naming anyone can resolve by reading the field
         // name — `luma_ac_quant_scale` sounds like the AC table and does not have to be. So it was
         // settled by asking libva to print the record this backend's values produce and reading it
-        // beside the same fields from a known-good decode of the same frame: at `base_q_idx` 160,
+        // beside the same fields from a known-good decode of the same frame. **The frame is named,
+        // so the sentence can be checked:** it is sample 1 of `vp9_p0_parity.mp4` (a
+        // `tests/common::FIXTURES` entry, regenerable with `cargo xtask fixtures platform`), whose
+        // `base_q_idx` this repository's own parser reports as 160 —
         // `AC_QLOOKUP[160] == 305` and `DC_QLOOKUP[160] == 223`, and the record reads
         // `luma_ac_quant_scale = 305`, `luma_dc_quant_scale = 223`. **So the field name is right and
         // the internal index it names is the misleading one** — the same inversion VP9 8.6.1's
         // `dequant[i][1]`-is-the-DC-value spelling comes from.
+        //
+        // Pinned, rather than merely cited, by
+        // `tests::the_vp9_quant_scales_are_ac_then_dc_on_a_frame_at_qindex_160`, which walks the whole
+        // run, finds the frames at qindex 160 and at the fixture's key-frame qindex 70, and asserts
+        // this exact pair — the two tables disagree at both, so filling both fields from one of them
+        // fails.
         luma_ac_quant_scale: vp9_quant(h, bd, &AC_QLOOKUP, qindex, 0)?,
         luma_dc_quant_scale: vp9_quant(h, bd, &DC_QLOOKUP, qindex, i32::from(h.delta_q_y_dc))?,
         chroma_ac_quant_scale: vp9_quant(h, bd, &AC_QLOOKUP, qindex, i32::from(h.delta_q_uv_ac))?,
@@ -2780,7 +2789,10 @@ fn hevc_same_picture(first: &filmcraft_hevc::slice::SliceHeader, sh: &filmcraft_
 ///
 /// `ReferenceFrames` is the decoded picture buffer after this picture's reference picture set has
 /// been applied to it, with each entry flagged as one of the picture set's `RPS_ST_CURR_*` groups
-/// or as a long-term reference (`va_dec_hevc.h:5319-5337`). The slice record's `RefPicList` entries
+/// or as a long-term reference. **Those flags are `va.h`'s, not `va_dec_hevc.h`'s**: the record's
+/// array is declared at `va_dec_hevc.h:64` and the *values* each entry carries are the
+/// `VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` / `_AFTER` / `_LT_CURR` macros, which live in `va.h`
+/// alongside the other HEVC picture flags (`va.h:5310-5346`). The slice record's `RefPicList` entries
 /// are indices into that array, which is why both come from the same call.
 fn fill_hevc_picture(
     params: &mut VaPictureParameterBufferHevc,
@@ -2845,7 +2857,8 @@ fn fill_hevc_picture(
 }
 
 /// The `ReferenceFrames` a picture's record carries, each entry flagged as one of the picture set's
-/// three groups (`va_dec_hevc.h:5320-5337`) or as a long-term reference.
+/// three groups (`va.h:5336-5346` — `VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` / `_AFTER` / `_LT_CURR`) or as
+/// a long-term reference.
 ///
 /// The groups are derived here rather than in [`hevc_ref_lists`] because that function has already
 /// applied the set to the buffer by the time it returns: what is left in `dpb` *is* the set, and an
@@ -2908,7 +2921,7 @@ fn hevc_reference_frames(
         }
     }
     // Only the entries the current picture's reference picture set names are live, and only they get a
-    // `ReferenceFrames` slot: `va.h:5322-5331` says the three `VA_PICTURE_HEVC_RPS_*` bits are how a
+    // `ReferenceFrames` slot: `va.h:5323-5346` says the three `VA_PICTURE_HEVC_RPS_*` bits are how a
     // driver learns *which* entries this picture refers to and that `NumPocTotalCurr` is their count —
     // and the HEVC record has no separate count field, so an entry with a valid `picture_id` and no
     // `RPS_*` bit is a state the header does not define. iHD tolerates it (which is why I and P
@@ -3497,7 +3510,7 @@ mod tests {
     /// Every `ReferenceFrames` entry the current picture's set does not name is
     /// `VA_PICTURE_HEVC_INVALID`.
     ///
-    /// The HEVC record has no count field: `va.h:5322-5331` says the three `RPS_*` bits are how a
+    /// The HEVC record has no count field: `va.h:5323-5346` says the three `RPS_*` bits are how a
     /// driver learns which entries the picture refers to and that `NumPocTotalCurr` is their count.
     /// An entry with a valid `picture_id` and no bit is therefore a state the header does not define.
     /// iHD tolerates it, which is why I and P pictures decode here — a driver that counted every
@@ -7070,5 +7083,344 @@ mod tests {
         let info = NalStreamInfo::from_entry(&file.tracks[track].entries[0]).expect("a NAL codec");
         let samples = (0..file.tracks[track].samples.len()).map(|i| file.read_sample(&bytes, track, i).expect("a sample")).collect();
         (info.map_err(|e| e.to_string()), samples)
+    }
+    /// One of this crate's VP9 parity fixtures as `(sample, pts)` pairs, generated on demand with the
+    /// same encoder arguments `tests/common::FIXTURES` gives it.
+    ///
+    /// **`FILMCRAFT_VP9_FIXTURE_ARGS` overrides the argument list**, which is how the drift between
+    /// this transcription and `tests/common::FIXTURES` would be *found* rather than tolerated: set it
+    /// to the exact `FIXTURES` arguments for that entry and every assertion below runs against the
+    /// file the integration suite decodes. Left unset, these tests generate their own — the same
+    /// encoded stream either way, since ffmpeg is deterministic for these arguments.
+    ///
+    /// **A transcription rather than a shared table**, because `tests/common` is an integration-test
+    /// module and cannot be imported into a unit test. Everything the assertions below depend on
+    /// about the encode — the segmentation deltas, the two qindexes, that one fixture segments and
+    /// the other does not — is asserted as a *number* rather than read off the builder, so a
+    /// different encode fails loudly instead of redefining what correct is.
+    fn vp9_fixture(name: &str, ff: &std::path::Path) -> Option<Vec<(Vec<u8>, i64)>> {
+        let out = filmcraft_testkit::fixtures_dir("platform").join(name);
+        let override_args = std::env::var("FILMCRAFT_VP9_FIXTURE_ARGS").ok().filter(|v| !v.is_empty());
+        let path = filmcraft_testkit::fixtures::generate(&out, |tmp| {
+            let args: Vec<String> = match &override_args {
+                Some(v) => v.split_whitespace().map(str::to_string).collect(),
+                None => vp9_parity_args(name).into_iter().map(str::to_string).collect(),
+            };
+            std::process::Command::new(ff)
+                .args(["-y", "-v", "error"])
+                .args(&args)
+                .arg(tmp)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })?;
+        let bytes = std::fs::read(path).ok()?;
+        let file = filmcraft_isobmff::open(bytes.clone()).ok()?;
+        let t = file.track_of_kind(filmcraft_isobmff::TrackKind::Video)?;
+        (0..file.tracks[t].samples.len()).map(|i| file.read_sample(&bytes, t, i).ok().map(|b| (b, file.tracks[t].samples[i].pts))).collect::<Option<Vec<_>>>()
+    }
+
+    /// `tests/common::FIXTURES`'s two VP9 parity entries, transcribed. `-aq-mode 2` is the **only**
+    /// difference between them, which is what makes the pair the two arms of
+    /// `va_dec_vp9.h:270-272` rather than two similar streams.
+    fn vp9_parity_args(name: &str) -> Vec<&'static str> {
+        let mut args = vec!["-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=4,noise=alls=12:allf=t", "-c:v", "libvpx-vp9", "-profile:v", "0"];
+        if name == "vp9_p0_segmented.mp4" {
+            args.extend_from_slice(&["-aq-mode", "2"]);
+        }
+        args.extend_from_slice(&[
+            "-b:v",
+            "0",
+            "-crf",
+            "40",
+            "-deadline",
+            "good",
+            "-cpu-used",
+            "4",
+            "-g",
+            "24",
+            "-auto-alt-ref",
+            "1",
+            "-lag-in-frames",
+            "16",
+            "-row-mt",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+        ]);
+        args
+    }
+
+    /// **The VP9 slice record's eight segments, pinned on a frame with segmentation off and one with it on.**
+    ///
+    /// The picture parameter record's 92 bytes are pinned byte for byte against a C compile
+    /// (`the_vp9_record_for_a_key_frame_is_exactly_these_bytes`). **The slice record's 316 bytes were
+    /// not**, and the gap was shaped exactly like the branch's other near-misses: every test that read the
+    /// record back read *two* fields of it — `slice_data_size` in `decoder.rs`, `.is_some()` in the
+    /// submission-list test — plus the two alignment bytes at 18-19 per segment. `segment_flags`,
+    /// `filter_level[4][2]` and the four quant scales had **no** assertion anywhere, on either arm.
+    ///
+    /// That matters because those fields are the record's whole content. `VADecPictureParameterBufferVP9`
+    /// has no `base_q_idx` and no `delta_q_*` (`va_dec_vp9.h:58-192`), so **the only route by which a
+    /// VP9 frame's quantizer reaches a driver is `SegParam[]` here** — a wrong entry is not a degraded
+    /// picture, it is a picture dequantized at the wrong qindex. And `va_dec_vp9.h:270-272` states two
+    /// rules that were both unasserted:
+    ///
+    /// - *"When segmentation is disabled, only `SegParam[0]` has valid values, all other entries should be
+    ///   populated with 0."* — a regression carrying this frame's quantizer into `SegParam[1..7]`
+    ///   submits eight segments that do not exist.
+    /// - *"Otherwise, all eight entries should be valid."* — zeroing all eight when segmentation *is* on
+    ///   throws away the per-segment parameters the record exists for.
+    ///
+    /// So this asserts **both arms, on real encoded frames**, by parsing the fixture with
+    /// `filmcraft_vp9::header` and reading the built record back through `ffi::slice_params_vp9` — the
+    /// record the driver is actually handed, not one re-derived here. The expected values are written out
+    /// from the specification (8.6.1 for the quant scales, 8.8.1 for the filter level, 6.2.11 for the
+    /// flags) rather than read off the builder, so a change in the builder fails rather than redefining
+    /// what correct is.
+    ///
+    /// **Both fixtures' assertions are checked against the state they are meant to be about**, so a
+    /// fixture that stopped using segmentation (or started) would fail here rather than silently
+    /// re-narrowing the coverage — [`a_vp9_fixture_that_really_uses_segmentation`] is the parse-level
+    /// statement of the same fact.
+    #[test]
+    fn the_vp9_slice_record_carries_every_segment_it_should() {
+        let Some(ff) = filmcraft_testkit::ffmpeg() else {
+            eprintln!("SKIPPED: ffmpeg not found");
+            return;
+        };
+        let refs: [Option<filmcraft_vp9::header::RefInfo>; 8] = std::array::from_fn(|_| Some(filmcraft_vp9::header::RefInfo { width: 640, height: 360 }));
+
+        for (name, want_segmentation) in [("vp9_p0_parity.mp4", false), ("vp9_p0_segmented.mp4", true)] {
+            let Some(samples) = vp9_fixture(name, &ff) else {
+                eprintln!("SKIPPED: ffmpeg cannot encode libvpx-vp9");
+                return;
+            };
+            let samples: Vec<(Vec<u8>, i64)> = samples;
+            let mut st = filmcraft_vp9::header::HeaderState::default();
+            // Every frame is checked, not the first: the header carries state forward, so one frame is
+            // not enough to say what the record does with a whole run.
+            let mut checked = 0usize;
+            // The quantizers the eight segments carried on the **first** frame checked, for the log line
+            // and for the distinctness guard — hoisted so it is available after the loop.
+            let mut first_distinct: std::collections::BTreeSet<i16> = std::collections::BTreeSet::new();
+            for (i, (bytes, _)) in samples.iter().enumerate() {
+                for part in filmcraft_vp9::header::split_superframe(bytes) {
+                    let h = filmcraft_vp9::header::parse_uncompressed(part, &mut st, &refs).unwrap_or_else(|e| panic!("{name} sample {i}: {e}"));
+                    if h.show_existing_frame {
+                        // 6.2 returns from the parse there, so this header describes no picture at all —
+                        // and a record built from it is refused rather than describing a frame of zeros.
+                        continue;
+                    }
+                    assert_eq!(st.seg.enabled, want_segmentation, "{name} sample {i}: this fixture is the {want_segmentation} arm");
+                    let bytes = super::vp9_slice_record(&h, &st, part).unwrap_or_else(|e| panic!("{name} sample {i} has a slice record: {e}"));
+                    assert_eq!(bytes.len(), 316, "{name} sample {i}: VASliceParameterBufferVP9 is 316 bytes");
+                    let r = crate::vaapi::ffi::slice_params_vp9(&bytes).expect("316 bytes is a VP9 slice record");
+
+                    // --- the three geometry words -------------------------------------------------
+                    assert_eq!(r.slice_data_size as usize, part.len(), "{name} sample {i}: slice_data_size is this frame's own length");
+                    assert_eq!(r.slice_data_offset, 0, "{name} sample {i}: the buffer begins at the frame, so partition 0's offset is 0");
+                    assert_eq!(r.slice_data_flag, crate::vaapi::ffi::SLICE_DATA_FLAG_ALL, "{name} sample {i}: a whole frame goes in one piece");
+                    assert_eq!(r.va_reserved, [0u32; 4], "{name} sample {i}: the tail is zero");
+
+                    // --- the eight segments, which is the content ---------------------------------
+                    for seg in 0..8usize {
+                        let seg_rec = r.seg_param[seg];
+                        // **`filter_level[4][2]`, transcribed from VP9 8.8.1 rather than read off the
+                        // builder.** It is the only other per-segment field in the record, and until now
+                        // it was asserted on exactly one arm (as part of "SegParam[1..7] are all zero"),
+                        // which says nothing about the eight-entry case. The spec's own process, spelled
+                        // out here so a change in `vp9_segment_param` fails instead of redefining correct:
+                        //
+                        //   nShift = loop_filter_level >> 5
+                        //   lvlSeg = loop_filter_level, or FeatureData[seg][SEG_LVL_ALT_L] + it
+                        //            (or just the feature, in abs mode), clipped to 0..MAX_LOOP_FILTER
+                        //   LvlLookup[seg][INTRA_FRAME][0] = Clip3(0, MAX_LOOP_FILTER,
+                        //       lvlSeg + (loop_filter_ref_deltas[INTRA_FRAME] << nShift))
+                        //   LvlLookup[seg][ref][mode]      = Clip3(0, MAX_LOOP_FILTER,
+                        //       lvlSeg + (loop_filter_ref_deltas[ref] << nShift)
+                        //              + (loop_filter_mode_deltas[mode] << nShift))   for the three inter rows
+                        //
+                        // Step 4 is gated on `loop_filter_delta_enabled`, not on `delta_update`: the
+                        // deltas persist across frames, so a frame that updates nothing still filters at
+                        // the deltas the last updating frame set. The intra row takes the reference delta
+                        // alone because step 4 spells it out separately — that is 8.8.1's own split, not a
+                        // simplification of it.
+                        let lvl_seg = if st.seg.feature_active(seg as u8, filmcraft_vp9::SEG_LVL_ALT_L) {
+                            let d = i32::from(st.seg.feature_data[seg][filmcraft_vp9::SEG_LVL_ALT_L]);
+                            (if st.seg.abs_or_delta_update { d } else { d + i32::from(st.lf.level) }).clamp(0, filmcraft_vp9::MAX_LOOP_FILTER)
+                        } else {
+                            i32::from(st.lf.level)
+                        };
+                        let n_shift = i32::from(st.lf.level >> 5);
+                        let mut want_levels = [[0i32; 2]; 4];
+                        for (ref_row, row) in want_levels.iter_mut().enumerate() {
+                            let base = if st.lf.delta_enabled { lvl_seg + (i32::from(st.lf.ref_deltas[ref_row]) << n_shift) } else { lvl_seg };
+                            for (mode, cell) in row.iter_mut().enumerate() {
+                                let mode_delta = if st.lf.delta_enabled && ref_row != 0 { i32::from(st.lf.mode_deltas[mode]) << n_shift } else { 0 };
+                                *cell = (base + mode_delta).clamp(0, filmcraft_vp9::MAX_LOOP_FILTER);
+                            }
+                        }
+                        let got_levels = seg_rec.filter_level.map(|row| row.map(i32::from));
+                        if !want_segmentation && seg != 0 {
+                            // **The rule itself, asserted on bytes.** `SegParam[1..7]` are not "the frame's
+                            // values again" and not "whatever the record had" — all 36 bytes of each are zero.
+                            // This is the arm a regression in `vp9_segment_param` would break.
+                            assert_eq!(
+                                (
+                                    seg_rec.segment_flags,
+                                    got_levels,
+                                    seg_rec.luma_ac_quant_scale,
+                                    seg_rec.luma_dc_quant_scale,
+                                    seg_rec.chroma_ac_quant_scale,
+                                    seg_rec.chroma_dc_quant_scale,
+                                    seg_rec.padding_before_va_reserved,
+                                    seg_rec.va_reserved
+                                ),
+                                (0, [[0i32; 2]; 4], 0, 0, 0, 0, [0u8; 2], [0u32; 4]),
+                                "{name} sample {i}: with segmentation off, SegParam[{seg}] is all zero — `va_dec_vp9.h:270-272`"
+                            );
+                            continue;
+                        }
+                        assert_eq!(
+                            got_levels, want_levels,
+                            "{name} sample {i} segment {seg}: filter_level[4][2] — nShift {} from level {}, ref_deltas {:?}, mode_deltas {:?}",
+                            n_shift, st.lf.level, st.lf.ref_deltas, st.lf.mode_deltas
+                        );
+                        if !want_segmentation {
+                            // The off arm's SegParam[0] is the one entry with valid values, and it carries
+                            // the frame's own quantizer: the picture record has nowhere else to put it.
+                            let (ac, dc) = (seg_rec.luma_ac_quant_scale, seg_rec.luma_dc_quant_scale);
+                            assert!(
+                                ac > 0 && dc > 0,
+                                "{name} sample {i}: SegParam[0] carries the frame's own quantizer (AC {ac}, DC {dc}), because the picture record has nowhere else to put it"
+                            );
+                            continue;
+                        }
+                        // Segmentation on: all eight are valid. Segments 0, 1, 2 and 4 carry
+                        // SEG_LVL_ALT_Q, so their quantizer is the frame's base shifted by their own delta
+                        // (8.6.1) — three *different* values, which is what makes this arm the test.
+                        let delta = i32::from(st.seg.feature_data[seg][filmcraft_vp9::SEG_LVL_ALT_Q]);
+                        let want_q = (delta + i32::from(h.base_q_idx)).clamp(0, 255) as usize;
+                        let want_ac = filmcraft_vp9::AC_QLOOKUP[want_q];
+                        let want_dc = filmcraft_vp9::DC_QLOOKUP[want_q];
+                        assert_eq!(
+                            i32::from(seg_rec.luma_ac_quant_scale),
+                            want_ac,
+                            "{name} sample {i} segment {seg}: luma AC is AC_QLOOKUP at qindex {want_q} (base {} + delta {delta})",
+                            h.base_q_idx
+                        );
+                        assert_eq!(
+                            i32::from(seg_rec.luma_dc_quant_scale),
+                            want_dc,
+                            "{name} sample {i} segment {seg}: luma DC is DC_QLOOKUP at qindex {want_q}"
+                        );
+                        assert_eq!(i32::from(seg_rec.chroma_ac_quant_scale), want_ac, "{name} sample {i} segment {seg}: chroma AC");
+                        assert_eq!(i32::from(seg_rec.chroma_dc_quant_scale), want_dc, "{name} sample {i} segment {seg}: chroma DC");
+                        assert_eq!(seg_rec.segment_flags, 0, "{name} sample {i} segment {seg}: no feature but SEG_LVL_ALT_Q is active, so the flags are clear");
+                    }
+                    // **And the four active segments really do differ in the record**, which is the whole
+                    // point: an implementation that wrote one segment's quantizer into all eight would
+                    // pass every per-segment assertion above. Only the segmentation-*on* arm has
+                    // distinct quantizers to compare — the off arm's whole claim is that entries 1..7
+                    // are zero, which the assertion in that branch already makes.
+                    let ac: Vec<i16> = r.seg_param.iter().map(|x| x.luma_ac_quant_scale).collect();
+                    let distinct: std::collections::BTreeSet<i16> = ac.iter().copied().collect();
+                    if want_segmentation {
+                        assert!(
+                            distinct.len() >= 4,
+                            "{name} sample {i}: the eight segments' quantizers are {ac:?}, which cannot tell the eight-entry branch from a copy of SegParam[0]"
+                        );
+                        // The **first** frame checked, kept for the log line, so the variable says what the
+                        // comment above it says it does.
+                        if first_distinct.is_empty() {
+                            first_distinct = distinct;
+                        }
+                    } else {
+                        assert_eq!(ac[1..], [0i16; 7], "{name} sample {i}: SegParam[1..7] carry no quantizer at all — not a second copy of SegParam[0]");
+                    }
+                    checked += 1;
+                }
+            }
+            assert!(checked > 20, "{name}: only {checked} frames reached the record, which is not a run");
+            if want_segmentation {
+                println!("{name}: {checked} frames' slice records pinned — segmentation on, quantizers {:?}", first_distinct);
+            } else {
+                println!("{name}: {checked} frames' slice records pinned — segmentation off, SegParam[1..7] all zero");
+            }
+        }
+    }
+
+    /// **The AC / DC quant-scale mapping, pinned on a frame whose `base_q_idx` this repository actually has.**
+    ///
+    /// `vp9_segment_param` fills `luma_ac_quant_scale` from `AC_QLOOKUP` and `luma_dc_quant_scale` from
+    /// `DC_QLOOKUP`, and the comment there justifies it with *"at `base_q_idx` 160, `AC_QLOOKUP[160] ==
+    /// 305` and `DC_QLOOKUP[160] == 223`"*. That sentence is correct, and **no fixture in this
+    /// repository had a frame at qindex 160** when it was written — so the evidence had no traceable
+    /// provenance, which is the exact shape of the three "confident claims of absence" this branch has
+    /// already paid for.
+    ///
+    /// **It is pinned here on `vp9_p0_parity.mp4`, which does carry one**, measured with this repo's own
+    /// parser: that fixture's frames run at `base_q_idx` 70, 160, 151, 140, 121 and back, and the ones at
+    /// 160 are ordinary inter frames of the run rather than a frame built for the purpose. Segmentation is
+    /// **off** there, which is what makes the pin exact rather than approximate: with no `SEG_LVL_ALT_Q`,
+    /// segment 0's qindex *is* `base_q_idx` (8.6.1's `get_qindex` returns it unchanged), so the record's
+    /// two fields are `AC_QLOOKUP[160]` and `DC_QLOOKUP[160]` and nothing else.
+    ///
+    /// Two frames at different qindexes are used, so neither the tables nor the choice of them can be
+    /// pinned by a coincidence, and `base_q_idx` is asserted before the value it justifies — a fixture
+    /// that stopped reaching qindex 160 fails as a missing premise rather than as a wrong number.
+    #[test]
+    fn the_vp9_quant_scales_are_ac_then_dc_on_a_frame_at_qindex_160() {
+        let Some(ff) = filmcraft_testkit::ffmpeg() else {
+            eprintln!("SKIPPED: ffmpeg not found");
+            return;
+        };
+        let Some(samples) = vp9_fixture("vp9_p0_parity.mp4", &ff) else {
+            eprintln!("SKIPPED: ffmpeg cannot encode libvpx-vp9");
+            return;
+        };
+        let refs: [Option<filmcraft_vp9::header::RefInfo>; 8] = std::array::from_fn(|_| Some(filmcraft_vp9::header::RefInfo { width: 640, height: 360 }));
+
+        // Every frame of the run is parsed once with one state, exactly as the decode loop does it, and
+        // each frame's own segment-0 record is checked. Walking the whole run rather than seeking is what
+        // makes "a frame at 160 exists" a property of the stream instead of a hand-picked index.
+        let mut st = filmcraft_vp9::header::HeaderState::default();
+        let mut seen: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+        let mut pinned: Vec<u8> = Vec::new();
+        for (i, (bytes, _)) in samples.iter().enumerate() {
+            for part in filmcraft_vp9::header::split_superframe(bytes) {
+                let h = filmcraft_vp9::header::parse_uncompressed(part, &mut st, &refs).unwrap_or_else(|e| panic!("sample {i}: {e}"));
+                if h.show_existing_frame {
+                    continue;
+                }
+                seen.insert(h.base_q_idx);
+                // Two distinct qindexes is enough; 160 is the one the record comment names and 70 is the
+                // fixture's key frame, so the two come from different parts of the run.
+                if pinned.len() == 2 || (h.base_q_idx != 160 && h.base_q_idx != 70) {
+                    continue;
+                }
+                let rec = super::vp9_slice_record(&h, &st, part).unwrap_or_else(|e| panic!("sample {i}: {e}"));
+                let r = crate::vaapi::ffi::slice_params_vp9(&rec).expect("316 bytes is a VP9 slice record");
+                let q = usize::from(h.base_q_idx);
+                // The premise: this fixture does not segment, so segment 0's qindex is the frame's own.
+                assert!(!st.seg.enabled, "sample {i}: vp9_p0_parity.mp4 carries no segmentation, so base_q_idx is SegParam[0]'s qindex unshifted");
+                let want_ac = filmcraft_vp9::AC_QLOOKUP[q];
+                let want_dc = filmcraft_vp9::DC_QLOOKUP[q];
+                assert_eq!(i32::from(r.seg_param[0].luma_ac_quant_scale), want_ac, "base_q_idx {q}: luma_ac_quant_scale is AC_QLOOKUP[{q}] == {want_ac}");
+                assert_eq!(i32::from(r.seg_param[0].luma_dc_quant_scale), want_dc, "base_q_idx {q}: luma_dc_quant_scale is DC_QLOOKUP[{q}] == {want_dc}");
+                // **The two tables disagree here**, so an implementation that filled both fields from one
+                // of them — the mistake `va_dec_vp9.h`'s field names invite — fails rather than passing on
+                // a qindex where they happen to agree.
+                assert_ne!(want_ac, want_dc, "base_q_idx {q}: AC_QLOOKUP and DC_QLOOKUP agree, so this frame cannot tell the two fields apart");
+                println!("sample {i}: base_q_idx {q} — AC_QLOOKUP[{q}] == {want_ac}, DC_QLOOKUP[{q}] == {want_dc}, and the record carries exactly those");
+                pinned.push(h.base_q_idx);
+            }
+        }
+        assert!(
+            seen.contains(&160),
+            "no frame of vp9_p0_parity.mp4 is at base_q_idx 160 (the run's qindexes are {seen:?}), so the record's own evidence is not reproducible here"
+        );
+        assert_eq!(pinned.len(), 2, "both qindexes were pinned: {pinned:?}");
     }
 }

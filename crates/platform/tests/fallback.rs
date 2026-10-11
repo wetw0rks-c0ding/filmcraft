@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use filmcraft_codecs::hw::NalStreamInfo;
+use filmcraft_codecs::hw::{FrameStreamInfo, NalStreamInfo, StreamInfo};
 use filmcraft_codecs::{DecodedFrame, Result, VideoDecoder};
 use filmcraft_platform::HybridDecoder;
 
@@ -37,8 +37,29 @@ impl VideoDecoder for Failing {
     }
 }
 
+/// The stream info a `HybridDecoder` is built around, for whichever of the two shapes this entry is.
+///
+/// **Both, not just NAL.** The VP9 fixtures in [`FIXTURES`] carry a `vpcC`, so
+/// [`NalStreamInfo::from_entry`] answers `None` for them — they have no NAL parameter sets to carry,
+/// because the whole frame is the unit. This helper used to `unwrap()` twice and said *"every fixture
+/// in this table is H.264 or HEVC"*, which stopped being true when VP9 joined the table and made this
+/// suite **panic on its first VP9 fixture** rather than test it. The fallback property being asserted
+/// is `HybridDecoder`'s, not H.264's: a frame-coded stream is exactly where a mid-stream failure has
+/// no in-band parameter set to notice, so the VP9 fixtures are the more interesting half of this
+/// test and the fix restores them rather than skipping them.
+///
+/// The two branches mirror what the backends' own factories do (`vaapi::stream_info`,
+/// `media_foundation`'s), so the `HybridDecoder` under test is built the way the application builds
+/// it rather than by a fourth spelling of the same rule.
+fn info_of(s: &Stream) -> filmcraft_codecs::hw::StreamInfo {
+    match NalStreamInfo::from_entry(&s.entry) {
+        Some(r) => StreamInfo::Nal(r.unwrap()),
+        None => StreamInfo::Frame(FrameStreamInfo::from_entry(&s.entry).unwrap().unwrap()),
+    }
+}
+
 fn hybrid(s: &Stream, fail_after: usize) -> HybridDecoder {
-    let info = NalStreamInfo::from_entry(&s.entry).unwrap().unwrap();
+    let info = info_of(s);
     let inner = filmcraft_codecs::software_video_decoder(&s.entry).unwrap();
     HybridDecoder::new(Box::new(Failing { inner, fail_after, fed: 0 }), s.entry.clone(), info)
 }

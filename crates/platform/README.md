@@ -92,7 +92,10 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
     that differs from the sample entry's, a libva older than 2.x, and no libva, render node or
     video decoder for the profile.
   - *VP9 is decoded*: profiles 0 and 2 at 4:2:0, 8- and 10-bit — the same scope the Windows backend
-    takes (`vaapi/picture.rs`, `vp9_decline_reason`). libva wants each frame's uncompressed header as
+    takes (`vaapi/picture.rs`, `vp9_decline_reason`). **Both depths are measured, not assumed**: the
+    8-bit run is `vp9_p0_parity.mp4` and the 10-bit run `vp9_p2_parity.mp4`, 96/96 pictures bit for bit
+    each, asserted by name in `tests/vaapi.rs::bit_exact_with_the_software_decoder` and regenerable with
+    `cargo xtask fixtures platform`. libva wants each frame's uncompressed header as
     a `VADecPictureParameterBufferVP9`, and `filmcraft_vp9::header` exposes exactly that, so the record
     is built from our own parser. **VP9 profiles 1 and 3** (4:2:2 / 4:4:0 / 4:4:4) and **profile 4**
     (which the specification reserves and does not define) are declined, as is 12-bit: every surface

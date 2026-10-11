@@ -391,6 +391,7 @@ fn serve_dir(dir: &std::path::Path, port: u16) -> Result<(), String> {
 const FIXTURE_GENERATORS: &[(&str, &str)] = &[
     ("h264", "conformance"),
     ("hevc", "conformance"),
+    ("platform", "vaapi"),
     ("isobmff", "oracle_demux"),
     ("matroska", "oracle"),
     ("prores", "oracle_decode"),

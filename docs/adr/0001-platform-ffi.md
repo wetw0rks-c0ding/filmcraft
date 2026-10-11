@@ -132,6 +132,15 @@ as is 12-bit: every surface this backend creates is 4:2:0 at 8 or 10 bits. **AV1
 because `filmcraft_av1` does not expose its per-frame header and an invented record is precisely the
 failure this record exists to prevent.
 
+**That scope is measured, at both depths.** `vp9_p0_parity.mp4` (profile 0, 8-bit) and
+`vp9_p2_parity.mp4` (profile 2, 10-bit) are `tests/common::FIXTURES` entries at `Tier::EveryPicture`,
+compared picture for picture — 96/96 each — by `bit_exact_with_the_software_decoder`, and regenerated
+from the committed table by `cargo xtask fixtures platform`. A third fixture,
+`vp9_p0_segmented.mp4`, is the same encode plus `-aq-mode 2` and is the only one whose frames carry
+`segmentation_enabled`; without it the eight-entry branch of `va_dec_vp9.h:270-272` would never be
+reached on hardware and a record that copied `SegParam[0]` into all eight entries would pass every
+other test in the tree.
+
 Two VP9 cases have no H.264 / HEVC analogue and are stated rather than left to fall out of the code:
 a frame that re-shows an earlier one (`show_existing_frame`) is **decoded** — VP9 8.2.2 has the
 decoder output the picture that slot holds and decode nothing, so it takes no surface from the ring
