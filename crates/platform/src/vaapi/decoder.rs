@@ -414,17 +414,24 @@ impl VideoDecoder for VaDecoder {
             }
         };
         let stamp = self.take_pts(pts);
-        self.timings.frames += 1;
+        // The counters are **pictures**, so a sample that showed two of them counts two — which is
+        // what makes `timings.frames` a per-picture cost for the superframe case too.
+        self.timings.frames += decoded.frames.len() as u64;
         self.timings.decode += decoded.decode;
         self.timings.readback += decoded.readback;
         self.timings.convert += decoded.convert;
-        let Some(frame) = decoded.frame else {
+        if decoded.frames.is_empty() {
             // A frame the stream does not show: it was rendered (and its slots moved), and there is
             // nothing to hand back. Its presentation time came out of `in_flight` above, which is
             // right — the sample was accounted for, it simply produced no picture.
             return Ok(Vec::new());
-        };
-        Ok(vec![DecodedFrame { pts: stamp, frame, draft: false }])
+        }
+        // **Every picture of the sample carries the sample's own presentation time.** A VP9
+        // superframe is several frames under one timestamp and has no other timestamp to give them,
+        // and this is what FilmCraft's software VP9 decoder does for the same bitstream
+        // (`crates/vp9/src/decoder.rs:248-255`) — so the two paths agree on the number of pictures
+        // *and* on the key a caller would look them up by.
+        Ok(decoded.frames.into_iter().map(|frame| DecodedFrame { pts: stamp, frame, draft: false }).collect())
     }
 
     fn flush(&mut self) -> Vec<DecodedFrame> {
@@ -552,7 +559,7 @@ impl VaDecoder {
             return Err(format!("surface {surface} is still being rendered into after vaSyncSurface"));
         }
         let (convert, frame) = self.readback(surface)?;
-        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame: Some(frame) })
+        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frames: vec![frame] })
     }
 
     /// One VP9 **sample**, which is not necessarily one frame: a container sample can be a
@@ -562,12 +569,12 @@ impl VaDecoder {
     /// **So this splits the sample first, and every frame in it is decoded as a frame of its own.**
     /// Handing the whole sample to `Vp9State::frame` would parse only the *first* frame's header,
     /// submit the whole sample as that one frame's data, and — the part that does real damage —
-    /// compute that frame's `first_partition_size` from the *whole sample's* length. That field is how
-    /// a driver finds the compressed header (`va_dec_vp9.h:167-169`), so on a two-frame superframe
-    /// whose first frame is 2 673 bytes and whose sample is 12 943, it would be told 12 933 where 2 663
-    /// is the truth: a header extent pointing most of the way through the next frame. This is the
-    /// `33`-instead-of-`32` class of error, and it is why the split is not an optimisation but the
-    /// only way the length means anything.
+    /// count the *whole sample* as that frame's `slice_data_size`, which the header says is "the byte
+    /// count of current frame in the bitstream buffer … but actually means `frame_data_size`"
+    /// (`va_dec_vp9.h:280-284`). So on a two-frame superframe whose first frame is 2 673 bytes and
+    /// whose sample is 12 943, the driver would be told the first frame's data runs to the end of the
+    /// *second* one. This is the `33`-instead-of-`32` class of error, and it is why the split is not
+    /// an optimisation but the only way the length means anything.
     ///
     /// ## What each frame does to the reference buffer, and to the caller's pictures
     ///
@@ -576,22 +583,21 @@ impl VaDecoder {
     /// the shown frame predicts from, so reading the shown frame before committing the alt-ref one
     /// would resolve its references against a buffer that does not hold them yet.
     ///
-    /// The picture the caller gets is **not** one per frame. A frame with `show_frame` clear is
-    /// decoded (it may refresh references) and produces no picture, which is the same
-    /// [`Decoded::frame`] rule a single-frame hidden picture follows, and which is what FilmCraft's own
+    /// The pictures the caller gets are **the shown frames, and only those.** A frame with `show_frame`
+    /// clear is decoded (it may refresh references) and produces no picture, which is the same
+    /// [`Decoded::frames`] rule a single-frame hidden picture follows, and which is what FilmCraft's own
     /// software VP9 decoder does (`crates/vp9/src/decoder.rs:413`, `:417`). So a superframe of
     /// [hidden alt-ref, shown] hands back exactly the one picture the stream shows, and `decode` gives
     /// it the sample's timestamp: one container sample, one timestamp, however many frames it holds.
     ///
-    /// **More than one shown frame in one superframe is the case worth naming.** The format allows it
-    /// and our software decoder emits every one (`crates/vp9/src/decoder.rs:248-255`), but this
-    /// backend has a single timestamp for the sample and a `Vec<DecodedFrame>` keyed by it — two
-    /// pictures under one timestamp would be indistinguishable to a caller comparing by presentation
-    /// time. So the **last** shown picture is the one returned, and the earlier ones are decoded and
-    /// committed and not shown. This is a deliberate divergence from the software path, named here
-    /// rather than left to be discovered as a picture-count difference: a superframe holding two shown
-    /// frames is not something any encoder here produces (see the fixture in `tests/vaapi.rs`), so
-    /// this is the one case with no test reaching it on real data.
+    /// **More than one shown frame in one superframe hands back all of them**, under that one
+    /// timestamp. The format allows it, our software decoder emits every one
+    /// (`crates/vp9/src/decoder.rs:248-255`), and the fixture in `tests/vaapi.rs` really does produce
+    /// it, so returning only the last was a divergence between the two paths for the same bitstream
+    /// and nothing caught it while the hardware path decoded nothing at all. A caller cannot tell two
+    /// pictures under one timestamp apart *by time* — and that is a property of the container, not a
+    /// reason to withhold one of them: they are both in the returned `Vec`, in decode order, and the
+    /// software decoder's picture for that timestamp is in the same shape.
     ///
     /// ## The order inside a frame is the reverse of [`Self::picture_nal`], and it has to be
     ///
@@ -637,7 +643,7 @@ impl VaDecoder {
         let (profile, bit_depth) = (info.profile, info.bit_depth);
         // Timings accumulate across every frame in the sample, so the cost of a superframe's hidden
         // alt-ref frame is reported rather than discarded — it is a real decode the user paid for.
-        let mut total = Decoded { decode: Duration::ZERO, readback: Duration::ZERO, convert: Duration::ZERO, frame: None };
+        let mut total = Decoded { decode: Duration::ZERO, readback: Duration::ZERO, convert: Duration::ZERO, frames: Vec::new() };
         for bytes in &frames {
             // An empty frame is not a frame: an index may name a zero-length member, and there is
             // nothing to decode or show in it. The software decoder skips these too
@@ -649,11 +655,10 @@ impl VaDecoder {
             total.decode += decoded.decode;
             total.readback += decoded.readback;
             total.convert += decoded.convert;
-            // The last shown picture wins, as the doc above says; a hidden frame leaves the previous
-            // one in place, which is what makes [hidden, shown] hand back the shown one.
-            if decoded.frame.is_some() {
-                total.frame = decoded.frame;
-            }
+            // **Every shown frame is collected, in decode order.** A hidden frame contributes none —
+            // which is what makes [hidden, shown] hand back exactly the shown one — and a superframe
+            // holding two *shown* frames hands back both, under the sample's one timestamp.
+            total.frames.extend(decoded.frames);
         }
         Ok(total)
     }
@@ -673,7 +678,7 @@ impl VaDecoder {
     /// across a loop that mutates the decoder is not possible, and cloning a description to work around
     /// that would be worse than naming the two numbers the check needs.
     ///
-    /// The returned `Decoded`'s `frame` is `None` for a frame the stream decodes but does not show,
+    /// The returned `Decoded`'s `frames` is empty for a frame the stream decodes but does not show,
     /// which still moved its reference slots — that is the point of not skipping it.
     fn picture_vp9_frame(&mut self, profile: u8, bit_depth: u32, bytes: &[u8]) -> std::result::Result<Decoded, String> {
         // **First, and this is the order the NAL path does not use:** read the frame, so that a frame
@@ -705,16 +710,42 @@ impl VaDecoder {
             .take_unreferenced(&live)
             .ok_or_else(|| format!("every one of the {} surfaces is still a reference; the stream needs more", self.ring.len()))?;
         let record = frame.record().ok_or_else(|| "a VP9 frame that is not a re-show carries no picture-parameter record".to_string())?;
+        let slice = frame.slice().ok_or_else(|| "a VP9 frame that is not a re-show carries no slice-parameter record".to_string())?;
 
         let decode0 = Instant::now();
-        // The two buffers a VP9 decode submits: the picture-parameter record, then **this frame's own
-        // bytes** — not the sample, which for a superframe would hand the driver the next frames'
-        // bytes as part of this one. VP9 has no slice headers (`va_dec_vp9.h` declares no
-        // `VASliceParameterBufferVP9`), so there is no slice record and no IQ matrix buffer to send
-        // with them. The handles live to the end of this function, so `vaDestroyBuffer` runs on every
+        // The three buffers a VP9 decode submits: the picture-parameter record, the **slice**
+        // parameter record, then **this frame's own bytes** — not the sample, which for a superframe
+        // would hand the driver the next frames' bytes as part of this one.
+        //
+        // **The slice parameter record is not optional, and this is the buffer whose absence cost a
+        // milestone.** It was previously omitted on the reasoning that "VP9 has no slice headers, so
+        // there is no slice record". That reasoning was half right about the codec and wrong about
+        // the API, and the error is worth not repeating:
+        //
+        // - VP9 *does* have no slice headers. 6.2 returns from `frame_header()` after the tile and
+        //   quantizer syntax and there is no slice layer at all, so every per-slice parsing field
+        //   H.264 and HEVC need has nothing to go in it. **That is why this record is thin — it is
+        //   why it is 316 bytes of segmentation parameters rather than 3128 bytes of reference lists
+        //   and prediction weights. It is not why it is absent.**
+        // - The record exists. `va_dec_vp9.h:279` declares `VASliceParameterBufferVP9`, in a file
+        //   named for this codec's decode API, with `slice_data_size`, `slice_data_offset`, the
+        //   `VA_SLICE_DATA_FLAG_*` field and `SegParam[8]`; and `va_dec_vp9.h:274-276` on the slice
+        //   data buffer says the bitstream sent there must include "whole or part of partition 0
+        //   (at least compressed header) to the end of frame".
+        // - It carries the one thing the picture record cannot. `VADecPictureParameterBufferVP9`
+        //   (`va_dec_vp9.h:58-192`) has no `base_q_idx` and no `delta_q_*` — no quantizer field at
+        //   all — so `SegParam[]` is the **only** route by which the qindex a frame is dequantized
+        //   with reaches a driver. Omitting it does not degrade the decode, it removes the decode's
+        //   parameters.
+        //
+        // What the omission actually looked like: `vaCreateBuffer`, `vaMapBuffer` and
+        // `vaRenderPicture` all returned `VA_STATUS_SUCCESS`, and `vaEndPicture` alone returned
+        // `VA_STATUS_ERROR_INVALID_PARAMETER` — one such status in a run of 81 758 successes.
+        //
+        // The handles live to the end of this function, so `vaDestroyBuffer` runs on every
         // path out of it.
-        let mut buffers = Vec::with_capacity(2);
-        for (kind, data) in Self::vp9_submission(record, bytes) {
+        let mut buffers = Vec::with_capacity(3);
+        for (kind, data) in Self::vp9_submission(record, slice, bytes) {
             buffers.push(self.session.buffer(kind, data)?);
         }
         let ids: Vec<u32> = buffers.iter().map(|b| b.id()).collect();
@@ -734,9 +765,9 @@ impl VaDecoder {
         let (frame_out, convert) = match frame.show() {
             true => {
                 let (convert, f) = self.readback(surface)?;
-                (Some(f), convert)
+                (vec![f], convert)
             }
-            false => (None, Duration::ZERO),
+            false => (Vec::new(), Duration::ZERO),
         };
         // The reference buffer moves **after** the driver rendered the picture, never before: a
         // record describes the buffer as it was before its own frame, and a decode that failed must
@@ -745,7 +776,7 @@ impl VaDecoder {
         // This runs for a hidden frame too, and that is the point: an alt-ref frame inside a
         // superframe is *why* the shown frame after it can be predicted at all.
         self.vp9.commit(&frame, surface)?;
-        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frame: frame_out })
+        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frames: frame_out })
     }
 
     /// A VP9 frame that re-shows a picture an earlier frame left in a reference slot: copy that
@@ -766,7 +797,7 @@ impl VaDecoder {
             return Err(format!("surface {surface}, which reference slot {slot} re-shows, is not ready to read"));
         }
         let (convert, frame) = self.readback(surface)?;
-        Ok(Decoded { decode: Duration::ZERO, readback: readback0.elapsed().saturating_sub(convert), convert, frame: Some(frame) })
+        Ok(Decoded { decode: Duration::ZERO, readback: readback0.elapsed().saturating_sub(convert), convert, frames: vec![frame] })
     }
 
     /// A VP9 frame's own size and depth, against the surfaces this session was created at and the
@@ -802,15 +833,43 @@ impl VaDecoder {
         Ok(())
     }
 
-    /// The buffers a VP9 decode submits: its picture-parameter record and the frame's own bytes.
+    /// The buffers a VP9 decode submits: its picture-parameter record, its slice-parameter record,
+    /// and the frame's own bytes.
     ///
     /// Split out for the same reason [`Self::submission`] is: the list is a value a test can read
-    /// rather than a sequence of calls only a driver can observe. **Two buffers and no more** — VP9
-    /// has no slice headers and no scaling lists, so a slice record or an IQ matrix buffer here would
-    /// be a record the driver does not read (and, for the matrix, one it would read as the VP9
-    /// segmentation probabilities).
-    fn vp9_submission<'p>(record: &'p [u8], sample: &'p [u8]) -> Vec<(i32, &'p [u8])> {
-        vec![(PICTURE_PARAMETER_BUFFER, record), (SLICE_DATA_BUFFER, sample)]
+    /// rather than a sequence of calls only a driver can observe. **Three buffers and no more.**
+    ///
+    /// What is *absent* from the list is a claim worth stating precisely, because a previous version
+    /// of this function got it wrong in the direction that broke the decoder. VP9 has no slice
+    /// headers and no scaling lists, so there is no IQ matrix buffer and none of H.264's per-slice
+    /// parsing fields — and **VP9 has a slice parameter record anyway**, declared at
+    /// `va_dec_vp9.h:279`, thin because the codec has no slice headers rather than absent because it
+    /// does. See the call site for what that record carries and why the driver refuses the picture
+    /// without it. The IQ matrix remains genuinely absent: a driver that read one would take its
+    /// bytes as VP9's segmentation probabilities (`mb_segment_tree_probs[7]` and
+    /// `segment_pred_probs[3]`, `va_dec_vp9.h:172-177`), which are in the picture record beside it.
+    ///
+    /// ## One `vaRenderPicture`, not two — measured, three ways
+    ///
+    /// ffmpeg's own VA-API VP9 path splits a picture into two renders: the picture-parameter buffer
+    /// alone, then the slice-parameter and slice-data buffers. **That split is not required**, and the
+    /// evidence is measurement rather than preference. Three shapes were run over `vp9_p0.mp4` on the
+    /// same driver:
+    ///
+    /// | shape | result |
+    /// |---|---|
+    /// | **one `vaBeginPicture`, one `vaRenderPicture` with all three buffers, one `vaEndPicture`** | `MATCH`, 24 of 24 pictures bit-exact |
+    /// | one `vaBeginPicture`, **two** `vaRenderPicture` calls (ffmpeg's shape), one `vaEndPicture` | `MATCH`, 24 of 24 pictures bit-exact |
+    /// | two `vaBeginPicture` / `vaRenderPicture` / `vaEndPicture` cycles | `VA_STATUS_ERROR_INVALID_PARAMETER` at `vaEndPicture`, all 24 pictures lost |
+    ///
+    /// So: the split buys nothing observable, the *extra buffer* was the whole of it, and the third row
+    /// is the trap — `Session::render` begins and ends a picture per call, so "splitting" by calling
+    /// it twice is not the split ffmpeg does and the driver refuses it for exactly the same reason it
+    /// refused the missing buffer. One render is kept because it is one fewer shape to be wrong about
+    /// and one `vaMapBuffer` / `vaSyncSurface` pair fewer per picture; nothing here depends on a
+    /// preference for it.
+    fn vp9_submission<'p>(record: &'p [u8], slice: &'p [u8], sample: &'p [u8]) -> Vec<(i32, &'p [u8])> {
+        vec![(PICTURE_PARAMETER_BUFFER, record), (SLICE_PARAMETER_BUFFER, slice), (SLICE_DATA_BUFFER, sample)]
     }
 }
 
@@ -824,10 +883,19 @@ struct Decoded {
     /// The conversion of the driver's planes into FilmCraft's own, which is CPU work inside the
     /// readback and reported apart from it.
     convert: Duration,
-    /// The picture to hand back, or `None` for a frame the stream decodes but does not show (VP9 6.2's
-    /// `show_frame` clear). **Not** for a failure: a frame this backend could not decode is an
+    /// The pictures to hand back, in decode order, and **empty for a sample that produced none** — a
+    /// frame the stream decodes but does not show (VP9 6.2's `show_frame` clear), which still moved
+    /// its reference slots. **Not** for a failure: a frame this backend could not decode is an
     /// `Err`, and an error latches `refused` — see `Self::refused`.
-    frame: Option<VideoFrame>,
+    ///
+    /// **A list, not an `Option`, because one container sample can hold more than one shown frame.**
+    /// A VP9 superframe is several frames under one presentation time, and a caller cannot tell two
+    /// pictures under one timestamp apart by time — but it can still be *given* both, and
+    /// FilmCraft's own software decoder gives both (`crates/vp9/src/decoder.rs:248-255`), so a
+    /// backend that returned one would make the hardware and software paths of the same bitstream
+    /// disagree about how many pictures the stream has. This was a single `Option` until the
+    /// hardware path decoded at all, which is how a documented divergence survived every test.
+    frames: Vec<VideoFrame>,
 }
 
 /// A decoded picture, as a `VideoFrame`.
@@ -839,14 +907,24 @@ mod tests {
     use super::*;
     use ffi::{SLICE_DATA_BUFFER, SLICE_PARAMETER_BUFFER};
 
-    /// **A VP9 superframe is one sample holding several frames, and each frame's record must be
+    /// **A VP9 superframe is one sample holding several frames, and each frame's records must be
     /// built from that frame's own bytes.**
     ///
-    /// This is the whole of the superframe fix, asserted without a driver: `first_partition_size` is
-    /// how a driver finds a frame's compressed header (`va_dec_vp9.h:167-169`), and it is computed as
-    /// *the frame's length less its uncompressed header*. Hand the record builder the whole sample and
-    /// that subtraction lands in the **next frame's bytes** — a valid-looking number pointing at the
-    /// wrong place, which is the `33`-instead-of-`32` class rather than a crash.
+    /// The field this is really about is the slice record's `slice_data_size`: `va_dec_vp9.h:280-284`
+    /// spells out that it is "the byte count of current frame in the bitstream buffer … but actually
+    /// means `frame_data_size`". Hand the record builder the whole sample and it counts every frame
+    /// after the first into this one's buffer, so a driver reads the next frame's bytes as part of
+    /// this one.
+    ///
+    /// **What this test pinned before was a field that does not have the problem.** It asserted that
+    /// the *picture* record's `first_partition_size` is `part.len() - uncompressed_size`, on the
+    /// reasoning that the field was "the rest of the frame". That reasoning was wrong —
+    /// `va_dec_vp9.h:167-169` defines it as "the byte count of compressed header", which is 6.2.14's
+    /// `header_size_in_bytes` and has nothing to do with the frame's length — and a driver told
+    /// 12 726 instead of 185 reads the tile data as compressed header and **renders nothing while
+    /// reporting success at every call**. With the definition corrected the picture record's two
+    /// lengths are both header fields, and the field that really is frame-length-dependent is the
+    /// slice record's, so the test follows it there.
     ///
     /// The frames here are hand-built, so the test can make the two lengths differ by a known amount
     /// and assert the exact value rather than only that they differ. The fixture in `tests/vaapi.rs`
@@ -856,8 +934,8 @@ mod tests {
     /// to `total` bytes so two frames of clearly different lengths can be made.
     ///
     /// **The padding is behind the header, not before it.** A VP9 frame is a header then a compressed
-    /// header, and the record's `first_partition_size` is the length of the second — so extra bytes
-    /// have to go where a real frame's compressed header goes, or the frame does not parse at all.
+    /// header, and the slice record's `slice_data_size` is the whole frame, so extra bytes have to go
+    /// where a real frame's tile data goes, or the frame does not parse at all.
     fn vp9_frame_of(total: usize) -> Vec<u8> {
         let mut bits: Vec<bool> = Vec::new();
         let put = |value: u32, n: usize, bits: &mut Vec<bool>| bits.extend((0..n).map(|i| value >> (n - 1 - i) & 1 == 1));
@@ -923,7 +1001,7 @@ mod tests {
         assert_eq!(parts[0], first.as_slice(), "member 0 is the first frame, byte for byte");
         assert_eq!(parts[1], second.as_slice(), "member 1 is the second frame, byte for byte");
 
-        // **And each member is what a record must be built from.** Asserted against the real builder
+        // **And each member is what a record must be built from.** Asserted against the real builders
         // and read back through `ffi`, so this is the number the driver would read rather than a
         // restatement of the formula.
         let refs: [Option<filmcraft_vp9::header::RefInfo>; 8] = std::array::from_fn(|_| Some(filmcraft_vp9::header::RefInfo { width: 320, height: 240 }));
@@ -933,19 +1011,32 @@ mod tests {
                 filmcraft_vp9::header::parse_uncompressed(part, &mut state, &refs).unwrap_or_else(|e| panic!("member {i} is a frame the parser reads: {e}"));
             let record = super::super::picture::vp9_picture_record(&header, &state, part, &super::super::picture::Vp9ReferenceSet::default())
                 .unwrap_or_else(|e| panic!("member {i} is describable: {e}"));
+            let slice = super::super::picture::vp9_slice_record(&header, &state, part).unwrap_or_else(|e| panic!("member {i} has a slice record: {e}"));
             let got = ffi::picture_params_vp9(&record).expect("92 bytes is a VP9 picture record").first_partition_size;
             assert_eq!(
                 usize::from(got),
-                part.len() - header.uncompressed_size,
-                "member {i}: first_partition_size is measured from the frame's own {} bytes, not the sample's {}",
-                part.len(),
-                sample.len()
+                usize::try_from(header.header_size_in_bytes).unwrap_or(usize::MAX),
+                "member {i}: first_partition_size is the COMPRESSED HEADER's own length, which the bitstream states — not the frame's length"
             );
+            // The picture record's `frame_header_length_in_bytes` is the other of the two counts, and is
+            // this frame's own: on a superframe the two members have different headers, so a record
+            // built from the sample could not tell them apart.
+            assert_eq!(
+                usize::from(ffi::picture_params_vp9(&record).expect("92 bytes").frame_header_length_in_bytes),
+                header.uncompressed_size,
+                "member {i}: the uncompressed header's length is this frame's own {} bytes",
+                header.uncompressed_size
+            );
+            // **And the field that really is frame-length-dependent**, which is where this test's power
+            // moved to once `first_partition_size` was corrected: the slice record's `slice_data_size`
+            // counts the frame, so a whole-sample reading is a *different, larger* number.
+            let sized = ffi::slice_params_vp9(&slice).expect("316 bytes is a VP9 slice record").slice_data_size;
+            assert_eq!(usize::try_from(sized).unwrap_or(usize::MAX), part.len(), "member {i}: slice_data_size is this frame's own {} bytes", part.len());
             // The defect this exists to catch, stated so a regression names itself: the whole-sample
             // reading is a *different, larger* number, so the two cannot be confused.
-            let whole_sample = sample.len() - header.uncompressed_size;
-            assert_ne!(usize::from(got), whole_sample, "member {i}: the per-frame and whole-sample readings agree, so this fixture cannot catch the defect");
-            assert!(usize::from(got) < whole_sample, "member {i}: the correct extent is the smaller one — the whole-sample value reaches into the next frame");
+            let whole_sample = u32::try_from(sample.len()).unwrap_or(u32::MAX);
+            assert_ne!(sized, whole_sample, "member {i}: the per-frame and whole-sample counts agree, so this fixture cannot catch the defect");
+            assert!(sized < whole_sample, "member {i}: the correct extent is the smaller one — the whole-sample value reaches into the next frame");
         }
     }
 
@@ -983,30 +1074,50 @@ mod tests {
         assert_eq!(vp9_surface_pool(), 8 + 1, "VP9's pool is its eight reference slots and the one being written");
     }
 
-    /// The buffers a VP9 frame is submitted as: its picture-parameter record and the frame's bytes,
-    /// **and nothing else**.
+    /// The buffers a VP9 frame is submitted as: **its picture-parameter record, its slice-parameter
+    /// record, and the frame's bytes — in that order, all three, in one render.**
     ///
-    /// VP9 has no slice headers (`va_dec_vp9.h` declares no `VASliceParameterBufferVP9`) and no
-    /// scaling lists, so a slice record or an IQ matrix buffer here would be a record the driver does
-    /// not read — and the matrix is worse than useless, because a driver that did read it would take
-    /// the bytes as something else. This is the same reasoning as
-    /// `an_h264_picture_submits_its_scaling_lists_and_one_record_per_slice` on the other side, and it
-    /// is asserted without a driver because the list is a value.
+    /// This test exists because the middle one was missing for a whole milestone and nothing but a
+    /// driver noticed. The list it asserts was previously two entries long, on the reasoning that
+    /// "VP9 has no slice headers (`va_dec_vp9.h` declares no `VASliceParameterBufferVP9`)". The
+    /// parenthetical was false — `va_dec_vp9.h:279` declares it — and the result was a decode the
+    /// driver accepted at `vaCreateBuffer`, `vaMapBuffer` and `vaRenderPicture` and refused at
+    /// `vaEndPicture`, which is the worst possible shape for a missing record. **So the reasoning is
+    /// corrected here, not just the expectation**: VP9 has no slice headers, and that is *why* the
+    /// record is thin — 316 bytes of `SegParam[8]` and three geometry words rather than H.264's
+    /// 3128 — rather than *why* it is absent. The header names both halves: `va_dec_vp9.h:265-268`
+    /// says the structure "should be sent once per frame", and `va_dec_vp9.h:270-276` says what the
+    /// slice data buffer beside it must contain.
+    ///
+    /// Asserted without a driver because the list is a value. The same reasoning as
+    /// `an_h264_picture_submits_its_scaling_lists_and_one_record_per_slice` on the other side — and
+    /// the same failure mode it exists for: the iHD driver reports success at every call for a
+    /// submission missing a buffer and leaves the render target holding something wrong, so "the
+    /// decode returned no error" would never have caught this.
     #[test]
-    fn a_vp9_picture_submits_one_record_and_the_frame_and_nothing_else() {
+    fn a_vp9_picture_submits_both_records_and_the_frame_in_one_render() {
         let record = vec![0x5au8; 92];
+        let slice = vec![0xa7u8; 316];
         let frame = vec![0xc3u8; 4000];
-        let bufs = VaDecoder::vp9_submission(&record, &frame);
+        let bufs = VaDecoder::vp9_submission(&record, &slice, &frame);
         let kinds: Vec<i32> = bufs.iter().map(|(k, _)| *k).collect();
-        assert_eq!(kinds, vec![PICTURE_PARAMETER_BUFFER, SLICE_DATA_BUFFER], "the picture record, then the frame's own bytes");
-        // Both are the bytes they claim to be, read back through `ffi`'s own safe reader rather than
-        // re-derived here.
+        assert_eq!(
+            kinds,
+            vec![PICTURE_PARAMETER_BUFFER, SLICE_PARAMETER_BUFFER, SLICE_DATA_BUFFER],
+            "picture record, slice record, then the frame's own bytes — in ONE render, which is measured, not preferred"
+        );
+        // All three are the bytes they claim to be, read back through `ffi`'s own safe readers rather
+        // than re-derived here. The slice record is the one a test that only read the picture record
+        // back would not have covered, which is the whole of the bug.
         assert!(ffi::picture_params_vp9(bufs[0].1).is_some(), "92 bytes the driver reads as a VP9 picture record");
         assert_eq!(bufs[0].1, record.as_slice());
+        assert!(ffi::slice_params_vp9(bufs[1].1).is_some(), "316 bytes the driver reads as a VP9 slice record");
+        assert_eq!(bufs[1].1, slice.as_slice());
         // The frame goes in whole, un-copied and un-relayed: the record's `frame_header_length_in_bytes`
-        // and `first_partition_size` are how the driver finds the two headers inside these bytes, so
-        // re-laying them out here would be a second, wrong answer to the same question.
-        assert_eq!(bufs[1].1, frame.as_slice(), "the slice data buffer is the frame itself");
+        // and `first_partition_size` are how the driver finds the two headers inside these bytes, and
+        // the slice record's `slice_data_size` is this frame's own length, so re-laying them out here
+        // would be a second, wrong answer to the same question.
+        assert_eq!(bufs[2].1, frame.as_slice(), "the slice data buffer is the frame itself");
     }
 
     /// A `Picture` whose records are recognisable lengths, for checking the submission list without a

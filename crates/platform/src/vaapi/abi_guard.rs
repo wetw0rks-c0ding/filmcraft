@@ -139,13 +139,17 @@ fn every_entry_point_has_the_arity_the_header_declares() {
     assert!(!ENTRY_POINTS.is_empty(), "the table of entry points is empty, so the loop above proved nothing");
 }
 
-/// `VADecPictureParameterBufferVP9` (`va_dec_vp9.h:58`) is measured here for the reason the other
-/// records are, and the header's one structural difference from H.264 is worth naming: its
-/// `first_partition_size` is a `uint16_t` behind a one-byte hole (offset 46, not 45), so a
-/// declaration that reads the header's field order as its byte order is 92 bytes of record at
-/// offsets a driver did not compile against.
+/// VP9's two records are measured here for the reason the other records are, and the slice record is
+/// named in this test's own title now rather than only in the table below because of what it is
+/// worth: `VADecPictureParameterBufferVP9` (`va_dec_vp9.h:58`) has a structural difference from
+/// H.264 — its `first_partition_size` is a `uint16_t` behind a one-byte hole (offset 46, not 45) —
+/// and `VASliceParameterBufferVP9` (`va_dec_vp9.h:279`) is eight `VASegmentParameterVP9`s, each of
+/// which is only 36 bytes rather than the 34 its fields add up to because of a `uint32_t` tail's
+/// alignment. Both are the shapes where a declaration that reads the header's field list as its
+/// byte order is a record at offsets the driver did not compile against, and both are **submitted
+/// for every VP9 picture**, so there is no "only the interesting codec" discount to apply.
 #[test]
-fn the_vp9_picture_record_is_the_size_the_header_declares() {
+fn the_vp9_records_are_the_sizes_the_header_declares() {
     if !std::path::Path::new(LIBVA_HEADERS).join("va_dec_vp9.h").is_file() {
         eprintln!("SKIPPED: no {LIBVA_HEADERS}/va_dec_vp9.h");
         return;
@@ -154,17 +158,33 @@ fn the_vp9_picture_record_is_the_size_the_header_declares() {
         eprintln!("SKIPPED: no C compiler to measure the headers with");
         return;
     };
-    // Both the size and the two offsets a plausible reading gets wrong, asked of the C compiler
-    // rather than of `offset_of!` on our own declaration: the point is that the two agree, and a
-    // test that reads both sides of the comparison out of our own code proves nothing.
+    // Every size, and the offsets a plausible reading gets wrong, asked of the C compiler rather than
+    // of `offset_of!` on our own declaration: the point is that the two agree, and a test that reads
+    // both sides of the comparison out of our own code proves nothing.
     let source = format!(
         "#include <stdint.h>\n#include <va/va.h>\n#include <va/va_dec_vp9.h>\n\
-         _Static_assert(sizeof(VADecPictureParameterBufferVP9) == {size}, \"sizeof\");\n\
+         _Static_assert(sizeof(VADecPictureParameterBufferVP9) == {pic_size}, \"sizeof\");\n\
          _Static_assert(__builtin_offsetof(VADecPictureParameterBufferVP9, first_partition_size) == {first}, \"first_partition_size\");\n\
-         _Static_assert(__builtin_offsetof(VADecPictureParameterBufferVP9, va_reserved) == {reserved}, \"va_reserved\");\n",
-        size = size_of::<VaPictureParameterBufferVp9>(),
+         _Static_assert(__builtin_offsetof(VADecPictureParameterBufferVP9, va_reserved) == {reserved}, \"va_reserved\");\n\
+         _Static_assert(sizeof(VASegmentParameterVP9) == {seg_size}, \"sizeof\");\n\
+         _Static_assert(__builtin_offsetof(VASegmentParameterVP9, filter_level) == {seg_filter}, \"filter_level\");\n\
+         _Static_assert(__builtin_offsetof(VASegmentParameterVP9, luma_ac_quant_scale) == {seg_ac}, \"luma_ac_quant_scale\");\n\
+         _Static_assert(__builtin_offsetof(VASegmentParameterVP9, chroma_dc_quant_scale) == {seg_uv_dc}, \"chroma_dc_quant_scale\");\n\
+         _Static_assert(__builtin_offsetof(VASegmentParameterVP9, va_reserved) == {seg_reserved}, \"va_reserved\");\n\
+         _Static_assert(sizeof(VASliceParameterBufferVP9) == {slice_size}, \"sizeof\");\n\
+         _Static_assert(__builtin_offsetof(VASliceParameterBufferVP9, seg_param) == {slice_seg}, \"seg_param\");\n\
+         _Static_assert(__builtin_offsetof(VASliceParameterBufferVP9, va_reserved) == {slice_reserved}, \"va_reserved\");\n",
+        pic_size = size_of::<VaPictureParameterBufferVp9>(),
         first = offset_of!(VaPictureParameterBufferVp9, first_partition_size),
         reserved = offset_of!(VaPictureParameterBufferVp9, va_reserved),
+        seg_size = size_of::<VaSegmentParameterVp9>(),
+        seg_filter = offset_of!(VaSegmentParameterVp9, filter_level),
+        seg_ac = offset_of!(VaSegmentParameterVp9, luma_ac_quant_scale),
+        seg_uv_dc = offset_of!(VaSegmentParameterVp9, chroma_dc_quant_scale),
+        seg_reserved = offset_of!(VaSegmentParameterVp9, va_reserved),
+        slice_size = size_of::<VaSliceParameterBufferVp9>(),
+        slice_seg = offset_of!(VaSliceParameterBufferVp9, seg_param),
+        slice_reserved = offset_of!(VaSliceParameterBufferVp9, va_reserved),
     );
     let dir = std::env::temp_dir().join(format!("filmcraft-va-vp9-abi-{}", std::process::id()));
     if std::fs::create_dir_all(&dir).is_err() {
@@ -181,7 +201,7 @@ fn the_vp9_picture_record_is_the_size_the_header_declares() {
     };
     let _ = std::fs::remove_dir_all(&dir);
     let out = out.unwrap_or_else(|e| panic!("running {cc} failed: {e}"));
-    assert!(out.status.success(), "{cc} disagrees with our VADecPictureParameterBufferVP9:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{cc} disagrees with our VP9 records:\n{}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// Every declaration, judged by a C compiler reading the same headers.
@@ -215,6 +235,8 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
         ("VAPictureParameterBufferHEVC", size_of::<VaPictureParameterBufferHevc>()),
         ("VASliceParameterBufferHEVC", size_of::<VaSliceParameterBufferHevc>()),
         ("VADecPictureParameterBufferVP9", size_of::<VaPictureParameterBufferVp9>()),
+        ("VASegmentParameterVP9", size_of::<VaSegmentParameterVp9>()),
+        ("VASliceParameterBufferVP9", size_of::<VaSliceParameterBufferVp9>()),
         ("VACodedBufferSegment", size_of::<VaCodedBufferSegment>()),
         ("VABufferInfo", size_of::<VaBufferInfo>()),
         ("VAEncSequenceParameterBufferH264", size_of::<VaEncSequenceParameterBufferH264>()),

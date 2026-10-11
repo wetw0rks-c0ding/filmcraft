@@ -52,6 +52,33 @@ pub use decoder::{DecodeStats, Decoder};
 /// `FrameContext`, which stays crate-private, so the compressed-header parser remains internal.
 pub use header::{ColorConfig, FrameHeader, HeaderState, LoopFilterParams, RefInfo, Segmentation, parse_uncompressed};
 
+/// The two quantizer lookup tables of the specification, and the segmentation feature numbers, for a
+/// backend that has to put a **per-segment quantizer** into a `VASliceParameterBufferVP9`.
+///
+/// ## Why these are reachable at all
+///
+/// A hardware backend cannot get these anywhere else. VP9's *picture* parameter record has no
+/// quantizer member at all — `va_dec_vp9.h:58-192` has `filter_level` and `sharpness_level` and no
+/// `base_q_idx` — so the only place the qindex a frame is dequantized with can reach a driver is
+/// the `SegParam[8]` array of the *slice* record (`va_dec_vp9.h:295-298`). A backend that has to
+/// fill that array needs 8.6.1's lookup and 6.2.11's feature numbering, and both of them are
+/// already here.
+///
+/// **Nothing about the decoder's behaviour changes.** These are the same two `const` arrays
+/// [`crate::decoder`] indexes at `decoder.rs:318-319` and the same four constants it names at
+/// `decoder.rs:312-313`; this is a `pub use` of items that already existed, added so a second copy
+/// of 1 536 specification integers cannot be typed into a backend and drift. The tables are
+/// generated from the specification text by `tools/extract_tables.py`; see the crate README.
+pub use spec_tables::{AC_QLOOKUP, DC_QLOOKUP};
+/// 6.2.11's segmentation feature numbers: `SEG_LVL_ALT_Q`, `SEG_LVL_ALT_L`, `SEG_LVL_REF_FRAME`
+/// and `SEG_LVL_SKIP` (`crates/vp9/src/tables.rs:52-55`), which index
+/// [`Segmentation::feature_enabled`] and [`Segmentation::feature_data`]. Re-exported for the same
+/// reason as the lookup tables above.
+pub use tables::{SEG_LVL_ALT_L, SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME, SEG_LVL_SKIP};
+/// The largest loop filter level VP9 6.2.8 can express, 63 — the ceiling 8.8.1's per-segment filter
+/// level table clamps to, and therefore the ceiling of `VASegmentParameterVP9::filter_level`.
+pub const MAX_LOOP_FILTER: i32 = tables::MAX_LOOP_FILTER;
+
 /// Stream parameters read from a key frame's uncompressed header (see [`keyframe_info`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyframeInfo {

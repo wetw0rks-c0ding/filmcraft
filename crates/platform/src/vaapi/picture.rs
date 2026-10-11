@@ -27,10 +27,11 @@ use super::ffi::{
     INVALID_SURFACE, PICTURE_H264_INVALID, PICTURE_H264_LONG_TERM_REFERENCE, PICTURE_H264_SHORT_TERM_REFERENCE, PICTURE_HEVC_INVALID,
     PICTURE_HEVC_LONG_TERM_REFERENCE, PICTURE_HEVC_RPS_LT_CURR, PICTURE_HEVC_RPS_ST_CURR_AFTER, PICTURE_HEVC_RPS_ST_CURR_BEFORE, SLICE_DATA_FLAG_ALL,
     VA_PADDING_LOW, VaIqMatrixBufferH264, VaPictureH264, VaPictureHevc, VaPictureParameterBufferH264, VaPictureParameterBufferHevc,
-    VaPictureParameterBufferVp9, VaSliceParameterBufferH264, VaSliceParameterBufferHevc, record_bytes,
+    VaPictureParameterBufferVp9, VaSegmentParameterVp9, VaSliceParameterBufferH264, VaSliceParameterBufferHevc, VaSliceParameterBufferVp9, record_bytes,
 };
 
 use filmcraft_vp9::header::{FrameHeader, HeaderState, KEY_FRAME};
+use filmcraft_vp9::{AC_QLOOKUP, DC_QLOOKUP, MAX_LOOP_FILTER, SEG_LVL_ALT_L, SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME, SEG_LVL_SKIP};
 
 /// The most reference frames a `VAPictureParameterBufferH264` holds (`ReferenceFrames[16]`,
 /// `va.h:3601`). The DPB a picture may use is bounded by the stream's own parsed DPB size and by
@@ -1124,13 +1125,15 @@ const INTER_FRAME: u8 = 1;
 /// satisfied here because `filmcraft_vp9` has already parsed them.
 ///
 /// **`data` is the frame's own bytes, and this is not an optimisation.**
-/// `frame_header_length_in_bytes` is the length of the **uncompressed** header and
-/// `first_partition_size` that of the **compressed** one; the second is `data.len() - uncompressed
-/// header length`. `FrameHeader` carries only the uncompressed side — `header_size_in_bytes` is the
-/// compressed header's length *as the bitstream states it*, which a corrupt stream can get wrong and
-/// which the record must not take on trust. So the record cannot be built from the parsed header
-/// alone, and taking `data` is what makes the difference between the two lengths the one the frame
-/// really has.
+/// `frame_header_length_in_bytes` is the length of the **uncompressed** header
+/// (`va_dec_vp9.h:157-164`) and `first_partition_size` that of the **compressed** one
+/// (`va_dec_vp9.h:167-169`, "the byte count of compressed header the bitstream buffer") — which is
+/// 6.2.14's `size_in_bytes`, read out of the bitstream and carried on `FrameHeader` as
+/// `header_size_in_bytes`. **`data` is therefore taken to check the sum against the frame**, not to
+/// compute it: the one number here a bitstream can get wrong is the one it spells, and a
+/// compressed header that claims to be longer than the frame that holds it is describing something
+/// that is not there. See the note on `first_partition_size` below for what a wrong reading of that
+/// field looks like from a driver.
 ///
 /// `surfaces` is the decoded picture buffer as the driver should see it — see [`Vp9ReferenceSet`],
 /// which is a named type rather than a bare array so that the *whole set* requirement is stated where
@@ -1188,17 +1191,41 @@ pub fn vp9_picture_record(h: &FrameHeader, st: &HeaderState, data: &[u8], surfac
     let header_len = u8::try_from(h.uncompressed_size)
         .map_err(|_| format!("a VP9 uncompressed header of {} bytes does not fit the record's one-byte field", h.uncompressed_size))?;
     // `first_partition_size` is "the byte count of compressed header the bitstream buffer"
-    // (`va_dec_vp9.h:167-169`) — the rest of the frame. `checked_sub` because a frame shorter than
-    // the header inside it is a corrupt frame, and `filter(|&n| n > 0)` because a frame that *ends*
-    // at the header has no compressed header at all: `first_partition_size == 0` would tell a driver
-    // there is nothing to parse, which is a claim the frame does not support.
-    let compressed = data
-        .len()
-        .checked_sub(h.uncompressed_size)
-        .filter(|&n| n > 0)
-        .ok_or_else(|| format!("a VP9 frame of {} bytes has no room for the {} byte uncompressed header", data.len(), h.uncompressed_size))?;
-    let first_partition_size =
-        u16::try_from(compressed).map_err(|_| format!("a VP9 compressed header of {compressed} bytes is longer than the record's field"))?;
+    // (`va_dec_vp9.h:167-169`) — **the compressed header's own length**, which is 6.2.14's
+    // `size_in_bytes`, read out of the bitstream by the parser as `header_size_in_bytes`.
+    //
+    // **It is not "the rest of the frame", and an earlier version of this function said it was,
+    // computing `data.len() - uncompressed_size`.** That is the same failure as the missing slice
+    // record next to it: a reading of the header that was reasoned from the word "partition" rather
+    // than checked. The measurement is unambiguous — for the key frame of `vp9_p0.mp4` (12 744
+    // bytes, 18-byte uncompressed header) this field read 12 726 and a known-good decode of the same
+    // file submitted **185**, which is exactly the frame's `header_size_in_bytes`. `first_partition`
+    // names the *first* partition's *header*; the tile data that follows is counted by the driver
+    // from the tile sizes the bitstream carries, not by this field. A driver told 12 726 reads 12
+    // 541 bytes of tile data as compressed header, fails to parse it, and **renders nothing** while
+    // reporting success at every call — a cleared mid-grey surface for every picture.
+    //
+    // Bounded twice. `u16` because the record's field is 16 bits and a `FrameHeader` a caller built
+    // itself is not a parsed one; and against `data` because the count is a length inside the frame
+    // and a bitstream that claims more compressed header than the frame holds is describing
+    // something that is not there.
+    let first_partition_size = u16::try_from(h.header_size_in_bytes)
+        .map_err(|_| format!("a VP9 compressed header of {} bytes does not fit the record's field", h.header_size_in_bytes))?;
+    let described = h.uncompressed_size.saturating_add(h.header_size_in_bytes as usize);
+    if described > data.len() {
+        return Err(format!(
+            "a VP9 frame of {} bytes has an {}-byte uncompressed header followed by a {}-byte compressed header, which does not fit in it",
+            data.len(),
+            h.uncompressed_size,
+            h.header_size_in_bytes
+        ));
+    }
+    // A zero-length compressed header would tell a driver there is nothing to parse, which is a claim
+    // the frame does not support. `parse_uncompressed` refuses it itself (`crates/vp9/src/header.rs`),
+    // and this is the same refusal at the record's boundary for a hand-built header.
+    if first_partition_size == 0 {
+        return Err("a VP9 frame with no compressed header".into());
+    }
 
     let record = VaPictureParameterBufferVp9 {
         frame_width: field_u16(h.width, "frame_width")?,
@@ -1231,6 +1258,221 @@ pub fn vp9_picture_record(h: &FrameHeader, st: &HeaderState, data: &[u8], surfac
         va_reserved: [0; super::ffi::VA_PADDING_MEDIUM],
     };
     Ok(record_bytes(&record))
+}
+
+/// The `VASliceParameterBufferVP9` for one VP9 frame, as the bytes the driver reads, or why this
+/// frame's slice record cannot be described.
+///
+/// ## This record is not optional, and the header is why
+///
+/// `va_dec_vp9.h` declares it at line 279 and says a VP9 picture carries it: *"This structure
+/// conveys parameters related to segmentation data and should be sent once per frame"*
+/// (`va_dec_vp9.h:265-268`). A submission without one is not refused by `vaCreateBuffer`,
+/// `vaMapBuffer` or `vaRenderPicture` — it is refused at `vaEndPicture` with
+/// `VA_STATUS_ERROR_INVALID_PARAMETER`, which is exactly what this backend's hardware VP9 path did
+/// for a whole milestone before this function existed.
+///
+/// Two things in it are load-bearing rather than decorative:
+///
+/// - **The quantizer.** `VADecPictureParameterBufferVP9` has **no `base_q_idx` and no
+///   `delta_q_*`** — read `va_dec_vp9.h:58-192` and there is nothing. The only route by which the
+///   qindex a frame is dequantized with can reach a driver is `SegParam[]` here, so a VP9 decode
+///   that omits this record does not degrade, it has no picture parameters at all.
+/// - **The frame's own extent.** *"The byte count of current frame in the bitstream buffer, starting
+///   from first byte of the buffer. It uses the name `slice_data_size` to be consitent with other
+///   codec, but actually means `frame_data_size`"* (`va_dec_vp9.h:280-284`). So this is **not** a
+///   slice inside a larger buffer the way H.264's is: a VP9 frame *is* the slice, and the count is
+///   the frame's whole length.
+///
+/// ## The one clause that is easy to get backwards, and is not a default either way
+///
+/// *"When segmentation is disabled, only `SegParam[0]` has valid values, all other entries should be
+/// populated with 0. Otherwise, all eight entries should be valid"* (`va_dec_vp9.h:270-272`). Two
+/// failures live here and they are not the same one: leaving `SegParam[1..7]` holding *this frame's*
+/// quantizer and filter level when segmentation is off submits eight segments that do not exist
+/// (the header says populate them with 0), and zeroing all eight when segmentation *is* on throws
+/// away the per-segment parameters the record exists for. [`vp9_segment_params`] implements the
+/// clause as written: all eight computed when `seg.enabled`, and `SegParam[0]` alone otherwise with
+/// the other seven explicitly zero.
+///
+/// ## `data` is the frame's own bytes, for the same reason the picture record takes them
+///
+/// `slice_data_size` counts a frame, so a superframe's sample length would be the wrong number by
+/// every one of the frames after the first — see `VaDecoder::picture_frame` for why the split is the
+/// only way a length means anything.
+pub fn vp9_slice_record(h: &FrameHeader, st: &HeaderState, data: &[u8]) -> Result<Vec<u8>, String> {
+    // `slice_data_size` is "the byte count of current frame in the bitstream buffer" — the whole
+    // frame, from byte 0. `u32` because that is what the field is; a frame that does not fit it
+    // cannot be described rather than described as a shorter frame.
+    let slice_data_size = u32::try_from(data.len()).map_err(|_| format!("a VP9 frame of {} bytes does not fit the slice record's byte count", data.len()))?;
+    let record = VaSliceParameterBufferVp9 {
+        slice_data_size,
+        // `slice_data_offset` is "offset to the first byte of partition data (control partition)"
+        // (`va_dec_vp9.h:286-289`), and this is **0, measured rather than assumed.** The same header's
+        // paragraph on the slice data buffer says the bitstream sent there "should include whole or
+        // part of partition 0 (at least compressed header) to the end of frame"
+        // (`va_dec_vp9.h:274-276`), so the buffer may legitimately *begin before* partition 0 — and it
+        // does, because `slice_data_size` is defined as counting from the first byte of the buffer,
+        // which is byte 0 of the frame. The pair (0, frame length) therefore addresses the whole
+        // frame, which is what "partition 0 through end of frame" is, and libva itself prints
+        // `slice_data_offset = 0` for this frame in a working decode.
+        //
+        // **The other reading was measured too, and this is not the reason it was rejected.**
+        // Setting it to the uncompressed header's length (so the pair addresses partition 0 onwards)
+        // also decodes bit-exact on this driver, 24 of 24 pictures — so the field is not what decides
+        // whether a VP9 picture comes out, and a claim that it is would be as unfounded as the one
+        // this function used to make. 0 is kept because it is the reading that is true without having
+        // to know anything about the driver: the pair addresses the frame, which is what the header
+        // says the buffer holds.
+        slice_data_offset: 0,
+        // The frame goes in whole, so `VA_SLICE_DATA_FLAG_ALL` — "whole slice is in the buffer"
+        // (`va.h:3080`). The other three flags describe a slice submitted in pieces, which a
+        // decoder that renders one picture per `vaRenderPicture` never does.
+        slice_data_flag: SLICE_DATA_FLAG_ALL,
+        seg_param: vp9_segment_params(h, st)?,
+        va_reserved: [0; VA_PADDING_LOW],
+    };
+    Ok(record_bytes(&record))
+}
+
+/// The eight `VASegmentParameterVP9` entries of a [`VaSliceParameterBufferVp9`], with the header's
+/// own rule about how many of them are valid applied literally.
+///
+/// The rule is `va_dec_vp9.h:270-272` and is stated in [`vp9_slice_record`]. This function is where
+/// it is decided, and the decision is a count rather than a filter afterwards, so "zeroed" means
+/// *never computed*: a segmentation-disabled frame's `SegParam[1..7]` carry no per-segment quantizer
+/// at all, which is not the same as carrying the frame's own eight times — and that difference is
+/// exactly what a driver reading them as real segments would dequantize with.
+fn vp9_segment_params(h: &FrameHeader, st: &HeaderState) -> Result<[VaSegmentParameterVp9; 8], String> {
+    // One iteration when segmentation is off (entry 0 only), eight when it is on. Written as a count
+    // so that the rule is the thing being expressed rather than a side effect of filtering a list
+    // that had already been computed.
+    let count = if st.seg.enabled { 8 } else { 1 };
+    let mut out = [VaSegmentParameterVp9::default(); 8];
+    for seg_id in 0..count {
+        out[seg_id] = vp9_segment_param(h, st, seg_id as u8)?;
+    }
+    Ok(out)
+}
+
+/// One segment's `VASegmentParameterVP9`, as VP9 8.6.1 and 8.8.1 define it.
+///
+/// Three groups, each from a named clause:
+///
+/// - **`segment_flags`** — 6.2.11's two segmentation features that change prediction, which the
+///   record carries per segment. `segment_reference_enabled` is whether `SEG_LVL_REF_FRAME` is on
+///   at all, `segment_reference` is that feature's value in the numbering the header spells out
+///   (*"0: reserved, 1: Last ref, 2: golden, 3: altref"*, `va_dec_vp9.h:213-220`), and
+///   `segment_reference_skipped` is `SEG_LVL_SKIP`. Bit positions are the header's, bit 0 first
+///   (`va_dec_vp9.h:212-226`).
+/// - **`filter_level[4][2]`** — 8.8.1's per-segment `lfi->lvl[seg][ref][mode]`, which the header
+///   names as its source (*"corresponds to variable `lfi->lvl[seg][ref][mode]` in VP9 code, where m
+///   is [ref], and n is [mode]"*, `va_dec_vp9.h:231-235`). Computed with the same arithmetic
+///   `filmcraft_vp9`'s own loop filter uses (`crates/vp9/src/loopfilter.rs:21-44`), because it is the
+///   same 8.8.1 and a second implementation of it would be a second thing to be wrong.
+/// - **the four quant scales** — 8.6.1's per-segment qindex read out of the specification's
+///   `dc_qlookup` / `ac_qlookup` tables: the frame's `base_q_idx` shifted by `SEG_LVL_ALT_Q`, then
+///   by the three `delta_q_*`. **This is the part a driver cannot get from the picture parameter
+///   record, because that record has no quantizer field at all.**
+fn vp9_segment_param(h: &FrameHeader, st: &HeaderState, seg_id: u8) -> Result<VaSegmentParameterVp9, String> {
+    let seg = &st.seg;
+    let at = usize::from(seg_id);
+    // `SEG_LVL_REF_FRAME` is read in 2 bits and is unsigned
+    // (`crates/vp9/src/tables.rs:117`: `SEGMENTATION_FEATURE_BITS[2] == 2`), so the value fits the
+    // record's two-bit field by construction — and it is checked rather than truncated, so a value
+    // from a hand-built `Segmentation` cannot become a reference the stream never named.
+    let ref_enabled = seg.feature_active(seg_id, SEG_LVL_REF_FRAME);
+    let reference = if ref_enabled { i32::from(seg.feature_data.get(at).and_then(|f| f.get(SEG_LVL_REF_FRAME)).copied().unwrap_or(0)) } else { 0 };
+    if !(0..=3).contains(&reference) {
+        return Err(format!("VP9 segment {seg_id} names reference {reference}, which the record's two-bit field cannot hold"));
+    }
+    // Bits 0, 1-2 and 3, in the header's order (`va_dec_vp9.h:212-226`). The shifts are constants
+    // and the operands are `u16`, so nothing here can shift out of the word.
+    let flags = u16::from(u8::from(ref_enabled)) | (u16::try_from(reference).unwrap_or(0) << 1) | (u16::from(seg.feature_active(seg_id, SEG_LVL_SKIP)) << 3);
+
+    // 8.8.1's `lfi->lvl[seg][ref][mode]`, ref `0..=3` (INTRA, LAST, GOLDEN, ALTREF) and mode
+    // `0..=1`. The deltas shift by the frame's `loop_filter >> 5` — `n_shift` below — which is
+    // 8.8.1's own rule, and the level is clamped to `MAX_LOOP_FILTER` at the end because that is
+    // what makes `filter_level` a `uint8_t` the record can carry.
+    let lf = &st.lf;
+    let n_shift = i32::from(lf.level >> 5);
+    let mut level = i32::from(lf.level);
+    if seg.feature_active(seg_id, SEG_LVL_ALT_L) {
+        let d = i32::from(seg.feature_data.get(at).and_then(|f| f.get(SEG_LVL_ALT_L)).copied().unwrap_or(0));
+        level = if seg.abs_or_delta_update { d } else { d + level };
+    }
+    level = level.clamp(0, MAX_LOOP_FILTER);
+    let mut filter_level = [[0u8; 2]; 4];
+    for (ref_row, slot) in filter_level.iter_mut().enumerate() {
+        // `ref_deltas` is indexed by VP9 6.2.8's reference index with 0 unused for `ref_frame_idx`
+        // and used for the *intra* level here, so row 0 is the intra row and takes the reference
+        // delta alone; the two mode deltas apply to the inter rows only, which is 8.8.1's own split
+        // rather than a simplification of one.
+        let ref_delta = lf.ref_deltas.get(ref_row).copied().unwrap_or(0);
+        let base = if lf.delta_enabled { level + (i32::from(ref_delta) << n_shift) } else { level };
+        for (mode, out) in slot.iter_mut().enumerate() {
+            let mode_delta = if lf.delta_enabled && ref_row != 0 { lf.mode_deltas.get(mode).copied().unwrap_or(0) } else { 0 };
+            *out = u8::try_from((base + (i32::from(mode_delta) << n_shift)).clamp(0, MAX_LOOP_FILTER)).unwrap_or(0);
+        }
+    }
+
+    // 8.6.1's per-segment qindex, then the specification's two lookup tables.
+    let bd = quant_lookup_base(h.color.bit_depth)?;
+    let qindex = if seg.feature_active(seg_id, SEG_LVL_ALT_Q) {
+        let d = i32::from(seg.feature_data.get(at).and_then(|f| f.get(SEG_LVL_ALT_Q)).copied().unwrap_or(0));
+        (if seg.abs_or_delta_update { d } else { d + i32::from(h.base_q_idx) }).clamp(0, 255)
+    } else {
+        i32::from(h.base_q_idx)
+    };
+    Ok(VaSegmentParameterVp9 {
+        segment_flags: flags,
+        filter_level,
+        // **Which lookup fills which field is measured, not assumed.** `va_dec_vp9.h` names each
+        // field after VP9's *internal* `y_dequant[qindex][1]` / `[qindex][0]` slots
+        // (`va_dec_vp9.h:236-254`), which is not a naming anyone can resolve by reading the field
+        // name — `luma_ac_quant_scale` sounds like the AC table and does not have to be. So it was
+        // settled by asking libva to print the record this backend's values produce and reading it
+        // beside the same fields from a known-good decode of the same frame: at `base_q_idx` 160,
+        // `AC_QLOOKUP[160] == 305` and `DC_QLOOKUP[160] == 223`, and the record reads
+        // `luma_ac_quant_scale = 305`, `luma_dc_quant_scale = 223`. **So the field name is right and
+        // the internal index it names is the misleading one** — the same inversion VP9 8.6.1's
+        // `dequant[i][1]`-is-the-DC-value spelling comes from.
+        luma_ac_quant_scale: vp9_quant(h, bd, &AC_QLOOKUP, qindex, 0)?,
+        luma_dc_quant_scale: vp9_quant(h, bd, &DC_QLOOKUP, qindex, i32::from(h.delta_q_y_dc))?,
+        chroma_ac_quant_scale: vp9_quant(h, bd, &AC_QLOOKUP, qindex, i32::from(h.delta_q_uv_ac))?,
+        chroma_dc_quant_scale: vp9_quant(h, bd, &DC_QLOOKUP, qindex, i32::from(h.delta_q_uv_dc))?,
+        va_reserved: [0; VA_PADDING_LOW],
+    })
+}
+
+/// Which 256-entry block of `DC_QLOOKUP` / `AC_QLOOKUP` a frame's bit depth selects.
+///
+/// The two tables are 768 entries — the specification's three bit depths of 256 qindex each, in the
+/// order 8, 10, 12 — and `filmcraft_vp9`'s own decoder indexes them exactly this way
+/// (`crates/vp9/src/decoder.rs:308-319`). **A depth this backend declines still has to be
+/// answerable**, so an unknown depth is a refusal rather than a clamp into the 8-bit block, which
+/// would be a picture dequantized with another depth's table.
+fn quant_lookup_base(bit_depth: u8) -> Result<usize, String> {
+    match bit_depth {
+        8 => Ok(0),
+        10 => Ok(256),
+        12 => Ok(512),
+        other => Err(format!("{other} bits is not a bit depth the VP9 quantizer tables cover")),
+    }
+}
+
+/// One quant scale: `table[base + (qindex + delta)]`, as the record's `int16_t`.
+///
+/// Both the sum and the table read are bounds-checked. The sum because a corrupt `delta_q_*` is an
+/// `i8` against a `u8` qindex and can leave `0..=255` in both directions — 8.6.1 clamps that, and
+/// the clamp here is that clamp, not a default. The read because the index is arithmetic on three
+/// input-derived numbers and `get` is what says so.
+fn vp9_quant(h: &FrameHeader, base: usize, table: &[i32], qindex: i32, delta: i32) -> Result<i16, String> {
+    let at = qindex.saturating_add(delta).clamp(0, 255);
+    let value = *table
+        .get(base + at as usize)
+        .ok_or_else(|| format!("VP9 quantizer index {at} for {}-bit pictures is outside the specification's table", h.color.bit_depth))?;
+    i16::try_from(value).map_err(|_| format!("VP9 quantizer {value} does not fit the record's 16-bit field"))
 }
 
 /// A fixed-width member of the `pic_fields` word: the value has to fit its `width` bits.
@@ -1468,6 +1710,14 @@ pub struct Vp9Frame {
     header: FrameHeader,
     /// The `VADecPictureParameterBufferVP9` bytes, empty for a re-show.
     record: Vec<u8>,
+    /// The `VASliceParameterBufferVP9` bytes, empty for a re-show.
+    ///
+    /// **Both records or neither.** A VP9 picture is rendered from one buffer of each kind plus the
+    /// frame's bytes, and a submission carrying only the first is refused at `vaEndPicture` — which
+    /// is how this backend spent a milestone: the picture record was right, complete and pinned
+    /// against a C compile, and the picture still would not decode because the buffer *beside* it
+    /// was never sent. They are built together in [`Vp9State::frame`] for the same reason.
+    slice: Vec<u8>,
     /// `refresh_frame_flags`: bit *i* set means this picture becomes slot *i*.
     refresh: u8,
 }
@@ -1488,6 +1738,17 @@ impl Vp9Frame {
     /// header would describe a frame the stream never coded.
     pub fn record(&self) -> Option<&[u8]> {
         if self.is_new() { Some(&self.record) } else { None }
+    }
+
+    /// The `VASliceParameterBufferVP9` bytes to submit, or `None` for a frame that re-shows an
+    /// earlier picture.
+    ///
+    /// **A VP9 picture needs this beside [`Self::record`], not instead of it.** See
+    /// [`vp9_slice_record`] for what the header says it carries and why the driver cannot do without
+    /// it; a test that reads only `record` back would not notice this one being absent at all,
+    /// which is the shape of the bug it fixes.
+    pub fn slice(&self) -> Option<&[u8]> {
+        if self.is_new() { Some(&self.slice) } else { None }
     }
 
     /// Whether this frame's picture is shown. 6.2's `show_frame`: a clear one is a hidden frame —
@@ -1569,10 +1830,17 @@ impl Vp9State {
 
     /// Read one frame's uncompressed header into this state and build its picture-parameter record.
     ///
-    /// The two halves are here together, because the record is only right if both came from the
-    /// same state: [`filmcraft_vp9::header::parse_uncompressed`] is what carries the inherited
-    /// colour configuration, the loop filter level and the segmentation probabilities forward from
-    /// the frames before this one, and the record is built out of them immediately afterwards.
+    /// **Both records are built here, together.** A VP9 picture is rendered from a
+    /// `VADecPictureParameterBufferVP9`, a `VASliceParameterBufferVP9` and the frame's bytes, and a
+    /// submission carrying only the first is refused at `vaEndPicture` with
+    /// `VA_STATUS_ERROR_INVALID_PARAMETER` — after `vaCreateBuffer`, `vaMapBuffer` and
+    /// `vaRenderPicture` have all reported success, which is why it looks like a driver bug rather
+    /// than a missing record. They are built together, and from the same state, because
+    /// [`filmcraft_vp9::header::parse_uncompressed`] is what carries the inherited colour
+    /// configuration, the loop filter level, the segmentation probabilities and the segmentation
+    /// feature data forward from the frames before this one: the picture record reads the first
+    /// three, the slice record reads the fourth and the loop filter's levels, and a frame's records
+    /// built against a state its header was not parsed into would describe two different frames.
     ///
     /// **Nothing is refreshed here.** The slots move in [`Self::commit`], once the driver has
     /// actually rendered the picture, so that a decode that failed cannot have moved the buffer and
@@ -1665,8 +1933,9 @@ impl Vp9State {
             }
         }
         let record = vp9_picture_record(&header, &self.headers, sample, &self.references())?;
+        let slice = vp9_slice_record(&header, &self.headers, sample)?;
         let refresh = header.refresh_frame_flags;
-        Ok(Vp9Frame { kind: Vp9FrameKind::New, header, record, refresh })
+        Ok(Vp9Frame { kind: Vp9FrameKind::New, header, record, slice, refresh })
     }
 
     /// A `show_existing_frame`: the picture the header's `frame_to_show_map_idx` names, and nothing
@@ -1680,6 +1949,10 @@ impl Vp9State {
             kind: Vp9FrameKind::ReShow { slot, surface: reference.surface },
             header,
             record: Vec::new(),
+            // 8.2.2: the decoder outputs the picture the named slot holds and decodes nothing, so
+            // there is no slice data to address and no segment quantizer to submit. Both records
+            // are empty for the same reason `record` is: there is no frame here to describe.
+            slice: Vec::new(),
             // 6.2 returns from the header parse before this frame has a `refresh_frame_flags` at
             // all, and 8.2.2 decodes nothing: a re-show neither refreshes a reference slot nor
             // refreshes a frame context. Zero is that answer, not a filler for a missing value.
@@ -3000,6 +3273,62 @@ mod tests {
     // The VP9 record tests below build a `FrameHeader` by hand, so the type is named here as well as
     // at the top of the file.
     use filmcraft_vp9::header::FrameHeader;
+
+    /// **The two header lengths are what a known-good decode of this exact frame submits.**
+    ///
+    /// Everything else about `first_partition_size` was argued from the header's wording and got it
+    /// wrong for a whole milestone: the record carried the frame's length less its uncompressed
+    /// header, where a driver needs the compressed header's own length. The argument could not have
+    /// caught itself, so this test does the only thing that can — it takes a real encoded key frame
+    /// and pins the record to the numbers **libva itself printed** for a working decode of the very
+    /// same frame.
+    ///
+    /// The oracle run (`LIBVA_TRACE=… LIBVA_TRACE_FLAGS=va,vaapi,drv ffmpeg -vaapi_device
+    /// /dev/dri/renderD128 -hwaccel vaapi -i vp9_p0.mp4 -f null -`) prints, for this frame:
+    ///
+    /// ```text
+    /// frame_width = 640   frame_height = 360   frame_type = 0   filter_level = 6
+    /// log2_tile_columns = 1   frame_header_length_in_bytes = 18   first_partition_size = 185
+    /// ```
+    ///
+    /// **185 is 1.4% of the frame.** The wrong reading was 12 726 — the uncompressed header plus
+    /// everything after it — and a driver told that reads 12 541 bytes of tile data as compressed
+    /// header, fails to parse it, and renders nothing while reporting success at every call. So the
+    /// numbers below are transcribed measurements, not expectations derived from the code under test,
+    /// and the fixture is a real 640x360 profile 0 key frame so it cannot pass by construction.
+    #[test]
+    fn the_record_for_a_real_key_frame_carries_the_lengths_a_working_decode_submitted() {
+        let Some(bytes) = std::fs::read(vp9_p0_fixture()).ok() else { return };
+        let Ok(file) = filmcraft_isobmff::open(bytes.clone()) else { return };
+        let Some(t) = file.track_of_kind(filmcraft_isobmff::TrackKind::Video) else { return };
+        let Ok(sample) = file.read_sample(&bytes, t, 0) else { return };
+        let mut state = filmcraft_vp9::header::HeaderState::default();
+        let header =
+            filmcraft_vp9::header::parse_uncompressed(&sample, &mut state, &[None; 8]).expect("the fixture's first sample is a key frame the parser reads");
+        assert_eq!(header.frame_type, super::KEY_FRAME, "the first sample is a key frame, which is what the oracle trace was aligned against");
+        let record = super::vp9_picture_record(&header, &state, &sample, &super::Vp9ReferenceSet::default()).expect("a profile 0 key frame is described");
+        let r = crate::vaapi::ffi::picture_params_vp9(&record).expect("92 bytes is a VP9 picture record");
+        assert_eq!((r.frame_width, r.frame_height), (640, 360), "the fixture is 640x360");
+        assert_eq!(r.frame_header_length_in_bytes, 18, "the UNCOMPRESSED header's length, as libva printed it");
+        assert_eq!(
+            r.first_partition_size,
+            185,
+            "the COMPRESSED header's own length, as libva printed it — and NOT {} (the frame's length less its uncompressed header), which is what an earlier version submitted",
+            sample.len() - 18
+        );
+        // The two candidate readings, side by side, because "the wrong one is much larger" is the
+        // whole content of the bug and a test that only asserts 185 would not notice it going back.
+        assert_ne!(r.first_partition_size, 12_726, "the frame's length less its uncompressed header is not what a driver is told");
+        assert_eq!(r.first_partition_size as usize + usize::from(r.frame_header_length_in_bytes), 203, "the compressed header starts at 18 and ends at 203");
+        assert!(203 < sample.len(), "and both headers fit inside the {} byte frame", sample.len());
+    }
+
+    /// Where the VP9 parity fixture lives. Read with `.ok()`, so a machine that has not generated it
+    /// — the fixture needs ffmpeg — skips these tests, which is the right outcome for a test whose
+    /// whole content is a recorded measurement of a real encoder's output.
+    fn vp9_p0_fixture() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/fixtures/platform/vp9_p0.mp4")
+    }
 
     /// The IQ matrix record carries the sequence parameter set's own scaling lists, in the raster
     /// order the record wants, and flat 16s when the set declares none.
@@ -4729,21 +5058,23 @@ mod tests {
     ) -> (Vec<u8>, filmcraft_vp9::header::HeaderState, filmcraft_vp9::header::FrameHeader) {
         const WIDTH: u32 = 320;
         const HEIGHT: u32 = 180;
-        /// How long the frame's compressed header **claims** to be, as 6.3's `header_size_in_bytes`
-        /// states it.
+        /// How long the frame's compressed header is, as 6.2.14's `header_size_in_bytes` states it.
         ///
-        /// Deliberately **different** from [`COMPRESSED`], the length the frame really has. A corrupt
-        /// bitstream can state anything here, and the record must submit the real length rather than
-        /// the claim — so a fixture where the two agree could not tell the two apart, and a builder
-        /// that used the claim would pass. Making them differ is what gives the byte-pinning test its
-        /// power here: `first_partition_size` must come out at `COMPRESSED`, not `CLAIMED`.
+        /// **This is the number the record submits.** An earlier version of this fixture went the
+        /// other way round: it made the bitstream claim `CLAIMED` bytes while the frame really held
+        /// `COMPRESSED`, and pinned the record to `COMPRESSED` on the reasoning that a decoder can
+        /// and should measure the compressed header rather than trust the stream's claim of where it
+        /// ends. That reasoning is wrong twice over, and the driver paid for it: the header defines
+        /// the field as "the byte count of compressed header the bitstream buffer"
+        /// (`va_dec_vp9.h:167-169`), so the claim *is* the count, and a decoder cannot know where the
+        /// compressed header ends except by being told — that is what the field is for. Keeping the
+        /// two numbers different is what gives the byte-pinning test its power here: the record must
+        /// come out at `CLAIMED`, and the `frame.len() - uncompressed_size` reading is `COMPRESSED`.
         const CLAIMED: u32 = 6;
-        /// How long the frame's compressed header really is.
+        /// How many bytes of compressed header the frame actually carries after its uncompressed one.
         ///
-        /// `parse_uncompressed` only checks `header_size_in_bytes` is non-zero — no test here calls
-        /// `parse_compressed`, which is what actually reads those bytes — but the record's
-        /// `first_partition_size` is the *real* length, so the frame below is built to be exactly this
-        /// long after the uncompressed header.
+        /// **Not** what `first_partition_size` is. The frame is built so the two differ, which is the
+        /// only reason a test can tell the two readings apart at all; see [`CLAIMED`].
         const COMPRESSED: u32 = 9;
         let mut w = Bits(Vec::new());
         w.put(2, 2); // frame_marker
@@ -4813,18 +5144,20 @@ mod tests {
         w.put(CLAIMED, 16); // header_size_in_bytes — the bitstream's claim, which is not what the record submits
 
         let header_bytes = w.bytes();
-        // The frame is the uncompressed header followed by exactly `COMPRESSED` bytes of compressed
-        // header, while the header *claims* `CLAIMED`. `first_partition_size` is the difference of the
-        // two real lengths, which is asserted below and is `COMPRESSED` — **not** the claim. That is
-        // the whole reason the builder takes the bytes: a `FrameHeader` carries both numbers and cannot
-        // be used to check either against the frame.
+        // The frame is the uncompressed header followed by `COMPRESSED` bytes, while the header
+        // *states* `CLAIMED` — deliberately, so that the record's `first_partition_size` has two
+        // candidate answers and only one of them is the bitstream's. See [`CLAIMED`].
         let mut frame = header_bytes.clone();
         frame.extend(std::iter::repeat_n(0u8, COMPRESSED as usize));
         let mut state = filmcraft_vp9::header::HeaderState::default();
         let header = filmcraft_vp9::header::parse_uncompressed(&header_bytes, &mut state, &[None; 8]).expect("a well-formed key frame header parses");
-        assert_eq!(header.uncompressed_size, header_bytes.len(), "the header is `header_bytes` long, which is what `first_partition_size` is measured from");
-        assert_eq!(header.header_size_in_bytes, CLAIMED, "the bitstream claims a {CLAIMED}-byte compressed header");
-        assert_eq!(frame.len() - header.uncompressed_size, COMPRESSED as usize, "and the frame really has a {COMPRESSED}-byte one");
+        assert_eq!(header.uncompressed_size, header_bytes.len(), "the header is `header_bytes` long, which is `frame_header_length_in_bytes`");
+        assert_eq!(header.header_size_in_bytes, CLAIMED, "the bitstream states a {CLAIMED}-byte compressed header");
+        assert_eq!(
+            frame.len() - header.uncompressed_size,
+            COMPRESSED as usize,
+            "and the frame carries {COMPRESSED} bytes of one — the other candidate answer for `first_partition_size`"
+        );
         // The two properties the tests below rest on, asserted here so a fixture that stops being the
         // thing it is claimed to be fails at the builder.
         assert_eq!(header.profile, profile);
@@ -4867,6 +5200,20 @@ mod tests {
         vp9_inter_frame_full(profile, size_from_ref, refresh, refs, true, false, 0, 3, None)
     }
 
+    /// [`vp9_inter_frame_refreshing`] for a frame whose size comes from a reference slot of
+    /// `ref_width` pixels.
+    ///
+    /// **6.2.13's `tile_info` depends on the frame's size**, so a frame that takes its size from a
+    /// 320-wide reference writes a different number of `tile_cols_log2` flags than one that spells
+    /// 1920. Getting that wrong shifts every bit after it — including `header_size_in_bytes`, which
+    /// is a field the record now reads — and the fixture silently produced a frame whose compressed
+    /// header was 32 769 bytes long. It went unnoticed for as long as the record derived that field
+    /// from the frame's length instead; [`vp9_inter_frame_full`] now asserts the parse round-trips,
+    /// which is what keeps it noticed.
+    fn vp9_inter_frame_refreshing_sized(profile: u8, size_from_ref: bool, refresh: u8, refs: [u32; 3], ref_width: u32) -> Vec<u8> {
+        vp9_inter_frame_full_at(profile, size_from_ref, refresh, refs, true, false, 0, 3, None, ref_width)
+    }
+
     /// An inter frame that **updates the segmentation map**, writing its own two probability arrays.
     ///
     /// The other inter frames all set `segmentation_enabled` clear, which means they *inherit* the
@@ -4893,6 +5240,26 @@ mod tests {
         reset_frame_context: u32,
         frame_context_idx: u32,
         segmentation: Option<([u8; 7], [u8; 3])>,
+    ) -> Vec<u8> {
+        vp9_inter_frame_full_at(profile, size_from_ref, refresh, refs, show, error_resilient, reset_frame_context, frame_context_idx, segmentation, 1920)
+    }
+
+    /// [`vp9_inter_frame_full`] for a frame whose coded width is `width` — which it only needs as a
+    /// parameter when `size_from_ref`, since 6.2.13's `tile_info` is derived from the frame's size and
+    /// a frame that spells its size writes the one it spells.
+    ///
+    /// See [`vp9_inter_frame_refreshing_sized`] for why that is a parameter at all.
+    fn vp9_inter_frame_full_at(
+        profile: u8,
+        size_from_ref: bool,
+        refresh: u8,
+        refs: [u32; 3],
+        show: bool,
+        error_resilient: bool,
+        reset_frame_context: u32,
+        frame_context_idx: u32,
+        segmentation: Option<([u8; 7], [u8; 3])>,
+        width: u32,
     ) -> Vec<u8> {
         const WIDTH: u32 = 1920;
         const HEIGHT: u32 = 1080;
@@ -4976,12 +5343,25 @@ mod tests {
                 w.put(0, 1); // segmentation_update_data
             }
         }
-        // 6.2.13 tile_info at 1920x1080: 30 superblock columns, so the tile-width loop runs twice
-        // (min 0, max 2 — `header.rs:373-389`) and both flags are set.
-        w.put(1, 1); // tile_cols_log2 — up to 1
-        w.put(1, 1); // tile_cols_log2 — up to 2
-        w.put(1, 1); // tile_rows_log2 — high bit, so a second bit follows
-        w.put(0, 1); // tile_rows_log2 — low bit; 1 + 0 = 1 tile row
+        // 6.2.13 tile_info, which is **derived from the frame's size**, so it has to be written for the
+        // size this frame will actually have: `width` when the frame takes it from a reference, and
+        // the spelled 1920 otherwise. `header.rs:373-389` reads `min_log2` flags' worth of `f(1)`
+        // until `tile_cols_log2` reaches `max_log2`, where the range comes from the superblock column
+        // count against `MAX_TILE_WIDTH_B64 = 64` and `MIN_TILE_WIDTH_B64 = 4`
+        // (`crates/vp9/src/tables.rs:59-60`). Written out here rather than imported because it is a
+        // fixture; the assertion at the end of this function is what says it agrees with the parser.
+        let sb64_cols = width.div_ceil(64);
+        assert!(sb64_cols <= 64, "the fixture assumes min_log2 is 0, which holds while the frame is at most 64 superblocks wide ({width} is not)");
+        let mut max_log2 = 1u32;
+        while (sb64_cols >> max_log2) >= 4 {
+            max_log2 += 1;
+        }
+        max_log2 -= 1;
+        for _ in 0..max_log2 {
+            w.put(1, 1); // tile_cols_log2 — one flag per step up to max_log2
+        }
+        w.put(1, 1); // tile_rows_log2 — high bit, so a second bit follows. The row count is read the
+        w.put(0, 1); // tile_rows_log2 — low bit; 1 + 0 = 1 tile row. (not size-dependent)
         w.put(6, 16); // header_size_in_bytes
 
         let header_bytes = w.bytes();
@@ -5009,6 +5389,13 @@ mod tests {
                 // The whole point: against a **fresh** state, this is 8 whatever the profile is,
                 // because `header.rs:265` copies `HeaderState::default().color`.
                 assert_eq!(h.color, filmcraft_vp9::header::ColorConfig::default(), "an inter frame inherits the state's colour configuration");
+                // **And every field after `tile_info` is where it was written.** 6.2.13's flag count
+                // comes from the frame's size, so a fixture that wrote the wrong number shifted this
+                // value along with everything after it — and nothing noticed until the record started
+                // reading `header_size_in_bytes`, which it now does because that is what
+                // `first_partition_size` is. A fixture that stops being a well-formed frame fails
+                // here, at the builder, instead of as an odd number in a record.
+                assert_eq!(h.header_size_in_bytes, 6, "`tile_info` wrote the right number of flags for a {width}-wide frame");
             }
             Err(e) => {
                 assert!(size_from_ref, "only the size-from-a-reference frame is expected to fail to parse");
@@ -5139,9 +5526,9 @@ mod tests {
         assert_eq!(bytes[45], 0, "the C layout's hole at offset 45 is submitted as zero, not as stack");
         assert_eq!(
             &bytes[46..48],
-            &9u16.to_le_bytes(),
-            "first_partition_size at offset 46 — the COMPRESSED header as the frame really is (`frame.len() - uncompressed_size`), \
-             NOT the `header_size_in_bytes` the bitstream claims, which is 6 here and must not be what a driver is told"
+            &6u16.to_le_bytes(),
+            "first_partition_size at offset 46 — the COMPRESSED header's own length, which is what the bitstream states \
+             (`header_size_in_bytes`), NOT `frame.len() - uncompressed_size`, which is 9 here and is the tile data as well"
         );
         // The two arrays the header says the application must parse itself (`va_dec_vp9.h:172-177`),
         // at 48 and 55, in the order 6.2.11 read them.
@@ -5178,8 +5565,8 @@ mod tests {
                 // 40: filter_level 37, sharpness 5, log2_tile_rows 1, log2_tile_columns 0
                 37, 5, 1, 0, //
                 // 44: frame_header_length_in_bytes (uncompressed), the hole at 45, and
-                // 46: first_partition_size (compressed) as a uint16
-                26, 0x00, 0x09, 0x00, //
+                // 46: first_partition_size (the compressed header's own length) as a uint16
+                26, 0x00, 0x06, 0x00, //
                 // 48: mb_segment_tree_probs[7]
                 7, 11, 13, 17, 19, 23, 29, //
                 // 55: segment_pred_probs[3]
@@ -5198,7 +5585,7 @@ mod tests {
         assert_eq!((r.frame_width, r.frame_height), (320, 180));
         assert_eq!(r.reference_frames[0], 11);
         assert_eq!(r.reference_frames[1], crate::vaapi::ffi::INVALID_SURFACE);
-        assert_eq!((r.frame_header_length_in_bytes, r.first_partition_size), (26, 9), "two different counts of the same frame, both in the record");
+        assert_eq!((r.frame_header_length_in_bytes, r.first_partition_size), (26, 6), "two different counts of the same frame, both in the record");
         assert_eq!((r.profile, r.bit_depth), (0, 8));
         assert_eq!(r.va_reserved, [0; crate::vaapi::ffi::VA_PADDING_MEDIUM]);
         assert_eq!(r.mb_segment_tree_probs, [7, 11, 13, 17, 19, 23, 29], "and not a permutation of them");
@@ -5589,12 +5976,12 @@ mod tests {
         let f = seeded.frame(&key).expect("the key frame sets the probabilities");
         seeded.commit(&f, 100).expect("it commits");
         // The inheriting key frame with its compressed header cut off: it parses in full — writing
-        // `lf.level` and `lf.sharpness` — and is then refused by `vp9_picture_record` for having no room
-        // for a compressed header. So this refusal is *after* a complete parse, on a state that already
-        // held probabilities.
+        // `lf.level` and `lf.sharpness` — and is then refused by `vp9_picture_record` because the two
+        // header lengths it states do not fit inside the bytes it was given. So this refusal is
+        // *after* a complete parse, on a state that already held probabilities.
         let (inherits, _, inherits_header) = vp9_key_frame_inheriting_segmentation();
         let e = seeded.frame(&inherits[..inherits_header.uncompressed_size]).map(|_| ()).expect_err("a frame with no compressed header");
-        assert!(e.contains("no room"), "{e}");
+        assert!(e.contains("does not fit in it"), "{e}");
         let f = seeded.frame(&vp9_inter_frame_refreshing(0, false, 0xff, [0, 1, 2])).expect("references are all held");
         let r = crate::vaapi::ffi::picture_params_vp9(f.record().expect("a record")).expect("92 bytes");
         assert_eq!(
@@ -5939,7 +6326,7 @@ mod tests {
         // A frame naming a slot whose picture is a *different* size must not get the wrong one. Slot 4
         // holds 320x180, so a frame taking its size from slot 4 is 320x180 — a size no zero or no
         // single "the last decoded frame" default could imitate.
-        let f = state.frame(&vp9_inter_frame_refreshing(0, true, 0b0000_0001, [4, 1, 2])).expect("a frame that takes its size from slot 4");
+        let f = state.frame(&vp9_inter_frame_refreshing_sized(0, true, 0b0000_0001, [4, 1, 2], 320)).expect("a frame that takes its size from slot 4");
         assert!(
             (f.header().width, f.header().height) == (320, 180),
             "slot 4's own size, not slot 5's: {width}x{height}",
@@ -5969,12 +6356,12 @@ mod tests {
         // is_the_way_back`, which pins that and says what a caller does about it.
         assert_eq!(state_slots(&state), [crate::vaapi::ffi::INVALID_SURFACE; 8], "and none of that moved a reference slot");
 
-        // A well-formed header with its compressed header cut off: the record needs
-        // `first_partition_size` and there is nothing to give it.
+        // A well-formed header with its compressed header cut off: the record states where the
+        // compressed header is and how long it is, and the frame has to hold both.
         let (frame, _, header) = vp9_key_frame();
         let header_only = &frame[..header.uncompressed_size];
         let e = state.frame(header_only).expect_err("a frame that ends at its own header");
-        assert!(e.contains("no room"), "{e}");
+        assert!(e.contains("does not fit in it"), "{e}");
 
         // A depth this backend does not decode is refused by the record the state builds, with the
         // profile table's own reason — so a decline is reachable through the state too, not only
@@ -5989,38 +6376,49 @@ mod tests {
         assert_eq!(state_slots(&state), [100; 8]);
     }
 
-    /// A frame whose header claims more than its own bytes hold is refused, and so is one whose
-    /// header is longer than the record's one-byte field, or whose compressed header is longer than
-    /// its two.
+    /// A frame whose two header lengths do not fit the frame, or do not fit the record's fields, is
+    /// refused — and each way is refused for the reason it actually failed, so a message cannot be
+    /// right about one and silently cover another.
     ///
     /// These are the ways the two header lengths can be nonsense, and they are **the reason the
-    /// builder takes `data`**: nothing in a `FrameHeader` can detect any of them, because all three
-    /// are properties of the bytes rather than of the parse.
+    /// builder takes `data`**: nothing in a `FrameHeader` can detect any of them, because all of them
+    /// are properties of the bytes rather than of the parse. `first_partition_size` is the bitstream's
+    /// own statement about where its compressed header ends (see [`vp9_picture_record`]), so a
+    /// corrupt stream states a length past the end of the frame — which is the one thing about it a
+    /// decoder can check and must.
     #[test]
     fn a_frame_with_impossible_header_lengths_is_refused() {
         let (frame, state, mut header) = vp9_key_frame();
-        // A frame that ends before its uncompressed header does — a truncated one, which is the shape
-        // a corrupt sample has. `checked_sub` on the length is what catches it.
+        // A frame that ends before its own header does — a truncated one, which is the shape a corrupt
+        // sample has. The two stated lengths have to fit inside the frame.
         let short = &frame[..header.uncompressed_size - 1];
         let e = super::vp9_picture_record(&header, &state, short, &super::Vp9ReferenceSet::default()).expect_err("a frame shorter than its own header");
-        assert!(e.contains("no room"), "{e}");
-        // A frame that ends *exactly* at the header, so there is no compressed header at all: a
-        // `first_partition_size` of 0 would tell a driver there is nothing to parse, which is a claim
+        assert!(e.contains("does not fit in it"), "{e}");
+        // A frame that ends *exactly* at the uncompressed header, so there is no compressed header at
+        // all: a `first_partition_size` of 0 — or a positive one pointing past the end — is a claim
         // the frame does not support.
         let header_only = &frame[..header.uncompressed_size];
         let e = super::vp9_picture_record(&header, &state, header_only, &super::Vp9ReferenceSet::default()).expect_err("no compressed header");
-        assert!(e.contains("no room"), "{e}");
+        assert!(e.contains("does not fit in it"), "{e}");
+        // And the same refusal for the value itself: a bitstream that states no compressed header is a
+        // frame with nothing to parse, whatever else the frame carries.
+        let mut zero = header.clone();
+        zero.header_size_in_bytes = 0;
+        let e = super::vp9_picture_record(&zero, &state, &frame, &super::Vp9ReferenceSet::default()).expect_err("a zero-length compressed header");
+        assert!(e.contains("no compressed header"), "{e}");
         // A header of more than 255 bytes cannot be described: the record's field is a `uint8_t`, and a
         // VP9 header that long is legal and simply not expressible here.
         header.uncompressed_size = 300;
         let long = vec![0u8; 400];
         let e = super::vp9_picture_record(&header, &state, &long, &super::Vp9ReferenceSet::default()).expect_err("a 300-byte uncompressed header");
         assert!(e.contains("one-byte field"), "{e}");
-        // A compressed header of more than 65535 bytes cannot be described either: `uint16_t`.
+        // A compressed header of more than 65535 bytes cannot be described either: `uint16_t`. The
+        // frame is long enough to hold it, so this is the field and not the bounds check refusing.
         header.uncompressed_size = 10;
-        let huge = vec![0u8; 70_000];
+        header.header_size_in_bytes = 70_000;
+        let huge = vec![0u8; 80_000];
         let e = super::vp9_picture_record(&header, &state, &huge, &super::Vp9ReferenceSet::default()).expect_err("a 70 KB compressed header");
-        assert!(e.contains("longer than the record's field"), "{e}");
+        assert!(e.contains("does not fit the record's field"), "{e}");
     }
 
     /// A size or a packed member the record's fields cannot hold is refused, not truncated or wrapped.

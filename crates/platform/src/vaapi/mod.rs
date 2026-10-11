@@ -55,7 +55,7 @@ pub use decoder::{Timings, VaDecoder};
 // built from and owns the eight reference slots, which `build_frame` cannot be given (see
 // `picture::build_frame`).
 pub use encoder::{Current, EncodeRequest, EncodedPicture, MAX_REFERENCES, Reference, VaEncoder, macroblocks_of, ramp_picture, ramp_shifted};
-pub use picture::{Vp9Frame, Vp9Reference, Vp9ReferenceSet, Vp9State, vp9_decline, vp9_is_new_frame, vp9_picture_record};
+pub use picture::{Vp9Frame, Vp9Reference, Vp9ReferenceSet, Vp9State, vp9_decline, vp9_is_new_frame, vp9_picture_record, vp9_slice_record};
 // What a caller outside this module needs to build a decoder: [`Display`] is the initialised libva
 // connection a session is created on; [`stream_info`] reads a sample entry into the codec-agnostic
 // `StreamInfo` the rest of the workspace speaks, and [`Stream`] is this backend's own view of a

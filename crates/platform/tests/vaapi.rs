@@ -462,8 +462,11 @@ fn a_forced_mid_stream_failure_continues_in_software() {
 /// because "the run is complete" is a real requirement of a fallback and has to be assertable without
 /// also asserting the pixels.
 fn assert_same_pts_only(what: &str, a: &[DecodedFrame], b: &[DecodedFrame]) {
-    let pts = |out: &[DecodedFrame]| -> Vec<i64> { by_pts(out).keys().copied().collect() };
-    assert_eq!(pts(a), pts(b), "{what}: presentation times");
+    // The keys are (presentation time, index among the pictures at it) — see `by_pts`, which says why
+    // the index is part of the key. Collecting the pairs keeps a stream that shows two pictures under
+    // one timestamp comparable here too, which is the whole point of the key.
+    let pts = |out: &[DecodedFrame]| -> Vec<(i64, usize)> { by_pts(out).keys().copied().collect() };
+    assert_eq!(pts(a), pts(b), "{what}: pictures, matched by presentation time");
 }
 
 /// Run `f` on a thread; fail if it panics or takes longer than `limit`, else hand back what it
@@ -836,8 +839,9 @@ fn a_vp9_superframe_fixture_really_carries_superframes() {
 /// pictures *after* it.
 ///
 /// **The software half is the one that runs everywhere** and it is what makes this test meaningful on a
-/// machine whose driver cannot decode VP9 at all. The hardware half is skipped, loudly, when the driver
-/// refuses the stream — and that skip is a fact about the machine, not a pass.
+/// machine whose driver cannot decode VP9 at all. The hardware half is skipped, loudly, only when the
+/// driver refuses the *stream* — no libva, no render node, no VP9 profile 0 — which is a fact about
+/// the machine. A driver that takes the stream and then fails a picture is a failure here.
 #[test]
 fn a_vp9_superframe_decodes_every_frame_and_shows_only_what_the_stream_shows() {
     let ff = filmcraft_testkit::require_ffmpeg!();
@@ -888,25 +892,20 @@ fn a_vp9_superframe_decodes_every_frame_and_shows_only_what_the_stream_shows() {
             return;
         }
     };
-    // **A driver that accepts the stream but cannot decode a VP9 picture at all is a known, separate,
-    // open problem, not a superframe failure** (`vaEndPicture: invalid parameter`, on a machine whose
-    // driver advertises VP9 and where ffmpeg's own VA-API VP9 path works — see
-    // docs/vaapi-progress.md §4). It is reported as a skip with the reason rather than a failure here,
-    // because attributing it to superframe handling would be wrong and would hide a real regression
-    // later; the superframe behaviour is pinned by the driver-free half above and by
-    // `a_vp9_superframe_gives_each_frame_a_record_built_from_its_own_bytes`, neither of which needs
-    // this machine's driver. **Task 5 owns closing it**, with a parity test that will fail loudly until
-    // it is fixed.
+    // **The hardware half is a real assertion now.** It used to report a decode failure as a skip,
+    // on the grounds that "this driver cannot decode a VP9 picture at all" was a separate open
+    // problem from superframe handling. That problem was this backend's, not the machine's: the
+    // submission carried a picture-parameter record and slice data but **no
+    // `VASliceParameterBufferVP9`** — the one buffer `va_dec_vp9.h:279` declares and
+    // `va_dec_vp9.h:265-268` says is sent once per frame — so `vaEndPicture` answered
+    // `VA_STATUS_ERROR_INVALID_PARAMETER` after every other call had reported success. With the
+    // record submitted the driver decodes, so a failure here is a failure of this backend and is
+    // reported as one.
     let mut out = Vec::new();
     for (sample, pts) in &s.samples {
         match hw.decode(sample, *pts) {
             Ok(frames) => out.extend(frames),
-            Err(e) => {
-                eprintln!(
-                    "SKIPPED: this driver cannot decode a VP9 picture at all ({e}), which is the open problem in docs/vaapi-progress.md §4 — the superframe assertions above and the driver-free test do not depend on it"
-                );
-                return;
-            }
+            Err(e) => panic!("the hardware decoder failed on a VP9 stream this driver accepted: {e}"),
         }
     }
     out.extend(hw.flush());

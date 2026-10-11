@@ -871,6 +871,95 @@ pub struct VaPictureParameterBufferVp9 {
     pub va_reserved: [u32; VA_PADDING_MEDIUM],
 }
 
+/// `VASegmentParameterVP9` (`va_dec_vp9.h:204`): one segment's parameters. **36 bytes**, eight of
+/// them in every [`VaSliceParameterBufferVp9`].
+///
+/// The record is thin for a reason worth stating, because "thin" is what makes it look optional:
+/// **VP9 has no slice headers** — 6.2 returns from `frame_header()` after the tile and quantizer
+/// syntax, and there is no slice layer at all — so none of H.264's or HEVC's per-slice parsing
+/// fields has anything to go in it. What is left is the per-segment state, and that is **not**
+/// derivable from the picture parameter record beside it: `VADecPictureParameterBufferVP9` carries
+/// `base_q` nowhere (read the whole of `va_dec_vp9.h:58-192`: no quantizer field at all, only
+/// `filter_level` and `sharpness_level`), so the **quantizer this frame is dequantized with
+/// reaches the driver here and nowhere else**. A VP9 decode that omits this record does not merely
+/// lose a refinement — the driver has no qindex at all.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaSegmentParameterVp9 {
+    /// `segment_flags`, packed into the union's `value` member the way
+    /// [`VaPictureParameterBufferVp9::pic_fields`] is: bit 0 is `segment_reference_enabled`, bits
+    /// 1-2 `segment_reference`, bit 3 `segment_reference_skipped`
+    /// (`va_dec_vp9.h:212-226`). `segment_reference` is VP9 6.2.11's `SEG_LVL_REF_FRAME` feature
+    /// data in its own numbering: "0: reserved, 1: Last ref, 2: golden, 3: altref"
+    /// (`va_dec_vp9.h:213-220`).
+    pub segment_flags: u16,
+    /// `filter_level[4][2]` (`va_dec_vp9.h:231-235`): "Specifies the filter level information per
+    /// segment", indexed `[ref][mode]` — the header's own comment is that it "corresponds to
+    /// variable `lfi->lvl[seg][ref][mode]` in VP9 code" (`va_dec_vp9.h:232-234`), so it is VP9
+    /// 8.8.1's `FilterLevel[ref][mode]` table copied across with the segment index dropped.
+    pub filter_level: [[u8; 2]; 4],
+    /// "Specifies per segment Luma AC quantization scale" (`va_dec_vp9.h:236-239`). See
+    /// [`crate::vaapi::picture::vp9_slice_record`] for which of the two specification lookup tables
+    /// fills which of the four, and why the field name is not the only evidence for it.
+    pub luma_ac_quant_scale: i16,
+    /// "Specifies per segment Luma DC quantization scale" (`va_dec_vp9.h:240-244`).
+    pub luma_dc_quant_scale: i16,
+    /// "Specifies per segment Chroma AC quantization scale" (`va_dec_vp9.h:245-249`).
+    pub chroma_ac_quant_scale: i16,
+    /// "Specifies per segment Chroma DC quantization scale" (`va_dec_vp9.h:250-254`).
+    pub chroma_dc_quant_scale: i16,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VASliceParameterBufferVP9` (`va_dec_vp9.h:279`): the record a VP9 decode submits **once per
+/// frame**, with the frame's bytes. **316 bytes**.
+///
+/// ## A VP9 decode cannot do without this, and the header says so twice
+///
+/// It is not declared optional and it is not optional in practice: a submission without it is
+/// accepted by `vaCreateBuffer`, `vaMapBuffer` and `vaRenderPicture` and refused at
+/// `vaEndPicture` with `VA_STATUS_ERROR_INVALID_PARAMETER`, which is where this backend spent a
+/// whole milestone's debugging time before the buffer was sent at all.
+///
+/// The two sentences in the header that make it unavoidable:
+///
+/// - *"Slice data buffer of `VASliceDataBufferType` is used to send the bitstream which should
+///   include whole or part of partition 0 (at least compressed header) to the end of frame"*
+///   (`va_dec_vp9.h:274-276`). The slice *is* the frame, from partition 0 to the end — which is
+///   what [`slice_data_size`] counts and where [`slice_data_offset`] points.
+/// - *"When segmentation is disabled, only `SegParam[0]` has valid values, all other entries
+///   should be populated with 0. Otherwise, all eight entries should be valid"*
+///   (`va_dec_vp9.h:270-272`). Even a frame with no segmentation at all has to carry the
+///   quantizer in `SegParam[0]`, because the picture parameter record has nowhere else to put it.
+///
+/// ## What is *not* in it, and why that is not a reason to send something else
+///
+/// There is no slice-header parsing field, no reference list and no scaling list, because VP9 has
+/// no slice headers and no scaling lists. That makes this record *small and fully derived from the
+/// frame's own header plus the reference set* — it does not make it absent. The distinction that
+/// caused a wrong turn once: **"VP9 has no slice headers" is a fact about the codec, and the
+/// conclusion it does not license is "so the API has no slice record".** `va_dec_vp9.h:279`
+/// declares one, in a file named `va_dec_vp9.h`, and its fields are the geometry and the
+/// segmentation parameters.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaSliceParameterBufferVp9 {
+    /// "The byte count of current frame in the bitstream buffer, starting from first byte of the
+    /// buffer. It uses the name `slice_data_size` to be consitent with other codec, but actually
+    /// means `frame_data_size`" (`va_dec_vp9.h:280-284`). **The header names this out**: the count
+    /// is the whole frame from byte 0, not the extent of a slice inside it.
+    pub slice_data_size: u32,
+    /// "offset to the first byte of partition data (control partition)" (`va_dec_vp9.h:286-289`).
+    pub slice_data_offset: u32,
+    /// "see `VA_SLICE_DATA_FLAG_XXX` definitions" (`va_dec_vp9.h:290-293`) —
+    /// [`SLICE_DATA_FLAG_ALL`], since a frame is submitted whole.
+    pub slice_data_flag: u32,
+    /// "per segment information" (`va_dec_vp9.h:295-298`), eight of them: see
+    /// [`VaSegmentParameterVp9`] and the rule the header states about when each one is valid.
+    pub seg_param: [VaSegmentParameterVp9; 8],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
 // ---------------------------------------------------------------------------------------------
 // The encode records. Encode is the mirror image of decode (the plan's "decisive difference"): the
 // app hands the driver a picture and the driver writes the slice headers, so these are the records
@@ -1353,6 +1442,17 @@ pub fn slice_params_hevc(bytes: &[u8]) -> Option<VaSliceParameterBufferHevc> {
 pub fn picture_params_vp9(bytes: &[u8]) -> Option<VaPictureParameterBufferVp9> {
     // SAFETY: `VaPictureParameterBufferVp9` is a `#[repr(C)]` struct declared above.
     unsafe { record_of::<VaPictureParameterBufferVp9>(bytes) }
+}
+
+/// The VP9 slice parameter record `bytes` carries, or `None` if it is not one long enough.
+///
+/// The counterpart of [`picture_params_vp9`] on the other side of the same submission: a VP9 decode
+/// sends both, and a test that reads only the picture record back would not notice a slice record
+/// that was never built at all — which is the shape of the bug this backend spent a milestone on.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn slice_params_vp9(bytes: &[u8]) -> Option<VaSliceParameterBufferVp9> {
+    // SAFETY: `VaSliceParameterBufferVp9` is a `#[repr(C)]` struct declared above.
+    unsafe { record_of::<VaSliceParameterBufferVp9>(bytes) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3817,6 +3917,31 @@ mod tests {
         assert_eq!(offset_of!(VaPictureParameterBufferVp9, profile), 58);
         assert_eq!(offset_of!(VaPictureParameterBufferVp9, bit_depth), 59);
         assert_eq!(offset_of!(VaPictureParameterBufferVp9, va_reserved), 60, "bit_depth ends at 60, which is already 4-aligned");
+        // The VP9 slice record (va_dec_vp9.h:204, :279). **316 bytes, made of eight 36-byte segments,
+        // and every one of those numbers is measured, not read off the field list.** The header's
+        // `VASegmentParameterVP9` is `uint16_t`, `uint8_t[4][2]`, four `int16_t` and a
+        // `uint32_t[4]` — 2 + 8 + 8 + 16 = 34, so the struct is 36 only because the tail is
+        // 4-aligned and the next member is 4-aligned; a declaration that packed the quantizers into
+        // an array or dropped the reserved tail would shift all eight segments and every field in
+        // them. The eight are 288 bytes at offset 12, and the reserved tail is 16 more.
+        assert_eq!(size_of::<VaSegmentParameterVp9>(), 36, "VASegmentParameterVP9 (va_dec_vp9.h:204)");
+        assert_eq!(offset_of!(VaSegmentParameterVp9, segment_flags), 0);
+        assert_eq!(offset_of!(VaSegmentParameterVp9, filter_level), 2, "the uint16_t union leaves no hole");
+        assert_eq!(offset_of!(VaSegmentParameterVp9, luma_ac_quant_scale), 10);
+        assert_eq!(offset_of!(VaSegmentParameterVp9, luma_dc_quant_scale), 12);
+        assert_eq!(offset_of!(VaSegmentParameterVp9, chroma_ac_quant_scale), 14);
+        assert_eq!(offset_of!(VaSegmentParameterVp9, chroma_dc_quant_scale), 16);
+        assert_eq!(
+            offset_of!(VaSegmentParameterVp9, va_reserved),
+            20,
+            "chroma_dc_quant_scale ends at 18, and 18 is 2-aligned, so the uint32_t tail starts at 20"
+        );
+        assert_eq!(size_of::<VaSliceParameterBufferVp9>(), 316, "VASliceParameterBufferVP9 (va_dec_vp9.h:279)");
+        assert_eq!(offset_of!(VaSliceParameterBufferVp9, slice_data_size), 0);
+        assert_eq!(offset_of!(VaSliceParameterBufferVp9, slice_data_offset), 4);
+        assert_eq!(offset_of!(VaSliceParameterBufferVp9, slice_data_flag), 8);
+        assert_eq!(offset_of!(VaSliceParameterBufferVp9, seg_param), 12, "eight 36-byte segments from offset 12");
+        assert_eq!(offset_of!(VaSliceParameterBufferVp9, va_reserved), 300, "12 + 8 * 36");
     }
 
     /// The `pic_fields` word is a C bitfield, and its layout is not a choice this crate makes: the

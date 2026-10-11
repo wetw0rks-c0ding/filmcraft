@@ -221,53 +221,78 @@ pub fn assert_same(what: &str, a: &[DecodedFrame], b: &[DecodedFrame]) {
 /// The draft flag is compared too: a backend that flagged every picture `draft` — approximate
 /// samples, a decoder that skips the deblocking filter — would otherwise pass a comparison that looks
 /// only at planes, colour and size.
+///
+/// **Where a presentation time repeats, the pictures at it are compared in the order they came out**
+/// — see [`by_pts`]. A VP9 superframe is several frames under one container sample and this
+/// project's own software VP9 decoder shows every one of them, so "one timestamp, one picture" is not
+/// a property of the format and refusing to compare such a stream would have left the whole VP9
+/// comparison untested.
 pub fn assert_same_by_pts(what: &str, a: &[DecodedFrame], b: &[DecodedFrame]) {
     let (pa, pb) = (by_pts(a), by_pts(b));
-    assert_eq!(pa.keys().collect::<Vec<_>>(), pb.keys().collect::<Vec<_>>(), "{what}: presentation times");
-    for (pts, x) in &pa {
-        let y = pb[pts];
+    assert_eq!(pa.keys().collect::<Vec<_>>(), pb.keys().collect::<Vec<_>>(), "{what}: pictures, matched by presentation time");
+    for (key, x) in &pa {
+        let (pts, nth) = key;
+        let y = pb[key];
         let (fx, fy) = (&x.frame, &y.frame);
         assert_eq!(x.draft, y.draft, "{what}: pts {pts} draft flag ({} vs {})", x.draft, y.draft);
         assert_eq!((fx.width, fx.height, fx.par, fx.color), (fy.width, fy.height, fy.par, fy.color), "{what}: pts {pts} geometry / colour");
+        let nth = if *nth == 0 { String::new() } else { format!(" picture {nth} of that timestamp") };
         match (&fx.data, &fy.data) {
             (PixelData::Yuv8 { planes: p, chroma: c, .. }, PixelData::Yuv8 { planes: q, chroma: d, .. }) => {
-                assert_eq!(c, d, "{what}: pts {pts} chroma");
+                assert_eq!(c, d, "{what}: pts {pts}{nth} chroma");
                 for i in 0..3 {
-                    assert!(p[i] == q[i], "{what}: pts {pts} plane {i} differs (max diff {})", max_diff8(&p[i], &q[i]));
+                    assert!(p[i] == q[i], "{what}: pts {pts}{nth} plane {i} differs (max diff {})", max_diff8(&p[i], &q[i]));
                 }
             }
             (PixelData::Yuv16 { planes: p, chroma: c, bits: bx, .. }, PixelData::Yuv16 { planes: q, chroma: d, bits: by, .. }) => {
-                assert_eq!((c, bx), (d, by), "{what}: pts {pts} chroma / bits");
+                assert_eq!((c, bx), (d, by), "{what}: pts {pts}{nth} chroma / bits");
                 for i in 0..3 {
-                    assert!(p[i] == q[i], "{what}: pts {pts} plane {i} differs (max diff {})", max_diff16(&p[i], &q[i]));
+                    assert!(p[i] == q[i], "{what}: pts {pts}{nth} plane {i} differs (max diff {})", max_diff16(&p[i], &q[i]));
                 }
             }
-            _ => panic!("{what}: pts {pts}: pixel formats differ"),
+            _ => panic!("{what}: pts {pts}{nth}: pixel formats differ"),
         }
     }
 }
 
-/// `out` keyed by presentation time, in presentation order.
+/// `out` keyed by presentation time **and, where a time repeats, by the order the pictures came out
+/// at it**.
 ///
-/// Keying a map by pts is what hides a picture: two pictures with the same presentation time
-/// collapse into one entry and a comparison then never sees either of them. So this refuses to
-/// produce the map unless every picture has its own presentation time, and says which one is
-/// repeated. Every comparison that matches by presentation time goes through here, so a decoder
-/// that returns a picture twice fails instead of quietly matching.
-pub fn by_pts(out: &[DecodedFrame]) -> std::collections::BTreeMap<i64, &DecodedFrame> {
+/// Keying a map by pts alone is what hides a picture: two pictures with the same presentation time
+/// collapse into one entry and a comparison then never sees either of them. So the occurrence index
+/// is part of the key, which is what lets a stream that *legitimately* shows two pictures under one
+/// container timestamp — a VP9 superframe, which is several frames under one sample — be compared
+/// picture for picture instead of refused.
+///
+/// **Refusing was the right answer when it was the only one available and it stayed too long.** The
+/// first version of this function asserted that every presentation time appeared once, on the grounds
+/// that "a decoder that returns a picture twice fails instead of quietly matching". That is true of
+/// every codec then tested and false of VP9: FilmCraft's own software VP9 decoder emits one picture
+/// per *shown frame* of a superframe (`crates/vp9/src/decoder.rs:248-255`), so the harness refused to
+/// compare the very picture it was written to check. Nothing noticed, because the hardware VP9 path
+/// decoded nothing and every VP9 comparison was a skip. The property the guard was protecting is kept:
+/// a decoder that returns a *different* number of pictures at a presentation time now fails on the
+/// key set, and one that returns the same two pictures in a different order fails on the pixels.
+pub fn by_pts(out: &[DecodedFrame]) -> std::collections::BTreeMap<(i64, usize), &DecodedFrame> {
     let mut counts: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    let mut map: std::collections::BTreeMap<(i64, usize), &DecodedFrame> = std::collections::BTreeMap::new();
     for f in out {
-        *counts.entry(f.pts).or_default() += 1;
+        let nth = counts.entry(f.pts).or_default();
+        map.insert((f.pts, *nth), f);
+        *nth += 1;
     }
-    let map: std::collections::BTreeMap<i64, &DecodedFrame> = out.iter().map(|f| (f.pts, f)).collect();
+    // Still said out loud, because a repeated presentation time is the one thing a reader of a
+    // failure here would otherwise have to work out from a mismatch: which stream, which timestamp,
+    // and how many pictures share it.
     let repeated: Vec<String> = counts.iter().filter(|(_, c)| **c > 1).map(|(p, c)| format!("{p} ({c} times)")).collect();
-    assert!(
-        repeated.is_empty(),
-        "{} pictures but {} distinct presentation times: {} is returned more than once, and matching by presentation time would hide it",
-        out.len(),
-        map.len(),
-        repeated.join(", ")
-    );
+    if !repeated.is_empty() {
+        eprintln!(
+            "NOTE: {} pictures over {} distinct presentation times — {} is shown more than once, so they are compared in the order they came out",
+            out.len(),
+            counts.len(),
+            repeated.join(", ")
+        );
+    }
     map
 }
 

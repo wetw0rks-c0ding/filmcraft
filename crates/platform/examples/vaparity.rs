@@ -4,6 +4,11 @@
 //! vaparity [--hw] <file>   compare the two decoders' luma hashes, picture by picture
 //! ```
 //!
+//! **Both stream shapes go through it.** The hardware decoder is asked for its stream description
+//! with `vaapi::stream_info`, which covers `avcC` / `hvcC` and the frame-coded sample entries
+//! (`vp09` + `vpcC`) alike; asking the NAL parser alone reported a VP9 file as "not an avcC / hvcC
+//! stream" and silently ran the software half alone.
+//!
 //! Pictures are matched by presentation time, not by position: a decoder that reorders emits its
 //! pictures in a different order from one that does not, so comparing "the sixth picture" of each
 //! compares two different frames. Every sample is fed to *both* decoders whatever the other one did
@@ -55,25 +60,26 @@ fn parity(path: &str, hw: bool) {
     };
 
     // The stream description the hardware backend needs, or why it is declined.
-    let described: Result<Option<filmcraft_codecs::hw::NalStreamInfo>, String> = match filmcraft_codecs::hw::NalStreamInfo::from_entry(entry) {
-        Some(r) => r.map(Some).map_err(|e| e.to_string()),
-        None => Ok(None),
-    };
-    let mut hardware: Option<filmcraft_platform::vaapi::VaDecoder> = match (hw, &described) {
-        (true, Ok(Some(info))) => filmcraft_platform::vaapi::VaDecoder::new(info.clone()).ok(),
+    //
+    // **`vaapi::stream_info`, not `NalStreamInfo::from_entry`.** The latter is the NAL path and says
+    // `None` for anything that is not an `avcC` / `hvcC` sample entry — which read "this entry is not
+    // an avcC / hvcC stream" for a VP9 file and made the hardware half of a VP9 oracle run report a
+    // refusal for a stream the backend decodes. `stream_info` is the backend's own front door and
+    // covers both shapes (see `vaapi/stream.rs`), so asking it means this harness exercises the same
+    // decision `VaDecoder::new` would be given by a caller.
+    let described = filmcraft_platform::vaapi::stream_info(entry);
+    let declined = described.is_none();
+    let mut hardware: Option<filmcraft_platform::vaapi::VaDecoder> = match (hw, described) {
+        (true, Some(info)) => filmcraft_platform::vaapi::VaDecoder::new(info).ok(),
         _ => None,
     };
     if hw && hardware.is_none() {
-        let why = match &described {
-            Ok(None) => "the entry is not an avcC / hvcC stream".to_string(),
-            Err(e) => format!("the stream description does not parse: {e}"),
-            Ok(Some(_)) => "VaDecoder::new declined it".to_string(),
-        };
+        let why = if declined { "the backend does not describe this sample entry".to_string() } else { "VaDecoder::new declined it".to_string() };
         println!("{path}: no hardware decoder: {why}");
     }
 
-    let mut sw_by_pts: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
-    let mut hw_by_pts: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
+    let mut sw_by_pts: std::collections::HashMap<i64, Picture> = std::collections::HashMap::new();
+    let mut hw_by_pts: std::collections::HashMap<i64, Picture> = std::collections::HashMap::new();
     // Pictures **returned**, alongside the maps. Two pictures at one presentation time collapse into one
     // map entry, so the map's length alone would read as pictures going missing — the very confusion
     // this file's doc exists to remove — and nothing in a `HashMap` records that it happened. The two
@@ -91,7 +97,7 @@ fn parity(path: &str, hw: bool) {
             Ok(frames) => {
                 sw_pictures += frames.len();
                 for f in frames {
-                    sw_by_pts.insert(f.pts, luma_hash(&f.frame));
+                    sw_by_pts.insert(f.pts, measure(&f.frame));
                 }
             }
             Err(e) => sw_errors.push((i, e.to_string())),
@@ -101,7 +107,7 @@ fn parity(path: &str, hw: bool) {
                 Ok(frames) => {
                     hw_pictures += frames.len();
                     for f in frames {
-                        hw_by_pts.insert(f.pts, luma_hash(&f.frame));
+                        hw_by_pts.insert(f.pts, measure(&f.frame));
                     }
                 }
                 Err(e) => hw_errors.push((i, e.to_string())),
@@ -113,12 +119,12 @@ fn parity(path: &str, hw: bool) {
     // a 72-picture stream reads as 65 — which looks like pictures going missing and is not.
     for f in software.flush() {
         sw_pictures += 1;
-        sw_by_pts.insert(f.pts, luma_hash(&f.frame));
+        sw_by_pts.insert(f.pts, measure(&f.frame));
     }
     if let Some(d) = hardware.as_mut() {
         for f in d.flush() {
             hw_pictures += 1;
-            hw_by_pts.insert(f.pts, luma_hash(&f.frame));
+            hw_by_pts.insert(f.pts, measure(&f.frame));
         }
     }
 
@@ -126,12 +132,12 @@ fn parity(path: &str, hw: bool) {
         let mut pts: Vec<i64> = hw_by_pts.keys().copied().collect();
         pts.sort_unstable();
         for p in pts {
-            println!("HW {p} {:016x}", hw_by_pts[&p]);
+            println!("HW {p} {:016x}", hw_by_pts[&p].hash);
         }
         let mut spts: Vec<i64> = sw_by_pts.keys().copied().collect();
         spts.sort_unstable();
         for p in spts {
-            println!("SW {p} {:016x}", sw_by_pts[&p]);
+            println!("SW {p} {:016x}", sw_by_pts[&p].hash);
         }
         return;
     }
@@ -153,6 +159,14 @@ fn parity(path: &str, hw: bool) {
     all.dedup();
     let mut only_hardware = 0usize;
     let mut only_software = 0usize;
+    // **Per-frame numbers, for every picture that differs.** A hash says *that* two pictures differ
+    // and nothing about how, and "how" is what distinguishes a blank surface from a picture built
+    // from the wrong references from a picture off by one quantizer step. So each differing
+    // presentation time is reported on its own line with the share of sampled luma values that
+    // differ, the largest single difference and the mean absolute difference — enough to tell a
+    // cleared render target (everything wrong, wildly) from a near miss (a few taps, by one or two
+    // levels) without dumping frames to disk.
+    let mut per_frame: Vec<String> = Vec::new();
     for p in &all {
         let (a, b) = (sw_by_pts.get(p), hw_by_pts.get(p));
         // `p` came out of the union, so exactly one side has it once the both-sides case is out of the
@@ -161,12 +175,13 @@ fn parity(path: &str, hw: bool) {
         // reports on a decoder has no business unwinding, and the examples/ target is not covered by the
         // lib crate's `deny`, so a panic path there would not be caught by the build.
         if let (Some(a), Some(b)) = (a, b) {
-            if a == b {
+            if a.hash == b.hash {
                 agree += 1;
             } else {
                 differ += 1;
+                per_frame.push(format!("  pts {p}: {}", a.against(b)));
                 if first_diff.is_none() {
-                    first_diff = Some(format!("pts {p}: software {a:016x} != hardware {b:016x}"));
+                    first_diff = Some(format!("pts {p}: software {:016x} != hardware {:016x}", a.hash, b.hash));
                 }
             }
             continue;
@@ -209,6 +224,108 @@ fn parity(path: &str, hw: bool) {
     if let Some((i, e)) = sw_errors.first() {
         println!("  first software error at sample {i}: {e} ({} errors)", sw_errors.len());
     }
+    for line in &per_frame {
+        println!("{line}");
+    }
+}
+
+/// What this harness keeps of one picture: its luma hash, and an evenly spaced sample of its luma
+/// values to measure a difference with.
+///
+/// **The sample is bounded on purpose.** Keeping every plane of every picture would make the harness
+/// scale with the file — a 4K run would hold gigabytes — and the numbers a mismatch needs are the
+/// *shape* of the difference, not a byte-exact diff of two large buffers. [`SAMPLES`] values spread
+/// across the plane answer "how much of it is wrong, by how much, and does it look like a cleared
+/// surface or a near miss", which is what tells a wrong reference apart from a wrong quantizer.
+struct Picture {
+    /// FNV-1a/64 over the whole luma plane's bytes, one byte per 8-bit sample and two per 10-bit one
+    /// — **the same measure `vaprobe` prints**, so the two agree and so a number from either is
+    /// comparable with a number from the other.
+    hash: u64,
+    /// `SAMPLES` luma values spread across the plane, as `u32` so an 8- and a 10-bit picture compare
+    /// the same way.
+    samples: Vec<u32>,
+    /// The mean of the whole luma plane, which is what says whether one picture is *brighter* than
+    /// the other — the difference between a colour-range or matrix mistake and a picture that is
+    /// simply the wrong picture.
+    mean: f64,
+}
+
+/// How many luma values one picture is reduced to for measurement.
+const SAMPLES: usize = 1024;
+
+/// [`Picture::against`]: the sentence a parity report prints for one picture that differs.
+impl Picture {
+    fn against(&self, other: &Picture) -> String {
+        if self.samples.len() != other.samples.len() {
+            return format!("the two pictures are different sizes ({} and {} sampled luma values)", self.samples.len(), other.samples.len());
+        }
+        let mut differing = 0usize;
+        let mut worst = 0i64;
+        let mut total = 0i64;
+        let mut first_at = None;
+        for (i, (a, b)) in self.samples.iter().zip(&other.samples).enumerate() {
+            let d = i64::from(*a) - i64::from(*b);
+            if d != 0 {
+                differing += 1;
+                worst = worst.max(d.abs());
+                total += d.abs();
+                first_at.get_or_insert(i);
+            }
+        }
+        let n = self.samples.len().max(1);
+        format!(
+            "{differing} of {} sampled luma values differ ({}%), largest {worst}, mean {:.2}, first at index {}; \
+             luma mean software {:.1}, hardware {:.1}; software starts {:?}, hardware starts {:?}",
+            n,
+            differing * 100 / n,
+            total as f64 / n as f64,
+            first_at.map_or_else(|| "-".to_string(), |i| i.to_string()),
+            self.mean,
+            other.mean,
+            &self.samples[..self.samples.len().min(6)],
+            &other.samples[..other.samples.len().min(6)]
+        )
+    }
+}
+
+/// One picture, reduced to what the comparison above needs.
+///
+/// The luma plane is walked once for the hash and once for the sample, so the sample is taken at a
+/// fixed stride rather than from the head of the plane — a stride over the head would only ever
+/// measure the first rows, and the top row is the same whatever went wrong below it.
+#[cfg(target_os = "linux")]
+fn measure(frame: &filmcraft_frame::VideoFrame) -> Picture {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let fold = |h: &mut u64, b: u8| *h = (*h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+    let values: Vec<u32> = match &frame.data {
+        filmcraft_frame::PixelData::Yuv8 { planes, .. } => planes[0].iter().map(|&v| u32::from(v)).collect(),
+        filmcraft_frame::PixelData::Yuv16 { planes, .. } => planes[0].iter().map(|&v| u32::from(v)).collect(),
+        // A format this backend does not produce compares as empty rather than as equal: two empty
+        // pictures hashing the same is the one result that would be a false "identical".
+        _ => Vec::new(),
+    };
+    match &frame.data {
+        filmcraft_frame::PixelData::Yuv8 { .. } => {
+            for &v in &values {
+                fold(&mut hash, v as u8);
+            }
+        }
+        filmcraft_frame::PixelData::Yuv16 { .. } => {
+            for &v in &values {
+                for b in v.to_le_bytes() {
+                    fold(&mut hash, b);
+                }
+            }
+        }
+        _ => {}
+    }
+    let stride = (values.len() / SAMPLES).max(1);
+    let samples = values.iter().step_by(stride).take(SAMPLES).copied().collect();
+    // `u64` for the sum so a 4K plane of 8-bit samples cannot overflow the accumulator.
+    let total: u64 = values.iter().map(|&v| u64::from(v)).sum();
+    let mean = total as f64 / values.len().max(1) as f64;
+    Picture { hash, samples, mean }
 }
 
 #[cfg(target_os = "linux")]
@@ -223,29 +340,6 @@ fn software_decoder(entry: &filmcraft_isobmff::SampleEntry) -> Option<filmcraft_
     let factories: [fn(&filmcraft_isobmff::SampleEntry) -> Option<filmcraft_codecs::Result<Box<dyn filmcraft_codecs::VideoDecoder>>>; 5] =
         [h264_factory, hevc_factory, vp9_factory, av1_factory, prores_factory];
     factories.into_iter().find_map(|f| f(entry))
-}
-
-/// FNV-1a/64 over the luma plane's bytes — the same measure `vaprobe` prints, so the two agree.
-#[cfg(target_os = "linux")]
-fn luma_hash(frame: &filmcraft_frame::VideoFrame) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let fold = |h: &mut u64, b: u8| *h = (*h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
-    match &frame.data {
-        filmcraft_frame::PixelData::Yuv8 { planes, .. } => {
-            for &b in planes[0].iter() {
-                fold(&mut h, b);
-            }
-        }
-        filmcraft_frame::PixelData::Yuv16 { planes, .. } => {
-            for &v in planes[0].iter() {
-                for b in v.to_le_bytes() {
-                    fold(&mut h, b);
-                }
-            }
-        }
-        _ => {}
-    }
-    h
 }
 
 #[cfg(not(target_os = "linux"))]
