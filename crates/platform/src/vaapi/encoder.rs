@@ -747,6 +747,58 @@ impl VaEncoder {
             .into())
     }
 
+    /// **`MaxFrameNum` as a function, for a caller outside this module** that has to decide whether a
+    /// key-frame interval is reachable at all.
+    ///
+    /// The interval is not the only thing that has to fit: the frame loop inserts a key frame every
+    /// [`MAX_FRAME_NUM`] pictures whatever the caller asks for (see the module note, "The
+    /// `frame_num` wrap, decided"), so an export that asked for a longer interval gets a shorter
+    /// one. That is reported on [`EncodedPicture::key_frame_reason`] when it happens, and **refused
+    /// before an encoder is built** by [`crate::hardware_encode::vaapi_config_for`] — this constant
+    /// is what it refuses against.
+    pub fn max_frame_num() -> u32 {
+        MAX_FRAME_NUM
+    }
+
+    /// What the driver says it supports for [`super::ffi::RC_CQP`] and the other rate-control
+    /// modes, as the mask itself (`va.h:1108-1164`). **A query, not a decision**: 0 means the
+    /// driver did not say, and this backend submits constant quantiser whatever the answer is —
+    /// see [`crate::hardware_encode::vaapi_config_for`] for why a bitrate is declined rather than
+    /// sent.
+    pub fn driver_rate_control_modes(display: &Arc<Display>) -> u32 {
+        ffi::Encoder::driver_rate_control_modes(display, Profile::H264Main)
+    }
+
+    /// The names of the rate-control modes in `mask`, as `CQP and VBR` — or `nothing the driver
+    /// named`, for a zero mask.
+    ///
+    /// **Written out rather than printed as a hex literal** because the mask's bits are `va.h`'s
+    /// (`va.h:1108-1176`) and a decline message containing `0x140` tells a reader nothing. A zero
+    /// mask is named as such and not as "none": it means the driver did not answer, which
+    /// [`VaEncoder::driver_rate_control_modes`] says is not a claim that nothing is supported.
+    ///
+    /// It is an associated function rather than a module-level one because `vaapi/mod.rs`
+    /// re-exports an explicit list of names from this module and that file belongs to another
+    /// milestone; an associated function needs no change there.
+    pub fn rate_control_names(mask: u32) -> String {
+        let named: Vec<&str> = [
+            (ffi::RC_NONE, "NONE"),
+            (ffi::RC_CBR, "CBR"),
+            (ffi::RC_VBR, "VBR"),
+            (ffi::RC_VBR_CONSTRAINED, "VBR_CONSTRAINED"),
+            (ffi::RC_CQP, "CQP"),
+            (ffi::RC_ICQ, "ICQ"),
+            (ffi::RC_QVBR, "QVBR"),
+            (ffi::RC_AVBR, "AVBR"),
+            (ffi::RC_TCBRC, "TCBRC"),
+        ]
+        .into_iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, name)| name)
+        .collect();
+        if named.is_empty() { "nothing the driver named".to_string() } else { named.join(" and ") }
+    }
+
     /// **State this stream's frame rate, which the driver is told per picture.** Required, and
     /// refused rather than defaulted: iHD refuses a render whose buffer list omits the frame-rate
     /// record, and a rate this module invented would be a stream whose timing nobody asked for.
@@ -2414,6 +2466,11 @@ mod tests {
         assert_eq!(ffi::RC_CBR, 0x2);
         assert_eq!(ffi::RC_VBR, 0x4);
         assert_eq!(ffi::RC_CQP, 0x10, "VA_RC_CQP is 0x10, not 0x8");
+        assert_eq!(ffi::RC_NONE, 0x1, "VA_RC_NONE");
+        assert_eq!(ffi::RC_VBR_CONSTRAINED, 0x20, "VA_RC_VBR_CONSTRAINED");
+        assert_eq!(ffi::RC_QVBR, 0x400, "VA_RC_QVBR");
+        assert_eq!(ffi::RC_AVBR, 0x800, "VA_RC_AVBR");
+        assert_eq!(ffi::RC_TCBRC, 0x1000, "VA_RC_TCBRC");
         assert_eq!(ffi::RC_ICQ, 0x40);
         assert_eq!(ffi::PACKED_HEADER_SEQUENCE, 0x1);
         assert_eq!(ffi::PACKED_HEADER_PICTURE, 0x2);

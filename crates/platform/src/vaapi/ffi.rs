@@ -355,6 +355,21 @@ pub const RC_VBR: u32 = 0x0000_0004;
 #[cfg_attr(not(test), allow(dead_code))]
 /// `VA_RC_ICQ` (`va.h:1121`): constant quality.
 pub const RC_ICQ: u32 = 0x0000_0040;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_RC_NONE` (`va.h:1108`).
+pub const RC_NONE: u32 = 0x0000_0001;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_RC_VBR_CONSTRAINED` (`va.h:1118`).
+pub const RC_VBR_CONSTRAINED: u32 = 0x0000_0020;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_RC_QVBR` (`va.h:1155`).
+pub const RC_QVBR: u32 = 0x0000_0400;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_RC_AVBR` (`va.h:1164`).
+pub const RC_AVBR: u32 = 0x0000_0800;
+#[cfg_attr(not(test), allow(dead_code))]
+/// `VA_RC_TCBRC` (`va.h:1176`), the temporal-layer rate control iHD's driver exposes.
+pub const RC_TCBRC: u32 = 0x0000_1000;
 
 /// `VA_ENC_PACKED_HEADER_SEQUENCE` (`va.h:1206`): the driver writes the SPS.
 pub const PACKED_HEADER_SEQUENCE: u32 = 0x0000_0001;
@@ -3464,6 +3479,26 @@ impl Encoder {
             Err(why) => {
                 log::info!("VA-API: no vaGetConfigAttributes, so the driver's reference depth is unknown: {why}");
                 (0, 0)
+            }
+        }
+    }
+
+    /// The rate-control modes the driver says it supports for this profile and entry point, as
+    /// the [`CONFIG_ATTRIB_RATE_CONTROL`] mask itself.
+    ///
+    /// **A mask, not a list**, because that is the shape the attribute has (`va.h:1108-1164`): a
+    /// bit per [`RC_CBR`], [`RC_VBR`], [`RC_CQP`] and so on. 0 means "the driver did not say" —
+    /// either it reported none or libva cannot answer — and is **not** a claim that nothing is
+    /// supported, for the same reason [`Encoder::driver_max_reference_frames`]'s `(0, 0)` is not.
+    /// A caller that needs to know which of the modes it may submit has to create a config and see
+    /// whether it is accepted, which is what this backend does: it submits [`RC_CQP`] and reports
+    /// the failure if that is refused.
+    pub fn driver_rate_control_modes(display: &Display, profile: Profile) -> u32 {
+        match display.config_attributes(profile, Entrypoint::EncSlice, &[CONFIG_ATTRIB_RATE_CONTROL]) {
+            Ok(values) => values.first().copied().unwrap_or(0),
+            Err(why) => {
+                log::info!("VA-API: no vaGetConfigAttributes, so the driver's rate-control modes are unknown: {why}");
+                0
             }
         }
     }

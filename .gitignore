@@ -7,3 +7,7 @@ plan/
 .claude/worktrees/
 .worktrees/
 .superpowers/
+# Scratch for tools told to keep TMPDIR inside the tree (`export TMPDIR=$PWD/.tmpwork`) when the
+# machine's /tmp is full or shared. Untracked-and-not-ignored is enough for `cargo xtask assets` to
+# scan it and demand attribution sidecars for a session's own WAV files, which is not a useful gate.
+.tmpwork/

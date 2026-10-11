@@ -91,6 +91,10 @@ fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, fps: u32, gop:
     // What the driver says it can hold references for, asked before any config exists.
     let (l0, l1) = filmcraft_platform::vaapi::max_reference_frames(&api);
     println!("VAConfigAttribEncMaxRefFrames: reference list 0 = {l0}, list 1 = {l1} (asked with {refs})");
+    // **What the driver reports for rate control**, which is what decides whether the settings
+    // gate could ever accept a bitrate. Printed here because the decline says "the driver reports
+    // <names>" and a probe that did not show it would leave the claim unchecked.
+    println!("VAConfigAttribRateControl: {}", filmcraft_platform::hardware_encode::vaapi_rate_control_modes_named());
 
     let mut encoder = VaEncoder::new(&api, (width, height), refs)?;
     encoder.at_rate(fps)?;

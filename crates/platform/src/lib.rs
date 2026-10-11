@@ -32,7 +32,10 @@
 mod annexb;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod biplanar;
-#[cfg(target_os = "macos")]
+// The hardware encoder behind `filmcraft_export::VideoEncoder`. VideoToolbox's H.264 and HEVC on
+// macOS, the VA-API H.264 slice encoder on Linux; on other systems the module is not compiled,
+// because both arms are OS-specific and there is nothing in it that is not.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod hardware_encode;
 pub mod hybrid;
 #[cfg(target_os = "windows")]
@@ -83,6 +86,12 @@ pub fn register() -> Availability {
     }
     #[cfg(target_os = "linux")]
     {
+        // Export ▸ Hardware encoding (VA-API H.264): in front of the software encoder, taking an
+        // export only when asked for and when the slice encoder can do what the settings ask. The
+        // `Once` is the Windows arm's shape — `register_encoder` already ignores a factory it has,
+        // so this says "this happens once" rather than being what makes it true.
+        static ENCODERS: std::sync::Once = std::sync::Once::new();
+        ENCODERS.call_once(|| filmcraft_export::register_encoder(hardware_encode::vaapi_encoder_factory));
         filmcraft_codecs::register_video_decoder(vaapi_factory);
         filmcraft_codecs::hw::set_hw_backend("VA-API");
         Availability::Available("VA-API")
