@@ -104,11 +104,27 @@ pub struct VaSurfaceAttrib {
 /// It was declared here as the bare eight-byte union the header's *inner* member is, which made
 /// every `VASurfaceAttrib` 8 bytes instead of 24. Nothing noticed, because the only array this
 /// backend ever passes is a null pointer — see the note on [`VaSurfaceAttrib`].
+///
+/// ## The 4 bytes at offsets 4-7, which the header also leaves unnamed
+///
+/// `value` is a union holding a `void *` (`va.h:1666-1675`), so C aligns it to 8 and puts it at
+/// offset 8 — leaving **a 4-byte hole between the 4-byte `type` word and it**. This is the same
+/// defect [`VaSegmentParameterVp9`] was fixed for, in a record nobody thought to look at because
+/// it has been correct by accident for as long as it existed: `offset_of!` and `sizeof` both agree
+/// with the header whether the padding is named or not, so nothing that reads a number out of the
+/// struct can see it. It is named here for the reason the note above this file's structures gives
+/// and no other: `#[derive(Default)]` initialises named fields only, so an unnamed hole is
+/// indeterminate memory and [`record_bytes`] would hand it to a driver as whatever was on the
+/// stack. `[u8; 4]` is align-1, so `value` stays 8-aligned at 8 and the record stays 16 bytes.
 #[repr(C)]
 pub struct VaGenericValue {
     /// `VAGenericValueType` (`va.h:1648-1656`): `VAGenericValueTypeInteger`, `…Float`,
     /// `…Pointer` or `…Func`.
     pub type_: VAStatus,
+    /// The C layout's hole at offsets 4-7, before `value` — **the header has one too, and a
+    /// declaration that did not name it left four indeterminate bytes in a record handed to a
+    /// driver.** `value` is a union containing a `void *`, so C aligns it to 8 and starts it at 8.
+    pub padding_before_value: [u8; 4],
     pub value: VaGenericValueValue,
 }
 
@@ -126,7 +142,10 @@ pub union VaGenericValueValue {
 
 impl Default for VaGenericValue {
     fn default() -> Self {
-        Self { type_: 0, value: VaGenericValueValue { integer: 0 } }
+        // Written out rather than derived, because `Default` is what the whole hole argument rests
+        // on: it must zero `padding_before_value` too, or the four bytes it covers are
+        // indeterminate and `record_bytes` hands them to a driver.
+        Self { type_: 0, padding_before_value: [0; 4], value: VaGenericValueValue { integer: 0 } }
     }
 }
 
