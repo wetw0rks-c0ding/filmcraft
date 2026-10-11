@@ -95,12 +95,12 @@ fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, all_idr: bool,
     let shift = 8u32;
     let mut annex_b = Vec::new();
     println!();
-    println!("{:>4}  {:>5}  {:>7}  {:>7}  {:>5}  {:>3}  note", "frame", "shift", "slice_t", "bytes", "QP", "refs");
+    println!("{:>4}  {:>5}  {:>7}  {:>7}  {:>5}  {:>3}  {:>12}  note", "frame", "shift", "slice_t", "bytes", "QP", "refs", "driver NALs");
     let mut sizes = Vec::new();
     for index in 0..frames {
         // **Every picture is a different picture.** This is the whole test: a still sequence would
         // decode correctly whether or not the references were used.
-        let (luma, chroma) = ramp_shifted(display.0, display.1, shift * index as u32);
+        let (luma, chroma) = ramp_shifted(display.0, display.1, shift * index as u32)?;
         encoder.upload(&luma, &chroma)?;
         // The first picture must be an IDR: there is nothing before it to predict from, and an
         // encoder asked for a P frame with no reference refuses rather than guessing.
@@ -108,13 +108,22 @@ fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, all_idr: bool,
         let picture = encoder.encode(request)?;
         let avg_qp = picture.status.first().copied().unwrap_or(0) & 0xff;
         sizes.push(picture.driver_bytes);
+        // **The NAL types the driver itself wrote**, which is the measurement Task 4 turns on: a
+        // driver that honours `VAConfigAttribEncPackedHeaders` puts a type 7 (SPS) and a type 8
+        // (PPS) in there, and one that accepts the attribute and then ignores it writes nothing but
+        // the slice. Printed per picture rather than once for the stream, because "the stream has
+        // parameter sets" and "the *driver* writes them" are different claims and only this one is
+        // about the driver.
+        let driver_only = picture.bytes.len().saturating_sub(picture.driver_bytes);
+        let driver_nals = nal_types(picture.bytes.get(driver_only..).unwrap_or(&[]));
         println!(
-            "{index:>4}  {:>5}  {:>7}  {:>7}  {:>5}  {:>3}  {}",
+            "{index:>4}  {:>5}  {:>7}  {:>7}  {:>5}  {:>3}  {:>12}  {}",
             shift * index as u32,
             picture.slice_type,
             picture.driver_bytes,
             avg_qp,
             picture.predicted_from,
+            driver_nals,
             if index == 0 { "key frame" } else { "predicted" }
         );
         if index == 0 {
@@ -153,7 +162,7 @@ fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, all_idr: bool,
         let mut control = VaEncoder::new(&api, (width, height), 1).map_err(|e| format!("control encoder: {e}"))?;
         let mut control_sizes = Vec::new();
         for index in 0..frames {
-            let (luma, chroma) = ramp_shifted(display.0, display.1, shift * index as u32);
+            let (luma, chroma) = ramp_shifted(display.0, display.1, shift * index as u32)?;
             control.upload(&luma, &chroma)?;
             let c = control.encode(EncodeRequest::new(qp, true)?)?;
             control_sizes.push(c.driver_bytes);
@@ -170,6 +179,24 @@ fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, all_idr: bool,
     println!("decode it with: ffmpeg -v error -f h264 -i {out} -f rawvideo -pix_fmt gray - | wc -c");
     println!("  (expect {} = {} pictures of {}x{} luma)", frames * display.0 as usize * display.1 as usize, frames, display.0, display.1);
     Ok(())
+}
+
+/// The `nal_unit_type` of every NAL in an Annex-B run, in order — `7 8 5`, say.
+///
+/// A real walk of the start codes rather than a search for `00 00 01` anywhere: that byte sequence
+/// occurs inside slice payload by coincidence, and a probe that matched one would report parameter
+/// sets a stream does not have.
+#[cfg(target_os = "linux")]
+fn nal_types(bytes: &[u8]) -> String {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(found) = bytes.get(at..).and_then(|rest| rest.windows(3).position(|w| w == [0, 0, 1])) {
+        let start = at + found + 3;
+        let Some(&header) = bytes.get(start) else { break };
+        out.push(header & 0x1f);
+        at = start;
+    }
+    out.iter().map(u8::to_string).collect::<Vec<_>>().join(" ")
 }
 
 /// Whether the stream's own parameter sets are the ones this module wrote.

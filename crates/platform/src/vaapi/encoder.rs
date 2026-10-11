@@ -149,13 +149,23 @@ pub const MAX_REFERENCES: u32 = 16;
 /// was told, and `display_size` is the crop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedPicture {
-    /// The complete Annex-B access unit: the SPS and the PPS ahead of the slice the driver wrote.
+    /// **The complete Annex-B access unit: a sequence parameter set, a picture parameter set, and
+    /// the slice(s) the driver wrote** — in that order, for every picture including a predicted one.
     ///
-    /// Which parameter sets these are is in [`Self::parameter_sets_from_driver`]. They are here
-    /// rather than in the driver's own output because the driver needs them to be *somewhere*, and a
-    /// stream without them is not a stream (Task 4 of the plan builds `avcC` from the driver's own
-    /// SPS and PPS; on the machine this milestone was written on, the driver writes none, which is
-    /// why [`super::params`] exists).
+    /// "The parameter sets ahead of the slice" is a statement about the bytes, not about where they
+    /// came from, and `parameter_sets_from_driver` below says which. On iHD 26.3.5 they are never
+    /// the driver's: **the driver writes no NAL of type 7 or 8 under any
+    /// `VAConfigAttribEncPackedHeaders` value**, so they are derived from the records this module
+    /// submitted and then checked against this picture's own coded NALs — see
+    /// [`VaEncoder::sample_entry`]. A caller writing this to a file gets a valid elementary stream; a
+    /// caller feeding an MP4 muxer wants [`Self::mp4_sample`] instead, and an `avcC` says which of
+    /// the two the samples are in.
+    ///
+    /// **A predicted picture carries the parameter sets too, and that is deliberate.** Repeating an
+    /// SPS and a PPS mid-stream is legal (7.4.2.1.1's `seq_parameter_set_id` makes the decoder
+    /// adopt the later one, and they are identical here), and it is what makes this stream decodable
+    /// from any of its pictures rather than only from the first. A caller assembling an elementary
+    /// stream and wanting the sets only once has [`Self::driver_bytes`] to subtract them.
     pub bytes: Vec<u8>,
     /// How many of `bytes` the driver itself wrote, which is `bytes.len()` minus the parameter sets.
     pub driver_bytes: usize,
@@ -190,6 +200,33 @@ pub struct EncodedPicture {
     pub frame_num: u16,
     /// The `pic_order_cnt_lsb` this picture was written with.
     pub poc: u16,
+}
+
+impl EncodedPicture {
+    /// **This access unit as an MP4/MOV sample: each NAL prefixed with its four-byte length**, which
+    /// is the form [`VaEncoder::sample_entry`]'s `avcC` declares with `length_size == 4`.
+    ///
+    /// It exists because the `avcC` and the samples have to agree about that field, and handing a
+    /// muxer Annex-B start codes under a configuration record that says "four-byte lengths" is a
+    /// file that plays on nothing. Everything else about the two forms is identical — same NAL
+    /// units, same order, same bytes.
+    ///
+    /// A NAL that does not fit a `u32` length, or a stream with no unit in it, is an `Err` rather
+    /// than a truncated prefix: the first would be a sample whose declared length wraps, and the
+    /// second is not a sample at all.
+    pub fn mp4_sample(&self) -> Result<Vec<u8>, String> {
+        let units = annex_b_units(&self.bytes)?;
+        let total: usize =
+            units.iter().try_fold(0usize, |sum, unit| sum.checked_add(unit.nal_unit().len() + 4)).ok_or("the sample's NAL units do not fit a length")?;
+        let mut out = Vec::with_capacity(total);
+        for unit in &units {
+            let nal = unit.nal_unit();
+            let len = u32::try_from(nal.len()).map_err(|_| format!("a {}-byte NAL unit does not fit a four-byte length", nal.len()))?;
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(&nal);
+        }
+        Ok(out)
+    }
 }
 
 /// A configured H.264 encoder: what [`VaEncoder::new`] returns and what a caller encodes through.
@@ -234,6 +271,11 @@ pub struct VaEncoder {
     sequence: Vec<u8>,
     /// The frame-rate misc buffer, also built once — see the module note for why it is mandatory.
     frame_rate: Vec<u8>,
+    /// The parameter sets the `avcC` is built from, held once a picture has come back and checked
+    /// against that picture's own output. `None` until then, which is what makes
+    /// [`VaEncoder::sample_entry`] answer "not yet" rather than guess — see its own note for why
+    /// that matters more here than on the VideoToolbox side.
+    sample_entry: Option<CodecParameterSets>,
 }
 
 impl VaEncoder {
@@ -301,7 +343,17 @@ impl VaEncoder {
             return Err(format!("{refs} reference pictures asked for, but VAConfigAttribEncMaxRefFrames reports {driver_l0} for reference list 0"));
         }
         let _ = driver_l1;
-        let coded = (size.0.div_ceil(MB) * MB, size.1.div_ceil(MB) * MB);
+        // **The rounding up is `checked_*`, and it has to be.** `size.0.div_ceil(MB) * MB` is a
+        // `u32` multiplication whose answer is not always a `u32`: `u32::MAX` rounds to 2^32. In a
+        // debug build that is a panic on a number the caller controls, and in a release build it is a
+        // silent wrap to 0 — after which everything below (`crop_of`, the macroblock counts,
+        // `coded_buffer_for`, the padded planes in [`VaEncoder::upload`]) is sizing itself against a
+        // picture of no columns. Both are the same failure as the arithmetic not being checked, so it
+        // is checked.
+        let (Some(cw), Some(ch)) = ((size.0.div_ceil(MB)).checked_mul(MB).filter(|v| *v > 0), (size.1.div_ceil(MB)).checked_mul(MB).filter(|v| *v > 0)) else {
+            return Err(format!("{}x{} rounds up past the largest picture this encoder can build", size.0, size.1));
+        };
+        let coded = (cw, ch);
         // The crop, in the units `frame_crop_*_offset` counts, as `(left, right, top, bottom)` —
         // the order the four `frame_crop_*_offset` fields are declared in, so the tuple can be
         // destructured straight into the record. For 4:2:0 progressive the unit is 2 luma samples
@@ -343,12 +395,98 @@ impl VaEncoder {
             references: Vec::new(),
             sequence,
             frame_rate,
+            sample_entry: None,
         })
     }
 
     /// How many reference pictures this encoder is currently holding.
     pub fn reference_count(&self) -> usize {
         self.references.len()
+    }
+
+    /// **The MP4/MOV sample entry for the stream this encoder produces**, or why there is not one
+    /// yet.
+    ///
+    /// `VideoEncoder::sample_entry` is documented as "may only be complete after the first frame",
+    /// and this is that in the strongest form available: before a picture has been encoded there is
+    /// no answer at all, because the only thing that could supply one is a description of a stream
+    /// that does not exist yet.
+    ///
+    /// # Where the parameter sets come from, measured
+    ///
+    /// **This driver writes none.** Re-measured for this task on the machine the milestone was
+    /// written for (Intel Arc B580, iHD 26.3.5, libva 1.24): `VAConfigAttribEncPackedHeaders` was
+    /// set to each of `0` through `7` in turn, and the coded picture was **byte-identical in all
+    /// eight cases** — the same `00 00 01 25` IDR slice, 935 bytes for a key frame and 656 for the
+    /// first P frame — with no NAL of type 7 or type 8 anywhere in the driver's own output. The
+    /// attribute is accepted and written back, the encode succeeds, and nothing else happens. The
+    /// one libva entry point that could answer the question from the other end,
+    /// `vaQuerySequenceHeaders`, **is not declared in `/usr/include/va/va.h` at this version and is
+    /// not exported by `/usr/lib/libva.so.2`** (`nm -D` over the 88 symbols it exports lists
+    /// `vaQueryConfigAttributes`, `vaQuerySurfaceAttributes` and no sequence-header call).
+    ///
+    /// So the sets in [`super::params`] are used, and they are **derived, never claimed to be the
+    /// driver's**. [`CodecParameterSets::from_driver`] says which happened, per picture, and it is
+    /// measured by looking for a NAL of type 7 or 8 in the bytes the driver actually wrote — not by
+    /// assuming, which is the failure this whole module exists to avoid.
+    ///
+    /// # How the derived path checks itself
+    ///
+    /// Writing bits and reading them back (`super::params`) proves the *writing* was right. It proves
+    /// nothing about whether the sets still **describe the output**, because a record is what was
+    /// asked for rather than what was encoded — and the review of this task named the gap exactly:
+    /// "if iHD ever rewrites `level_idc` or the reference count, the derived SPS describes a stream
+    /// that was not encoded, and nothing in this range would detect it."
+    ///
+    /// So every picture's own coded NALs are parsed back **against the sets that would go into the
+    /// `avcC`**, and the two are compared — see [`check_output_matches_the_sets`]. That is a real
+    /// cross-check rather than a restatement, because a slice header only parses at the right length
+    /// if the SPS's `log2_max_frame_num`, `frame_mbs_only_flag` and `log2_max_pic_order_cnt_lsb_minus4`
+    /// are the ones the driver wrote to, and the quantiser the driver reports for the picture is its
+    /// own statement of what `pic_init_qp` turned into. A divergence in either is an `Err` at the
+    /// picture that caused it, not a file.
+    ///
+    /// # What this still cannot see, stated rather than implied
+    ///
+    /// `pic_width_in_mbs`, `frame_crop_*` and `max_num_ref_frames` appear in the SPS and in nothing
+    /// else a decoder sends back, and libva 1.24 exposes no call that reads an encode record back
+    /// (there is no `vaGetBufferSubset` and no `VABufferSubType` in this header). They are checked
+    /// only in that they match the record FilmCraft submitted — the same record the picture's
+    /// geometry came from. A driver that encoded at a different size than it was told and did not
+    /// say so would not be caught here; it is caught by the export-level oracle (Task 7), which
+    /// decodes the file and compares the picture, and that is where the plan puts it.
+    ///
+    /// # HEVC
+    ///
+    /// **There is no `hvcC` here, because there is no HEVC encoder here.** This module declares
+    /// `VAEncSequenceParameterBufferH264` and its siblings and nothing for HEVC, so a
+    /// `CodecParameterSets` can only ever be H.264's. Building an `hvcC` from a record layout this
+    /// crate does not declare would be a config record describing a stream no code produces.
+    pub fn sample_entry(&self) -> Result<filmcraft_isobmff::SampleEntry, String> {
+        let Some(sets) = self.sample_entry.as_ref() else {
+            return Err("no H.264 sample entry yet: this encoder has encoded nothing, and the parameter sets describe a stream that does not exist. \
+                 Encode at least one picture (the first has to be a key frame) and ask again"
+                .into());
+        };
+        // **The picture size in the sample entry is the size a decoder shows**, not the
+        // macroblock-padded size the encoder works in: 640x360 is coded at 640x368 and the SPS's
+        // crop takes eight rows off, so a sample entry carrying 368 would make a player show eight
+        // rows of the padding the encoder filled with 16.
+        let (w, h) = (self.display.0, self.display.1);
+        let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
+            return Err(format!("a {w}x{h} picture does not fit the sample entry's 16-bit dimensions"));
+        };
+        // **Four-byte NAL lengths, and [`EncodedPicture::mp4_sample`] is the matching sample form.**
+        // An `avcC` states how long each NAL is, so declaring four and handing the muxer Annex-B
+        // start codes would be a configuration record describing a bitstream it does not match — the
+        // same class of defect as an SPS whose width is not the picture's.
+        Ok(filmcraft_isobmff::SampleEntry::avc(filmcraft_isobmff::AvcConfig::new(vec![sets.sps.clone()], vec![sets.pps.clone()], 4), width, height))
+    }
+
+    /// The parameter sets the [`VaEncoder::sample_entry`] would use, once a picture has been
+    /// encoded. `None` before then, for the reason [`VaEncoder::sample_entry`] gives.
+    pub fn parameter_sets(&self) -> Option<&CodecParameterSets> {
+        self.sample_entry.as_ref()
     }
 
     /// The most references this encoder will hold: **what the caller asked for**, not the size of
@@ -401,8 +539,18 @@ impl VaEncoder {
     /// some drivers, move the slice boundary upward, which is a visibly different picture.
     pub fn upload(&self, luma: &[u8], chroma: &[u8]) -> Result<(), String> {
         let (w, h) = self.coded;
-        let luma_len = w as usize * h as usize;
-        let chroma_len = luma_len / 2;
+        // **Every length here is derived, checked and capped** — `vec![16u8; w * h]` on a size this
+        // module cannot vouch for is an allocation of whatever the multiplication happened to
+        // produce, and an allocation that cannot be satisfied does not return an `Err`: it aborts
+        // the process through `handle_alloc_error`, which the panic hook and the `catch_unwind`
+        // around the UI pass do not cover. That is the one place an "every input-derived number is
+        // hostile" mistake costs a session rather than a frame, which is why `coded_buffer_for`,
+        // `copy_picture` and `Encoder::upload` in the FFI module all compute their lengths with
+        // `checked_*` and refuse what they cannot bound — and this is the same rule applied to the
+        // padded planes that were still doing `w as usize * h as usize`.
+        let (Some(luma_len), Some(chroma_len)) = (luma_len(w, h), chroma_len(w, h)) else {
+            return Err(format!("a {w}x{h} picture's padded planes cannot be sized"));
+        };
         // Neutral-value padding, filled in for the rows and columns the crop takes away.
         let mut padded_luma = vec![16u8; luma_len];
         let mut padded_chroma = vec![128u8; chroma_len];
@@ -484,7 +632,12 @@ impl VaEncoder {
         // decided below, from the driver's own output.
         let picture_read = read::<ffi::VaEncPictureParameterBufferH264>(&picture).ok_or("the picture record just built does not read back")?;
         let sequence_read = read::<ffi::VaEncSequenceParameterBufferH264>(&self.sequence).ok_or("the sequence record just built does not read back")?;
-        let parameter_sets = super::params::parameter_sets(&sequence_read, &picture_read)?;
+        // Built and verified by FilmCraft's own H.264 parser before the render, so that a record
+        // this module cannot describe is refused *before* a picture is encoded — an error naming the
+        // field is worth more than a stream a decoder cannot parse. `resolve_parameter_sets` below
+        // decides whether these are the ones that describe the output; this call only proves they
+        // are well-formed and say what the records said.
+        let derived = super::params::parameter_sets(&sequence_read, &picture_read)?;
         // The buffers are submitted in one `vaRenderPicture`, which is what the header requires for
         // the sequence, picture and slice records together. The order is the one iHD documents:
         // sequence, picture, slice, then the misc records.
@@ -504,13 +657,27 @@ impl VaEncoder {
         let segments = coded.segments();
         let status = coded.status().to_vec();
         let coded_buffer_used = u32::try_from(coded.bytes().len()).unwrap_or(u32::MAX);
-        // **The driver's own parameter sets win.** iHD accepts the packed-header mode and on this
-        // machine writes none, but a driver that does write them has described the stream more
-        // authoritatively than a parameter set this module derived — and this module's would be
-        // built from a record the driver may have adjusted. So the driver's are used when present
-        // and ours only when they are not, and which happened is reported.
-        let from_driver = super::params::has_parameter_sets(coded.bytes());
-        let parameter_sets = if from_driver { Vec::new() } else { parameter_sets };
+        // **Which parameter sets describe this picture, decided by looking at what the driver wrote
+        // and checked against what it was told** — see [`VaEncoder::sample_entry`] for the
+        // measurement behind the derived case.
+        //
+        // A driver that *does* write its own sets is authoritative about itself: it is describing the
+        // stream it produced, where a derived set is describing the record. So the driver's are used
+        // when both are present, and they are then run through the same
+        // [`super::params::cross_check`] against the submitted record — a driver that rewrote the
+        // picture size, the reference depth, the frame-number width or the level is **declined**,
+        // because there is no way to tell from here whether its set or ours describes the stream
+        // that was actually encoded, and guessing is what this module is for.
+        let (parameter_sets, sets) = self.resolve_parameter_sets(
+            &sequence_read,
+            &picture_read,
+            &derived,
+            coded.bytes(),
+            &current,
+            request,
+            coded.status().first().copied().map(|status| (status & 0xff) as u8),
+        )?;
+        let from_driver = sets.from_driver;
         // The picture came back, so the sequence state can advance. **The counters wrap**: H.264's
         // `frame_num` is a `u16` that is a function of position modulo `MaxFrameNum`, and an
         // encoder that panics at the 65536th picture would be a crash rather than a rollover.
@@ -575,6 +742,367 @@ impl VaEncoder {
         let depth = (self.refs as u32).saturating_add(1);
         u32::from(frame_num) % depth.max(1)
     }
+
+    /// **Decide which parameter sets describe the picture the driver just wrote, and refuse if the
+    /// answer is not derivable.**
+    ///
+    /// Returns the Annex-B bytes to put ahead of the driver's picture in
+    /// [`EncodedPicture::bytes`] and the sets themselves for [`VaEncoder::sample_entry`]. The
+    /// second element is `None`-free on purpose: this either produces a description or fails, and
+    /// there is no third outcome in which a sample entry is handed out and nobody has checked it.
+    ///
+    /// Three cases, in this order:
+    ///
+    /// 1. **The driver wrote both an SPS and a PPS** — the ones it wrote are used, cross-checked
+    ///    against the record with [`super::params::cross_check`], and a divergence is an `Err`
+    ///    rather than a preference. Nothing can be derived from the bitstream about which of the two
+    ///    describes the picture, so choosing would be a coin toss on the one question that decides
+    ///    whether the file plays.
+    /// 2. **The driver wrote one of them** — refused. Half a parameter set describes nothing, and
+    ///    using ours for the other half would produce a configuration record mixing two sources.
+    /// 3. **The driver wrote neither** — which is what iHD 26.3.5 does for every value of
+    ///    `VAConfigAttribEncPackedHeaders` (see [`VaEncoder::sample_entry`]) — and the derived sets
+    ///    are used, having been verified against the bits by [`super::params::parameter_sets`].
+    ///
+    /// Either way the sets are then run through [`check_output_matches_the_sets`] against the
+    /// picture's own coded NALs, so a derived set cannot outlive the picture it described, and a
+    /// quantiser that moves under an established `avcC` is refused at the picture that moved it.
+    fn resolve_parameter_sets(
+        &mut self,
+        sequence: &ffi::VaEncSequenceParameterBufferH264,
+        picture: &ffi::VaEncPictureParameterBufferH264,
+        derived: &[u8],
+        driver_bytes: &[u8],
+        current: &Current,
+        request: EncodeRequest,
+        average_qp: Option<u8>,
+    ) -> Result<(Vec<u8>, CodecParameterSets), String> {
+        let units = annex_b_units(driver_bytes)?;
+        let sps_unit = units.iter().find(|unit| unit.header & 0x1f == 7);
+        let pps_unit = units.iter().find(|unit| unit.header & 0x1f == 8);
+        let sets = match (sps_unit, pps_unit) {
+            (Some(sps), Some(pps)) => {
+                let sps_rbsp = filmcraft_bitstream::unescape_rbsp(sps.body);
+                let pps_rbsp = filmcraft_bitstream::unescape_rbsp(pps.body);
+                let parsed_sps = filmcraft_h264::params::Sps::parse(&sps_rbsp).map_err(|e| format!("the driver wrote an SPS that does not parse: {e}"))?;
+                let parsed_pps = filmcraft_h264::params::Pps::parse(&pps_rbsp, &[Some(parsed_sps.clone())])
+                    .map_err(|e| format!("the driver wrote a PPS that does not parse: {e}"))?;
+                // **A driver that writes its own sets and disagrees with the record is declined.**
+                // Its set is more authoritative than ours about the stream; ours is a description of
+                // what was asked for. When they differ, one of the two is describing a stream that
+                // was not encoded, and nothing here can say which — so the export stops with the
+                // mismatch named rather than writing a configuration record for a stream nobody can
+                // play.
+                super::params::cross_check(&parsed_sps, &parsed_pps, sequence, picture)
+                    .map_err(|why| format!("the driver wrote its own parameter sets and they disagree with the record it was given: {why}"))?;
+                CodecParameterSets { sps: sps.nal_unit(), pps: pps.nal_unit(), from_driver: true }
+            }
+            (None, None) => {
+                let (Some(sps), Some(pps)) = (nal_unit_bytes(derived, 7), nal_unit_bytes(derived, 8)) else {
+                    return Err("the derived parameter sets have no start code, so they cannot go into a configuration record".into());
+                };
+                CodecParameterSets { sps, pps, from_driver: false }
+            }
+            _ => return Err("the driver wrote one H.264 parameter set and not the other, which describes no stream this backend can use".into()),
+        };
+        check_output_matches_the_sets(&sets, driver_bytes, current, request, average_qp)?;
+        // **The sets are held from the first picture and must not change under an `avcC` that has
+        // already been handed out.** Everything in an SPS comes from the sequence record, which is
+        // fixed for the encoder's life; the one field that moves is the PPS's `pic_init_qp`, which
+        // follows the quantiser. A caller that changes the quantiser mid-export would leave the
+        // `avcC` describing the first picture's quality while the rest of the stream is at another —
+        // so it is refused here, at the picture that changed it, naming the quantiser.
+        match self.sample_entry.as_ref() {
+            Some(established) if established != &sets => {
+                return Err(format!(
+                    "picture {} needs different parameter sets from the ones this encoder's sample entry already carries: \
+                     the quantiser moved to {} (the sample entry describes pic_init_qp {}). \
+                     One H.264 sample entry cannot describe two quantisers; build a new encoder",
+                    current.frame_num,
+                    picture.pic_init_qp,
+                    parsed_pic_init_qp(established),
+                ));
+            }
+            _ => self.sample_entry = Some(sets.clone()),
+        }
+        // The bytes ahead of the driver's picture: nothing at all when the driver's own sets are
+        // already in its output, and the derived Annex-B pair when they are not.
+        let prefix = if sets.from_driver { Vec::new() } else { derived.to_vec() };
+        Ok((prefix, sets))
+    }
+}
+
+/// The NAL unit of type `kind` in an Annex-B run `bytes`, **as a configuration record stores it**
+/// (NAL header byte and payload, no start code) — or `None`.
+fn nal_unit_bytes(bytes: &[u8], kind: u8) -> Option<Vec<u8>> {
+    annex_b_units(bytes).ok()?.into_iter().find(|unit| unit.header & 0x1f == kind).map(|unit| unit.nal_unit())
+}
+
+/// `pic_init_qp` as [`filmcraft_h264::params::Pps`] reads it back out of an established
+/// `CodecParameterSets`, or `-1` when those bytes no longer parse — which is itself worth saying
+/// rather than defaulting.
+fn parsed_pic_init_qp(sets: &CodecParameterSets) -> i32 {
+    sets.pps
+        .get(1..)
+        .map(filmcraft_bitstream::unescape_rbsp)
+        .and_then(|rbsp| filmcraft_h264::params::Pps::parse(&rbsp, &[None]).ok())
+        .map_or(-1, |pps| pps.pic_init_qp)
+}
+
+/// One NAL unit of an Annex-B run: the header byte, and the bytes after it.
+struct NalUnit<'a> {
+    /// The NAL header byte, `forbidden_zero_bit | nal_ref_idc | nal_unit_type`.
+    header: u8,
+    /// Everything after the header, still carrying its emulation-prevention bytes.
+    body: &'a [u8],
+}
+
+impl NalUnit<'_> {
+    /// This unit as a configuration record stores it: the NAL header byte followed by the payload.
+    ///
+    /// **`AVCDecoderConfigurationRecord` keeps the one-byte NAL header**, which is worth stating
+    /// because 14496-15's wording ("not including the NAL unit header byte") is routinely read the
+    /// other way and both ffmpeg and every file this project has read keep it: `AvcConfig::new`
+    /// takes the profile, constraints and level from bytes 1..4 of what it is handed, and
+    /// `filmcraft_codecs::hw` parses a stored set with `get(1..)`. A record built without it is one
+    /// every reader in this workspace — and every player — reads a byte out of step.
+    fn nal_unit(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.body.len() + 1);
+        out.push(self.header);
+        out.extend_from_slice(self.body);
+        out
+    }
+}
+
+/// The NAL units of the Annex-B run `bytes`, or why `bytes` is not one.
+///
+/// `ffi::check_annex_b` has already established that the driver's window begins with a start code,
+/// holds no empty unit and ends with at least a header byte; this is the walk that reads the list
+/// out of it. It is deliberately a **start-code walk and not a search for `00 00 01` anywhere**:
+/// that byte sequence occurs inside slice payload by coincidence all the time, and a scan that
+/// matched one would report a parameter set the stream does not have — the plausible-looking wrong
+/// answer this whole module exists to avoid.
+fn annex_b_units(bytes: &[u8]) -> Result<Vec<NalUnit<'_>>, String> {
+    let mut units = Vec::new();
+    let mut at = 0usize;
+    while let Some(found) = bytes.get(at..).and_then(|rest| rest.windows(3).position(|w| w == [0, 0, 1])) {
+        // A four-byte code is the same three bytes one later, so the next search starts past the
+        // header byte this one found rather than past the code — otherwise the tail of a 4-byte code
+        // is read as a second, empty start of a unit.
+        let start = at + found + 3;
+        let Some(&header) = bytes.get(start) else { break };
+        at = start + 1;
+        let end = bytes.get(at..).and_then(|rest| rest.windows(3).position(|w| w == [0, 0, 1])).map_or(bytes.len(), |next| at + next);
+        let Some(body) = bytes.get(at..end) else { break };
+        if body.is_empty() {
+            return Err("the coded picture holds an empty NAL unit".into());
+        }
+        units.push(NalUnit { header, body });
+    }
+    if units.is_empty() {
+        return Err("the coded picture holds no NAL unit".into());
+    }
+    Ok(units)
+}
+
+/// **Parse the picture the driver wrote against the sets that would go into the `avcC`, and check
+/// the two describe the same thing.**
+///
+/// This is the self-check the derived path exists for. Writing the SPS and reading the bits back
+/// proves the writing was right; it says nothing about whether the sets still describe *the output*,
+/// because a submitted record is what was asked for, not what was encoded. So the driver's own NALs
+/// are parsed a second time, by the same parsers the software decoder uses, **with the sets under
+/// test as the only way to resolve them** — and every field that both sides state is compared.
+///
+/// What that actually catches, which is the point:
+///
+/// - **`log2_max_frame_num`, `frame_mbs_only_flag`, `log2_max_pic_order_cnt_lsb_minus4` and the
+///   picture order count type are not readable from a slice header.** The slice header is a bit
+///   string whose length *is* their definition: `frame_num` is `log2_max_frame_num` bits and
+///   `pic_order_cnt_lsb` is `log2_max_pic_order_cnt_lsb_minus4 + 4`. Set any of them wrong and the
+///   fields after it are read at the wrong offsets, so a wrong value does not fail the parse — it
+///   produces a *different, plausible* `frame_num`. Comparing the parsed `frame_num` and
+///   `pic_order_cnt_lsb` with the values this module submitted is what turns that into an error.
+/// - **The PPS's flags steer the parse.** `entropy_coding_mode_flag` decides whether `cabac_init_idc`
+///   is read at all and `deblocking_filter_control_present_flag` decides whether
+///   `disable_deblocking_filter_idc` is; a flag written at the wrong position shifts the tail and the
+///   header still parses.
+/// - **`pic_init_qp` is cross-checked against the driver's own statement of the quality.** The low
+///   byte of `VACodedBufferSegment::status` is the average QP the picture was coded at
+///   (`va.h:3897-3933`), which is a number from the driver about the picture rather than about the
+///   request. `pps.pic_init_qp + slice_qp_delta` is what H.264 says the slice's QP is (7.4.2.1.1);
+///   the two agreeing is the driver's quantiser confirming the PPS.
+/// - **The slice type and the key-frame flag** are read back from the NAL header and the header
+///   itself, so a driver that coded every picture intra — which would still decode, and would look
+///   right — is caught here rather than in a file three hours long.
+///
+/// A tolerance is used for the quantiser and only for it: `VA_STATUS` reports an *average* QP over
+/// a picture's macroblocks, so it is a different quantity from the constant `pic_init_qp` even when
+/// everything is correct. Measured on this driver at a requested QP of 26 it reports 26 exactly for
+/// a key frame and for predicted frames alike; the tolerance is four, which is what a CQP encoder is
+/// allowed to move by on a picture whose content is not uniform.
+fn check_output_matches_the_sets(
+    sets: &CodecParameterSets,
+    driver_bytes: &[u8],
+    current: &Current,
+    request: EncodeRequest,
+    average_qp: Option<u8>,
+) -> Result<(), String> {
+    let units = annex_b_units(driver_bytes)?;
+    // The stored sets keep their NAL header byte (see [`NalUnit::nal_unit`]), so the RBSP the
+    // parsers want starts one byte in. `get(1..)` rather than `[1..]`: a set this module built
+    // always has the header, and one that does not is an error here rather than a panic.
+    let Some(sps_rbsp) = sets.sps.get(1..).map(filmcraft_bitstream::unescape_rbsp) else {
+        return Err("the sequence parameter set in the sample entry is empty".into());
+    };
+    let Some(pps_rbsp) = sets.pps.get(1..).map(filmcraft_bitstream::unescape_rbsp) else {
+        return Err("the picture parameter set in the sample entry is empty".into());
+    };
+    let sps = filmcraft_h264::params::Sps::parse(&sps_rbsp).map_err(|e| format!("the sequence parameter set in the sample entry does not parse: {e}"))?;
+    let pps = filmcraft_h264::params::Pps::parse(&pps_rbsp, &[Some(sps.clone())])
+        .map_err(|e| format!("the picture parameter set in the sample entry does not parse: {e}"))?;
+    let where_ = if sets.from_driver { "the driver's" } else { "the derived" };
+    let mut slices = 0usize;
+    for unit in &units {
+        let type_ = unit.header & 0x1f;
+        if type_ != 1 && type_ != 5 {
+            // A type 7 or 8 in the driver's own output is its parameter set, checked by
+            // `resolve_parameter_sets` against the record; anything else is not something this
+            // backend submits and not something it can describe, so it is named rather than skipped.
+            continue;
+        }
+        let nal = filmcraft_h264::slice::NalHeader::parse(unit.header)
+            .map_err(|e| format!("{where_} parameter sets and a slice header in the same picture do not agree: {e}"))?;
+        let rbsp = filmcraft_bitstream::unescape_rbsp(unit.body);
+        let lookup = |id: u32| -> filmcraft_h264::Result<(&filmcraft_h264::params::Pps, &filmcraft_h264::params::Sps)> {
+            if id != pps.id {
+                return Err(filmcraft_h264::Error::MissingParameterSet(format!(
+                    "the slice names picture parameter set {id} and {where_} picture parameter set {} is the only one in the sample entry",
+                    pps.id
+                )));
+            }
+            Ok((&pps, &sps))
+        };
+        let (header, header_pps, _) = filmcraft_h264::slice::SliceHeader::parse(&rbsp, nal, lookup)
+            .map_err(|e| format!("the driver's slice does not parse against {where_} parameter sets: {e}"))?;
+        slices += 1;
+        let want_intra = request.idr;
+        let want_type = if want_intra { filmcraft_h264::slice::SliceType::I } else { filmcraft_h264::slice::SliceType::P };
+        if header.slice_type != want_type {
+            return Err(format!("the driver coded picture {} as a {:?} slice and a {:?} one was submitted", current.frame_num, header.slice_type, want_type));
+        }
+        if header.idr != want_intra {
+            return Err(format!("picture {} came back with idr_pic_flag {} and {} was submitted", current.frame_num, header.idr, want_intra));
+        }
+        // **Both counters are compared modulo the width the SPS declares, and that is not a
+        // softening — it is the definition.** `frame_num` is `u(v)` with `v = log2_max_frame_num`
+        // (7.4.3) and `pic_order_cnt_lsb` is `u(v)` with `v = log2_max_pic_order_cnt_lsb_minus4
+        // + 4` (7.4.3.1), so a driver can only write `frame_num mod MaxFrameNum` and `poc mod
+        // MaxPicOrderCntLsb`. This encoder declares `log2_max_frame_num_minus4 = 0` and
+        // `log2_max_pic_order_cnt_lsb_minus4 = 0`, so **both fields are four bits and both wrap
+        // every 16 pictures**, while `self.frame_num` and `self.poc` are `u16` counters that wrap
+        // at 65536.
+        //
+        // Comparing the two directly — which is what this did until a 20-picture run caught it —
+        // refuses picture 16 of every export with "log2_max_frame_num is not what the driver
+        // used", on a stream the driver encoded correctly. Measured: with the modulo in place a
+        // 20-picture run encodes and the check still catches a genuinely wrong `log2_max_frame_num`,
+        // because reading four bits where the driver wrote five produces a *different* number
+        // rather than a wrapped one.
+        //
+        // **What this check cannot see is the other half of the wrap, which is Task 5's.**
+        // `gaps_in_frame_num_value_allowed_flag` is written clear, and 7.4.3 then requires that no
+        // two pictures in the DPB share a `frame_num` unless an IDR separates them. This encoder's
+        // `intra_idr_period` is 0, so there is exactly one IDR and the wrap at picture 16 is
+        // unaccompanied — which is harmless at the reference depths this module is measured at
+        // and **wrong at the maximum**: `MaxFrameNum` is 16 and [`MAX_REFERENCES`] is 16, so at
+        // `refs = 16` the DPB holds all sixteen frame numbers at once and the wrapped picture does
+        // collide with one of them. Measured on this driver at `refs = 1` a twenty-picture run
+        // decodes with ffmpeg to the right pictures and a flat deviation, so the gap is stated
+        // rather than treated as a live failure; it becomes one the moment a caller asks for 16
+        // references, and the fix is an IDR at the wrap rather than anything in this function.
+        // Nothing in this range verifies that, and this check compares only the numbers the
+        // bitstream carries.
+        let max_frame_num = max_width(sps.log2_max_frame_num, "log2_max_frame_num")?;
+        let max_poc_lsb = max_width(sps.log2_max_poc_lsb, "log2_max_pic_order_cnt_lsb_minus4")?;
+        if header.frame_num != u32::from(current.frame_num) % max_frame_num {
+            return Err(format!(
+                "the driver's slice for picture {} reads back frame_num {}, which is not {} modulo MaxFrameNum {max_frame_num} as {} parameter sets say",
+                current.frame_num, header.frame_num, current.frame_num, where_
+            ));
+        }
+        if header.pic_order_cnt_lsb != u32::from(current.poc) % max_poc_lsb {
+            return Err(format!(
+                "the driver's slice for picture {} reads back pic_order_cnt_lsb {}, which is not {} modulo MaxPicOrderCntLsb {max_poc_lsb} as {} parameter sets say",
+                current.frame_num, header.pic_order_cnt_lsb, current.poc, where_
+            ));
+        }
+        // A key frame names no reference at all (7.4.3.3 empties the decoded picture buffer), so the
+        // picture record's count is only a claim about a predicted picture.
+        let want_refs = if request.idr { 0 } else { pps.num_ref_idx_l0_default_active };
+        if header.num_ref_idx_active[0] != want_refs {
+            return Err(format!(
+                "the driver's slice for picture {} predicts from {} references and {where_} parameter sets say {}",
+                current.frame_num, header.num_ref_idx_active[0], want_refs
+            ));
+        }
+        // The one comparison with a tolerance, and the reason it needs one is in this function's own
+        // doc comment: the driver reports an *average* over the picture's macroblocks.
+        if let Some(qp) = average_qp {
+            let slice_qp = header.qp(header_pps);
+            if slice_qp.saturating_sub(i32::from(qp)).abs() > QP_REPORT_SLACK {
+                return Err(format!(
+                    "the driver coded picture {} at an average quantiser of {qp} and {where_} parameter sets say its slices are at {slice_qp}",
+                    current.frame_num
+                ));
+            }
+        }
+    }
+    if slices == 0 {
+        return Err("the driver's picture holds no slice, so there is nothing for the parameter sets to describe".into());
+    }
+    Ok(())
+}
+
+/// `1 << width`, the modulus H.264 gives `frame_num` and `pic_order_cnt_lsb` — or why `width`
+/// is not a number this can build a modulus from.
+///
+/// A width of 31 or more would make the shift overflow, and the syntax elements it comes from are
+/// a `u4` each (`log2_max_frame_num_minus4`, `log2_max_pic_order_cnt_lsb_minus4`), so it cannot
+/// happen from a record this module submits; it is checked anyway because the width here comes from
+/// a *parsed* parameter set, and this function is also run against the driver's own.
+fn max_width(width: u32, which: &str) -> Result<u32, String> {
+    if width == 0 || width >= 32 {
+        return Err(format!("{which} is {width}, which names no modulus a slice header could carry"));
+    }
+    Ok(1u32 << width)
+}
+
+/// How far the driver's reported average quantiser may sit from the one the parameter sets imply.
+///
+/// `VACodedBufferSegment::status`'s low byte is an average over a picture's macroblocks
+/// (`va.h:3897-3933`) and `pps.pic_init_qp` is a constant, so the two are different quantities even
+/// when nothing is wrong; this is the room between them. Measured on iHD 26.3.5 the two agree
+/// exactly (26 asked for, 26 reported, for a key frame and for every predicted frame), so the
+/// slack is slack for a driver that rounds or clamps, not for one that is known to.
+const QP_REPORT_SLACK: i32 = 4;
+
+/// The NAL units an MP4/MOV `avcC` carries, as [`VaEncoder::sample_entry`] uses them.
+///
+/// **`from_driver` is a measurement, not a preference.** It is true only when the driver's own coded
+/// bytes carried a NAL of type 7 or 8, which on iHD 26.3.5 they never do, whatever the packed-header
+/// mode is set to (see [`VaEncoder::sample_entry`] for the measurement). When it is false these
+/// bytes are **derived from the records this backend submitted** and have been checked against the
+/// picture the driver actually wrote — which is a weaker claim than "the driver's own", and is
+/// recorded as such rather than as the latter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodecParameterSets {
+    /// The sequence parameter set as an `avcC` stores it: the RBSP, no start code, no NAL header.
+    pub sps: Vec<u8>,
+    /// The picture parameter set, the same way.
+    pub pps: Vec<u8>,
+    /// Whether the driver wrote these bytes itself.
+    pub from_driver: bool,
 }
 
 /// The crop offset in `frame_crop_*_offset` units for a dimension, or why it cannot be expressed.
@@ -992,7 +1520,7 @@ fn copy_picture(to: &mut [u8], padded_w: usize, from: &[u8], shown_w: usize, sho
 ///
 /// The alternative — noise — is the worst possible choice here: a lossy encoder's noise is
 /// plausible, so a wrong decode of noise looks like noise, and nothing says it is wrong.
-pub fn ramp_picture(width: u32, height: u32) -> (Vec<u8>, Vec<u8>) {
+pub fn ramp_picture(width: u32, height: u32) -> Result<(Vec<u8>, Vec<u8>), String> {
     ramp_shifted(width, height, 0)
 }
 
@@ -1024,17 +1552,31 @@ pub fn ramp_picture(width: u32, height: u32) -> (Vec<u8>, Vec<u8>) {
 /// The chroma stays flat and neutral, for the reason [`ramp_picture`] gives: any colour shift is the
 /// chroma plane's, and a chroma error from a mispredicted reference would otherwise be invisible in
 /// a picture whose luma happens to be a smooth ramp.
-pub fn ramp_shifted(width: u32, height: u32, shift: u32) -> (Vec<u8>, Vec<u8>) {
+///
+/// **`Result`, because the size is hostile and an allocation is not a check.** This function used to
+/// return two `Vec`s and do `Vec::with_capacity(w * h)` / `vec![128u8; w * h / 2]` on whatever `u32`
+/// pair it was handed. That is not an overflow on a 64-bit target — `u32::MAX²` still fits a `usize`
+/// — so nothing caught it, and the allocation is what would have: a request past what the allocator
+/// grants does not return an `Err`, it calls `handle_alloc_error` and **aborts**, which no
+/// `catch_unwind` in this project covers. Both planes are now sized through [`luma_len`] and [`chroma_len`], so a
+/// size that overflows or exceeds [`MAX_PLANE_BYTES`] is an `Err` naming the picture before a byte is
+/// allocated.
+pub fn ramp_shifted(width: u32, height: u32, shift: u32) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (w, h) = (width as usize, height as usize);
+    // Both planes are sized before either is allocated, so a picture that cannot be sized never
+    // gets half of one built.
+    let (Some(luma_len), Some(chroma_len)) = (luma_len(width, height), chroma_len(width, height)) else {
+        return Err(format!("a {width}x{height} synthetic picture does not fit {MAX_PLANE_BYTES} bytes of plane"));
+    };
     // The ramp spans 219 levels across the width, so `span` is the last column and a one-column
     // picture has no span — `checked_sub` with a filter, so a width of 1 gets a flat 16 rather than
     // a division by zero.
     let span = w.checked_sub(1).filter(|span| *span > 0);
     // The shift wraps modulo the width rather than pushing the ramp off the legal luma range. The
-    // `max(1)` is what makes the modulus safe for a zero-width picture, which `Vec::with_capacity(0)`
+    // `max(1)` is what makes the modulus safe for a zero-width picture, which the empty ramp above
     // already makes harmless — the modulo is the only thing that would panic.
     let shift = shift as usize % w.max(1);
-    let mut luma = Vec::with_capacity(w * h);
+    let mut luma = Vec::with_capacity(luma_len);
     for _y in 0..h {
         // The ramp is a function of the column only, so it is the same on every row — which is also
         // what makes a row-order or stride bug obvious rather than plausible.
@@ -1046,8 +1588,44 @@ pub fn ramp_shifted(width: u32, height: u32, shift: u32) -> (Vec<u8>, Vec<u8>) {
     }
     // Flat neutral chroma: Cb = Cr = 128 is the centre of the range, so any colour error is
     // visible as a colour cast rather than hidden in a gradient.
-    let chroma = vec![128u8; w * h / 2];
-    (luma, chroma)
+    let chroma = vec![128u8; chroma_len];
+    Ok((luma, chroma))
+}
+
+/// The most a single padded plane may be sized at, in bytes.
+///
+/// **A cap, and the reason there is one.** A plane this module allocates is sized by a picture size
+/// that came from a caller (a settings layer, a project, an agent over the control channel), and an
+/// allocation `Vec` cannot satisfy does not come back as an `Err`: `Vec::with_capacity` and
+/// `vec![0; n]` both abort the process through `handle_alloc_error` once the request passes what
+/// the allocator will grant, and **that abort is not a panic** — the panic hook, the `catch_unwind`
+/// around the UI pass and every job supervisor in this project are all built for unwinding and
+/// cover none of it. So a size this module cannot bound has to be refused *before* the allocation,
+/// not discovered by it.
+///
+/// One gibibyte is far past any picture that can be encoded: 8K 4:2:0 luma is 8192 × 4320 ≈ 34 MiB,
+/// so the cap is about thirty times the largest plausible frame rather than a limit anyone would
+/// notice. It exists so that a hostile `u32` pair is an `Err` naming the size, and it is checked
+/// alongside the overflow rather than instead of it, because `u32 × u32` does not overflow a 64-bit
+/// `usize` and so cannot be caught by `checked_mul` alone.
+pub const MAX_PLANE_BYTES: usize = 1 << 30;
+
+/// The length of the **luma** plane of a `w` x `h` 4:2:0 picture, or `None` past the cap above.
+fn luma_len(w: u32, h: u32) -> Option<usize> {
+    (w as usize).checked_mul(h as usize).filter(|bytes| *bytes <= MAX_PLANE_BYTES)
+}
+
+/// The length of the **chroma** plane of a `w` x `h` 4:2:0 picture, or `None` past the cap above.
+///
+/// `ceil(w/2) * ceil(h/2) * 2` and not `w * h / 2`: those are the same number when both dimensions
+/// are even and a different one when either is odd, and an encoder session at an odd size is refused
+/// upstream rather than here — but computing it the way the picture actually is keeps this correct
+/// for any size a future caller manages to reach, and `Encoder::upload` in the FFI module derives
+/// its chroma plane the same way.
+fn chroma_len(w: u32, h: u32) -> Option<usize> {
+    let cols = (w as usize).div_ceil(2).checked_mul(2)?;
+    let rows = (h as usize).div_ceil(2);
+    cols.checked_mul(rows).filter(|bytes| *bytes <= MAX_PLANE_BYTES)
 }
 
 /// The macroblock count a coded size holds, or `None` for a size that is not a whole number of
@@ -1368,7 +1946,7 @@ mod tests {
     /// compared against, so they are pinned rather than regenerated.
     #[test]
     fn the_synthetic_picture_is_the_ramp_it_documents() {
-        let (luma, chroma) = ramp_picture(640, 360);
+        let (luma, chroma) = ramp_picture(640, 360).expect("a 640x360 ramp");
         assert_eq!(luma.len(), 640 * 360);
         assert_eq!(chroma.len(), 640 * 360 / 2);
         // Legal luma range at both ends, and strictly increasing across the row.
@@ -1449,7 +2027,8 @@ fn the_derived_parameter_sets_say_what_the_records_said() {
     // Annex-B, SPS then PPS, and the two NAL headers are what say which is which.
     assert!(sets.starts_with(&[0, 0, 0, 1, 0x67]), "an SPS with nal_ref_idc 3 and type 7");
     assert!(sets.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]), "and a PPS with nal_ref_idc 3 and type 8");
-    assert!(super::params::has_parameter_sets(&sets), "and this module recognises its own output");
+    assert!(nal_unit_bytes(&sets, 7).is_some(), "and this module's own Annex-B walk finds the SPS it wrote");
+    assert!(nal_unit_bytes(&sets, 8).is_some(), "and the PPS");
     // And a picture record that cannot be described is an error, not a parameter set: a QP outside
     // H.264's range would make `pic_init_qp_minus26` name a quantiser no decoder accepts.
     let mut impossible = picture;
@@ -1474,15 +2053,33 @@ fn the_derived_parameter_sets_say_what_the_records_said() {
 /// picture contains several of them, and a heuristic that matched one would report parameter sets a
 /// stream does not have. That is the plausible-looking wrong answer this module exists to avoid,
 /// so it is pinned with a stream that has none.
+///
+/// This runs against [`nal_unit_bytes`] — **the function the answer actually comes from** — rather
+/// than a helper of its own, because a detection helper that nothing calls proves nothing about the
+/// detection the encoder performs.
 #[test]
 fn parameter_set_detection_does_not_match_the_byte_sequence_by_accident() {
     // A slice payload with `00 00 01` inside it and no parameter set anywhere.
     let slice = [0u8, 0, 0, 1, 0x05, 0x88, 0, 0, 1, 0x2a, 0x99];
-    assert!(!super::params::has_parameter_sets(&slice), "a slice payload is not a parameter set");
-    assert!(super::params::has_parameter_sets(&[0, 0, 0, 1, 0x67, 0x4d]), "an SPS");
-    assert!(super::params::has_parameter_sets(&[0, 0, 0, 1, 0x67, 0x4d, 0, 0, 0, 1, 0x68, 0xce]), "an SPS then a PPS");
-    assert!(!super::params::has_parameter_sets(&[]), "nothing");
-    assert!(!super::params::has_parameter_sets(&[0, 0, 0, 1]), "a start code with no header after it");
+    assert!(nal_unit_bytes(&slice, 7).is_none(), "a slice payload is not a parameter set");
+    assert!(nal_unit_bytes(&slice, 8).is_none(), "and neither is it a PPS");
+    // **The interior `00 00 01` really is in there and really is walked past**: a search that
+    // matched every occurrence would read the byte after it (`0x2a`, type 10) as a NAL header and
+    // this assertion would pass for the wrong reason, so the walk's output is checked too.
+    let units = annex_b_units(&slice).expect("the slice is a whole Annex-B run");
+    assert_eq!(units.len(), 2, "the start code inside the payload does not begin a unit: {:?}", units.iter().map(|u| u.header & 0x1f).collect::<Vec<_>>());
+    assert_eq!(units[0].header & 0x1f, 5, "the first unit is the IDR slice");
+    assert_eq!(units[1].header & 0x1f, 10, "and the second is the end-of-sequence the interior code really starts");
+    assert!(nal_unit_bytes(&[0, 0, 0, 1, 0x67, 0x4d], 7).is_some(), "an SPS");
+    assert!(nal_unit_bytes(&[0, 0, 0, 1, 0x67, 0x4d, 0, 0, 0, 1, 0x68, 0xce], 7).is_some(), "an SPS then a PPS");
+    assert!(nal_unit_bytes(&[0, 0, 0, 1, 0x67, 0x4d, 0, 0, 0, 1, 0x68, 0xce], 8).is_some(), "and the PPS is found too");
+    assert!(nal_unit_bytes(&[], 7).is_none(), "nothing");
+    assert!(nal_unit_bytes(&[0, 0, 0, 1], 7).is_none(), "a start code with no header after it");
+    // A four-byte code is also its own three-byte code one byte later, so a walk that did not skip
+    // the header byte would read the tail of `00 00 00 01` as a second, empty unit. This is the
+    // shape that makes an empty unit, and it is refused rather than pushed.
+    assert!(annex_b_units(&[0, 0, 0, 1, 0x67, 0x4d]).is_ok(), "a 4-byte code does not read as two units");
+    assert_eq!(annex_b_units(&[0, 0, 0, 1, 0x67, 0x4d]).expect("one unit").len(), 1);
 }
 
 /// The reference state a P chain actually uses, and that it is the same state in both records.
@@ -1535,9 +2132,9 @@ fn a_p_picture_names_the_same_reference_in_both_records() {
 #[test]
 fn the_moving_ramp_moves_by_a_step_larger_than_the_quantisers_noise() {
     let (w, h, step) = (640u32, 360u32, 8u32);
-    let (a, _) = ramp_shifted(w, h, 0);
-    let (b, _) = ramp_shifted(w, h, step);
-    let (c, _) = ramp_shifted(w, h, step * 2);
+    let (a, _) = ramp_shifted(w, h, 0).expect("the unshifted ramp");
+    let (b, _) = ramp_shifted(w, h, step).expect("the ramp one step along");
+    let (c, _) = ramp_shifted(w, h, step * 2).expect("the ramp two steps along");
     let row = w as usize;
     // The pictures differ, and they differ by much more than the ~3/255 the decode check accepts:
     // a whole step at the middle of the picture is `step * 219 / (w - 1)` luma, which at 640 wide and
@@ -1596,7 +2193,7 @@ fn the_encode_readback_returns_a_whole_decodable_picture() {
     let mut sizes = Vec::new();
     for index in 0..3u32 {
         // A different picture every time, which is what makes the prediction observable at all.
-        let (luma, chroma) = ramp_shifted(640, 360, 8 * index);
+        let (luma, chroma) = ramp_shifted(640, 360, 8 * index).expect("the ramp is buildable");
         encoder.upload(&luma, &chroma).expect("the ramp uploads");
         let request = EncodeRequest::new(26, index == 0).expect("QP 26 is in range");
         let picture = encoder.encode(request).unwrap_or_else(|e| panic!("picture {index} did not encode: {e}"));
@@ -1614,6 +2211,68 @@ fn the_encode_readback_returns_a_whole_decodable_picture() {
     // predicting produces. A readback returning the same buffer's stale contents every time would
     // not have this shape.
     assert!(sizes[0] > sizes[1], "the key frame ({}) is not larger than the first P frame ({})", sizes[0], sizes[1]);
+}
+
+/// **More pictures than `MaxFrameNum`, which is the regression test for the wrap the check above
+/// was refusing.**
+///
+/// `log2_max_frame_num_minus4` and `log2_max_pic_order_cnt_lsb_minus4` are both 0 in
+/// [`sequence_record`], so both syntax elements are four bits wide and **both wrap every sixteen
+/// pictures** while `self.frame_num` and `self.poc` are `u16` counters that wrap at 65536. The
+/// self-check in [`check_output_matches_the_sets`] compared the two directly and so failed on
+/// picture 16 of every export — reported as "log2_max_frame_num is not what the driver used", on a
+/// picture the driver encoded correctly. Three pictures could not see it; this runs twenty.
+///
+/// It is a hardware test and skips without a VA display, which is the honest shape for a claim
+/// about what a driver writes.
+#[test]
+fn a_sequence_longer_than_max_frame_num_encodes_without_the_self_check_refusing_it() {
+    let Ok(api) = super::open_display() else {
+        eprintln!("SKIPPED: no VA display");
+        return;
+    };
+    let mut encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    // 20 pictures: past the 16-picture `MaxFrameNum` wrap on both counters, with room for the
+    // picture-order-count wrap to land on the same frame.
+    for index in 0..20u32 {
+        let (luma, chroma) = ramp_shifted(640, 360, 8 * index).expect("the ramp is buildable");
+        encoder.upload(&luma, &chroma).expect("the ramp uploads");
+        let request = EncodeRequest::new(26, index == 0).expect("QP 26 is in range");
+        let picture = encoder.encode(request).unwrap_or_else(|e| panic!("picture {index} did not encode: {e}"));
+        assert!(!picture.bytes.is_empty(), "picture {index} came back empty");
+        assert!(ffi::check_annex_b(&picture.bytes).is_ok(), "picture {index} is a whole Annex-B run");
+    }
+    // And the sample entry is still there and still describes the last picture, because the
+    // parameter sets are checked against **every** picture rather than only the first.
+    let entry = encoder.sample_entry().expect("a sample entry after twenty pictures");
+    // The `avcC`'s profile/compatibility/level come from bytes 1..4 of the stored SPS, so a set
+    // stored without its NAL header byte reads as a profile of 0. This is the byte-offset claim
+    // `NalUnit::nal_unit` makes, checked through the record the muxer would actually get.
+    let filmcraft_isobmff::CodecConfig::Avc(avc) = &entry.codec else {
+        panic!("an H.264 sample entry carries an avcC, not {:?}", entry.codec);
+    };
+    assert_eq!(avc.length_size, 4, "and the samples' four-byte lengths are what it declares");
+    assert!(!avc.sps.is_empty() && !avc.pps.is_empty(), "and it carries one SPS and one PPS");
+    assert_eq!(avc.profile, crate::vaapi::params::PROFILE_IDC_FOR_TEST, "read from byte 1 of the stored SPS");
+    assert_ne!(avc.profile, 0, "which is what proves the NAL header byte is still on the front");
+}
+
+/// `sample_entry` answers "not yet" before a picture exists, and says why.
+///
+/// `VideoEncoder::sample_entry` is documented as "may only be complete after the first frame", and
+/// the strongest available form of that here is an answer rather than a guess: before the first
+/// picture the only thing that could supply an `avcC` is a description of a stream that does not
+/// exist. Hardware-dependent for the encoder itself, so it skips without a display.
+#[test]
+fn there_is_no_sample_entry_before_the_first_picture() {
+    let Ok(api) = super::open_display() else {
+        eprintln!("SKIPPED: no VA display");
+        return;
+    };
+    let encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let why = encoder.sample_entry().expect_err("nothing has been encoded, so there is no stream to describe");
+    assert!(why.contains("encoded nothing"), "the refusal says what is missing, not just that something is: {why}");
+    assert!(encoder.parameter_sets().is_none(), "and no sets are held yet either");
 }
 
 /// The record of type `T` in `bytes`, or `None` when it is too short. The safe reader this module's

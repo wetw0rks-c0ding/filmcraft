@@ -60,20 +60,36 @@ const fn iowr(kind: u8, nr: u8, size: usize) -> std::ffi::c_ulong {
 /// goes into the **third** field, which an eight-byte struct does not have: the export succeeds, the
 /// kernel opens a descriptor, and that descriptor is never read and never closed. One per encoded
 /// picture, for the life of the process.
+///
+/// **The record and its fields are `pub(crate)` for one reason: the ABI guard.** Until this was the
+/// only record in the backend that nothing could check — it was not in
+/// [`crate::vaapi::abi_guard`]'s record list, the C oracle included only `<va/*.h>` and never
+/// `<drm/drm.h>`, and the two literals in the test below were read out of the same header by hand.
+/// `docs/vaapi-progress.md` §6 records that exact style of verification as one that "read as
+/// rigorous and was wrong" the first time it was used, and §3's claim that both guards were "verified
+/// to fail on the exact historical bugs" was false for this record: the historical bug was the
+/// twelve-byte struct, and nothing could fail on it. Nothing about the struct changes — the guard
+/// now judges the same bytes from `/usr/include/drm/drm.h` and from `DRM_IOCTL_PRIME_HANDLE_TO_FD`
+/// itself.
 #[repr(C)]
-struct DrmPrimeHandle {
+pub(crate) struct DrmPrimeHandle {
     /// `__u32 handle`: the GEM handle to export.
-    handle: u32,
+    pub(crate) handle: u32,
     /// The `open` flags to export with. Zero is `O_RDONLY`, which is all a mapping of coded output
     /// needs: the driver has already written it, and this process never writes into the buffer.
-    flags: u32,
+    pub(crate) flags: u32,
     /// `__s32 fd`: "User-space sets `drm_prime_handle.handle` with the GEM handle to export and
     /// `drm_prime_handle.flags`, and gets back a DMA-BUF file descriptor in `drm_prime_handle->fd`"
     /// (`drm.h:1159-1161`). **Not** in `handle`.
-    fd: c_int,
+    pub(crate) fd: c_int,
 }
 
-const PRIME_HANDLE_TO_FD: std::ffi::c_ulong = iowr(b'd', 0x2d, size_of::<DrmPrimeHandle>());
+/// The request number the guard reads the header's own macro for, so a test can ask a C compiler
+/// whether the two agree. The hand-typed literal in the test below is exactly what this replaces.
+#[cfg(test)]
+pub(crate) const PRIME_HANDLE_TO_FD_ABI_NAME: &str = "DRM_IOCTL_PRIME_HANDLE_TO_FD";
+
+pub(crate) const PRIME_HANDLE_TO_FD: std::ffi::c_ulong = iowr(b'd', 0x2d, size_of::<DrmPrimeHandle>());
 
 /// A read-only window on a buffer object's storage, mapped by this process and unmapped when it is
 /// dropped.
@@ -249,6 +265,20 @@ mod tests {
     /// this replaced gave `0xc008642d`, and the kernel — which dispatches on the request number and
     /// not on the size encoded in it — accepted that happily while writing its answer four bytes past
     /// the end of the struct, where nothing could read it.
+    ///
+    /// **These two assertions are the declaration restated, not checked.** They are here so a reader
+    /// of the constant knows the number is *derived* from the struct rather than typed beside it,
+    /// and on their own they prove nothing: both numbers were read out of the same header by hand,
+    /// which is the style `docs/vaapi-progress.md` §6 records as having "read as rigorous and been
+    /// wrong" the first time it was used here. The check that is worth something is
+    /// [`crate::vaapi::abi_guard`], which asks a C compiler for `sizeof(struct drm_prime_handle)`,
+    /// every `offsetof` in it and `DRM_IOCTL_PRIME_HANDLE_TO_FD` itself — all read from the installed
+    /// `/usr/include/drm/drm.h`, none of them from this file. Verified to fail on the historical
+    /// shape: a record declared wider than the header fails
+    /// `static assertion failed: "struct drm_prime_handle"`, fields declared in the wrong order fail
+    /// the `offsetof` and hole checks with the size still correct, and a request number no kernel
+    /// defines fails `static assertion failed: "DRM_IOCTL_PRIME_HANDLE_TO_FD"`. Removing a field is
+    /// caught at compile time instead, because the guard's record list names every one of them.
     #[test]
     fn prime_handle_to_fd_is_the_ioctl_its_struct_size_gives() {
         assert_eq!(size_of::<DrmPrimeHandle>(), 12, "struct drm_prime_handle: handle, flags, fd");

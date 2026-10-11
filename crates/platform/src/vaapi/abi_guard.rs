@@ -30,7 +30,17 @@ use super::*;
 use std::mem::{offset_of, size_of};
 
 /// Where the libva headers live on this machine.
+///
+/// **This is a path to check, never an include flag.** The C sources below say `#include <va/va.h>`,
+/// so compiling them with `-I /usr/include/va` asks the compiler to resolve that as
+/// `/usr/include/va/va/va.h`; it only worked because `/usr/include` is searched as a fallback after
+/// every `-I` has missed, which is exactly the kind of "right today, wrong the moment anyone relies
+/// on the flag" this project keeps writing down. The default system include path already resolves
+/// `<va/…>` and `<drm/…>`, so no `-I` is passed at all.
 const LIBVA_HEADERS: &str = "/usr/include/va";
+
+/// Where the DRM headers live, for the one record that is not a libva record.
+const DRM_HEADERS: &str = "/usr/include/drm";
 
 /// The header text with its `/* … */` and `//` comments blanked out, so a prototype cannot be found
 /// inside a doc comment and a parameter cannot be cut in half by one. Newlines are kept, so a byte
@@ -212,7 +222,7 @@ fn the_vp9_records_are_the_sizes_the_header_declares() {
     let path = dir.join("vp9abi.c");
     let written = std::fs::write(&path, source.as_bytes()).is_ok();
     let out = if written {
-        std::process::Command::new(&cc).args(["-fsyntax-only", "-I", LIBVA_HEADERS, path.to_str().unwrap_or_default()]).output()
+        std::process::Command::new(&cc).args(["-fsyntax-only", path.to_str().unwrap_or_default()]).output()
     } else {
         eprintln!("SKIPPED: cannot write {}", path.display());
         return;
@@ -647,6 +657,26 @@ static SUBMITTED_RECORDS: &[SubmittedRecord] = submitted_records![
         ("quantization_flags", quantization_flags, size_of::<u32>()),
         ("va_reserved", va_reserved, size_of::<u32>()),
     ],
+    // **The one record here that is not a libva record**, and the one whose verification read as
+    // rigorous and was wrong: `struct drm_prime_handle` is handed to the kernel by
+    // `DRM_IOCTL_PRIME_HANDLE_TO_FD`, it was declared eight bytes short, and the request number that
+    // follows from its size was therefore a request number no kernel defines — which the kernel
+    // dispatched anyway, writing its answer past the end of the struct. One dma-buf descriptor leaked
+    // per encoded picture, and the descriptor libva owns was closed twice.
+    //
+    // Until this row existed it was the only record in the backend no oracle could reach: not in
+    // this list, and the C sources above did not include `<drm/drm.h>` at all. Both `sizeof` and every
+    // `offsetof` are now asked of the installed header, and `every_declaration_matches_what_a_c_compiler_measures`
+    // additionally asserts the *request number* against `DRM_IOCTL_PRIME_HANDLE_TO_FD` itself rather
+    // than against a literal somebody typed from the same header twice.
+    // Named with the C spelling `struct drm_prime_handle` rather than the bare tag, because that is
+    // what every generated `sizeof` / `offsetof` needs — a C struct has no typedef. The other rows
+    // are `typedef struct … Name;` in libva and drm, which is why they need no `struct`.
+    "struct drm_prime_handle": size_of::<drm::DrmPrimeHandle>() => [
+        ("handle", handle, size_of::<u32>()),
+        ("flags", flags, size_of::<u32>()),
+        ("fd", fd, size_of::<c_int>()),
+    ],
 ];
 
 /// **Every byte of every record this backend hands to a driver belongs to a named field**, and the
@@ -695,16 +725,20 @@ fn every_record_the_backend_submits_tiles_byte_for_byte() {
 /// byte order fails here with the record and field named.
 #[test]
 fn no_submitted_record_has_a_byte_the_header_does_not_account_for() {
-    if !std::path::Path::new(LIBVA_HEADERS).join("va.h").is_file() {
-        eprintln!("SKIPPED: no {LIBVA_HEADERS}/va.h");
+    if !std::path::Path::new(LIBVA_HEADERS).join("va.h").is_file() || !drm_headers_present() {
+        eprintln!("SKIPPED: no {LIBVA_HEADERS}/va.h or no {DRM_HEADERS}/drm.h");
         return;
     }
     let Some(cc) = ["cc", "gcc", "clang"].into_iter().find_map(which) else {
         eprintln!("SKIPPED: no C compiler to measure the headers with");
         return;
     };
+    // `<drm/drm.h>` is in the list because `struct drm_prime_handle` is a record this backend hands
+    // to the kernel — see the `drm_prime_handle` row of the list above. It is installed on every
+    // machine that can run this backend at all (libva's own DRM backend includes it), so its absence
+    // is a machine with no DRM headers rather than a machine where the check could not be asked.
     let mut source = String::from(
-        "#include <stdint.h>\n#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n",
+        "#include <stdint.h>\n#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n#include <drm/drm.h>\n",
     );
     for record in SUBMITTED_RECORDS {
         source.push_str(&format!("\n/* {} */\n", record.c_name));
@@ -762,7 +796,7 @@ fn no_submitted_record_has_a_byte_the_header_does_not_account_for() {
     let path = dir.join("holes.c");
     let written = std::fs::write(&path, source.as_bytes()).is_ok();
     let out = if written {
-        std::process::Command::new(&cc).args(["-fsyntax-only", "-I", LIBVA_HEADERS, path.to_str().unwrap_or_default()]).output()
+        std::process::Command::new(&cc).args(["-fsyntax-only", path.to_str().unwrap_or_default()]).output()
     } else {
         eprintln!("SKIPPED: cannot write {}", path.display());
         return;
@@ -785,8 +819,8 @@ fn no_submitted_record_has_a_byte_the_header_does_not_account_for() {
 /// two are compared directly instead of both being compared with a number somebody typed twice.
 #[test]
 fn every_declaration_matches_what_a_c_compiler_measures() {
-    if !std::path::Path::new(LIBVA_HEADERS).join("va.h").is_file() {
-        eprintln!("SKIPPED: no {LIBVA_HEADERS}/va.h");
+    if !std::path::Path::new(LIBVA_HEADERS).join("va.h").is_file() || !drm_headers_present() {
+        eprintln!("SKIPPED: no {LIBVA_HEADERS}/va.h or no {DRM_HEADERS}/drm.h");
         return;
     }
     let Some(cc) = ["cc", "gcc", "clang"].into_iter().find_map(which) else {
@@ -816,9 +850,11 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
         ("VAEncSliceParameterBufferH264", size_of::<VaEncSliceParameterBufferH264>()),
         ("VAEncMiscParameterFrameRate", size_of::<VaEncMiscParameterFrameRate>()),
         ("VAEncMiscParameterQuantization", size_of::<VaEncMiscParameterQuantization>()),
+        ("struct drm_prime_handle", size_of::<drm::DrmPrimeHandle>()),
     ];
-    let mut source =
-        String::from("#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n");
+    let mut source = String::from(
+        "#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n#include <drm/drm.h>\n",
+    );
     source.push_str(
         "/* One line per entry point, exactly as ffi.rs declares it. A redeclaration\n   that disagrees with the header is an error, not a warning. */\n",
     );
@@ -830,6 +866,11 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
     for (name, size) in records {
         source.push_str(&format!("_Static_assert(sizeof({name}) == {size}, \"{name}\");\n"));
     }
+    source.push_str(&format!(
+        "/* The request number, asked of the header's own macro rather than of a literal\n   somebody typed from that header: this is the value the drm_prime_handle struct\n   produced, and it is the value the kernel dispatches on. */\n_Static_assert({name} == {value:#x}, \"{name}\");\n",
+        name = drm::PRIME_HANDLE_TO_FD_ABI_NAME,
+        value = drm::PRIME_HANDLE_TO_FD,
+    ));
     let dir = std::env::temp_dir().join(format!("filmcraft-va-abi-{}", std::process::id()));
     if std::fs::create_dir_all(&dir).is_err() {
         eprintln!("SKIPPED: no writable temporary directory");
@@ -838,7 +879,7 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
     let path = dir.join("abi.c");
     let written = std::fs::write(&path, &source).is_ok();
     let out = if written {
-        std::process::Command::new(&cc).args(["-fsyntax-only", "-I", LIBVA_HEADERS, path.to_str().unwrap_or_default()]).output()
+        std::process::Command::new(&cc).args(["-fsyntax-only", path.to_str().unwrap_or_default()]).output()
     } else {
         eprintln!("SKIPPED: cannot write {}", path.display());
         return;
@@ -846,6 +887,14 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
     let _ = std::fs::remove_dir_all(&dir);
     let out = out.unwrap_or_else(|e| panic!("running {cc} failed: {e}"));
     assert!(out.status.success(), "{cc} rejected our declarations against the headers:\n{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Whether the DRM headers are installed, which they are on every machine that can run this backend
+/// at all — libva's DRM backend includes them, so "no `drm.h`" means a machine with no DRM
+/// development files rather than a stack this backend could use. The guard skips there, with a note,
+/// so that adding the record cannot turn a machine red for a reason that has nothing to do with it.
+fn drm_headers_present() -> bool {
+    std::path::Path::new(DRM_HEADERS).join("drm.h").is_file()
 }
 
 /// `name` on the `PATH`, or `None`.

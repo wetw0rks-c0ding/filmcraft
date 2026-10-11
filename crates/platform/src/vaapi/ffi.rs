@@ -179,7 +179,7 @@ const BYTE_ORDER_LSB_FIRST: u32 = 1;
 /// derives something else — NV21, say, which is the same picture with U and V swapped — is
 /// refused rather than read as if the components were in the order FilmCraft expects.
 pub const NV12_FOURCC: u32 = FOURCC_NV12;
-/// `VA_FOURCC_P010` (`va.h:4478`): the 10-bit biplanar 4:2:0 image, each sample a 16-bit word with
+/// `VA_FOURCC_P010` (`va.h:4629`): the 10-bit biplanar 4:2:0 image, each sample a 16-bit word with
 /// the 10 significant bits in the high half.
 pub const P010_FOURCC: u32 = 0x3031_3050;
 
@@ -199,17 +199,17 @@ pub const P010_BPP: u32 = 24;
 /// return when a surface cannot be represented as a `VAImage`, which is the signal to read the
 /// picture the indirect way instead (`vaCreateImage` + `vaPutImage`). See [`Session::read`].
 pub const OPERATION_FAILED: i32 = 0x1;
-/// `VA_STATUS_ERROR_HW_BUSY` (`va.h:291`): the video engine was resetting. `vaSyncSurface` reports
+/// `VA_STATUS_ERROR_HW_BUSY` (`va.h:302`): the video engine was resetting. `vaSyncSurface` reports
 /// it while the reset runs and succeeds on a later call, so [`Session::sync`] asks again rather
 /// than reporting a decode failure the stream may not have had.
 pub const HW_BUSY: i32 = 0x22;
-/// `VA_STATUS_ERROR_TIMEDOUT` (`va.h:284`): `vaSyncBuffer` was not finished. **`va.h:4381-4382` is
+/// `VA_STATUS_ERROR_TIMEDOUT` (`va.h:308`): `vaSyncBuffer` was not finished. **`va.h:4381-4382` is
 /// explicit that this means "synchronization is still in progress, client should call the function
 /// again to complete synchronization"** — not that the encode failed — so [`Encoder::sync`] asks
 /// again rather than reporting a failure the picture may not have had.
 pub const TIMED_OUT: i32 = 0x26;
 
-/// `VASurfaceRendering` / `VASurfaceDisplaying` / `VASurfaceReady` (`va.h:4296-4299`): what
+/// `VASurfaceRendering` / `VASurfaceDisplaying` / `VASurfaceReady` (`va.h:4311-4315`): what
 /// `vaQuerySurfaceStatus` says about a surface. `READY` is the state a surface has to be in before
 /// its pixels can be read.
 pub const SURFACE_READY: u32 = 0x4;
@@ -279,18 +279,18 @@ pub const PICTURE_H264_INVALID: u32 = 0x0000_0001;
 
 /// `VA_PICTURE_HEVC_INVALID` (`va.h:5310`): see [`PICTURE_H264_INVALID`].
 pub const PICTURE_HEVC_INVALID: u32 = 0x0000_0001;
-/// `VA_PICTURE_HEVC_LONG_TERM_REFERENCE` (`va.h:5316`): the `ReferenceFrames` entry is a long-term
-/// reference of the stream (`va.h:5319`).
+/// `VA_PICTURE_HEVC_LONG_TERM_REFERENCE` (`va.h:5321`): the `ReferenceFrames` entry is a long-term
+/// reference of the stream (`va.h:5321`).
 pub const PICTURE_HEVC_LONG_TERM_REFERENCE: u32 = 0x0000_0008;
-/// `VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` (`va.h:5325`): the entry is one of the
+/// `VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` (`va.h:5336`): the entry is one of the
 /// `NumPocStCurrBefore` pictures the current picture's short-term reference picture set refers to.
 pub const PICTURE_HEVC_RPS_ST_CURR_BEFORE: u32 = 0x0000_0010;
-/// `VA_PICTURE_HEVC_RPS_ST_CURR_AFTER` (`va.h:5331`): see
+/// `VA_PICTURE_HEVC_RPS_ST_CURR_AFTER` (`va.h:5341`): see
 /// [`PICTURE_HEVC_RPS_ST_CURR_BEFORE`], for `NumPocStCurrAfter`.
 pub const PICTURE_HEVC_RPS_ST_CURR_AFTER: u32 = 0x0000_0020;
-/// `VA_PICTURE_HEVC_RPS_LT_CURR` (`va.h:5337`): see [`PICTURE_HEVC_RPS_ST_CURR_BEFORE`], for
+/// `VA_PICTURE_HEVC_RPS_LT_CURR` (`va.h:5346`): see [`PICTURE_HEVC_RPS_ST_CURR_BEFORE`], for
 /// `NumPocLtCurr`. The three are exclusive of one another and of
-/// [`PICTURE_HEVC_LONG_TERM_REFERENCE`] (`va.h:5326`), so one entry carries one of the four.
+/// [`PICTURE_HEVC_LONG_TERM_REFERENCE`] (`va.h:5321`), so one entry carries one of the four.
 pub const PICTURE_HEVC_RPS_LT_CURR: u32 = 0x0000_0040;
 
 /// `VA_INVALID_SURFACE` (`va.h:1648`), which is `VA_INVALID_ID`: the picture id an invalid entry
@@ -2666,6 +2666,22 @@ pub struct Encoder {
     /// encoding and needs somewhere to put that; it may not overwrite the picture it is reading,
     /// and it may not be a reference, because the caller overwrites it with the next picture.
     input: VASurfaceID,
+    /// **Every surface `vaCreateSurfaces` made, as it made them.** This is the ownership record, and
+    /// it exists because the two obvious substitutes are both wrong:
+    ///
+    /// - `input != 0` is not "the session owns a surface". Surface id 0 is a **legal, real** id —
+    ///   the driver allocates from its own counter and the first surface a session creates is id 0
+    ///   on this driver (`LIBVA_TRACE` shows `render_targets = 0x00000000`), which is why every
+    ///   unused reference slot in this module is `VA_INVALID_SURFACE` and never zero. A guard that
+    ///   reads "no input, nothing to destroy" therefore destroys nothing on the *normal* path.
+    /// - `input` plus `recon_pool` is not the array either: `rotate_reconstruction` rotates the pool,
+    ///   so reassembling from the two gives the same ids in a different order, and an error path
+    ///   between the `vaCreateSurfaces` call and the assignment of either leaves both empty while
+    ///   the driver holds `count` surfaces of real memory.
+    ///
+    /// `Drop` destroys exactly this vector, so the surfaces exist from the moment libva filled it to
+    /// the moment the session goes away, whatever happens in between.
+    surfaces: Vec<VASurfaceID>,
     /// Where reconstructions go, in rotation. **Length is what makes inter prediction possible**:
     /// an encoder with one surface has a reconstruction and nothing to predict from, so a P picture
     /// has no reference to name. `recon` is `recon_pool[0]` until the caller rotates it.
@@ -2734,6 +2750,7 @@ impl Encoder {
             display: Arc::clone(display),
             config: 0,
             input: 0,
+            surfaces: Vec::new(),
             recon_pool: Vec::new(),
             recon: 0,
             context: 0,
@@ -2801,29 +2818,64 @@ impl Encoder {
             // This matters beyond this call: `VA_INVALID_SURFACE` is `0xffff_ffff` precisely
             // because 0 is a real surface id, which is why every unused reference slot in this
             // module is `VA_INVALID_SURFACE` and never zero.
-            if surfaces.len() < count {
-                return Err(format!("vaCreateSurfaces filled in fewer than the {count} surface ids it was asked for"));
-            }
-            for (i, a) in surfaces.iter().enumerate() {
-                if surfaces.get(i + 1..).is_some_and(|rest| rest.contains(a)) {
+            //
+            // **The surfaces are handed to `session` before anything is checked.** Both refusals
+            // below used to run before the assignment, and `Drop` used to look at `input` and
+            // `recon_pool` — so a driver that returned a duplicate id leaked `count` surfaces of
+            // real driver memory until the display was torn down, and `Drop`'s own comment claimed
+            // it covered "an `Encoder` that failed part-way through `Encoder::new`". `Drop` now
+            // destroys `session.surfaces`, which is filled on the line below, so every exit from
+            // here between `vaCreateSurfaces` returning success and the session existing releases
+            // the surfaces it made.
+            session.surfaces = surfaces;
+            let Some(input) = session.surfaces.first().copied() else {
+                return Err("vaCreateSurfaces returned no surface ids at all".into());
+            };
+            let Some(pool) = session.surfaces.get(1..).map(<[VASurfaceID]>::to_vec).filter(|pool| !pool.is_empty()) else {
+                return Err("vaCreateSurfaces returned fewer than two surface ids, so the picture has nowhere to be reconstructed into".into());
+            };
+            // A duplicate is a real driver answer, not a hypothetical one: two ids that name the
+            // same surface would make the input surface and a reconstruction surface the same
+            // memory, which is the exact confusion `picture_record` refuses to build.
+            for (i, a) in session.surfaces.iter().enumerate() {
+                if session.surfaces.get(i + 1..).is_some_and(|rest| rest.contains(a)) {
                     return Err("vaCreateSurfaces returned the same surface id twice".into());
                 }
             }
+            // **There is no check that libva filled all `count` of them, because libva reports no
+            // count.** `vaCreateSurfaces` (`va.h:2285-2297`) takes `num_surfaces` and writes that
+            // many ids into the array, and nothing says how many it wrote; the previous version of
+            // this code asked `surfaces.len() < count` and could never be right, because `surfaces`
+            // is `vec![0; count]` two lines above — a check whose answer was decided before the call
+            // was made. Under-filling is therefore not detectable here, and the honest statement is
+            // the one the field makes elsewhere: an id this code did not read from the driver is not
+            // checked, and 0 is a legal id, so a driver that filled fewer than it was asked for
+            // leaves ids this backend cannot tell from real ones. The duplicate check above is the
+            // part of "did libva fill this correctly" that *is* decidable, and it is checked.
             // Surface 0 is the input and is never a reference; the rest are the DPB.
-            session.input = surfaces[0];
-            session.recon_pool = surfaces[1..].to_vec();
-            session.recon = session.recon_pool[0];
+            session.input = input;
+            session.recon_pool = pool;
+            session.recon = session.recon_pool.first().copied().unwrap_or(input);
             let (context_width, context_height) = (
                 c_int::try_from(size.0).map_err(|_| format!("picture width {}", size.0))?,
                 c_int::try_from(size.1).map_err(|_| format!("picture height {}", size.1))?,
             );
             let mut context: VAContextID = 0;
-            // SAFETY: `config` is the config created above, `surfaces` the array just filled, and
-            // `context` a live local for the id to be written into. The whole pool is the context's
-            // render target list: a reconstruction a later picture predicts from is rendered into
-            // and read from as a surface, so it has to be one the context knows.
+            // SAFETY: `config` is the config created above, `session.surfaces` the array just
+            // filled, and `context` a live local for the id to be written into. The whole pool is
+            // the context's render target list: a reconstruction a later picture predicts from is
+            // rendered into and read from as a surface, so it has to be one the context knows.
             let st = unsafe {
-                (api.create_context)(display.dpy, config, context_width, context_height, PROGRESSIVE, surfaces.as_mut_ptr(), count as c_int, &mut context)
+                (api.create_context)(
+                    display.dpy,
+                    config,
+                    context_width,
+                    context_height,
+                    PROGRESSIVE,
+                    session.surfaces.as_mut_ptr(),
+                    count as c_int,
+                    &mut context,
+                )
             };
             if st != OK {
                 return Err(format!("vaCreateContext failed for the encoder at {}x{}: {}", size.0, size.1, api.status_text(st)));
@@ -2970,12 +3022,27 @@ impl Encoder {
     /// libva's answer for that is `vaSyncBuffer`. Reading it without is a truncated picture, which
     /// on a driver that is fast enough is a picture that is usually right.
     pub fn sync(&self) -> Result<(), String> {
+        // **A libva without `vaSyncBuffer` is an error, and the reason is that nothing else in
+        // this file can tell a finished encode from an unfinished one.**
+        //
+        // The first version of this comment claimed the caller could: "the slice records say how
+        // bytes each slice is, and a picture shorter than that is a truncated one". **There are no
+        // such records** — see the note on [`VaCodedBufferSegment`]: `VAEncSliceParameterBufferH264`
+        // has no `slice_data_size` and no `slice_data_offset` on libva 1.24, the per-slice records
+        // the driver writes back are described by no header at all, and `check_annex_b` only proves
+        // the window is a whole run of NAL units, which a *truncated* slice still is (a NAL header
+        // plus fewer payload bytes is a well-formed NAL unit). So there is no length anywhere in
+        // this module to compare the picture against, and returning `Ok(())` here would hand
+        // unsynchronised bytes to the muxer on the strength of a check that does not exist.
+        //
+        // The module's rule is "a value we cannot derive faithfully is an `Err`, never a default",
+        // and that is the whole of the rule here: the encoder cannot be shown to have finished, so
+        // it does not report that it has. `vaSyncBuffer` has been in libva since 1.0, which is
+        // exactly what makes a false premise here durable — the branch is near-unreachable, so it
+        // will never be exercised and a wrong comment about it would outlive everyone who could
+        // have caught it.
         let Some(sync_buffer) = self.display.api.sync_buffer else {
-            // Not an error: the buffer can still be mapped, and the caller can see whether it holds
-            // a whole picture (the slice records say how many bytes each slice is, and a picture
-            // shorter than that is a truncated one).
-            log::info!("VA-API: this libva has no vaSyncBuffer, so an encoded picture is read without synchronising first");
-            return Ok(());
+            return Err("this libva has no vaSyncBuffer, so nothing can say the encode has finished before the coded buffer is read".into());
         };
         let _gate = self.display.gate();
         // **The timeout argument is passed explicitly.** `vaSyncBuffer`'s third parameter
@@ -3073,14 +3140,17 @@ impl Encoder {
             unsafe { destroy_image(self.display.dpy, image.image_id) };
             return Err(format!("vaMapBuffer failed for the encode upload: {}", self.display.api.status_text(st)));
         }
-        if mapped.is_null() {
-            let _gate = self.display.gate();
-            // SAFETY: as above.
-            unsafe { destroy_image(self.display.dpy, image.image_id) };
-            return Err("vaMapBuffer succeeded for the encode upload but returned no address".into());
-        }
+        // **The map is taken by `Upload` before the address is checked**, so the unmap is paired on
+        // the null-address path too. `vaMapBuffer` returned success, which is what incremented
+        // libva's map count on this buffer; returning without a matching `vaUnmapBuffer` — the
+        // shape this had before, where `Upload` was only built after the null test — leaves the
+        // image buffer mapped and every later pair on it off by one. The image is destroyed by
+        // `Upload::drop` below on this path, which is the same one release as everywhere else.
         let image_id = image.image_id;
         let upload = Upload { display: Arc::clone(&self.display), image, data: mapped, mapped: true };
+        if upload.data.is_null() {
+            return Err("vaMapBuffer succeeded for the encode upload but returned no address".into());
+        }
         // The two planes are copied through the driver's own geometry, and every number in it is
         // checked against `data_size` before a byte is written.
         upload.copy_in(luma, chroma)?;
@@ -3140,10 +3210,17 @@ impl Encoder {
         if st != OK {
             return Err(format!("vaMapBuffer failed on the coded buffer: {}", self.display.api.status_text(st)));
         }
-        if mapped.is_null() {
+        // **The mapping is taken by `CodedReadback` before the address is checked, so the unmap is
+        // paired on every path out of here — including the one below.** `vaMapBuffer` returned
+        // `VA_STATUS_SUCCESS`, which is what incremented libva's map count; returning without a
+        // matching `vaUnmapBuffer` leaves the buffer mapped, and every later map/unmap pair on it is
+        // then off by one, which is a use-after-free rather than a leak. This mirrors what
+        // [`Encoder::upload`] does for the same condition on its image.
+        let read = CodedReadback { display: Arc::clone(&self.display), id: self.coded.id(), data: mapped };
+        if read.data.is_null() {
+            // `Drop` unmaps as this returns.
             return Err("vaMapBuffer succeeded on the coded buffer but returned no address".into());
         }
-        let read = CodedReadback { display: Arc::clone(&self.display), id: self.coded.id(), data: mapped };
         // `read` owns the mapping and unmaps it in `Drop` on every path, so a malformed coded
         // buffer cannot leave the buffer mapped.
         read.picture()
@@ -3170,16 +3247,22 @@ impl Drop for Encoder {
                 // destroyed on any earlier path.
                 unsafe { (api.destroy_context)(self.display.dpy, self.context) };
             }
-            if self.input != 0 && !self.recon_pool.is_empty() {
-                // The input plus the whole reconstruction pool, which is every surface the context
-                // was created with. `self.input` is `surfaces[0]` and `recon_pool` is `surfaces[1..]`,
-                // so this reassembles the exact array `Encoder::new` created, in the same order.
-                let mut surfaces = vec![self.input];
-                surfaces.extend_from_slice(&self.recon_pool);
-                // SAFETY: `surfaces` is a live array of exactly the ids `vaCreateSurfaces` wrote in
+            // **The surfaces are released from `self.surfaces`, which is not `input != 0`.** The
+            // old guard read `self.input != 0 && !self.recon_pool.is_empty()`, and that was false in
+            // two different ways: the ids were only assigned after the validation refusals that
+            // return above, so a refusal leaked the whole pool; and 0 is a *legal* surface id (this
+            // driver allocates id 0 to the first surface a session makes), so the guard was also
+            // false on the ordinary path for a session whose input surface is id 0. `self.surfaces`
+            // is filled the moment `vaCreateSurfaces` returns success and is empty before it, so
+            // non-empty means "the driver made these and nothing has destroyed them" — which is the
+            // question `Drop` actually has to answer.
+            if !self.surfaces.is_empty() {
+                // SAFETY: `self.surfaces` is exactly the array `vaCreateSurfaces` filled in
                 // `Encoder::new`, none destroyed on any earlier path, and the context that used them
-                // was destroyed above — which is libva's own order.
-                unsafe { (api.destroy_surfaces)(self.display.dpy, surfaces.as_mut_ptr(), surfaces.len() as c_int) };
+                // was destroyed above — which is libva's own order. The order of the ids is the
+                // order the driver wrote them, and does not depend on `recon_pool` having been
+                // rotated since.
+                unsafe { (api.destroy_surfaces)(self.display.dpy, self.surfaces.as_mut_ptr(), self.surfaces.len() as c_int) };
             }
             if self.config != 0 {
                 // SAFETY: `config` is this session's own config id, created in `Encoder::new` and

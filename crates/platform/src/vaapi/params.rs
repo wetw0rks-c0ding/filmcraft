@@ -44,6 +44,12 @@ use filmcraft_h264::params::{Pps, Sps};
 /// `profile_idc` for Main is 77. They are different numbering systems, which is worth naming because
 /// the config profile and the SPS profile have to agree and nothing checks that for us.
 const PROFILE_IDC_MAIN: u8 = 77;
+
+/// The same number, reachable from `encoder`'s tests, so the byte offset an `avcC` takes its
+/// profile from can be checked against the value that was written rather than against a second
+/// copy of 77 typed in the assertion.
+#[cfg(test)]
+pub(crate) const PROFILE_IDC_FOR_TEST: u8 = PROFILE_IDC_MAIN;
 /// `nal_ref_idc = 3` (the parameter sets are reference NAL units) and `nal_unit_type` 7 for an SPS.
 const NAL_SPS: u8 = 0x67;
 /// `nal_ref_idc = 3`, `nal_unit_type` 8 for a PPS.
@@ -217,6 +223,21 @@ pub fn parameter_sets(sequence: &ffi::VaEncSequenceParameterBufferH264, picture:
 
 /// Read `sps_bytes` and `pps_bytes` back with FilmCraft's own parsers and check them against the
 /// records they were written from.
+///
+/// Two checks, and the split is not tidiness — it is the difference between *what the record
+/// determines* and *what this module chose*, and the two are verified differently:
+///
+/// - [`cross_check`] compares the fields the submitted record carries, and it is the one that runs
+///   on **either** provenance. A driver that writes its own SPS and PPS is checked against the same
+///   record we submitted, so a driver that quietly rewrote the picture size or the reference depth
+///   is caught rather than believed.
+/// - the table below additionally compares the fields **no record carries** — `profile_idc`,
+///   `gaps_in_frame_num_value_allowed_flag`, `bottom_field_pic_order_in_frame_present_flag`,
+///   `constrained_intra_pred_flag`, `redundant_pic_cnt_present_flag` — against the values this
+///   module chose to write. That check only makes sense for the derived path, where those values
+///   *are* this module's and a bit written in the wrong place would go unnoticed; for a
+///   driver-written set they are the driver's own choice and comparing them against ours would be
+///   comparing the driver with a guess.
 fn verify(
     sps_bytes: &[u8],
     pps_bytes: &[u8],
@@ -231,39 +252,25 @@ fn verify(
     };
     let sps = Sps::parse(&sps_rbsp).map_err(|e| format!("the SPS this module built does not parse: {e}"))?;
     let pps = Pps::parse(&pps_rbsp, &[Some(sps.clone())]).map_err(|e| format!("the PPS this module built does not parse: {e}"))?;
-    // Every comparison below is between a field this module wrote and the field the parser read
-    // back. They are different code paths over the same bytes, which is the only kind of check that
-    // catches a bit written at the wrong position.
-    let seq_fields = sequence.seq_fields;
+    cross_check(&sps, &pps, sequence, picture)?;
+    // Every comparison below is between a field this module **wrote** and the field the parser
+    // read back. They are different code paths over the same bytes, which is the only kind of check
+    // that catches a bit written at the wrong position.
+    //
+    // **Every syntax element this module writes is checked, not the ones that happened to be
+    // convenient.** The ones below were missing until now, and they are missing for the worst
+    // possible reason: each stays parseable when it is wrong. `pic_order_cnt_type` is a `ue(v)`
+    // either way, so a `log2_max_pic_order_cnt_lsb_minus4` written at the wrong position does not
+    // stop the SPS parsing — it shifts everything after it and the parser reports a *different*
+    // `max_num_ref_frames`, which is a picture nobody can play rather than an error. The module's
+    // own premise is that this comparison "is the only defence that does not depend on care", and a
+    // defence with a list of exceptions is not one.
     let mismatches: Vec<String> = [
         (sps.profile_idc == PROFILE_IDC_MAIN, format!("profile_idc is {} not {PROFILE_IDC_MAIN}", sps.profile_idc)),
-        (sps.level_idc == sequence.level_idc, format!("level_idc is {} not {}", sps.level_idc, sequence.level_idc)),
-        (
-            sps.pic_width_in_mbs == u32::from(sequence.picture_width_in_mbs),
-            format!("width is {} mbs not {}", sps.pic_width_in_mbs, sequence.picture_width_in_mbs),
-        ),
-        (
-            sps.pic_height_in_map_units == u32::from(sequence.picture_height_in_mbs),
-            format!("height is {} not {}", sps.pic_height_in_map_units, sequence.picture_height_in_mbs),
-        ),
-        (
-            sps.max_num_ref_frames == sequence.max_num_ref_frames,
-            format!("max_num_ref_frames is {} not {}", sps.max_num_ref_frames, sequence.max_num_ref_frames),
-        ),
-        (sps.chroma_format_idc == (seq_fields & 0b11), format!("chroma_format_idc is {} not {}", sps.chroma_format_idc, seq_fields & 0b11)),
-        (sps.frame_mbs_only == ((seq_fields >> 2) & 1 != 0), "frame_mbs_only_flag".into()),
-        (sps.direct_8x8_inference == ((seq_fields >> 5) & 1 != 0), "direct_8x8_inference_flag".into()),
-        (
-            sps.log2_max_frame_num == ((seq_fields >> 6) & 0xf) + 4,
-            format!("log2_max_frame_num is {} not {}", sps.log2_max_frame_num, ((seq_fields >> 6) & 0xf) + 4),
-        ),
-        (sps.pic_order_cnt_type == (seq_fields >> 10) & 0b11, format!("pic_order_cnt_type is {} not {}", sps.pic_order_cnt_type, (seq_fields >> 10) & 0b11)),
-        (sps.frame_crop == expected_crop(sequence), format!("frame_crop is {:?} not {:?}", sps.frame_crop, expected_crop(sequence))),
-        (pps.pic_init_qp == i32::from(picture.pic_init_qp), format!("pic_init_qp is {} not {}", pps.pic_init_qp, picture.pic_init_qp)),
-        (pps.entropy_coding_mode == (picture.pic_fields & (1 << 3) != 0), "entropy_coding_mode_flag".into()),
-        (pps.deblocking_filter_control_present == (picture.pic_fields & (1 << 9) != 0), "deblocking_filter_control_present_flag".into()),
-        (pps.weighted_pred == (picture.pic_fields & (1 << 4) != 0), "weighted_pred_flag".into()),
-        (pps.weighted_bipred_idc == (picture.pic_fields >> 5) & 0b11, format!("weighted_bipred_idc is {}", pps.weighted_bipred_idc)),
+        (!sps.gaps_in_frame_num_allowed, format!("gaps_in_frame_num_value_allowed_flag is {}", sps.gaps_in_frame_num_allowed)),
+        (pps.bottom_field_pic_order_in_frame_present == (picture.pic_fields & (1 << 11) != 0), "bottom_field_pic_order_in_frame_present_flag".into()),
+        (pps.constrained_intra_pred == (picture.pic_fields & (1 << 7) != 0), "constrained_intra_pred_flag".into()),
+        (pps.redundant_pic_cnt_present == (picture.pic_fields & (1 << 10) != 0), "redundant_pic_cnt_present_flag".into()),
     ]
     .into_iter()
     .filter_map(|(ok, why)| (!ok).then_some(why))
@@ -272,10 +279,115 @@ fn verify(
         return Ok(());
     }
     Err(format!(
-        "the parameter sets this module built say {} — {} mismatch(es) against the record they were written from",
+        "the parameter sets this module built say {} — {} mismatch(es) against the values they were written from",
         mismatches.join(", "),
         mismatches.len()
     ))
+}
+
+/// **Check a parameter set against the record this backend submitted**, whichever wrote the set.
+///
+/// This is the check that makes a derived `avcC` self-checking rather than merely self-consistent:
+/// the derived sets are written from the record and read back out of the bits, which proves the
+/// *writing* was right. It proves nothing about whether the sets still *describe the output* — a
+/// record is what was asked for, not what was encoded. So the same comparison is run against a
+/// driver's own parameter sets, where it does mean that: if the driver wrote an SPS saying a
+/// different picture size, a different reference depth or a different frame-number width from the
+/// record, then the `avcC` FilmCraft would hand the muxer and the stream are describing different
+/// things, and the honest result is this error.
+///
+/// Only the fields the record carries are compared. `profile_idc`, `constraint_set*_flag`,
+/// `gaps_in_frame_num_value_allowed_flag`, `bottom_field_pic_order_in_frame_present_flag`,
+/// `constrained_intra_pred_flag` and `redundant_pic_cnt_present_flag` are **not** in
+/// `VAEncSequenceParameterBufferH264` or `VAEncPictureParameterBufferH264`: they are choices this
+/// module makes when it derives a set, and a driver that made different ones is not contradicting
+/// anything FilmCraft submitted.
+pub fn cross_check(
+    sps: &Sps,
+    pps: &Pps,
+    sequence: &ffi::VaEncSequenceParameterBufferH264,
+    picture: &ffi::VaEncPictureParameterBufferH264,
+) -> Result<(), String> {
+    let seq_fields = sequence.seq_fields;
+    let mismatches: Vec<String> = [
+        // The ids first, because everything else is looked up through them: a slice resolves its
+        // PPS by `pic_parameter_set_id`, which resolves its SPS, and an `avcC` whose sets are not
+        // the ones the slices name is a stream no decoder can start.
+        (sps.id == u32::from(sequence.seq_parameter_set_id), format!("seq_parameter_set_id is {} not {}", sps.id, sequence.seq_parameter_set_id)),
+        (pps.id == u32::from(picture.pic_parameter_set_id), format!("pic_parameter_set_id is {} not {}", pps.id, picture.pic_parameter_set_id)),
+        (
+            pps.sps_id == u32::from(sequence.seq_parameter_set_id),
+            format!("the PPS names sequence parameter set {} not {}", pps.sps_id, sequence.seq_parameter_set_id),
+        ),
+        // `level_idc` is a conformance statement, and a stream whose level is below its own
+        // geometry is one a conforming decoder refuses — so it is a field the record determines and
+        // therefore checked on **either** provenance. If a driver rewrote it, the level FilmCraft
+        // reports and the level in the `avcC` are different claims about the same stream.
+        (sps.level_idc == sequence.level_idc, format!("level_idc is {} not {}", sps.level_idc, sequence.level_idc)),
+        (
+            sps.log2_max_frame_num == ((seq_fields >> 6) & 0xf) + 4,
+            format!("log2_max_frame_num is {} not {}", sps.log2_max_frame_num, ((seq_fields >> 6) & 0xf) + 4),
+        ),
+        (sps.pic_order_cnt_type == (seq_fields >> 10) & 0b11, format!("pic_order_cnt_type is {} not {}", sps.pic_order_cnt_type, (seq_fields >> 10) & 0b11)),
+        // Bits 12-15. Written as a `ue(v)` that is 0 for this encoder's `pic_order_cnt_type == 0`
+        // configuration, and read back as the value the parser saw — so a bit position mistake here
+        // shows up as a number rather than as a parse failure, which is exactly the case a check is
+        // for. The frame loop derives every picture's `pic_order_cnt_lsb` modulo
+        // `1 << (this + 4)`, so a wrong value here is a wrong picture order count, silently.
+        (
+            sps.log2_max_poc_lsb == ((seq_fields >> 12) & 0xf) + 4,
+            format!("log2_max_pic_order_cnt_lsb is {} not {}", sps.log2_max_poc_lsb, ((seq_fields >> 12) & 0xf) + 4),
+        ),
+        // `delta_pic_order_always_zero_flag` is bit 16. `sps()` reads it so the field is accounted
+        // for and does not write it, because `pic_order_cnt_type == 0` makes it implicit in the
+        // syntax; the parser only reports it for type 1, so it is compared against the same rule
+        // rather than against the bit.
+        (sps.delta_pic_order_always_zero || sps.pic_order_cnt_type != 1, "delta_pic_order_always_zero_flag".into()),
+        (
+            sps.max_num_ref_frames == sequence.max_num_ref_frames,
+            format!("max_num_ref_frames is {} not {}", sps.max_num_ref_frames, sequence.max_num_ref_frames),
+        ),
+        (sps.chroma_format_idc == (seq_fields & 0b11), format!("chroma_format_idc is {} not {}", sps.chroma_format_idc, seq_fields & 0b11)),
+        (sps.frame_mbs_only == ((seq_fields >> 2) & 1 != 0), "frame_mbs_only_flag".into()),
+        (sps.direct_8x8_inference == ((seq_fields >> 5) & 1 != 0), "direct_8x8_inference_flag".into()),
+        (
+            sps.pic_width_in_mbs == u32::from(sequence.picture_width_in_mbs),
+            format!("width is {} mbs not {}", sps.pic_width_in_mbs, sequence.picture_width_in_mbs),
+        ),
+        (
+            sps.pic_height_in_map_units == u32::from(sequence.picture_height_in_mbs),
+            format!("height is {} not {}", sps.pic_height_in_map_units, sequence.picture_height_in_mbs),
+        ),
+        (sps.frame_crop == expected_crop(sequence), format!("frame_crop is {:?} not {:?}", sps.frame_crop, expected_crop(sequence))),
+        // The PPS's `pic_init_qp`: the one field of a picture record that a derived SPS/PPS pair
+        // cannot be stable under, because it moves with the quantiser. A driver that rewrote it is
+        // caught here, and a caller that changes the quantiser mid-export is caught by
+        // `VaEncoder::sample_entry`.
+        (pps.pic_init_qp == i32::from(picture.pic_init_qp), format!("pic_init_qp is {} not {}", pps.pic_init_qp, picture.pic_init_qp)),
+        // `pic_init_qs_minus26` is written as the same quantiser: this backend submits no VUI timing
+        // and no picture-order-count cycle, so nothing overrides the initial Q for a non-I picture.
+        // That is a decision, and a decision that is not checked is a decision that can drift.
+        (pps.pic_init_qs == i32::from(picture.pic_init_qp), format!("pic_init_qs is {} not {}", pps.pic_init_qs, picture.pic_init_qp)),
+        (pps.entropy_coding_mode == (picture.pic_fields & (1 << 3) != 0), "entropy_coding_mode_flag".into()),
+        (pps.deblocking_filter_control_present == (picture.pic_fields & (1 << 9) != 0), "deblocking_filter_control_present_flag".into()),
+        (pps.weighted_pred == (picture.pic_fields & (1 << 4) != 0), "weighted_pred_flag".into()),
+        (pps.weighted_bipred_idc == (picture.pic_fields >> 5) & 0b11, format!("weighted_bipred_idc is {}", pps.weighted_bipred_idc)),
+        (
+            pps.num_ref_idx_l0_default_active == u32::from(picture.num_ref_idx_l0_active_minus1) + 1,
+            format!("num_ref_idx_l0_default_active is {} not {}", pps.num_ref_idx_l0_default_active, u32::from(picture.num_ref_idx_l0_active_minus1) + 1),
+        ),
+        (
+            pps.num_ref_idx_l1_default_active == u32::from(picture.num_ref_idx_l1_active_minus1) + 1,
+            format!("num_ref_idx_l1_default_active is {} not {}", pps.num_ref_idx_l1_default_active, u32::from(picture.num_ref_idx_l1_active_minus1) + 1),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(ok, why)| (!ok).then_some(why))
+    .collect();
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(format!("the parameter sets say {} — {} mismatch(es) against the record this backend submitted", mismatches.join(", "), mismatches.len()))
 }
 
 /// The crop the SPS should carry, or `None` when the record declares none.
@@ -292,24 +404,11 @@ fn strip(bytes: &[u8], header: u8) -> Option<Vec<u8>> {
     Some(rbsp.to_vec())
 }
 
-/// Whether `bytes` is an Annex-B access unit carrying a NAL of type 7 (SPS) or 8 (PPS) — which is
-/// what the driver would have written if it honoured the packed-header mode.
-///
-/// Used to decide whether the driver's own parameter sets exist or this module has to derive them,
-/// so it answers a question about the driver's output and nothing else.
-pub fn has_parameter_sets(bytes: &[u8]) -> bool {
-    // Walk the Annex-B start codes rather than searching for `00 00 01` anywhere: that byte
-    // sequence occurs inside slice data by coincidence all the time, and a heuristic matching one
-    // of those would report a parameter set the stream does not have — the plausible-looking wrong
-    // answer this whole module is about avoiding.
-    let mut at = 0usize;
-    while let Some(found) = bytes.get(at..).and_then(|rest| rest.windows(3).position(|w| w == [0, 0, 1])) {
-        let start = at + found + 3;
-        let Some(&header) = bytes.get(start) else { return false };
-        if header & 0x1f == 7 || header & 0x1f == 8 {
-            return true;
-        }
-        at = start;
-    }
-    false
-}
+// **Whether the driver wrote its own parameter sets is decided in `encoder`, not here**, by
+// [`super::encoder::resolve_parameter_sets`] walking the driver's own coded NAL units with
+// `annex_b_units` and looking for a type 7 and a type 8. An earlier version of this module
+// answered the question with a `has_parameter_sets` helper here; it was removed rather than
+// repaired because it was a *second* Annex-B walk that nothing but its own tests called, and two
+// walks of one format is two places for the answer to differ — which is the whole failure this
+// branch has documented three times. There is one walk now, and it is the one the answer comes
+// from.
