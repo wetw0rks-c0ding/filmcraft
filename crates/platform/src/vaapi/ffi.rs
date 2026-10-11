@@ -3414,12 +3414,6 @@ impl Encoder {
         self.input
     }
 
-    /// The surface `curr_pic.picture_id` names: where the reconstructed picture lands, and the
-    /// surface a later P or B picture predicts from.
-    pub fn recon_surface(&self) -> VASurfaceID {
-        self.recon
-    }
-
     /// **Move the reconstruction target to the next surface in the pool**, and say which one it is
     /// now.
     ///
