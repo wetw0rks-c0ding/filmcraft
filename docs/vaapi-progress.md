@@ -357,7 +357,7 @@ honouring the `bit_offset_*` handshake where rate control rewrites the driver's 
 The answer lives in `vaapi/vp9_enc.rs` rather than in ~1000 lines of correctly-measured, C-pinned records for
 a codec this machine refuses.
 
-### 3.7 AV1 encode: the records are pinned, and nothing submits them yet
+### 3.7 AV1 encode: the records are submitted, and the driver refuses the picture record
 
 The driver advertises `EncSlice` for `VAProfileAV1Profile0` **only** — profiles 1 and 2 answer
 `VA_STATUS_ERROR_UNSUPPORTED_PROFILE` — and `vaGetConfigAttributes` returns three populated words for it
@@ -383,8 +383,41 @@ struct↔table join check that exists because shrinking a hole in the *struct* l
 breaks were made; eleven were caught on the first attempt, and the escape is what the join check was added
 for.
 
-**What is deliberately absent is the point**: no `encode()`, no submission path, no settings wiring. Declaring
-AV1 encode records is not the same claim as encoding AV1, and this section does not make it.
+**The submission path now exists, and the driver refuses the picture record.** It reaches `vaRenderPicture`
+and stops: the **sequence record alone renders successfully**, and adding any picture record refuses.
+Measured two ways that agree — FilmCraft's own path (`vaRenderPicture failed for 5 encode buffers: invalid
+VABufferID`) and, independently through the public API, ffmpeg's own `av1_vaapi`, which declines the same
+profile on this machine: *"No usable encoding entrypoint found for profile VAProfileAV1Profile0 (32)"*.
+
+The failure was localised by sweeping rate control {NONE,CBR,VBR,CQP,ICQ} × packed headers
+{NONE,SEQ,PIC,SEQ|PIC,0x1b} × surfaces {2,3,4,8} — 80 combinations — plus 16 cumulative picture-record field
+variants and 80 candidate extra buffer types. It did not move. So this is **the picture record, and nothing
+else**, on a driver that advertises `EncSlice` and then refuses it.
+
+**No AV1 bytes exist**, so there is nothing to decode and nothing to claim about picture fidelity. What the
+round trip *did* produce is five bitstream bugs that no size or offset check could have seen, one of them
+worth naming: `showable_frame` is *inferred* when `show_frame` is 1, and writing it cost one bit which
+landed in `error_resilient_mode` and sent the decoder into a `ref_order_hint[8]` loop the specification has
+no reason to read — surfacing 50 bits away as *"reference to an empty slot"*. Also `frame_type` built from
+a bool cast (KEY_FRAME is 0, not 1), `max_frame_*_minus_1` written 15 bits wide instead of 16, and
+`force_integer_mv` / `use_ref_frame_mvs` written where the specification infers them.
+
+**The `wmmat` scale question this section used to call unanswerable is answered, and then made moot.**
+`AGENTS.md` §2 permits the AV1 bitstream specification, and `crates/av1` is built from it: `WARPEDMODEL_PREC_BITS
+= 16` (`crates/av1/src/spec_tables.rs:423`), so `default_gm_params` (`crates/av1/src/header.rs:1360`) makes
+identity `[0, 0, 65536, 0, 0, 65536]`. **The scale is never needed** — `is_global = 0` reads no parameters,
+and identity reads 0 of the eight `wmmat` entries. Nothing was invented; a question this file carried as open
+was open because a brief said the specification was out of bounds, which it is not (§6).
+
+**Two buffers genuinely cannot be sent, and were not faked**: `VAEncTileGroupBufferAV1` and
+`VAQMatrixBufferAV1` have **no `VABufferType` in libva 1.24.0** — encode types run 21..30 then jump to 41.
+Sending an invented type number yields a buffer that creates successfully and then fails inside the driver,
+which reads as a record bug. Whether a one-tile-group picture needs one is **not answerable from the
+installed headers**, and is recorded as unknown rather than guessed.
+
+**Still absent**: `Format::Av1`, export wiring, and a line in `vaapi/mod.rs` — so `Av1Encoder` is
+crate-internal and nothing in `tests/` or `examples/` can reach it yet. Declaring AV1 encode records is not
+the same claim as encoding AV1, and this section still does not make the second claim.
 
 ### 3.8 Three libva landmines, each of which cost real time
 
@@ -619,11 +652,18 @@ The architectural asymmetry below still explains *why* any of this was needed.
 
 ## 6. Findings recorded because they were wrong here first
 
-Eight conclusions on this branch were wrong and were caught by measurement rather than review. They are listed
+Nine conclusions on this branch were wrong and were caught by measurement rather than review. They are listed
 because each was plausible, and each cost real time. The last three came out of **briefs written for this
 branch**, and all three reached committed code or a design decision before the agents receiving them refuted
 them — which is why they are here and not merely in a commit message:
 
+- **A clean-room rule quoted from memory, and wrong.** A brief for the AV1 encode task stated that the AV1
+  bitstream specification was unavailable and outside `AGENTS.md` §2, on the strength of a note this file
+  carried. §2 permits it in as many words — *"the VP9 and AV1 bitstream specs"* (line 110) — and `crates/av1`
+  is built from it. The task therefore spent its premise on an open question (`wmmat`'s scale) that was
+  answerable: `WARPEDMODEL_PREC_BITS = 16`, identity `[0, 0, 65536, 0, 0, 65536]`, and the scale then turned
+  out to be **never needed**, because `is_global = 0` reads no parameters at all. **A prohibition quoted
+  second-hand is worse than no prohibition** — it manufactures a dead end and looks like diligence.
 - **A clause that does not exist.** An H.264 "8.2.3.2.1" deriving separable per-position weights was proposed
   and acted on. Zero occurrences of that clause number — or of `lumaWeightL0`, `weightA`, `weightB`,
   `PocDiffB`, `w1`/`w2` — across six ITU editions. A fabricated clause reads exactly like a real one.
