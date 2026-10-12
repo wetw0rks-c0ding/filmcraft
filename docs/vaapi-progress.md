@@ -1,12 +1,12 @@
 # Linux GPU video support: progress
 
-Status of the VA-API work on this branch, written so a reader does not have to reconstruct it from 36
-commits. Everything here has been measured on the development machine (Intel Arc B580, `/dev/dri/renderD128`,
+Status of the VA-API work on this branch, written so a reader does not have to reconstruct it from the
+branch's commits. Everything here has been measured on the development machine (Intel Arc B580, `/dev/dri/renderD128`,
 libva 1.24, iHD 26.3.5); nothing is carried over from another platform unverified.
 
-Two milestones are in flight: **decode**, essentially complete, and **encode**, mid-way through its
-feasibility work. Two more are wired into the decode path *and* measured against our own decoder's
-pictures, one for one — **VP9 decode** (§4) and **AV1 decode** (§5).
+Two milestones are in flight: **decode**, essentially complete, and **encode**, which is working for H.264,
+proven for HEVC and declined by the driver for VP9. Two more are wired into the decode path *and* measured
+against our own decoder's pictures, one for one — **VP9 decode** (§4) and **AV1 decode** (§5).
 
 Every number below is produced by a committed test, and each one names the fixture it came from:
 `cargo test -p filmcraft-platform --test vaapi -- --nocapture` prints one line per fixture with its
@@ -41,10 +41,17 @@ that asserts it does *not* when hardware decoding is switched off.
 | `vp9_p0_parity.mp4` | 96/96 (profile 0, 8-bit) |
 | `vp9_p2_parity.mp4` | 96/96 (profile 2, **10-bit**) |
 | `vp9_p0_segmented.mp4` | 96/96 (`SEG_LVL_ALT_Q` on all 96 frames) |
+| `av1_p0_8bit.mp4` | 96/96 (AV1 Main, profile 0, 8-bit) |
+| `av1_p0_10bit.mp4` | 96/96 (AV1 Main, profile 0, **10-bit**) |
+| `av1_tiled.mp4` | 48/48 (8×4 tile grid, 640×500, `show_existing_frame`, four-frame units) |
+| `av1_intra_only.mp4` | 96/96 (every frame a key frame, CDEF off) |
+| `av1_loop_restoration.mp4` | 96/96 (WIENER and SGRPROJ both present) |
 
 Each row is one `tests/common::FIXTURES` entry at `Tier::EveryPicture`, so
 `cargo xtask fixtures platform` regenerates the file and `bit_exact_with_the_software_decoder` decodes
-it, after a `reset` and reseek to every later sync sample and again after all the resets.
+it, after a `reset` and reseek to every later sync sample and again after all the resets. The VP9 and
+AV1 fixtures are additionally asserted **by name** in that test, so dropping one from the table fails
+the suite rather than quietly leaving every document's sentence as true and the proof smaller.
 
 The last two exist because every earlier HEVC fixture coded a prediction weight table whose every flag was
 0 — so the weight record's delta recovery had only ever run with delta 0, *on hardware*. The new fixtures
@@ -57,6 +64,14 @@ not, at any encoder effort setting.)
 `segmentation_enabled`. On every other VP9 fixture `SegParam[1..7]` are zero by rule, so the eight-entry
 branch that `va_dec_vp9.h:270-272` describes had never been taken on hardware — a regression that copied
 `SegParam[0]` into all eight entries would have passed every other test in the branch.
+
+The five AV1 fixtures earn their place one arm each, and the reason each exists is the thing the other four
+cannot reach: `av1_p0_8bit` / `av1_p0_10bit` are the two depths; `av1_tiled` is the only one that reaches
+the **per-tile** slice record (`va_dec_av1.h:635`, "should be sent once per tile"), the only one carrying
+`show_existing_frame`, and the only one whose sample 1 holds **four** frames; `av1_intra_only` is
+`-usage allintra`, so `primary_ref_frame` is `PRIMARY_REF_NONE` on every frame and 7.20's
+`setup_past_independence` runs each time, and its sequence header has CDEF off; `av1_loop_restoration` is
+the only one that can tell AV1's two restoration numberings apart (§5). §5 has the rest.
 
 **Measured acceleration**, from `cargo xtask bench --sections decode`:
 
@@ -82,11 +97,15 @@ reason.
 | declined | why |
 |---|---|
 | H.264 with implicit weighted biprediction | See below. `weighted_bipred_idc == 2` is x264's default for High profile with B frames, so this is **most H.264**. |
-| AV1 outside profile 0, or with applied film grain | Profile 0 at 4:2:0 8/10-bit **decodes** (§5). Profiles 1 and 2 are 4:4:4 / 4:2:2 and `va_dec_av1.h:44` says the API is "8-bit/10bit 420 format only"; 12-bit has no surface. An applied film grain is declined because this backend copies pictures out and never synthesises grain, so a driver rendering grain would disagree with FilmCraft's own decoder on exactly those frames. Large-scale tile is declined too — `filmcraft-av1` parses no LST syntax at all. |
+| AV1 at 4:4:4, 4:2:2 or monochrome | `plan_frame` checks subsampling before it resolves a profile (`vaapi/stream.rs`), so a 4:4:4 stream is declined *as its chroma* even when it is profile 1. Every surface this backend creates is 4:2:0. Asserted by `an_av1_stream_this_backend_cannot_describe_is_declined_as_such` on a `yuv444p` fixture. |
+| AV1 profiles 1 and 2, and 12-bit | `va_dec_av1.h:44` in the header's own words: "This AV1 decoding API supports 8-bit/10bit 420 format only." AV1 5.1.1 fixes profile 1 to 4:4:4 and profile 2 to 4:2:2 at 12 bits, so neither is reachable on its own; 12-bit is separately refused because the record's `bit_depth_idx` would say 2 and no surface here can hold it. The 12-bit arm is what reaches `av1_decline`'s own table in that test. |
+| AV1 with **applied** film grain | This backend copies pictures out through `vaDeriveImage` + `vaMapBuffer` and never synthesises grain, so a driver rendering grain into `current_display_picture` would disagree with FilmCraft's own decoder on exactly the frames grain touches (`vaapi/av1.rs`, `AV1_FILM_GRAIN`). |
+| AV1 large-scale tile | **A scope limitation, not a gate**: `grep -rn "large_scale_tile\|enable_large_scale_tile" crates/av1/src` returns nothing, so there is no flag to read the feature from and no anchor frames to submit. No encoder this suite can drive produces such a stream (`ffmpeg -h encoder=libaom-av1` has no LST option, checked), so it is recorded as a limit rather than as a decline that does not exist (`AV1_LARGE_SCALE_TILE`). |
+| AV1 with an in-band sequence header that differs | The surfaces and the `avcC`-equivalent `av1C` were created from one sequence header; a frame that re-declares itself with a different one is an error rather than a re-seed, because the surfaces do not match what it says. |
 | VP9 outside profiles 0 / 2 | 4:2:2 / 4:4:0 / 4:4:4 (profiles 1, 3), the reserved profile 4, and 12-bit. Every surface this backend creates is 4:2:0 at 8 or 10 bits, so there is nowhere to put them. |
 | 10-bit H.264 | Matches the Windows backend's own decision (`media_foundation/stream.rs:279`); no fixture would prove a hardware path here. |
 | HEVC with `scaling_list_enabled_flag` | Needs `VAIQMatrixBufferHEVC`, which this backend does not build. `va_dec_hevc.h` sends that buffer only when the flag is 1, so a driver default would decode a picture the stream does not contain. |
-| 4:2:2, 4:4:4 | Out of scope by decision. |
+| 4:2:2, 4:4:4 (H.264 / HEVC) | Out of scope by decision. |
 
 ### The H.264 implicit-weight decline
 
@@ -114,32 +133,240 @@ header under a condition not yet found. Recorded rather than resolved.
 
 ---
 
-## 3. Hardware encode — in progress
+## 3. Hardware encode — working for H.264, proven for HEVC, VP9 declined by the driver
 
 Plan: `docs/superpowers/plans/2026-10-09-vaapi-linux-encode.md`. Encode inverts the decode data flow: the
 application hands the driver a *picture* and **the driver writes the slice headers**, so the bitstream is read
-back out and the codec configuration is the driver's. Verification is necessarily **weaker** than decode's —
-a hardware encoder and the software encoder are different algorithms, so bit-equality is unavailable.
+back out and the codec configuration is the driver's.
 
-Feasibility is established: the capability probe reports `EncSlice: true` for H.264 Main/High/ConstrainedBaseline
-and HEVC Main/Main10 on this machine. VP9 reports false, correctly — there is no hardware VP9 encoder.
+### The verification standard, which is weaker, and is described that way everywhere
 
-Three spikes, each measured rather than assumed:
+Decode can assert 72 of 72 pictures bit-exact against ffmpeg. **Encode cannot, at any level**: a hardware
+encoder and a software encoder are different algorithms, so bit-equality is unavailable — and "matches
+ffmpeg" would be a meaningless claim for an encode, not a weaker one. The gate is therefore:
+
+- the exported file **decodes with ffmpeg to the right pictures**, compared against the **source** within a
+  lossy tolerance appropriate to the bitrate — never against another encode;
+- the stream is **well-formed**: the `avcC` / `hvcC` parses, describes the bitstream it is handed, and
+  `sample_entry()` refuses before the first picture rather than handing out an empty config record;
+- size and rate control land in the neighbourhood the settings asked for;
+- ffmpeg's own stderr is empty — a stream it decodes with a warning has been accepted and is not
+  necessarily right.
+
+Nothing below borrows decode's language. Where a figure is "within N/255 of the source", that is the whole
+of the claim.
+
+### What the capability probe says, and what it does not
+
+`EncSlice: true` for H.264 Main / High / ConstrainedBaseline and for HEVC Main / Main10 on this machine,
+and `EncSlice: true` for **AV1 profile 0**. VP9 reports false, and that is measured rather than inferred
+(§3.6).
+
+### 3.0 The three spikes that established feasibility, each measured rather than assumed
 
 1. **One I frame.** Encodes and decodes to the right picture (luma ramp, max deviation 3/255, driver average
    QP as requested).
 2. **P frames predict from the picture before them.** Six frames, ramp shifted 8 columns per picture:
-   935 bytes for the I frame then 656/307/322/196/208. Two controls make it falsifiable — coded as intra the
-   same content averages 941 bytes (2.79×), and a stale reference would give a 253/255 maximum against a
-   measured ~0.3 mean, a 60× separation. **Reference depth > 1 is refused, not attempted**: at depth 2 the
-   render succeeds, sync succeeds, ffmpeg decodes every frame *without a warning*, and every picture from the
-   third on is wrong (mean 7.16 rising to 35.08). Four candidate causes were measured and cleared first.
+   **935 bytes** for the I frame then **656/307/322/196/208**. Two controls make it falsifiable — coded as
+   intra the same content averages 941 bytes (2.79×), and a stale reference would give a 253/255 maximum
+   against a measured ~0.3 mean, a 60× separation. The depth>1 result out of this spike is §3.4.
 3. **The coded-output readback**, which was the blocker. `vaMapBuffer` returns a staging area, not the
    picture. Solved by `vaAcquireBufferHandle` → `DRM_IOCTL_PRIME_HANDLE_TO_FD` → `mmap`: every byte now comes
    from a mapping this backend issued. Output byte-for-byte identical to the previous mechanism.
 
-`pic_order_cnt_type = 2` was tried as a lead for depth > 1 and is **refuted** — the driver reads it, but the
-pictures are byte-identical and the refusal stands.
+### 3.1 Rate control works, and the measurement is content-dependent — which is the lesson
+
+Measured on the oracle's own content at 320×180: **0.94 against a 2000 kbit/s target, bit-identical across
+runs**, over 300 pictures. The band in the test is `0.80..=1.05` *because the measurement is 0.94*, and
+`89% ± 2%` at steady state across a 6× target sweep on other content.
+
+**What made that number legible was the content, and getting the content wrong cost two rounds of
+investigation that reached the wrong conclusion.** The oracle originally encoded a **luma ramp**, whose
+ceiling on this driver is **~162 kbit/s** at the quantiser floor, and asked for 8000 kbit/s. That target is
+unreachable *by construction*, so:
+
+- VBR looked as if it ignored the target — flat across a 40× sweep;
+- CBR looked as if it faked one — 98.6 % trailing zeros.
+
+**Both were the ramp.** On content that can carry the bits, VBR tracks at 89–94 % and CBR does not pad. The
+full-texture ceiling on the same driver is **~6598 kbit/s**, and 2000 sits well inside it. Reverting to the
+ramp fails the assertion at **ratio 0.16** — the gate was verified red before it was trusted.
+
+A second measurement is in the test for a reason: the controller **ramps to a plateau** (2981 / 3353 / 3574 /
+3591 kbit/s over 60 / 150 / 300 / 900 frames), so a 24-picture run reads the warm-up and charges the
+controller for it. The run is 300 pictures because of that number and not for any other reason.
+
+### 3.2 A key-frame interval above 16 works, by widening `frame_num` — and **8 of 11 shipped presets now export**
+
+`vaapi_config_for` used to refuse **eight of the eleven H.264 presets FilmCraft ships**, all with the same
+message: a key frame every 60 pictures, this encoder's `MaxFrameNum` is 16. The fix is
+`log2_max_frame_num_minus4` **0 → 4**, so `MaxFrameNum` is **256** and the caller's interval is carried by
+the counter on its own. The IDR the loop still writes at the wrap stays, but it is a *policy* reported on
+`key_frame_reason`, not a codec requirement.
+
+**MMCO is not an alternative, because it is not expressible.** `VAEncSliceParameterBufferH264` carries **no
+`dec_ref_pic_marking` field and no `adaptive_ref_pic_marking_mode_flag`** — the record ends at the deblocking
+fields and a `va_reserved` the header says "must be zero". libva's H.264 encoder marks references itself from
+the reference lists it is given, so choosing MMCO would mean writing into a reserved field and hoping, which
+is the one class of value this backend refuses everywhere else.
+
+**And a wrap is conformant anyway.** H.264 7.4.3's Equation 7-22 forbids a *skipped* frame number still marked
+used for short-term reference, and at the wrap the `UnusedShortTermFrameNum` loop's initialiser is already
+`frame_num`, so the body never runs and the set is empty. With
+`gaps_in_frame_num_value_allowed_flag` clear, 7.4.3 goes further and *requires* `frame_num == (PrevRefFrameNum
++ 1) % MaxFrameNum` — which is the wrap. The standard mandates it rather than forbidding it.
+
+Measured, not argued: **200 pictures at 640×360 and 240 at 1280×720**, both a 60-picture interval, both
+decoded by ffmpeg with **no warning at all** and a flat 9/255 mean absolute deviation on every picture.
+`trace_headers` reads `log2_max_frame_num_minus4 = 4` and writes `frame_num` as `00010000 = 16` — **eight
+bits**, which the old four-bit field could not reach — with IDRs at pictures 0, 61, 122, 183 and **none** at
+16, 32 or 48. `MAX_FRAME_NUM` is 256 and the wrap run is 260 pictures.
+
+**The gate's refusal stays a refusal**, now against 256: **250 is taken** and asserted taken (the value the
+old ceiling declined), **300 still declines** and names both numbers in the message.
+
+### 3.3 `H264Profile::Auto` exists, and it is the default
+
+Before `Auto`, every H.264 export on Linux was a lie in one direction or the other: pick **Main** for Linux
+and the preset you did not touch quietly stopped being High; pick **High** and the VA-API gate declines,
+because its derived parameter sets write `profile_idc = 77` and an offered `VA_PROFILE_H264_HIGH` comes back
+as a **byte-identical Main bitstream**. `Auto` is the delegation, resolved by one accessor
+(`ExportSettings::resolved_h264_profile`) that the export summary calls, so **the summary prints the profile
+that is in the file, not the one that was stored**: Main when the OS encoder may take the export and that
+encoder writes Main (Linux + hardware encoding on + a container it can carry), High otherwise. Every encoder
+is handed the resolved value — the built-in one, the MXF picture record, VideoToolbox, NVENC — which is what
+makes `Auto` worth having. A named `High` is still honoured: the gate declines it, the export falls back to
+the built-in encoder, and both the summary and the file say High.
+
+**Deriving High parameter sets is not feasible here**, and that is why substituting silently was rejected:
+the sequence record **carries no profile field to derive one from**, so `params::sps` writes
+`profile_idc = 77` unconditionally; the derived PPS writes `entropy_coding_mode_flag = 0`, so the stream is
+CAVLC with no CABAC and no 8×8 transform; and the driver answers an offered `VA_PROFILE_H264_HIGH` with a
+**byte-identical Main bitstream**. An SPS claiming High over CAVLC slices and a 4×4 transform would describe
+a different stream from the one encoded, and substituting Main for High without saying so would have left
+the summary asserting High over a Main file — which is the defect `Auto` exists to remove.
+
+### 3.4 Reference depth > 1 is refused, measured on both codecs — and **it does not error**
+
+H.264 at depth 2: the render succeeds, the sync succeeds, **ffmpeg stays silent**, and every picture from the
+third on is wrong — mean **7.16** rising to **35.08**. Four candidate causes were measured and cleared first,
+and `pic_order_cnt_type = 2` was tried as a lead and refuted (the driver reads it; the pictures are
+byte-identical).
+
+**HEVC shows the same signature, measured on its own path rather than borrowed**: with the refusal lifted, a
+depth of 2 **renders, syncs, and decodes in ffmpeg with no diagnostic**, and the mean absolute deviation
+from the source ramp goes **9.1, 9.1, 16.8, 26.6, 36.9, 37.1** — the third picture, the first that reads the
+second reference, is the one at 137 bytes against the 43–55 of the frames that do not. Both are refused, and
+each refusal carries its own codec's measurement.
+
+**Two agents were misled by this**, and the reason is worth naming: it is the one failure in this milestone
+that produces a *valid-looking* stream. Nothing logs, nothing returns a status, and the file decodes.
+
+### 3.5 HEVC encode works — the blocker was four packed-header buffers the path configured for and never sent
+
+**One I frame then P frames that genuinely predict, decoded clean by ffmpeg.** Measured at **320×240** under
+`VA_RC_CQP` QP 26: **I 184 bytes, then P 51 / 45 / 43 / 55 / 48** (mean 48), every picture within a mean
+absolute deviation of **9.1/255** of the **source** ramp, worst 21, flat across the sequence, with the MP4
+holding all six samples.
+
+Two agents failed on this before, and both recorded the failure as *the records are wrong*. It was neither
+the records nor the config attribute: **`va_enc_hevc.h:299-309` says the packed slice header's data buffer
+"shall contain the `slice_header()` syntax element only, along with any start code prefix and NAL unit type
+preceeding it", and the driver writes no slice header of its own** — it writes the bytes the application
+supplies, then the slice data. A capture of
+ffmpeg's own `hevc_vaapi` on this machine shows those bytes passed through verbatim. With none supplied, the
+six-buffer submission answers `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` at `0x5`, `0x3`, `0x2` and `0x0`
+alike, while `vaRenderPicture`, `vaEndPicture` and `vaSyncBuffer` all return success. Adding the packed
+sequence and slice header pairs is what produced the table above. `VAConfigAttribEncPackedHeaders` is
+`SEQUENCE | SLICE` (0x5) because that is what this path supplies — **not** because it is what fixed it; the
+attribute reads 0x0, 0x2, 0x3 and 0x5 alike on this driver once the buffer is there.
+
+`slice_type` is **measured, not typed**: HEVC's header states no encoding and libva has no enum for one
+(`grep -rn "SLICE_TYPE" /usr/include/va/` returns only H.264's), so I = 2, P = 1, B = 0 was established by
+`trace_headers` over a stream this driver encoded and ffmpeg decodes with 0 errors. **What the driver
+*accepts* is not measured**, because the submissions that would answer it did not exist when the question was
+open, and the code says which half is which.
+
+### 3.6 VP9 encode: the driver declines it, and the evidence is a file rather than a stub
+
+**No hardware VP9 encoder on this driver.** All four `VAProfileVP9Profile0..3` are advertised, and **every one
+offers `VAEntrypointVLD` and nothing else**. Asking anyway — `vaGetConfigAttributes` for every (profile,
+`EncSlice` / `EncSliceLP`) pair, across the 26 attributes — returns `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`
+for **all eight pairs**, with the poison left intact. `va_enc_vp9.h` and `VAConfigAttribEncVP9` (**58**)
+**do** exist in the installed headers, so this is **the driver declining a codec libva can express**, not an
+API gap. That distinction is the deliverable: it is a statement about *this machine's driver*, not about VP9,
+not about libva, and not about FilmCraft's ability to *decode* VP9, which is proven and unaffected.
+
+The answer lives in `vaapi/vp9_enc.rs` rather than in ~1000 lines of correctly-measured, C-pinned records for
+a codec this machine refuses.
+
+### 3.7 AV1 encode: the records are pinned, and nothing submits them yet
+
+The driver advertises `EncSlice` for `VAProfileAV1Profile0` **only** — profiles 1 and 2 answer
+`VA_STATUS_ERROR_UNSUPPORTED_PROFILE` — and `vaGetConfigAttributes` returns three populated words for it
+(`VAConfigAttribEncAV1` 52 → `0x05001000`, Ext1 53 → `0x0000241f`, Ext2 54 → `0x0000ffcf`) against the H.264
+control's `VA_ATTRIB_NOT_SUPPORTED` for the same three.
+
+**Six records declared and pinned against a C compile**, every one measured rather than transcribed, with
+**five compiler holes** — one in every record that has one, each named as a `padding_*` field of the
+C-measured width:
+
+| record | measured `sizeof` | holes |
+|---|---|---|
+| `VAEncSequenceParameterBufferAV1` | 88 | 1 (bytes 21-23) |
+| `VAEncSegParamAV1` | 156 | 1 (bytes 138-139) |
+| `VAEncWarpedMotionParamsAV1` | 56 | 1 (bytes 37-39) |
+| `VARefFrameCtrlAV1` | 4 | **0**, asserted as a C-measured gap of zero |
+| `VAEncPictureParameterBufferAV1` | 1032 | 1 (bytes 538-539) |
+| `VAEncTileGroupBufferAV1` | 20 | 1 (bytes 2-3) |
+
+Plus **100 bit positions across nine unions and three attribute unions, all measured by running C**, and a
+struct↔table join check that exists because shrinking a hole in the *struct* left `sizeof` and every
+`offsetof` unchanged so all the pins passed green — the compiler re-inserts the byte. Twelve deliberate
+breaks were made; eleven were caught on the first attempt, and the escape is what the join check was added
+for.
+
+**What is deliberately absent is the point**: no `encode()`, no submission path, no settings wiring. Declaring
+AV1 encode records is not the same claim as encoding AV1, and this section does not make it.
+
+### 3.8 Three libva landmines, each of which cost real time
+
+1. **`vaQueryConfigAttributes` segfaults inside `iHD_drv_video.so`** on this libva **1.24** (gdb-confirmed on
+   this branch). Use **`vaGetConfigAttributes`**, which is what every probe here resolves.
+2. **A probe with no working control is not evidence.** The attribute sweep that exonerated the HEVC records
+   made them byte-for-byte identical to a submission this same driver accepts and reported that the failure
+   did not move. Re-capturing ffmpeg's own `hevc_vaapi` submission through the public entry points and
+   comparing field by field showed **the two record sets were never equal in the first place** — so the
+   conclusion "the records are not the cause" was right and the evidence for it was weaker than claimed. The
+   corrected claim is the weaker, better one: *no difference between these records accounted for the
+   failure*, which is what re-running ffmpeg's own records through this submission shows — they fail here
+   exactly as ours do. **A comparison over a subset cannot distinguish the thing under test from the thing
+   you left out of it.**
+3. **An unsupported profile/entrypoint pair leaves the attribute value poisoned rather than zeroed.** libva
+   returns the status and does not write the caller's `VAConfigAttrib` at all, so a `0x00000000` means "nothing
+   was written here", not "nothing is set". **Gate on the returned status and poison the value you check**
+   (`0xDEADBEEF` here) so "the driver never wrote this" and "the driver wrote zero" stay distinguishable.
+
+The rate-control sweep has the same shape as landmine 2, and now **states its own precondition**: it was
+taken with no packed slice header, which this driver refuses to encode without, so it measured the **buffer
+set** rather than the modes. Of the **eight** modes this driver advertises for HEVC Main (`0x14de`, expanded
+in the code as CBR, VBR, VCM, CQP, ICQ, MB, QVBR, TCBRC), **six failed at `vaMapBuffer`** and two
+(`VA_RC_ICQ`, `VA_RC_QVBR`) **at `vaEndPicture`** — and those two failing earlier is the signature of a
+buffer the driver wants and is not getting, not of a mode it dislikes. With the slice header supplied
+**`VA_RC_CQP` — the mode this path names — encodes**, so the other seven are **untested rather than refuted**.
+
+### 3.9 Reachability from the UI, and what is in progress
+
+The H.264 path is **reachable**: `register()` puts `vaapi_encoder_factory` in front of the software encoders
+on Linux, behind a `Once` the way the Windows arm does it, and every decline goes through
+`note_hw_encode_declined` so `perf.stats` `export.hardware` can tell a user their machine has no hardware
+encode path. It is opt-in per export (`Export ▸ Hardware encoding`, off by default), because a hardware
+stream differs from ours and exports are otherwise byte-identical across machines. There is **no mid-stream
+fallback**: a decoder can replay samples through another decoder, an encoder cannot hand a half-written stream
+to one, so a failure during an export stops it with an error.
+
+**HEVC's export reachability is in progress on this branch** and is deliberately not claimed here in either
+direction: the encode path itself is proven (§3.5), what is being wired is the export surface around it.
 
 ### The FFI audit
 
@@ -169,10 +396,13 @@ fields at the correct size (invisible to the old literals), a wrong request numb
 
 **The guard has since grown a blind spot of its own, which is worth stating because `sizeof` cannot see it.** A
 compiler hole changes no size, so `sizeof` passes over one. `VASegmentParameterVP9` decoded 24/24 bit-exact for five
-commits while handing the driver two uninitialised bytes per record, and it was found by construction rather than by
-symptom. Every record submitted to a driver is now also checked for unnamed holes, pinned as *gaps* rather than
+commits — that was the `vaparity` run on the old 24-picture `vp9_p0.mp4`, before the 96-picture fixtures of §4
+existed — while handing the driver two uninitialised bytes per record, and it was found by construction rather than
+by symptom. Every record submitted to a driver is now also checked for unnamed holes, pinned as *gaps* rather than
 sizes, each named as a `padding_*` field of the C-measured width. Shrinking a gap does not always move `sizeof` —
-the compiler re-inserts the byte — which is why the pins ask for the gap and not the size.
+the compiler re-inserts the byte — which is why the pins ask for the gap and not the size, and why the AV1 encode
+records (§3.7) carry a struct↔table join check in addition: twelve deliberate breaks were made and the one that
+slipped through was a shrunk hole in the *struct* that left every `sizeof` and every `offsetof` unchanged.
 
 ---
 
@@ -276,7 +506,7 @@ headers do not settle, and both were wrong first:
 **Both score the same 18, and the 18 are the frames that restore nothing.** The other four fixtures
 have loop restoration off and would have passed under either reading, so without
 `av1_loop_restoration.mp4` the suite could not have chosen. That is the whole lesson, and it is §6's
-fifth entry rather than a new one.
+second entry rather than a new one.
 
 **A fixture that cannot fail is worse than no fixture.** This section's Q1 note claimed a 2×4 tiled
 fixture scored "68 of 96" under the rejected tile-number indexing. It scores **96 of 96** — a grid
@@ -285,8 +515,14 @@ grid of differing columns and rows, where the readings score **48 of 48 against 
 what `av1_tiled.mp4` now encodes and what
 `av1::tests::the_tiled_fixture_is_the_one_that_can_tell` enforces.
 
+**Scope is Main profile (0), 4:2:0, 8 and 10 bits, and every decline outside it is in §2's table** with the
+header line it comes from — 4:4:4 / 4:2:2 / monochrome, profiles 1 and 2 and 12-bit, applied film grain,
+large-scale tile, and an in-band sequence header that differs from the one the surfaces were created for.
+
 **Still open, and recorded as open rather than claimed:** what a *full* 64-entry
-`width_in_sbs_minus_1` does (no fixture this suite can generate has 64 tiles in one axis); and
+`width_in_sbs_minus_1` does (the record's array is 63 wide and the header says the last tile is computed,
+so a 64-tile axis is the one shape it does not cover; no fixture this suite can generate produces one — a
+640×500 frame has 10 × 8 superblocks, and libaom's `-tile-columns` will not exceed 32 at 8 bits); and
 whether a rotated or affine `gm_params` survives the `wmmat` copy, since no fixture carries
 non-identity global motion — `-enable-global-motion 1` changes nothing on `testsrc2`, measured.
 
@@ -296,8 +532,10 @@ The architectural asymmetry below still explains *why* any of this was needed.
 
 ## 6. Findings recorded because they were wrong here first
 
-Five conclusions on this branch were wrong and were caught by measurement rather than review. They are listed
-because each was plausible, and each cost real time:
+Eight conclusions on this branch were wrong and were caught by measurement rather than review. They are listed
+because each was plausible, and each cost real time. The last three came out of **briefs written for this
+branch**, and all three reached committed code or a design decision before the agents receiving them refuted
+them — which is why they are here and not merely in a commit message:
 
 - **A clause that does not exist.** An H.264 "8.2.3.2.1" deriving separable per-position weights was proposed
   and acted on. Zero occurrences of that clause number — or of `lumaWeightL0`, `weightA`, `weightB`,
@@ -316,33 +554,96 @@ because each was plausible, and each cost real time:
   It is present — clause 7.3.6.3, in the same `for(i)` body as `delta_luma_weight`, and present since v1.
 - **A struct miscounted while verifying.** `struct drm_prime_handle` was confirmed as 8 bytes from five
   lines of a header; line 932 holds a third field. The verification read as rigorous and was wrong.
+- **A libva constant that does not exist.** `VAProfileH265Enc` was named as the profile to ask for when
+  HEVC encode was first planned. `grep -rn "VAProfileH265Enc" /usr/include/va/` returns **nothing**, and there
+  is not even a separate encode profile: **libva reuses the codec profile with an encode entrypoint** —
+  `VAProfileHEVCMain` (17) and `VAProfileHEVCMain10` (18) answer `[1 VLD, 6 EncSlice]` on this driver, which
+  is why both decode and encode ride on the same constants. The same trap sits next to VP9, where
+  `VAConfigAttribEncVP9` **does** exist (`va.h:1065`) and invites the matching mistake. A constant that
+  reads like the surrounding ones is not thereby in the header.
+- **An enum value read off a bitfield as 3.** A brief reported `support_cdef_channel_strength = 3` in the AV1
+  encode feature word and called it `VA_FEATURE_REQUIRED`. **`va.h:398` defines `VA_FEATURE_REQUIRED` as 2,
+  so 3 is not a valid `VA_FEATURE_*` value at all**, and the real value is **1** — CDEF is *supported*, and
+  since **no** AV1 encode feature is required, CDEF in the sequence record is a choice rather than an
+  obligation. Wrong twice over, and the second wrongness is the dangerous one: a decoder that cannot tell 2
+  from 1 gets HEVC right by luck (its `amp` and `cu_qp_delta` genuinely read 2) and AV1 wrong on purpose.
+- **A mechanism described as a clamp that actually refuses.** A brief described the key-frame-interval
+  ceiling as clamping an interval down to what the encoder could carry. The gate **refuses**, naming both
+  numbers, because "tell the caller" and "shorten it silently" are the only two honest answers and silently
+  shortening would hand back a file a sixth larger than it was promised. An earlier draft of the gate's own
+  comment claimed it clamped; that comment was wrong and now says so.
 
 Also worth recording: a per-task review by fresh subagents **missed** the MMCO 3/6 spec deviation and the
 HEVC reference-lists-built-once-per-picture bug, both of which a single CodeRabbit pass found. The
-second silently produced wrong pictures on multi-segment HEVC and survived four review rounds.
+second silently produced wrong pictures on multi-segment HEVC and survived four review rounds. And a probe
+with no working control is not evidence at all — see §3.8, where two separate exonerations had to be
+downgraded from "the records are not the cause" to the weaker "no difference between these records
+accounted for it".
 
 ---
 
-## 7. Not ours: `crates/gpu` failures
+## 7. `crates/gpu` — was red here, and the cause was not ill-conditioning
 
-`cargo xtask ci` is **red** for reasons predating this branch. Proven unrelated: `git diff main...HEAD --
-crates/gpu crates/render` is empty, `filmcraft-gpu`'s dependency closure (`color`, `frame`, `geom`, `render`,
-`media`, `project`, `time`) contains nothing this branch changes, `cargo tree` confirms `codecs`, `platform`,
-`engine` and `hevc` are absent from its tree, and `Cargo.lock` has zero version bumps. Almost certainly the
-new Arc B580 and its driver.
+`cargo xtask ci` was red on `crates/gpu` for reasons that looked like pre-existing hardware trouble. It was
+not, and both symptoms are fixed. The earlier diagnosis was wrong in kind: it read a sample-coordinate
+residual as an unstable shader.
 
-- `fx_tests::gpu_effects_match_cpu_exactly` — `invert` with `channel=Choice(4)` (alpha) fails on *flips*, a
-  2 %+ relative difference. Not a tolerance problem and deliberately not absorbed by one: the Rust CPU
-  reference and the GPU arm in `gpufx.rs` are byte-identical including the `k = na/a` guard at `a > 1e-6`, so
-  the divergence is in the shader, and that ratio is unbounded as alpha approaches zero.
-- The suite **segfaults 3 of 3 threaded and never single-threaded** — a concurrency defect, likely multiple
-  GPU contexts created at once, not flakiness.
+### `invert` on the alpha channel diverged, and the cause was a bilinear tap
 
-Fixed here: a per-op tolerance for the effects whose GPU path is a power function (`gamma_correction`,
-`levels` via `powf(g)`; `tint`, `extract` via `linear_to_srgb`). A GPU evaluates `pow(x, g)` as
-`exp2(g·log2(x))` with its own transfer approximation — a different algorithm, not a different rounding — and
-a gamma of 5.0 amplifies the relative error. Those four get 1e-3; everything else keeps 1e-4. This took the
-test from three failures to one.
+`fx_tests::gpu_effects_match_cpu_exactly` — case `invert [("channel", Choice(4)), ("blend", Float(20.0))]`,
+which allows **no** flipped value — failed on the alpha channel. **The compositor's `load4` bilinear tap let `f`
+be a small nonzero number on a 1:1
+draw**: `sp` comes from the vertex stage and the rasteriser interpolates it a few ULPs off each texel centre,
+so `mix` blended in a fraction of the *neighbouring* texel. A fully transparent pixel then picked up a few
+ULPs of alpha, and `Invert{channel: 4}` computes `rgb / a` on it — at 67×41 the leak is 3.8e-6 of a texel,
+`1/a` is 2.6e5, and the product is **CPU 0.0, GPU 1.0**: a fully opaque pixel where the reference is fully
+transparent, from a single transparent texel beside an opaque one. It is a sample-coordinate residual, not a
+texture-format loss — the leak is the same fraction of neighbours 1000× apart.
+
+Measured by having `load4` return its raw fraction, over **17 configurations** (1:1 from 48×32 to 4096×4096,
+minifying and magnifying draws, rotations of 13/30/45 degrees): **exactly zero at every power-of-two
+extent**, and at most **0.853 × f32::EPSILON × the source extent (1.25 ULP)** otherwise. The window is sized
+on the **source extent**, not on this pixel's coordinate — the rasteriser interpolates across the whole
+triangle, so the error is set by the attribute endpoints and does not shrink towards the origin.
+
+The fix is **snapping the sample coordinate to the nearest texel centre** in `composite.wgsl`, with
+`CENTRE_SNAP = 2^-22`. Comparing against the distance to the *nearest* centre rather than testing the
+fraction makes it two-sided, which matters because the residual is signed: **5.7 % of the samples of a
+1920×1080 1:1 draw (2384 of 41472) land on the far side**, where `f` wraps to ~1 and a one-sided test blends
+in almost the whole previous texel.
+
+Blast radius measured rather than assumed, because the tap is the compositor's under every transform, crop,
+flip and resample: over 11 transforms at 192×108, **8 of the 10 genuine resamples are bit-identical** (non-
+integer downscale, 1/3 downscale, 2.4× upscale, rotations of 7/30/45 degrees, a shear, half-, quarter- and
+eighth-pixel offsets), and every transform that differs does so by **≤ 0.5 ULP of the Rgba16Float
+accumulator** — 1/8 of one 8-bit code value. Only the 1:1 control changes, which is the leak being removed.
+`one_to_one_draw_copies_the_source_exactly` pins it with black-and-white vertical stripes compared through
+`to_bits()`, so the statement is "exactly 0" rather than "within tolerance", and it is red without the
+change at every non-power-of-two size.
+
+Also kept from the earlier diagnosis, which was right about these: a per-op tolerance for the effects whose
+GPU path is a power function (`gamma_correction`, `levels` via `powf(g)`; `tint`, `extract` via
+`linear_to_srgb`). A GPU evaluates `pow(x, g)` as `exp2(g·log2(x))` with its own transfer approximation — a
+different algorithm, not a different rounding. **All 76 effect cases now match the CPU with no tolerance or
+budget moved, and the worst of them improves from 3.84e-4 to 5.71e-6.**
+
+### The suite segfaulted, and `--test-threads=1` was not the fix
+
+**5/5 runs at 6 threads, 0/3 surviving at every thread count ≥ 2, serial never.** Under gdb the fault is in
+`wgpu::Instance::default()` itself: `desired_extensions` called with a null `ash::Entry` while another thread
+sits in `vkEnumerateInstanceExtensionProperties`, then a jump to address 0. Concurrent Vulkan instance
+creation on this driver, **before any of our code runs** — not a limit, not flakiness, not ours.
+
+Fixed by making the instance and device process-wide behind a `OnceLock`, with the `Instance` held separately
+so it cannot be torn down under the device. **15/15 threaded runs now survive, where the same binary was
+1/15.**
+
+### Still open: the same defect in `crates/golden`
+
+`crates/golden/tests/golden.rs:742` builds its **own `wgpu::Instance` per test** and requests a device on the
+same physical GPU — the shape that faulted above, in a second binary, unfixed. It is not the same test run,
+so it is not urgent, and it is recorded rather than claimed to be harmless: the fault is a race in driver
+initialisation and this is the pattern that provokes it.
 
 ---
 
@@ -356,20 +657,37 @@ test from three failures to one.
   header directly (`a_vp9_profile_this_backend_does_not_decode_is_an_error_not_a_record` and the
   `vp9_segment_param` tests in `vaapi::picture`). A real-world stream with any of the three would be
   the fixture that closes this; §4.
-- **AV1, two scope limits that are recorded rather than resolved** — §5. A *full* 64-entry
-  `width_in_sbs_minus_1` (no fixture this suite can generate has 64 tiles in one axis: a 640×500
-  frame has 10 × 8 superblocks, and libaom's `-tile-columns` will not exceed 32 at 8 bits), and
-  whether a **rotated or affine `gm_params`** survives the `wmmat` copy — no fixture carries
-  non-identity global motion, because `-enable-global-motion 1` changes nothing on `testsrc2`, which
-  is a property of the source and not of the encoder settings.
-- **Encode** — `VideoEncoder`/`EncoderFactory` implementation, `sample_entry` from the driver's parameter
-  sets, the frame loop driven by settings, and the docs. Also: reference depth > 1, multi-slice pictures
-  (a second coded segment is refused), and five syscalls per encoded frame.
-- **The FFI guard does not check parameter width or signedness** — arity is bound mechanically, but the
-  Rust↔C type mapping is still a reviewer's job, and both header checks are skipped on GitHub runners where
-  the headers are absent.
+- **AV1, two scope limits that are recorded rather than resolved** — §5. A *full* 64-tile axis, where the
+  record's `width_in_sbs_minus_1` is 63 wide and the header says the last tile is computed (no fixture this
+  suite can generate has 64 tiles in one axis: a 640×500 frame has 10 × 8 superblocks, and libaom's
+  `-tile-columns` will not exceed 32 at 8 bits), and whether a **rotated or affine `gm_params`** survives the
+  `wmmat` copy — no fixture carries non-identity global motion, because `-enable-global-motion 1` changes
+  nothing on `testsrc2`, which is a property of the source and not of the encoder settings. Large-scale tile
+  is a third recorded limit, and it is a limit rather than a gate because there is no flag to read it from;
+  §2.
+- **HEVC export reachability** — **in progress on this branch.** The encode path is proven (§3.5) and the
+  gate accepts the format; what is being wired is the export surface around it. Nothing here claims it
+  works and nothing here claims it does not.
+- **H.264 encode, what is still refused** — §3. Each refusal carries its measurement: reference depth > 1
+  (measured on both codecs, §3.4), multi-slice pictures (a second coded segment is refused; reachable at 70
+  pictures, refused unmeasured), B pictures (the driver reports it *could* — `VAConfigAttribEncMaxRefFrames`
+  answers (3, 1) — and emits none over a 40-picture run spanning two mid-stream IDRs and two `frame_num`
+  wraps), `Vbr2Pass`, HDR, MXF, a fractional frame rate, and five syscalls per encoded frame.
+- **AV1 encode** — the records are pinned (§3.7) and **nothing submits them**. What a submission still needs
+  is written down where it is not known: the `wmmat` scale is stated nowhere in the header, and the two
+  pointers it gives (the specification and a third-party decoder's source) are both outside what this tree
+  may read under `AGENTS.md` §2.
+- **HEVC rate control beyond `VA_RC_CQP`** — the sweep that exonerated the modes was taken with no packed
+  slice header, so it measured the buffer set and not the modes: six of the eight modes the driver advertises
+  failed at `vaMapBuffer` and two at `vaEndPicture`. With the header supplied `VA_RC_CQP` encodes, so the
+  other seven are **untested rather than refuted** (§3.8). A re-sweep is in flight.
+- **The FFI guard does not check parameter width or signedness** — arity is bound mechanically, and holes
+  are now pinned as gaps, but the Rust↔C type mapping is still a reviewer's job, and both header checks are
+  skipped on GitHub runners where the headers are absent.
 - **iHD writes no packed parameter sets** — it accepts the mode, returns `0x3`, emits no NAL 7/8. Whether
-  that is this driver or this submission is open.
-- **`cargo xtask ci` red on `crates/gpu`** — §7. Needs a decision: investigate, or record and skip.
+  that is this driver or this submission is open. (This is the *decode-side* statement and is separate from
+  the encode-side finding that the driver writes no slice header of its own either, §3.5.)
+- **`crates/golden/tests/golden.rs:742` builds a `wgpu::Instance` per test** — the exact pattern that faulted
+  `crates/gpu`'s suite at every thread count ≥ 2, in a second binary, unfixed; §7.
 - **libva licence** — approved 2026-10-08 for the run-time `dlopen` (ADR 0001). The ruling rests on libva
   staying behind `dlopen`; linking it would void it.

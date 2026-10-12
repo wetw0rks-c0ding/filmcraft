@@ -26,10 +26,13 @@ Containment rules:
 1. The crate does not use `lints.workspace = true`. Its own `[lints]` table copies the workspace
    lints except `unsafe_code = "deny"` (not `forbid`), and adds
    `clippy::undocumented_unsafe_blocks = "deny"`. Only the FFI modules (`videotoolbox`, `media_foundation::gpu` / `media_foundation::mft`, and
-   `nvenc::ffi` / `nvenc::session` on Windows, `vaapi::ffi` on Linux) carry `#[allow(unsafe_code)]`;
+   `nvenc::ffi` / `nvenc::session` on Windows, `vaapi::ffi` and `vaapi::drm` on Linux) carry `#[allow(unsafe_code)]`;
    the rest of the crate (the fallback logic in `hybrid`, the decoder logic in `media_foundation`
    and in `vaapi::mod` / `vaapi::stream` / `vaapi::picture` / `vaapi::decoder`, `annexb`,
-   `biplanar`, the encoder logic in `nvenc`) has no `unsafe`.
+   `biplanar`, the encoder logic in `nvenc`, and the whole of `hardware_encode` and every
+   `vaapi` module that is not one of those two) has no `unsafe`. `vaapi::drm` is a second FFI module
+   because it is a second ABI — plain DRM, for the encode readback's buffer storage — and the rule that
+   `unsafe` lives only in FFI modules is what keeps that boundary where it is.
 2. Every `unsafe` block has a `// SAFETY:` comment saying why it is sound.
 3. The public API is safe: no `pub unsafe fn`, no raw pointers or FFI types in public signatures;
    failures are `Result`s. The crate keeps the never-crash `deny(clippy::unwrap_used, …)`
@@ -128,9 +131,11 @@ class of defect that cost the H.264 milestone its budget cannot occur here.
 
 Scope is profiles 0 and 2 at 4:2:0, 8- and 10-bit. Profiles 1 and 3 (4:2:2 / 4:4:0 / 4:4:4) and
 profile 4 (reserved by the specification, so undefined rather than merely unimplemented) are declined,
-as is 12-bit: every surface this backend creates is 4:2:0 at 8 or 10 bits. **AV1 remains declined**,
-because `filmcraft_av1` does not expose its per-frame header and an invented record is precisely the
-failure this record exists to prevent.
+as is 12-bit: every surface this backend creates is 4:2:0 at 8 or 10 bits. **The paragraph below is what
+this addendum originally said about AV1 — "AV1 remains declined, because `filmcraft_av1` does not expose
+its per-frame header" — and it is superseded by the AV1 addendum below.** The stated reason was wrong in
+any case: the enabler turned out to be one `pub` on `BitReader` and a small re-export list, not a
+module boundary.
 
 **That scope is measured, at both depths.** `vp9_p0_parity.mp4` (profile 0, 8-bit) and
 `vp9_p2_parity.mp4` (profile 2, 10-bit) are `tests/common::FIXTURES` entries at `Tier::EveryPicture`,
@@ -146,6 +151,88 @@ a frame that re-shows an earlier one (`show_existing_frame`) is **decoded** — 
 decoder output the picture that slot holds and decode nothing, so it takes no surface from the ring
 and is a readback with no submission — and a frame with `show_frame` clear is rendered (it may refresh
 references) but produces no picture, which is what FilmCraft's own software VP9 decoder does too.
+
+## Addendum (2026-10-12): AV1 through VA-API on Linux
+
+**AV1 Main (profile 0) at 4:2:0 decodes on Linux, at 8 and 10 bits**, and the two earlier addenda's
+"AV1 is declined" is withdrawn rather than amended in place, because a reader who found it would be
+reading a decline of a codec this backend decodes.
+
+The "never invent a record" rule turned out to be cheaper than the alternative in a way worth stating:
+`crates/av1` needed **one `pub` on `BitReader` and a small `pub use` list** — not a module-visibility
+change — and the VP9 precedent does not transfer. `crates/av1/src/lib.rs:16` already held
+`pub mod header;`, `HeaderState` was already `pub`, and `header.rs` had 224 `pub` items against 3
+`pub(crate)`.
+
+**Two hazards, the same shapes VP9 had.** `ref_frame_map` is the whole decoded picture buffer
+addressed by slot, so `Av1State` owns 7.20's eight slots and carries each slot's surface **and** its
+`RefInfo` together — AV1's reference state is read by the *next frame's header parse*, not only by the
+record, which is not VP9's situation. And the AV1 decode record has **no `refresh_frame_flags` member
+at all** (`grep -in refresh /usr/include/va/va_dec_av1.h` returns two hits, both inside comments; the
+field is encode-only), so that state is entirely ours. A `show_existing_frame` is **not decoded** the
+way VP9's is — it carries none of its own picture parameters and is a re-read of the slot.
+
+**Two record members were guesses the headers do not settle, and both were wrong first** — settled by
+making a stream that distinguishes the readings and asking the driver. `lr_unit_shift` is the inverse
+of what the name suggests (256 → shift **2**, 64 → shift 0), and `yframe_restoration_type` carries
+the **specification's** `FrameRestorationType` (NONE/WIENER/SGRPROJ/SWITCHABLE), not the bitstream's
+two-bit field. Submitted wrongly, `av1_loop_restoration.mp4` decoded **18 of 96** — and the 18 are
+exactly the frames that restore nothing, which is why that fixture is the one that decides.
+
+Scope is Main profile 0, 4:2:0, 8 and 10 bits. Declined with the header line each comes from:
+4:4:4 / 4:2:2 / monochrome (no such surface), profiles 1 and 2, 12-bit
+(`va_dec_av1.h:44`, "This AV1 decoding API supports 8-bit/10bit 420 format only"), and an **applied**
+film grain, because this backend copies pictures out and never synthesises grain. Large-scale tile is
+a **scope limitation rather than a gate**: `filmcraft-av1` parses no LST syntax at all, so there is
+nothing to read the flag from, and no encoder this suite can drive produces such a stream.
+
+**Measured, at both depths, picture for picture.** `av1_p0_8bit.mp4` and `av1_p0_10bit.mp4` are
+96/96 each, `av1_tiled.mp4` 48/48, `av1_intra_only.mp4` 96/96 and `av1_loop_restoration.mp4` 96/96,
+all at `Tier::EveryPicture` in `bit_exact_with_the_software_decoder` and all five asserted **by
+name** in that test, regenerated from the committed table by `cargo xtask fixtures platform`.
+
+## Addendum (2026-10-12): hardware H.264 and H.265 encoding through VA-API on Linux
+
+The same containment applies unchanged — `unsafe` stays in `vaapi::ffi` and `vaapi::drm`, every block
+has a `// SAFETY:` comment, no panic crosses the FFI boundary, the public API is safe — and two
+differences from decoding are deliberate and stated in the plan the work follows.
+
+- **It is opt-in per export** and there is **no mid-stream fallback**, exactly as on macOS and Windows.
+- **The codec configuration is the driver's, not ours.** `avcC` / `hvcC` is built from the parameter
+  sets the driver emitted, parsed back out of our own output with FilmCraft's own parsers, and
+  `sample_entry()` refuses before the first picture rather than handing out an empty config record.
+
+**And the verification standard is weaker, which this record records because borrowing decode's language
+here would be a false claim.** A hardware encoder and a software encoder are different algorithms, so
+bit-equality is unavailable at any level and "matches ffmpeg" would be meaningless. The gate is that the
+exported file **decodes with ffmpeg to the right pictures against the *source*** within a lossy tolerance,
+that the stream is well-formed, and that size and rate control land near the settings.
+
+Three things this milestone established that a reader should not have to reconstruct:
+
+- **Rate control works, and the measurement is content-dependent.** 0.94 against a 2000 kbit/s target,
+  bit-identical across runs — on content that can carry the bits. A **luma ramp's ceiling on this driver
+  is ~162 kbit/s** and full texture's is **~6598 kbit/s**, so an 8000 kbit/s target against a ramp is
+  unreachable by construction, which is what made VBR look as if it ignored the target and CBR as if it
+  faked one. Both were the ramp. A measurement that cannot be reproduced on representative content
+  measures the content.
+- **A key-frame interval past 16 works by widening `frame_num`, not by MMCO**, because
+  `VAEncSliceParameterBufferH264` carries no `dec_ref_pic_marking` field at all and H.264 7.4.3 makes
+  the wrap conformant anyway. `MaxFrameNum` goes 16 → 256, and **8 of the 11 H.264 presets FilmCraft
+  ships export**. The gate still *refuses* an interval past the modulus, naming both numbers rather than
+  silently shortening it.
+- **Reference depth > 1 is refused on a measurement that does not raise an error.** At depth 2 the
+  render succeeds, the sync succeeds, ffmpeg stays silent, and every picture from the third on is wrong
+  — H.264's mean absolute deviation 7.16 rising to 35.08, HEVC's 9.1, 9.1, 16.8, 26.6, 36.9, 37.1. It
+  is the one failure on this branch that produces a valid-looking stream, and it misled two agents.
+
+`H264Profile::Auto` is the default and resolves to what the backend will actually write, so the export
+summary names the profile in the file rather than the one that was stored. **HEVC's export reachability
+is in progress** and is not claimed in either direction here; **VP9 encode is not available on this
+driver** (every VP9 profile advertises decode only, and every encode entrypoint answers
+`VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`, while `va_enc_vp9.h` and `VAConfigAttribEncVP9` do exist —
+so it is the driver declining a codec libva can express); and **AV1 encode records are pinned and
+nothing submits them**.
 
 ## Addendum (2026-10-08): VA-API hardware decoding on Linux
 
@@ -169,9 +256,9 @@ image), so there is no zero-copy path on Linux yet — the same gap the other tw
 VP9 is decoded through the same rules (addendum below): profiles 0 and 2 at 4:2:0 8/10-bit, its
 picture-parameter record built by `vaapi::picture` from `filmcraft_vp9`'s own uncompressed-header
 parser, so libva's requirement that the application parse the frame headers is met by FilmCraft's
-own code rather than by a third-party one. AV1 is not, because `filmcraft_av1` does not expose its
-per-frame header; declining it is the same "never invent a record" rule the rest of this record
-applies.
+own code rather than by a third-party one. AV1 was not, because `filmcraft_av1` did not expose its
+per-frame header; declining it was the same "never invent a record" rule the rest of this record
+applies, and it stopped applying once the header *was* reachable (AV1 addendum below).
 
 One caveat about this record's own claims: the safe decline tables in `vaapi::stream` and
 `vaapi::picture` have nothing OS-specific in them and would compile anywhere, but the module is

@@ -70,7 +70,8 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
   It declines two-pass VBR, HDR, MXF, interlaced output, sizes outside NVENC's limits and systems
   without an NVIDIA GPU or driver, and the software encoder runs instead. A failure during an export
   ends it with an error, since a hardware stream cannot be finished in software.
-- **Linux: VA-API, H.264 (`avcC`) and HEVC (`hvcC`)**, 8-bit H.264 and 8- or 10-bit HEVC, 4:2:0
+- **Linux: VA-API, H.264 (`avcC`), HEVC (`hvcC`), VP9 (`vpcC`) and AV1 (`av1C`)**, 8-bit H.264, 8- or 10-bit
+  HEVC, VP9 profiles 0 / 2 and AV1 Main profile 0, at 4:2:0
   progressive (`vaapi/`). libva is `dlopen`ed at run time and never linked or shipped, so the build
   gains no dependency on it; its LGPL-2.1+ licence was approved against `AGENTS.md` §2 on 2026-10-08,
   see [ADR 0001](../../docs/adr/0001-platform-ffi.md), which also records that it must stay behind
@@ -206,6 +207,80 @@ random access points of types 16–21 (BLA, IDR, CRA).
 The sample entry's `hvcC` record is the one VideoToolbox wrote for the stream (read from the
 format description's sample description extension atoms, with the VPS / SPS / PPS), so profile,
 level and flags are the encoder's own. If it is missing the export stops with that reason.
+
+## Hardware H.264 and H.265 encoding (Linux, VA-API)
+
+`hardware_encode.rs` (safe code) holds `vaapi_config_for`, the export gate, and `vaapi_encoder_factory`,
+which `register()` puts in front of the software encoders on Linux the way it puts VideoToolbox's and NVENC's
+on the other two platforms. The records and the frame loop are `vaapi/encoder.rs` (H.264) and
+`vaapi/hevc_submit.rs` (HEVC); libva is still `dlopen`ed and never linked, so nothing about this changes
+[ADR 0001](../../docs/adr/0001-platform-ffi.md).
+
+**Verification here is materially weaker than decode's, and is described that way.** A hardware encoder and
+the software encoder are different algorithms, so bit-equality is unavailable at any level and "matches
+ffmpeg" would be meaningless. The gate is: the exported file **decodes with ffmpeg to the right pictures,
+compared against the *source*** within a lossy tolerance; the `avcC` / `hvcC` parses and describes the
+bitstream it is handed, and `sample_entry()` refuses before the first picture rather than handing out an empty
+config record; size and rate control land near what the settings asked for; and ffmpeg's stderr is empty.
+
+- **Opt-in per export**, for the same reason as the macOS and Windows arms, and with **no mid-stream
+  fallback**: an encoder that fails during an export stops it with an error, because a half-written stream
+  cannot be handed to another encoder.
+- **Rate control works, and the measurement is content-dependent.** Measured **0.94 against a 2000 kbit/s
+  target over 300 pictures**, bit-identical across runs; `89% ± 2%` at steady state across a 6× sweep. The
+  lesson is in the numbers that are *not* 0.94: a **luma ramp's ceiling on this driver is ~162 kbit/s** and
+  full texture's is **~6598 kbit/s**, so an 8000 kbit/s target against a ramp is unreachable by
+  construction — which is what made VBR look as if it ignored the target and CBR as if it faked one. Both
+  were the ramp.
+- **A key-frame interval above 16 works, by widening `frame_num`.** `log2_max_frame_num_minus4` is written as
+  **4**, so `MaxFrameNum` is **256** and a preset's 60-picture interval is carried by the counter on its own.
+  **8 of the 11 H.264 presets FilmCraft ships export through this backend.** MMCO is *not* the mechanism:
+  `VAEncSliceParameterBufferH264` carries no `dec_ref_pic_marking` field at all, and H.264 7.4.3 makes a
+  `frame_num` wrap conformant anyway. The gate still **refuses** an interval past the modulus — it names both
+  numbers rather than shortening the interval, because an export that asked for 300 and got 256 is a file a
+  sixth larger than it was promised.
+- **`H264Profile::Auto` is the default**, and `ExportSettings::resolved_h264_profile` resolves it to what the
+  backend will actually write — Main on the Linux hardware path, High everywhere else — so the export summary
+  prints the profile **in the file** rather than the one that was stored. This backend's derived SPS writes
+  `profile_idc = 77` and the derived PPS `entropy_coding_mode_flag = 0` whatever profile it is offered, so an
+  offered `VA_PROFILE_H264_HIGH` comes back as a byte-identical **Main** bitstream; a named `High` is still
+  honoured by declining and falling back, rather than by lying.
+- **Reference depth is one, and the measurement is on both codecs.** At depth 2 the render succeeds, the sync
+  succeeds, **ffmpeg stays silent**, and every picture from the third on is wrong — H.264's mean absolute
+  deviation 7.16 rising to 35.08, HEVC's 9.1, 9.1, 16.8, 26.6, 36.9, 37.1. This is the one failure in the
+  milestone that produces a valid-looking stream, which is why two agents were misled by it.
+- **No B pictures.** The driver reports it *could* — `VAConfigAttribEncMaxRefFrames` answers (3, 1) here — and
+  emits none: over a 40-picture run spanning two mid-stream IDRs and two `frame_num` wraps every coded NAL it
+  wrote was a type 1 or a type 5 and every slice header read back `slice_type` 5 or 7. `media_start()` is 0
+  for a measured reason.
+- **What it declines** (the built-in encoder is used, nothing fails; each carries its reason, logged at
+  `info`): the setting off; MXF (this backend's samples are length-prefixed, not Annex B); two-pass VBR and
+  a first pass; HDR; odd picture sizes; non-square pixels (the derived SPS carries no VUI aspect-ratio
+  signalling); interlaced output (`frame_mbs_only_flag = 1` cannot express a field sequence); a **fractional**
+  frame rate (the record carries whole pictures per second); a zero bitrate; a named Baseline or High profile
+  (the derived parameter sets state Main); and a key-frame interval past `MaxFrameNum`.
+- **HEVC** has its own frame loop and its own records because almost nothing about the two shapes is shared
+  (the reference identity is `(surface, pic_order_cnt)`, a slice is addressed in CTUs, and HEVC needs a VPS).
+  It is **proven**: one I frame then P frames that genuinely predict, decoded clean by ffmpeg at 320×240
+  (I 184 bytes, P 51/45/43/55/48, every picture within a mean 9.1/255 of the source ramp). **Export
+  reachability for it is in progress on this branch** — the gate takes the format, and nothing here claims
+  the export surface works or does not.
+- **VP9 encode is not available on this driver**, and that is measured rather than assumed: all four VP9
+  profiles are advertised and every one offers `VAEntrypointVLD` and nothing else, and
+  `vaGetConfigAttributes` on every (profile, `EncSlice` / `EncSliceLP`) pair returns
+  `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`. `va_enc_vp9.h` and `VAConfigAttribEncVP9` (58) **do** exist in the
+  headers, so this is the driver declining a codec libva can express — a statement about this machine, not
+  about VP9, libva, or FilmCraft's ability to decode VP9.
+- **AV1 encode records are declared and pinned** (six records, every size, offset and hole measured with a C
+  compiler, five holes named as `padding_*` fields) because the driver advertises `EncSlice` for
+  `VAProfileAV1Profile0`. **Nothing submits them.** Declaring a record is not the same claim as encoding with
+  it.
+
+Two libva facts this backend learned the hard way and that any new code here needs: **`vaQueryConfigAttributes`
+segfaults inside `iHD_drv_video.so`** on libva 1.24 — use `vaGetConfigAttributes`; and **an unsupported
+profile/entrypoint pair leaves the caller's attribute untouched rather than zeroing it**, so every read is
+gated on the returned status with the value poisoned beforehand (`0xDEADBEEF`), or "the driver never wrote
+this" and "the driver wrote zero" are indistinguishable.
 
 ## Guarantees
 
