@@ -824,23 +824,6 @@ pub fn build_nal(info: &NalStreamInfo, sample: &[u8], poc: &mut NalPoc, surface:
     }
 }
 
-/// The tail the **AV1** decline ends in. [`super::stream::plan_frame`] and [`build_frame`] both build
-/// their message from this, so a caller that hits either is told the same thing.
-///
-/// **This sentence was false and is now true, and the change is the point.** It used to read
-/// *"does not expose the uncompressed frame header"*, which was accurate while
-/// `filmcraft_av1::header::FrameHeader::parse` was `pub(crate)` over a `pub(crate)` `BitReader`. Both
-/// are `pub` now, with a `HeaderState::new` beside them, and the header **is** reachable — so the old
-/// wording would have been a confident claim of absence that nothing checks, in a file whose whole
-/// subject is that exact failure. What is missing is the *record* built from it.
-///
-/// **VP9 never used it, and that is the shape both codecs should reach.** Its uncompressed frame header
-/// was exposed first and [`Vp9State`] then reads it and builds the record with
-/// [`vp9_picture_record`]; what is missing at this level for a frame codec is the record, and the
-/// reference state behind it, which has its own message. The wording is kept as one constant rather
-/// than inlined so the two AV1 sites cannot drift.
-pub(crate) const AV1_RECORD_MISSING: &str = "exposes the uncompressed frame header, but no picture-parameter record is built from it yet";
-
 /// The reason this backend does not decode a VP9 frame of this profile at this depth, or `None` for
 /// the ones it does.
 ///
@@ -1576,14 +1559,12 @@ fn vp9_byte_field(what: &str, value: u32) -> Result<(), String> {
 /// agree about what this backend supports — a decline that names a reason the other side does not is a
 /// bug in one of them — and the tests below compare the two for every profile.
 ///
-/// **AV1 remains declined here, and now says something true.** Its uncompressed frame header *is*
-/// exposed — `filmcraft_av1::FrameHeader::parse` is reachable, with `BitReader` and a `HeaderState`
-/// beside it — so the old sentence ("does not expose the uncompressed frame header") is no longer
-/// accurate. What is missing is the record built from it: an invented `VADecPictureParameterBufferAV1`
-/// would be one a driver reads as a valid picture, which is the one failure this backend refuses to
-/// risk. A profile or depth [`av1_decline`] covers is declined as *that profile*, with the codec's
-/// own reason and before the sample is looked at, so a caller never sees "I have no record" for a
-/// stream that was never going to be described.
+/// **AV1's record is built too**, by [`super::av1::Av1State`] — which is the object that holds the
+/// state this function cannot be given, for the same reason VP9's is: a stream description is the
+/// stream, not the decode, and the eight reference surfaces are the pictures decoded before this one.
+/// A profile or depth [`av1_decline`] covers is declined as *that profile*, with the codec's own
+/// reason and before the sample is looked at, so a caller never sees "I have no record" for a stream
+/// that was never going to be described.
 ///
 /// **VP9's record *is* built**, by [`Vp9State`] — which is the object that holds the state this
 /// function cannot be given. What [`build_frame`] cannot do from a stream description alone is the
@@ -1601,13 +1582,19 @@ pub fn build_frame(info: &FrameStreamInfo, sample: &[u8]) -> Result<Picture, Str
 
 /// Why the AV1 arm of [`build_frame`] has no record to build, for the same reason and with the same
 /// sentence [`super::stream::plan_frame`] gives.
+///
+/// AV1's missing state is the same as VP9's and is named as it: `Av1State` reads the frame header
+/// **and** needs the reference surfaces of the pictures decoded before this one, and a stream
+/// description carries none. The profile table is asked first, so a 4:4:4 or 12-bit stream is told
+/// what is wrong with *it* rather than that this backend lacks a record.
 fn av1_frame_entry_error(info: &FrameStreamInfo) -> String {
-    // The profile table first, so a 4:4:4 or 12-bit stream is told what is wrong with *it* and not
-    // that this backend lacks a record — the VP9 arm's shape, and the reason the two agree.
     if let Some(why) = av1_decline(info.profile, info.bit_depth) {
         return why;
     }
-    format!("AV1 picture parameters: filmcraft-av1 {AV1_RECORD_MISSING}")
+    "AV1 picture parameters: a VADecPictureParameterBufferAV1 is built by `Av1State`, which reads the frame header \
+     with `filmcraft_av1` and also needs the reference surfaces of the pictures decoded before this one; a stream \
+     description alone carries none"
+        .into()
 }
 
 /// Why the VP9 arm of [`build_frame`] cannot build a record from a sample alone, which is the whole of
@@ -4872,20 +4859,18 @@ mod tests {
     /// `build_frame` is the backstop for a caller that skipped `plan_frame`, so its two arms have to say
     /// what is actually missing for each codec — and for VP9 that is **not** the frame header.
     ///
-    /// AV1's is, too, now: `filmcraft_av1`'s uncompressed frame header **is** exposed
-    /// (`FrameHeader::parse`, `BitReader` and `HeaderState::new` are all reachable), so what the arm
-    /// says is that no *record* is built from it yet. VP9's header *is* exposed and its record *is*
-    /// built by [`super::vp9_picture_record`]; what `build_frame` cannot do from a stream description
-    /// alone is name the eight reference surfaces, which is state the caller must have. The old test
-    /// asserted the shared constant for both codecs, which asserted something false about VP9, so it
-    /// is split here into what each arm actually claims.
+    /// AV1's is too, now that both records exist: `filmcraft-av1`'s uncompressed frame header **is**
+    /// exposed (`FrameHeader::parse`, `BitReader` and `HeaderState::new` are all reachable) and
+    /// `super::av1::Av1State` builds the record from it. What `build_frame` cannot do for either codec
+    /// is name the eight reference surfaces from a stream description alone — state the caller must
+    /// have — so the two arms now say the *same* missing thing rather than different ones.
     ///
-    /// **`build_frame` is still a refusal for a VP9 profile this backend decodes, and that is now a
-    /// statement about this function rather than about VP9.** `plan_frame` *plans* such a stream and
-    /// the decode loop decodes it, through [`Vp9State`]. What is still true is narrower and is what
-    /// the last arm asserts: from a stream description and a sample, with no run's state, there is
-    /// no reference set to name, so this function cannot build a record. It says so rather than
-    /// inventing one.
+    /// **`build_frame` is still a refusal for a profile this backend decodes, and that is a statement
+    /// about this function rather than about either codec.** `plan_frame` *plans* such a stream and the
+    /// decode loop decodes it, through [`Vp9State`] and `super::av1::Av1State`. What is still true is
+    /// narrower and is what the last arm asserts: from a stream description and a sample, with no run's
+    /// state, there is no reference set to name, so this function cannot build a record. It says so
+    /// rather than inventing one.
     #[test]
     fn the_frame_codec_declines_say_what_each_one_is_missing() {
         // A profile this backend takes, with a sample that is not a VP9 frame at all: refused as an
@@ -4895,19 +4880,21 @@ mod tests {
         assert!(e.contains("uncompressed frame header"), "{e}");
         // An empty sample is declined too, and never reaches a parser.
         assert!(super::build_frame(&info, &[]).is_err(), "an empty frame");
-        // And so is AV1, whose decline never parses anything: its frame header is exposed, so there is
-        // nothing about the *sample* it could say, and what it says is that no record is built from the
-        // header yet. Both samples, because the point is that the sample makes no difference to this arm.
+        // And so is AV1, whose arm never parses anything: it has no sample to say anything about, and
+        // what it says is that the reference surfaces are missing — the same missing thing as VP9's,
+        // now that both records exist. Both samples, because the point is that the sample makes no
+        // difference to this arm.
         let av1 = FrameStreamInfo::for_tests(FrameCodec::Av1, 0, 8, (1, 1), (1920, 1080));
         for sample in [&[][..], &[0xff, 0xff, 0xff]] {
             let e = super::build_frame(&av1, sample).expect_err("AV1");
-            assert!(e.contains("filmcraft-av1"), "AV1: {e}");
-            assert!(e.contains(super::AV1_RECORD_MISSING), "AV1: {e}");
-            assert!(!e.contains("does not expose"), "the uncompressed frame header IS exposed now: {e}");
+            assert!(e.contains("VADecPictureParameterBufferAV1"), "AV1: {e}");
+            assert!(e.contains("Av1State"), "AV1: the missing state is named, and it is the one that exists: {e}");
+            assert!(!e.contains("does not expose"), "the uncompressed frame header IS exposed: {e}");
         }
-        // `plan_frame` says the same thing for AV1, which is the invariant this module holds.
-        let planned = crate::vaapi::stream::plan_frame(&av1).expect_err("plan_frame declines AV1");
-        assert!(planned.contains("filmcraft-av1"), "AV1: {planned}");
+        // And `plan_frame` now *plans* an AV1 stream this backend decodes, as the profile its record
+        // carries — the two sites must not disagree about which AV1 that is.
+        let planned = crate::vaapi::stream::plan_frame(&av1).unwrap_or_else(|e| panic!("plan_frame plans a decodable AV1 profile: {e}"));
+        assert_eq!(planned.profile, crate::vaapi::ffi::Profile::Av1Main, "planned as the profile the record carries");
 
         // VP9: a profile the record builder would refuse is refused as *that profile*, with the
         // codec's reason, **before the sample is looked at**. A caller never sees "I could not describe
@@ -4930,7 +4917,6 @@ mod tests {
         // per-frame header is missing, which is the sentence they once shared.
         let planned = crate::vaapi::stream::plan_frame(&ok).unwrap_or_else(|e| panic!("plan_frame plans a decodable VP9 profile: {e}"));
         assert_eq!(planned.profile, crate::vaapi::ffi::Profile::Vp9(0), "planned as the profile the record carries");
-        assert!(!e.contains(super::AV1_RECORD_MISSING), "VP9's record IS built: {e}");
     }
 
     /// **The AV1 decline table is one table, and both sites that use it say the same sentence.**
@@ -4985,20 +4971,18 @@ mod tests {
                         let built = from_build.expect_err("the table declines this pair, so build_frame must too");
                         assert_eq!(built, table, "profile {profile} at {bits} bits: build_frame says `{built}`, the table says `{table}`");
                     }
-                    // A pair within scope: both sites refuse, and both refuse **for the same reason** — the
-                    // record. Their sentences differ in the prefix, and that is correct rather than a
-                    // split: `plan_frame` has resolved the profile and the format the stream *would*
-                    // have been planned as and names them, and `build_frame` is a backstop that never
-                    // resolved one. What must be identical is the reason, so that is what is compared.
-                    // This half also catches a table entry that was widened without the decode
-                    // following it: `Ok` here would mean a stream within scope that nothing decodes.
+                    // A pair within scope: `plan_frame` now **plans** it (the record exists), while `build_frame`
+                    // still refuses — because it has no run's state to name the reference slots from.
+                    // That difference is the point, and it is the same one VP9 has: what must be
+                    // identical is the *reason* the two give for a pair the table declines, and
+                    // `Ok` here (a stream within scope that nothing decodes) would be the real
+                    // failure, which the arms above already catch.
                     None => {
-                        let p = from_plan.expect_err("AV1 profile {profile} at {bits} bits is still not decodable");
-                        let b = from_build.expect_err("AV1 profile {profile} at {bits} bits is still not decodable");
-                        assert!(p.ends_with(super::AV1_RECORD_MISSING), "profile {profile} at {bits} bits: {p}");
-                        assert!(b.ends_with(super::AV1_RECORD_MISSING), "profile {profile} at {bits} bits: {b}");
-                        assert!(!p.contains("does not expose"), "the uncompressed frame header IS exposed now: {p}");
-                        assert!(!b.contains("does not expose"), "the uncompressed frame header IS exposed now: {b}");
+                        let p = from_plan.unwrap_or_else(|e| panic!("AV1 profile {profile} at {bits} bits is planned: {e}"));
+                        assert_eq!(p.profile, crate::vaapi::ffi::Profile::Av1Main, "planned as the profile its record carries");
+                        let b = from_build.expect_err("build_frame has no reference state to name the slots from");
+                        assert!(b.contains("reference surfaces"), "profile {profile} at {bits} bits: {b}");
+                        assert!(!b.contains("does not expose"), "the uncompressed frame header IS exposed: {b}");
                     }
                 }
             }

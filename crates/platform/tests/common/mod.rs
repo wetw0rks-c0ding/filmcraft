@@ -261,6 +261,197 @@ pub const FIXTURES: &[(&str, &[&str])] = &[
             "yuv420p",
         ],
     ),
+    // ---- AV1: Main (profile 0), 4:2:0, at 8 and 10 bits ----
+    //
+    // **These five are the fixtures that make the branch's AV1 claim testable**, and each one exists
+    // for a specific reason that the other four cannot serve. All are `libaom-av1` over the same
+    // `testsrc2` + noise source, 4 seconds at 24 fps with `-g 24`, which is what gives this suite its
+    // seek legs (four key frames) and its picture-count floor.
+    //
+    // `av1_p0_8bit.mp4` and `av1_p0_10bit.mp4` are the same encode at the two depths
+    // `vaapi::av1::av1_decline_reason` takes — profile 0 at 8 and 10 bits — so they are the depth
+    // comparison, and the 10-bit one is what turns "AV1 Main at 8- and 10-bit" from a claim into
+    // something a committed test checks. `-lag-in-frames 16` with `-auto-alt-ref 1` is what makes
+    // libaom hide a reference frame, which is the mode that reaches `refresh_frame_flags` and the slot
+    // map: **the AV1 decode record has no such field** (`va_dec_av1.h`, `grep -in refresh` → lines 421
+    // and 436, both comments), so that state is entirely ours and this is the fixture that exercises it.
+    //
+    // `av1_tiled.mp4` is the only AV1 fixture that reaches the **per-tile** slice record
+    // (`va_dec_av1.h:635`, "should be sent once per tile"), which VP9's one-per-frame record never
+    // did, and it is also the only one that carries **`show_existing_frame`** — measured with this
+    // repository's own parser, its samples 2, 5 and 8 are one-byte `OBU_FRAME_HEADER`s whose first
+    // bit is set, and its sample 1 holds **four** frames (three `OBU_FRAME` tile groups plus one
+    // more, with four different `refresh_frame_flags`). One fixture reaching the tiled, multi-frame
+    // and re-show arms at once is deliberate: they arrive together in a real stream, and a decoder
+    // that handled only single-tile single-frame streams would pass the other four.
+    //
+    // Its grid — **8 columns × 4 rows, none of them all the same size** — is the second half of why it
+    // exists. `width_in_sbs_minus_1` is indexed by tile *column* and `height_in_sbs_minus_1` by tile
+    // *row*, and the alternative reading (indexed by tile number) is what `va_dec_av1.h:392-397`'s
+    // "ones of the last tile are computed from ones of the other tiles" invites. On a grid of equal
+    // columns and rows the two produce identical arrays and the fixture tests nothing; on this one
+    // they produce different ones, and the oracle reads **48 of 48** against **0 of 48**. A fixture
+    // that cannot fail is not a fixture — see the note on the source size, and
+    // `av1::tests::the_tiled_fixture_is_the_one_that_can_tell`, which fails loudly if an ffmpeg or
+    // libaom upgrade makes the grid uniform again.
+    //
+    // `av1_intra_only.mp4` is `-usage allintra` and nothing else: every frame is a key frame, so
+    // `primary_ref_frame` is `PRIMARY_REF_NONE` on every one of them and 7.20's `setup_past_independence`
+    // runs each time — the inherited-deltas path, and the arm where a record that wrote `0` into
+    // `primary_ref_frame` instead of `7` would load the LAST frame's loop filter deltas and
+    // segmentation features. Its sequence header also has `enable_cdef` **off**, which is what makes it
+    // the measurement of the "CDEF off ⇒ `cdef_damping_minus_3 == 0`" claim rather than an assumption.
+    //
+    // `av1_loop_restoration.mp4` exists for exactly one field. libaom leaves loop restoration **off**
+    // by default at these settings, so the other four never set `frame_restoration_type` and could not
+    // tell the two AV1 numberings apart; `-enable-restoration 1 -cpu-used 4` produces frames whose
+    // restoration types are `[SGRPROJ, WIENER, NONE] = [2, 1, 0]`, `[0, 0, SGRPROJ]`,
+    // `[0, 0, WIENER]`, `[0, SGRPROJ, WIENER]` and `[WIENER, NONE, NONE]` — **every value the two
+    // numberings disagree about, all five of them.** The specification's `FrameRestorationType`
+    // (`NONE/WIENER/SGRPROJ/SWITCHABLE` = 0/1/2/3, `crates/av1/src/spec_tables.rs:274-277`) and the
+    // bitstream's own two-bit field (`NONE/SWITCHABLE/WIENER/SGRPROJ` = 0/1/2/3) agree only on
+    // `NONE`, and `va_dec_av1.h:606-618` documents neither. Submitting the wire numbering instead of
+    // the enum's decodes this fixture to **18 of 96**, and the 18 are exactly the frames whose
+    // restoration types are all `NONE`: the frames that cannot tell the two apart. Three of the other
+    // four fixtures have restoration off and would have passed under either reading, so without this
+    // one the suite could not have chosen — which is the whole reason it exists.
+    (
+        "av1_p0_8bit.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=640x360:r=24:d=4,noise=alls=12:allf=t",
+            "-c:v",
+            "libaom-av1",
+            "-crf",
+            "50",
+            "-b:v",
+            "0",
+            "-cpu-used",
+            "8",
+            "-g",
+            "24",
+            "-lag-in-frames",
+            "16",
+            "-auto-alt-ref",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    ),
+    (
+        "av1_p0_10bit.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=640x360:r=24:d=4,noise=alls=12:allf=t",
+            "-c:v",
+            "libaom-av1",
+            "-crf",
+            "50",
+            "-b:v",
+            "0",
+            "-cpu-used",
+            "8",
+            "-g",
+            "24",
+            "-lag-in-frames",
+            "16",
+            "-auto-alt-ref",
+            "1",
+            "-pix_fmt",
+            "yuv420p10le",
+        ],
+    ),
+    (
+        "av1_tiled.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            // **640x500 rather than 640x360, and that is the whole point of this fixture.** The tile
+            // options below are what produce a grid whose columns and rows are **not all the same
+            // size** — `mi_col_starts = [0, 32, 48, 64, 80, 96, 112, 128, 160]` over 8 columns and
+            // `mi_row_starts = [0, 32, 64, 96, 126]` over 4 — and a grid where every column is the
+            // same width cannot tell `width_in_sbs_minus_1` (indexed by tile column) from the same
+            // array indexed by tile number. On a 640x360 source both indexings decode 96 of 96 and
+            // the fixture silently stops testing the thing it exists to test. On this one they do
+            // not: 48 of 48 against 0 of 48. See `av1::tests::the_tiled_fixture_is_the_one_that_can_tell`.
+            "testsrc2=s=640x500:r=24:d=2,noise=alls=12:allf=t",
+            "-c:v",
+            "libaom-av1",
+            "-crf",
+            "50",
+            "-b:v",
+            "0",
+            "-cpu-used",
+            "8",
+            "-g",
+            "24",
+            "-lag-in-frames",
+            "16",
+            "-auto-alt-ref",
+            "1",
+            "-tile-columns",
+            "3",
+            "-tile-rows",
+            "2",
+            "-row-mt",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    ),
+    (
+        "av1_intra_only.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=640x360:r=24:d=4,noise=alls=12:allf=t",
+            "-c:v",
+            "libaom-av1",
+            "-crf",
+            "50",
+            "-b:v",
+            "0",
+            "-cpu-used",
+            "8",
+            "-usage",
+            "allintra",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    ),
+    (
+        "av1_loop_restoration.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=640x360:r=24:d=4,noise=alls=12:allf=t",
+            "-c:v",
+            "libaom-av1",
+            "-crf",
+            "50",
+            "-b:v",
+            "0",
+            "-cpu-used",
+            "4",
+            "-g",
+            "24",
+            "-lag-in-frames",
+            "16",
+            "-auto-alt-ref",
+            "1",
+            "-enable-restoration",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    ),
 ];
 
 pub fn dir() -> PathBuf {

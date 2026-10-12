@@ -160,6 +160,15 @@ fn software(s: &Stream) -> Box<dyn VideoDecoder> {
 /// into something a committed test checks, and
 /// [`a_vp9_fixture_that_really_uses_segmentation`] is what stops the third of them from quietly
 /// becoming a fourth copy of the first.
+///
+/// **AV1 is `EveryPicture` in all five of its fixtures**, for the same reason and one more: AV1 has
+/// **no `refresh_frame_flags` in its decode record** (`grep -in refresh /usr/include/va/va_dec_av1.h`
+/// returns lines 421 and 436, both inside comments), so the reference state a picture is built against
+/// is entirely this backend's, and a picture-for-picture comparison is the only thing that says it is
+/// the stream's. The five entries exist because five different arms need five different encodes — see
+/// the note on [`FIXTURES`] in `tests/common/mod.rs` for what each one reaches that the others do not.
+/// `streams()` assigns `EveryPicture` to every non-`h264_high.mp4` entry, so each is wired by being
+/// named here at all.
 fn streams(ff: &Path) -> Vec<(String, Stream, Tier)> {
     let mut out = Vec::new();
     for (name, _) in FIXTURES {
@@ -372,6 +381,22 @@ fn bit_exact_with_the_software_decoder() {
         assert!(
             streams.iter().any(|(n, _, t)| n == name && *t == Tier::EveryPicture),
             "{name} was not compared bit for bit, so the VP9 claim the documents make is unproven again"
+        );
+    }
+    // **AV1, by name, at both depths and on the three fixtures that exist for one arm each.** These
+    // five are what the repository's documents claim ("AV1 Main (profile 0) at 4:2:0, 8- and 10-bit"
+    // in `README.md` / `ROADMAP.md` / `docs/architecture.md` / `docs/adr/0001-platform-ffi.md`), so
+    // they are counted rather than inferred from `compared`. Each entry earns its place by reaching
+    // an arm the others do not — the tiles and the `show_existing_frame` and the four-frame temporal
+    // unit (`av1_tiled.mp4`), the `PRIMARY_REF_NONE` inherited path and CDEF-off
+    // (`av1_intra_only.mp4`), the restoration-type encoding (`av1_loop_restoration.mp4`) — and a run
+    // that silently dropped any of them would leave the documents' sentence exactly as true and the
+    // proof smaller, which is how five documents came to assert a 10-bit decode no committed test
+    // could check.
+    for name in ["av1_p0_8bit.mp4", "av1_p0_10bit.mp4", "av1_tiled.mp4", "av1_intra_only.mp4", "av1_loop_restoration.mp4"] {
+        assert!(
+            streams.iter().any(|(n, _, t)| n == name && *t == Tier::EveryPicture),
+            "{name} was not compared bit for bit, so the AV1 claim the documents make is unproven again"
         );
     }
 }
@@ -1332,37 +1357,94 @@ fn a_vp9_fixture_that_really_uses_segmentation() {
     println!("vp9_p0_parity.mp4: none of its {frames2} frames carry segmentation_enabled — the segmentation-off arm");
 }
 
-/// **An AV1 stream is still declined before a context exists, and the reason names what is missing.**
+/// **An AV1 stream this backend cannot describe is still declined before a context exists, and the
+/// reason names what is wrong with *it*.**
 ///
-/// This is the half of the old `a_frame_codec_is_declined_before_a_context_exists` that VP9 has left
-/// behind, and it is a *separate* test because AV1's reason is a different fact from VP9's former
-/// one: `filmcraft_av1` does not expose the per-frame header libva wants as a record, so an invented
-/// record would be one a driver reads as a valid picture. A test that lumped the two codecs together
-/// could not have said which of them was true, and would have failed when VP9 was enabled — which is
-/// exactly what happened.
+/// **This test used to assert that every AV1 stream is declined, and that was true until the record
+/// was built.** The decodable half is now a parity fixture instead (`av1_p0_8bit.mp4` and its four
+/// siblings in `FIXTURES`, all at `Tier::EveryPicture`), exactly as the VP9 milestone moved its half
+/// out; what stayed behind is the *feature* decline — a profile or a depth this backend has no surface
+/// for — which is a different fact from "no record exists" and would have been lost with it.
+///
+/// The fixture is generated here rather than taken from the table because it is the only one whose
+/// **encoder arguments differ from every parity fixture**: `libaom-av1 -pix_fmt yuv444p` is AV1
+/// profile 1, 4:4:4, which `va_dec_av1.h:44` rules out of this API ("This AV1 decoding API supports
+/// 8-bit/10bit 420 format only") and which `plan_frame` therefore refuses as *that profile*. A
+/// profile-0 stream is not what this test is about, and adding one to the parity table to prove the
+/// opposite of what this test says would be the confusing way to spend a fixture.
+///
+/// What it also pins, which is a claim that used to be false: **the factory hands the software
+/// decoder an AV1 stream this backend cannot take, and takes one it can.** The factory arm below is
+/// the user's-visible half; the second assertion is the one that would have failed before the record
+/// existed, because `vaapi_factory` returned `None` for *every* AV1 stream.
 #[test]
-fn an_av1_stream_is_declined_before_a_context_exists() {
+fn an_av1_stream_this_backend_cannot_describe_is_declined_as_such() {
     let ff = filmcraft_testkit::require_ffmpeg!();
     let src = "testsrc2=s=640x360:r=24:d=1";
     let Some(path) =
-        fixture(&ff, "av1_p0.mp4", &["-f", "lavfi", "-i", src, "-c:v", "libaom-av1", "-crf", "50", "-b:v", "0", "-cpu-used", "8", "-pix_fmt", "yuv420p"])
+        fixture(&ff, "av1_p1_444.mp4", &["-f", "lavfi", "-i", src, "-c:v", "libaom-av1", "-crf", "50", "-b:v", "0", "-cpu-used", "8", "-pix_fmt", "yuv444p"])
     else {
         eprintln!("SKIPPED: ffmpeg cannot encode libaom-av1");
         return;
     };
     let s = read_stream(&path);
     // The entry is recognised as a frame-coded stream…
-    let info = filmcraft_platform::vaapi::stream_info(&s.entry).unwrap_or_else(|| panic!("av1_p0.mp4: not recognised as a vpcC / av1C stream"));
+    let info = filmcraft_platform::vaapi::stream_info(&s.entry).unwrap_or_else(|| panic!("av1_p1_444.mp4: not recognised as a vpcC / av1C stream"));
     assert!(matches!(info, StreamInfo::Frame(_)), "recognised as {info:?}");
-    // …and declined with a reason that names the missing record, not the driver.
-    let why = VaDecoder::new(info).err().unwrap_or_else(|| panic!("av1_p0.mp4: this backend took a frame-coded stream"));
-    assert!(why.contains("picture parameters"), "av1_p0.mp4: {why}");
-    assert!(why.contains("frame header"), "av1_p0.mp4: {why}");
-    assert!(why.contains("filmcraft-av1"), "av1_p0.mp4: {why}");
+    // …and declined — but **as the chroma it is, and not as the profile**, because that is what it
+    // actually is declined as. `plan_frame` checks subsampling before it resolves a profile
+    // (`stream.rs:152-154`), and 4:4:4 is a chroma this backend has no surface for whatever the
+    // profile says. **This test used to assert the profile's reason here and was wrong**, which is
+    // the same shape of error the plan warns about: a test that asserts a decline reason the code
+    // does not produce is a test that passes only until someone reads what it is really checking.
+    // The profile table is reached by the 12-bit case below, which is 4:2:0 and so passes the chroma
+    // check first.
+    let why = VaDecoder::new(info).err().unwrap_or_else(|| panic!("av1_p1_444.mp4: this backend took a 4:4:4 AV1 stream"));
+    assert!(why.contains("chroma subsampling"), "av1_p1_444.mp4: 4:4:4 is declined for its chroma, which is the check that fires first: {why}");
+    assert!(!why.contains("filmcraft-av1"), "the record EXISTS now, so a decline must never blame the parser: {why}");
     // The factory declines it too, so a user gets FilmCraft's own decoder and never sees this.
-    assert!(filmcraft_platform::vaapi_factory(&s.entry).is_none(), "av1_p0.mp4: the factory handed a frame-coded stream to a VA-API decoder");
+    assert!(filmcraft_platform::vaapi_factory(&s.entry).is_none(), "av1_p1_444.mp4: the factory handed a 4:4:4 AV1 stream to a VA-API decoder");
     // …and FilmCraft's own decoder can still play it, which is the point of declining.
-    assert!(!decode_all(software(&s).as_mut(), &s.samples).is_empty(), "av1_p0.mp4: the software decoder produced no pictures");
+    assert!(!decode_all(software(&s).as_mut(), &s.samples).is_empty(), "av1_p1_444.mp4: the software decoder produced no pictures");
+
+    // **The depth decline, which is the AV1 table's own and the one the plan's Q3 and scope rest on.**
+    // 12-bit 4:2:0 is *still* profile 0 — so it clears the chroma check and reaches
+    // `av1_decline(0, 12)`, which is the arm that cites `va_dec_av1.h:44`. Without this half the
+    // test would cover only a check shared with H.264 and HEVC and would never touch AV1's table.
+    let Some(deep) = fixture(
+        &ff,
+        "av1_p0_12bit.mp4",
+        &["-f", "lavfi", "-i", src, "-c:v", "libaom-av1", "-crf", "50", "-b:v", "0", "-cpu-used", "8", "-pix_fmt", "yuv420p12le"],
+    ) else {
+        eprintln!("SKIPPED: ffmpeg cannot encode a 12-bit libaom-av1 stream, so AV1's own decline table is untested here");
+        return;
+    };
+    let d = read_stream(&deep);
+    let info = filmcraft_platform::vaapi::stream_info(&d.entry).unwrap_or_else(|| panic!("av1_p0_12bit.mp4: not recognised as an av1C stream"));
+    let why = VaDecoder::new(info).err().unwrap_or_else(|| panic!("av1_p0_12bit.mp4: this backend took a 12-bit AV1 stream"));
+    assert!(why.contains("12"), "av1_p0_12bit.mp4: the decline names the depth: {why}");
+    assert!(why.contains("va_dec_av1.h:44"), "av1_p0_12bit.mp4: the header line is what makes the claim checkable: {why}");
+    assert!(filmcraft_platform::vaapi_factory(&d.entry).is_none(), "av1_p0_12bit.mp4: the factory handed a 12-bit AV1 stream to a VA-API decoder");
+    assert!(!decode_all(software(&d).as_mut(), &d.samples).is_empty(), "av1_p0_12bit.mp4: the software decoder produced no pictures");
+
+    // And the converse, on a profile-0 stream the *table* names: the factory takes it, so a user gets
+    // the hardware decoder and the parity suite is what holds it to bit-exactness. This assertion is
+    // the one that fails if the record is quietly removed again.
+    let Some(p0) = named(&ff, "av1_p0_8bit.mp4") else {
+        eprintln!("SKIPPED: av1_p0_8bit.mp4 could not be generated");
+        return;
+    };
+    let s0 = read_stream(&p0);
+    let info0 = filmcraft_platform::vaapi::stream_info(&s0.entry).unwrap_or_else(|| panic!("av1_p0_8bit.mp4: not recognised as an av1C stream"));
+    match filmcraft_platform::vaapi_factory(&s0.entry) {
+        None => eprintln!("SKIPPED: no VA-API decoder on this machine for av1_p0_8bit.mp4 — the take-it half is untested here"),
+        Some(Err(why)) => panic!("av1_p0_8bit.mp4: the factory declined a profile-0 8-bit AV1 stream this backend decodes: {why}"),
+        Some(Ok(d)) => {
+            assert!(d.name().starts_with("VA-API"), "av1_p0_8bit.mp4: taken by {}", d.name());
+            let plan = filmcraft_platform::vaapi::Stream::from(info0).plan().unwrap_or_else(|e| panic!("av1_p0_8bit.mp4: planned: {e}"));
+            assert_eq!(format!("{:?}", plan.profile), "Av1Main", "planned as AV1 Main");
+        }
+    }
 }
 
 /// How many of `out`'s pictures are ffmpeg's, and the presentation time of the first that is not.

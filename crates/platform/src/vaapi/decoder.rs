@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use filmcraft_codecs::hw::{FrameCodec, NalCodec, StreamInfo};
 use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
 
+use super::av1::{Av1State, av1_entry_disagreement, av1_surface_pool};
 use super::ffi::{self, Display, Session};
 use super::picture::{NalPoc, Picture, Vp9State, surface_pool, vp9_entry_disagreement, vp9_surface_pool};
-use super::stream::{Stream, plan_frame, supports};
+use super::stream::{Stream, supports};
 use super::{Ring, validate_image};
 use crate::biplanar::{self, Geometry};
 use ffi::{IQ_MATRIX_BUFFER, PICTURE_PARAMETER_BUFFER, SLICE_DATA_BUFFER, SLICE_PARAMETER_BUFFER};
@@ -67,6 +68,12 @@ pub struct VaDecoder {
     /// state, which is the right one for a stream that is not VP9 and for the first frame of one that
     /// is. See [`Vp9State`] for why this is a per-decode object and not a per-picture one.
     vp9: Vp9State,
+    /// The AV1 decode's reference state: the 7.20 slots its records name, and the parse state every
+    /// frame's header is read against. `refresh_frame_flags` has **no member in the AV1 decode
+    /// record** (`grep -in refresh /usr/include/va/va_dec_av1.h` returns only lines 421 and 436, both
+    /// inside comments), so unlike VP9 the record cannot say which slots this picture becomes: the
+    /// application owns that entirely, and `Av1State` is where it lives.
+    av1: Av1State,
     /// The significant bits per sample this session's surfaces hold (8 or 10), which is what a VP9
     /// frame's own `color_config` is checked against: the surfaces were created in one format, and a
     /// frame declaring another is a stream this session was not set up for — the same shape as
@@ -135,17 +142,9 @@ impl VaDecoder {
             // and `Vp9State` holds a picture in a slot only while `refresh_frame_flags` says so.
             Stream::Frame(info) => match info.codec {
                 FrameCodec::Vp9 => vp9_surface_pool(),
-                // AV1 is declined by `plan` above, so this arm is unreachable today; it is written
-                // rather than unreachable so that adding a frame codec is not a compile error. An `Ok`
-                // here would mean a frame codec had been planned without the records to decode it, and
-                // that is refused too rather than turned into an allocation for a stream this backend
-                // cannot submit.
-                FrameCodec::Av1 => {
-                    let Err(why) = plan_frame(info) else {
-                        return Err("a frame-coded stream was planned without the picture-parameter records this backend cannot build".into());
-                    };
-                    return Err(why);
-                }
+                // AV1's own bound, from its own record: `ref_frame_map[8]` is all eight slots and
+                // `Av1State` holds a surface in a slot only while 7.20's `refresh_frame_flags` says so.
+                FrameCodec::Av1 => av1_surface_pool(),
             },
         };
         let session = Session::new(&display, plan.profile, plan.entrypoint, plan.format, plan.size, count)?;
@@ -169,6 +168,13 @@ impl VaDecoder {
         Ok(Self {
             info: stream.info(),
             geometry,
+            // Seeded from the sample entry's `av1C`, which is where the sequence header lives before
+            // the first frame: a container sample carries one only at the start of a run, and
+            // `Av1State` needs a sequence header to parse a frame header against. **Infallible**, so a
+            // non-AV1 stream — which has no configuration OBUs and never consults this — is not made
+            // unconstructible by it; a stream whose `av1C` carried no sequence header is refused at
+            // its first frame instead, with the missing thing named.
+            av1: Av1State::new(frame_config_obus(&stream)),
             stream,
             session,
             ring,
@@ -296,8 +302,23 @@ impl VaDecoder {
     }
 }
 
-/// `RTFormat` as the significant bits per sample its pictures hold: 8 for NV12, 10 for P010.
+/// The `av1C` configuration OBUs of a frame-coded stream, or `None` for one that has none.
 ///
+/// **Only AV1 needs them.** `Av1State` parses a frame header against a sequence header, and a
+/// container sample carries one only at the start of a run — `Stream::input` prepends `config_obus`
+/// for exactly that reason, which is why the decode loop calls it once per run and then discards
+/// the bytes. The state therefore has to be primed from the sample entry itself. A VP9 stream has no
+/// configuration OBUs and `Av1State` is never consulted for it, so `None` is the right answer rather
+/// than an error.
+fn frame_config_obus(stream: &Stream) -> &[u8] {
+    match stream {
+        Stream::Nal(_) => &[],
+        Stream::Frame(info) if info.codec == FrameCodec::Av1 => &info.config_obus,
+        Stream::Frame(_) => &[],
+    }
+}
+
+/// `RTFormat` as the significant bits per sample its pictures hold: 8 for NV12, 10 for P010.
 /// Only `plan_nal`'s two formats can reach here, and `RtFormat::Other` is refused in `Session::new`
 /// before that. The third arm is an `Err` rather than a silent 8-bit depth: a default there would
 /// hand a decoder a picture geometry that does not match the surface it was created at, which is a
@@ -335,6 +356,10 @@ impl VideoDecoder for VaDecoder {
             // empty so that a reference resolves to nothing rather than to the previous run's
             // picture. `Vp9State::reset` forgets both halves together, which is what a seek needs.
             self.vp9.reset();
+            // AV1's is the same argument for the same state: 7.20's slots *and* its propagated loop
+            // filter deltas, segmentation features and global motion all belong to the run that
+            // produced them, so a seek takes both halves together.
+            self.av1.reset();
         }
         // HEVC RASL pictures after a CRA / BLA at the start of a run refer to pictures that were
         // never decoded, so they are left out — as the software decoder does, and so the pictures
@@ -444,6 +469,7 @@ impl VideoDecoder for VaDecoder {
         // are gone with it. Keeping them would make the next run's first frame resolve a reference
         // into a surface the driver has already been asked to overwrite.
         self.vp9.reset();
+        self.av1.reset();
         self.first = true;
         self.skip_rasl = false;
         self.need_headers = true;
@@ -461,6 +487,7 @@ impl VideoDecoder for VaDecoder {
         // because the first frame of the new run must be read as the first frame of a run — an
         // inherited `color_config` would describe the previous run's depth.
         self.vp9.reset();
+        self.av1.reset();
         self.in_flight.clear();
         self.skip_rasl = false;
         self.need_headers = true;
@@ -621,26 +648,92 @@ impl VaDecoder {
     /// inherit from a state this one has already advanced, which is exactly the hazard above, and a
     /// superframe is not a restart point (VP9 6.2's restart points are key frames, which begin a
     /// sample of their own).
+    /// One frame-coded sample, dispatched to the codec that owns it.
+    ///
+    /// **Which stream shape this is decides everything below it**, because the two are not the same
+    /// pipeline: a NAL codec builds a picture *then* takes a surface for it, while a VP9 or AV1 frame
+    /// is read first and only then turns out to need a surface at all (a frame that re-shows an
+    /// earlier picture needs none). So the dispatch is here rather than inside either arm.
     fn picture_frame(&mut self, sample: &[u8]) -> std::result::Result<Decoded, String> {
-        let info = match &self.stream {
-            Stream::Frame(info) => info,
+        // The codec and the two numbers the cross-check reads, taken **by value** before the mutable
+        // borrow: `info` would borrow `self.stream` immutably across a call that needs `&mut self`.
+        let (codec, profile, bit_depth) = match &self.stream {
+            Stream::Frame(info) => (info.codec, info.profile, info.bit_depth),
             // Unreachable: `picture` dispatches here only for a frame-coded stream.
             Stream::Nal(_) => return Err("a NAL-coded stream reached the frame-coded decode path".into()),
         };
-        if info.codec != FrameCodec::Vp9 {
-            // Declined while it was still a description, so a caller that skipped planning is told
-            // exactly what `plan_frame` says rather than a reason invented here. An `Ok` would mean a
-            // frame codec got past `new`, which the ring sizing there already refused.
-            return match plan_frame(info) {
-                Err(why) => Err(why),
-                Ok(_) => Err("a frame-coded stream reached the decode loop without picture-parameter records".into()),
-            };
+        match codec {
+            FrameCodec::Vp9 => self.picture_vp9_sample(profile, bit_depth, sample),
+            FrameCodec::Av1 => self.picture_av1_sample(profile, bit_depth, sample),
         }
+    }
+
+    /// One VP9 **sample**, which is not necessarily one frame: a container sample can be a
+    /// *superframe* — several frames concatenated, described by a trailing superframe index (VP9
+    /// Annex B), and the usual shape is a hidden alt-ref frame followed by the shown frame.
+    ///
+    /// **So this splits the sample first, and every frame in it is decoded as a frame of its own.**
+    /// Handing the whole sample to `Vp9State::frame` would parse only the *first* frame's header,
+    /// submit the whole sample as that one frame's data, and — the part that does real damage —
+    /// count the *whole sample* as that frame's `slice_data_size`, which the header says is "the byte
+    /// count of current frame in the bitstream buffer … but actually means `frame_data_size`"
+    /// (`va_dec_vp9.h:280-284`). So on a two-frame superframe whose first frame is 2 673 bytes and
+    /// whose sample is 12 943, the driver would be told the first frame's data runs to the end of the
+    /// *second* one. This is the `33`-instead-of-`32` class of error, and it is why the split is not
+    /// an optimisation but the only way the length means anything.
+    ///
+    /// ## What each frame does to the reference buffer, and to the caller's pictures
+    ///
+    /// Frames are decoded **in order, one at a time, each committed before the next is read**, which
+    /// is the whole of the relationship: an alt-ref frame inside the superframe refreshes the slots
+    /// the shown frame predicts from, so reading the shown frame before committing the alt-ref one
+    /// would resolve its references against a buffer that does not hold them yet. **AV1's
+    /// [`picture_av1_sample`] is the same shape for the same reason**, and there it is not only the
+    /// record that reads the slots but the *next frame's header parse*.
+    ///
+    /// The pictures the caller gets are **the shown frames, and only those.** A frame with `show_frame`
+    /// clear is decoded (it may refresh references) and produces no picture, which is the same
+    /// [`Decoded::frames`] rule a single-frame hidden picture follows, and which is what FilmCraft's own
+    /// software VP9 decoder does (`crates/vp9/src/decoder.rs:413`, `:417`). So a superframe of
+    /// [hidden alt-ref, shown] hands back exactly the one picture the stream shows, and `decode` gives
+    /// it the sample's timestamp: one container sample, one timestamp, however many frames it holds.
+    ///
+    /// **More than one shown frame in one superframe hands back all of them**, under that one
+    /// timestamp. The format allows it, our software decoder emits every one
+    /// (`crates/vp9/src/decoder.rs:248-255`), and the fixture in `tests/vaapi.rs` really does produce
+    /// it, so returning only the last was a divergence between the two paths for the same bitstream
+    /// and nothing caught it while the hardware path decoded nothing at all. A caller cannot tell two
+    /// pictures under one timestamp apart *by time* — and that is a property of the container, not a
+    /// reason to withhold one of them: they are both in the returned `Vec`, in decode order, and the
+    /// software decoder's picture for that timestamp is in the same shape.
+    ///
+    /// ## The order inside a frame is the reverse of [`Self::picture_nal`], and it has to be
+    ///
+    /// The NAL path takes a surface from the ring *before* it knows what the picture is, because
+    /// `build_nal` adds the picture to the buffer and the surface must not be one of the buffer's own.
+    /// A VP9 frame inverts that: whether it needs a surface at all is a property of the frame
+    /// (`show_existing_frame`, which 6.2 resolves before the frame has a size), so [`Vp9State::frame`]
+    /// runs first and the ring is only asked if the frame turns out to code a picture. Taking a
+    /// surface first and then finding the frame is a re-show would leave a surface marked in use for a
+    /// frame that decoded nothing.
+    ///
+    /// ## Every refusal here is an `Err`, and that is load-bearing
+    ///
+    /// `frame()` may have advanced the parse state before it refused (see its own documentation), so
+    /// turning one of its errors into a *skip* would let the next frame inherit a refused frame's
+    /// `color_config` — a valid record of the wrong depth, which a driver decodes into a plausible
+    /// wrong picture. Propagating instead reaches `VideoDecoder::decode`, which latches `refused` and
+    /// ends the run: the caller falls back to the software decoder from a known point rather than
+    /// carrying on in hardware from an unknown one. **That is why a refused frame inside a superframe
+    /// refuses the whole sample** rather than skipping to the next frame in it: the frames after it
+    /// inherit from a state this one has already advanced, which is exactly the hazard above, and a
+    /// superframe is not a restart point (VP9 6.2's restart points are key frames, which begin a
+    /// sample of their own).
+    fn picture_vp9_sample(&mut self, profile: u8, bit_depth: u32, sample: &[u8]) -> std::result::Result<Decoded, String> {
         // The superframe index is parsed by the codec's own parser, the only implementation of it in
         // the workspace. A sample with no index is returned unchanged, so an ordinary single-frame
         // sample is the one-iteration case below with `sample` as its only frame.
         let frames = filmcraft_vp9::header::split_superframe(sample);
-        let (profile, bit_depth) = (info.profile, info.bit_depth);
         // Timings accumulate across every frame in the sample, so the cost of a superframe's hidden
         // alt-ref frame is reported rather than discarded — it is a real decode the user paid for.
         let mut total = Decoded { decode: Duration::ZERO, readback: Duration::ZERO, convert: Duration::ZERO, frames: Vec::new() };
@@ -661,6 +754,143 @@ impl VaDecoder {
             total.frames.extend(decoded.frames);
         }
         Ok(total)
+    }
+
+    /// One AV1 **sample**, which is not necessarily one frame.
+    ///
+    /// **This is measured, not assumed, and it is the same shape VP9's superframe is.** An MP4 AV1
+    /// sample is one *temporal unit*, and a temporal unit may hold **several frame units**. Measured on
+    /// `av1_tiled.mp4` with this repository's own parser: sample 1 of that fixture is 3 408 bytes of
+    /// **four** `OBU_FRAME`s, each with its own `refresh_frame_flags` (`0x02`, `0x04`, `0x08`,
+    /// `0x10`), its own `primary_ref_frame` and its own eight tiles — four frames, not one. A decoder
+    /// that treated the sample as a single frame would decode one picture of four and hand back one
+    /// timestamp for the lot.
+    ///
+    /// ## Why they are decoded one at a time, and each committed before the next is read
+    ///
+    /// 7.20 refreshes reference slots **between** frames, and in AV1 the next frame's *header parse*
+    /// reads them: `frame_size_with_refs` asks a named slot for its size, `skip_mode_params` and
+    /// `OrderHints` ask for its order hint, and `load_previous` reads the primary reference's loop
+    /// filter deltas, segmentation features and global motion out of it. FilmCraft's own software
+    /// decoder therefore parses frame *n*+1 only after it has updated 7.20 for frame *n*
+    /// (`crates/av1/src/decoder.rs:586-607`), and the hardware path has to do the same or the two
+    /// paths of one bitstream disagree about what the second frame inherits. So this loop is
+    /// `Av1State::frame_at` → decode → `commit`, repeated — the same shape as
+    /// [`Self::picture_vp9_sample`], one level down.
+    ///
+    /// ## `show_existing_frame` is decoded, not declined
+    ///
+    /// A temporal unit that re-shows an earlier picture carries no frame of its own: the parse returns
+    /// from `header.rs:539` with almost nothing set, and there are no tiles to submit. 7.21's answer is
+    /// that the decoder outputs the picture the named slot holds and decodes nothing, which is what
+    /// FilmCraft's own software decoder does (`crates/av1/src/decoder.rs:481-505`) — so this is
+    /// handed back as a picture with no submission and no surface taken from the ring. Declining it
+    /// would put a hole where the stream *requires* a picture, and the blank timeline that follows is
+    /// the outcome this backend exists to prevent. **The tiled fixture really contains these**
+    /// (samples 2, 5 and 8 are one-byte `OBU_FRAME_HEADER`s whose first bit is set), so this is
+    /// measured rather than argued.
+    ///
+    /// ## What is handed back, and why every shown frame
+    ///
+    /// The shown frames, and only those: a frame with `show_frame` clear is decoded — it may refresh
+    /// references 7.20 needs — and produces no picture, which is the same [`Decoded::frames`] rule a
+    /// single-frame hidden picture follows and what the software decoder does
+    /// (`crates/av1/src/decoder.rs:521`, `:608`). **More than one shown frame in one sample hands back
+    /// all of them under the sample's one timestamp**, for the same reason VP9's superframe does: our
+    /// software decoder emits every shown frame (`crates/av1/src/decoder.rs:521`), and a backend that
+    /// returned one would make the hardware and software paths of the same bitstream disagree about how
+    /// many pictures it has.
+    ///
+    /// ## Every refusal here is an `Err`, not a skip
+    ///
+    /// `Av1State::frame_at` may have advanced the parse state before it refused — see its own
+    /// documentation, and the note on `Av1State::frame_at` about why that is not rolled back — so
+    /// skipping would let the next frame inherit a refused frame's propagated deltas. Every refusal
+    /// propagates to `VideoDecoder::decode`, which latches `refused` until `reset()`: the caller falls
+    /// back to software from a known point rather than carrying on in hardware from an unknown one.
+    fn picture_av1_sample(&mut self, profile: u8, bit_depth: u32, sample: &[u8]) -> std::result::Result<Decoded, String> {
+        let mut total = Decoded { decode: Duration::ZERO, readback: Duration::ZERO, convert: Duration::ZERO, frames: Vec::new() };
+        let mut at = 0usize;
+        while let Some(frame) = self.av1.frame_at(sample, at)? {
+            at = frame.next();
+            let decoded = self.picture_av1_frame(profile, bit_depth, &frame, sample)?;
+            total.decode += decoded.decode;
+            total.readback += decoded.readback;
+            total.convert += decoded.convert;
+            total.frames.extend(decoded.frames);
+        }
+        Ok(total)
+    }
+
+    /// One AV1 frame read by [`Av1State::frame_at`]: submit its picture-parameter record and its
+    /// **per-tile** slice-parameter records beside the frame's own bytes, or — for a frame that
+    /// re-shows an earlier picture — copy that picture out again with nothing submitted.
+    ///
+    /// `sample` is the temporal unit the frame was read from, and it is what the slice data buffer
+    /// is: the per-tile records address byte ranges *inside* it (`va_dec_av1.h:649-658`, "starting
+    /// from first byte of the buffer"), so the buffer and the offsets have to be the same bytes.
+    fn picture_av1_frame(&mut self, profile: u8, bit_depth: u32, frame: &super::av1::Av1Frame, sample: &[u8]) -> std::result::Result<Decoded, String> {
+        // The container's description and the stream's sequence header have to agree, and `Av1State`
+        // holds no container: the surfaces were created for the profile and depth the sample entry
+        // said, so a record carrying another would be a picture of one format decoded into a surface of
+        // another. One function, shared with `picture::build_frame`'s backstop, so the two sites cannot
+        // disagree about it.
+        if let Some(seq) = self.av1.sequence_header()
+            && let Some(why) = av1_entry_disagreement(profile, bit_depth, seq)
+        {
+            return Err(why);
+        }
+        if let Some((slot, surface)) = frame.re_show() {
+            // 7.21: the decoder outputs the picture that slot holds and decodes nothing. No submission,
+            // no sync, no reference slot moved, and no surface taken from the ring.
+            return self.re_show(slot, surface);
+        }
+        // The frame's own size, against the surfaces this session was created at and the rectangle the
+        // readback copies. Read *after* `frame_at`, because that is where the header is.
+        self.check_av1_shape(frame)?;
+        let live = self.av1.live_surfaces();
+        let surface = self
+            .ring
+            .take_unreferenced(&live)
+            .ok_or_else(|| format!("every one of the {} surfaces is still a reference; the stream needs more", self.ring.len()))?;
+        let record = self.av1.picture_record(frame, surface)?;
+
+        let decode0 = Instant::now();
+        // The buffers an AV1 decode submits, in order: the picture-parameter record, **one
+        // slice-parameter record per tile**, then the frame's own bytes.
+        //
+        // The slice records are per tile because libva says so — `va_dec_av1.h:635`, "should be sent
+        // once per tile" — and the slice data buffer is the whole temporal unit the frame came in, so
+        // that each record's `slice_data_offset`/`slice_data_size` address the tile it names *inside
+        // that buffer* (`va_dec_av1.h:649-658`). The handles live to the end of this function, so
+        // `vaDestroyBuffer` runs on every path out of it.
+        let mut buffers = Vec::with_capacity(frame.slices().len() + 2);
+        for (kind, data) in Self::av1_submission(&record, frame.slices(), sample) {
+            buffers.push(self.session.buffer(kind, data)?);
+        }
+        let ids: Vec<u32> = buffers.iter().map(|b| b.id()).collect();
+        self.session.render(surface, &ids)?;
+        self.session.sync(surface)?;
+        let decode = decode0.elapsed();
+
+        let readback0 = Instant::now();
+        if !self.session.surface_ready(surface)? {
+            return Err(format!("surface {surface} is still being rendered into after vaSyncSurface"));
+        }
+        // Only a shown frame is read back: `show_frame` clear is a frame the stream decodes and no
+        // player shows, and it still refreshes the reference slots below.
+        let (frame_out, convert) = match frame.show() {
+            true => {
+                let (convert, f) = self.readback(surface)?;
+                (vec![f], convert)
+            }
+            false => (Vec::new(), Duration::ZERO),
+        };
+        // The reference buffer moves **after** the driver rendered the picture, never before: a record
+        // describes the buffer as it was before its own frame, and a decode that failed must not have
+        // moved it.
+        self.av1.commit(frame, surface)?;
+        Ok(Decoded { decode, readback: readback0.elapsed().saturating_sub(convert), convert, frames: frame_out })
     }
 
     /// One frame of a VP9 sample: read it into this decoder's [`Vp9State`], and then either submit its
@@ -798,6 +1028,80 @@ impl VaDecoder {
         }
         let (convert, frame) = self.readback(surface)?;
         Ok(Decoded { decode: Duration::ZERO, readback: readback0.elapsed().saturating_sub(convert), convert, frames: vec![frame] })
+    }
+
+    /// An AV1 frame's own size, against the surfaces this session was created at and the rectangle the
+    /// readback copies.
+    ///
+    /// **Why both, and what AV1 adds to the VP9 version.** `frame_width_minus1` in the record is the
+    /// picture's **upscaled** resolution (`va_dec_av1.h:332-336`), and a driver renders into a
+    /// surface created at `Plan.size` — so a frame wider or taller than that surface is a record
+    /// asking for a write past the end of it, and surfaces cannot be resized under a live context.
+    /// SuperRes widens the *coded* frame past `FrameWidth` without changing `FrameHeight`, so the check
+    /// is against `upscaled_width` and `frame_height`, which is exactly what the record carries.
+    ///
+    /// The readback copies the rectangle `self.geometry.crop` names, so the frame's **render** size
+    /// has to be that rectangle too: AV1's `render_width` / `render_height` (5.9.20) may be smaller
+    /// than the coded picture, and reading a smaller frame out at the coded rectangle gives a picture
+    /// padded with whatever the surface held. Unlike VP9 — whose geometry is updated from each key
+    /// frame, because only a key frame spells its size — **AV1 spells its render size in every frame
+    /// header**, so the geometry follows the bitstream frame by frame rather than at restart points.
+    ///
+    /// A key frame that changes either is caught earlier and more cheaply by the hybrid decoder
+    /// (`FrameStreamInfo::parameters_changed`, which compares an in-band sequence header against the
+    /// sample entry's). This is the check for the frames *between* those.
+    fn check_av1_shape(&mut self, frame: &super::av1::Av1Frame) -> std::result::Result<(), String> {
+        let Some(header) = frame.header() else { return Ok(()) };
+        let size = (header.upscaled_width, header.frame_height);
+        let (surface_w, surface_h) = self.session.size();
+        if size.0 > surface_w || size.1 > surface_h {
+            return Err(format!("a {}x{} AV1 frame does not fit the {surface_w}x{surface_h} surfaces this session was created at", size.0, size.1));
+        }
+        // A frame that renders at a different size than the picture is read back at. Taken from the
+        // frame's own header rather than from `self.geometry`, because the geometry is only updated
+        // from the stream's declared picture — which for AV1 is `max_frame_width` x
+        // `max_frame_height` and says nothing about `render_width`.
+        let render = (header.render_width, header.render_height);
+        if render != size {
+            self.geometry.crop = (0, 0, render.0, render.1);
+        }
+        let depth = u32::from(self.av1.sequence_header().map_or(0, |s| s.color.bit_depth));
+        if depth != 0 && depth != self.bits {
+            return Err(format!("an AV1 frame at {depth} bits, where this session's surfaces hold {}", self.bits));
+        }
+        Ok(())
+    }
+
+    /// The buffers an AV1 decode submits: its picture-parameter record, **one slice-parameter record
+    /// per tile**, and the temporal unit those records address.
+    ///
+    /// Split out for the same reason [`Self::submission`] is: the list is a value a test can read
+    /// rather than a sequence of calls only a driver can observe.
+    ///
+    /// **What is absent from the list is a claim worth stating.** AV1 has no IQ matrix buffer — the
+    /// quantizer is in the picture record (`base_qindex` and the four `delta_q`s, `va_dec_av1.h:497-523`)
+    /// and the segmentation parameters in `seg_info` — so nothing here stands in for one, and a driver
+    /// that read a buffer it was not given would read another kind's bytes as AV1's.
+    ///
+    /// ## The slice data buffer is the temporal unit, and that is a decision
+    ///
+    /// `va_dec_av1.h:634-645` says the host is "responsible to parse out the per tile information" and
+    /// the bitstream "is sent to driver in per tile granularity", while `slice_data_size` is "The byte
+    /// count of current tile in the bitstream buffer, starting from first byte of the buffer" and
+    /// `slice_data_offset` "offset to the first byte of the data buffer" (`va_dec_av1.h:649-658`). So
+    /// the buffer holds more than one thing and the per-tile records address into it: the whole
+    /// temporal unit is the buffer, and each record names the tile's own bytes inside it. Submitting
+    /// the temporal unit rather than a concatenation of bare tile payloads keeps every OBU header
+    /// intact, which is what a driver parsing the low-overhead stream needs, and the per-tile records
+    /// still address exactly the same tiles either way.
+    fn av1_submission<'p>(record: &'p [u8], slices: &'p [Vec<u8>], data: &'p [u8]) -> Vec<(i32, &'p [u8])> {
+        let mut out = Vec::with_capacity(slices.len() + 2);
+        out.push((PICTURE_PARAMETER_BUFFER, record));
+        for slice in slices {
+            out.push((SLICE_PARAMETER_BUFFER, slice.as_slice()));
+        }
+        out.push((SLICE_DATA_BUFFER, data));
+        out
     }
 
     /// A VP9 frame's own size and depth, against the surfaces this session was created at and the
@@ -1050,15 +1354,16 @@ mod tests {
     /// marking functions trim to it, and a VP9 frame moves only the slots its `refresh_frame_flags`
     /// names), so a pool one larger than that always has one free surface.
     ///
-    /// **All three codecs this backend decodes are in the table.** Leaving VP9 out would leave the
-    /// invariant untested for exactly the codec whose slot count is fixed by its record
-    /// (`reference_frames[8]`), which is the one where a wrong number is a plausible-looking wrong
-    /// picture rather than an allocation failure.
+    /// **All four codecs this backend decodes are in the table.** Leaving VP9 or AV1 out would leave
+    /// the invariant untested for exactly the two codecs whose slot count is fixed by their record
+    /// (`reference_frames[8]` and `ref_frame_map[8]`), which are the two where a wrong number is a
+    /// plausible-looking wrong picture rather than an allocation failure.
     #[test]
     fn the_surface_pool_is_always_larger_than_the_picture_buffer() {
-        // Each codec's bound is its record's own slot count, and the pool is that plus one. VP9's
-        // number is read out of production code so it cannot drift from the pool that is allocated.
-        for (codec, slots, pool) in [("H.264", 16usize, 17usize), ("HEVC", 15, 16), ("VP9", 8, vp9_surface_pool())] {
+        // Each codec's bound is its record's own slot count, and the pool is that plus one. The two
+        // frame codecs' numbers are read out of production code so they cannot drift from the pools
+        // that are allocated.
+        for (codec, slots, pool) in [("H.264", 16usize, 17usize), ("HEVC", 15, 16), ("VP9", 8, vp9_surface_pool()), ("AV1", 8, av1_surface_pool())] {
             assert!(pool > slots, "{codec}: a pool of {pool} does not exceed a buffer of {slots} plus one");
             // And a ring of that size, filled to the brim, still has a free surface to decode into.
             let ids: Vec<u32> = (0..pool as u32).collect();
@@ -1069,9 +1374,11 @@ mod tests {
             // reference being overwritten.
             assert_eq!(ring.take_unreferenced(&ids), None, "{codec}: nothing free means an error");
         }
-        // And the bound VP9's pool comes from is its record's own array rather than a number typed
-        // here: eight slots is `reference_frames[8]` in `va_dec_vp9.h:70-77`.
+        // And the bound each frame codec's pool comes from is its own record's array rather than a
+        // number typed here: eight slots is `reference_frames[8]` in `va_dec_vp9.h:70-77` and
+        // `ref_frame_map[8]` in `va_dec_av1.h:347-356`.
         assert_eq!(vp9_surface_pool(), 8 + 1, "VP9's pool is its eight reference slots and the one being written");
+        assert_eq!(av1_surface_pool(), 8 + 1, "AV1's pool is 7.20's eight slots and the one being written");
     }
 
     /// The buffers a VP9 frame is submitted as: **its picture-parameter record, its slice-parameter

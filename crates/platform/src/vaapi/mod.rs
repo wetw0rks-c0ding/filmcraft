@@ -34,6 +34,11 @@ mod stream;
 // What a picture is submitted as, read out of FilmCraft's own parsers. Safe code with nothing
 // OS-specific in it either, for the same reason as `stream` above.
 mod picture;
+// AV1: the reference slots 7.20 refreshes, the picture-parameter record, and the **per-tile** slice
+// records. Its own file because `picture.rs` is where VP9's equivalent state lives and this is a
+// second, materially different one: AV1's reference slot is read by the frame *header parser*, not
+// only by the record, and its slice record is one per tile where VP9's is one per frame.
+mod av1;
 // The SPS and PPS for a picture this module encoded, derived from the records it submitted and
 // verified by FilmCraft's own H.264 parser. It exists because iHD 26.3.5 on the machine this
 // milestone was written for accepts the packed-header mode and then writes no parameter sets at all
@@ -56,6 +61,13 @@ pub use decoder::{Timings, VaDecoder};
 // `picture::build_frame`).
 pub use encoder::{Current, EncodeRequest, EncodedPicture, MAX_REFERENCES, Reference, VaEncoder, macroblocks_of, ramp_picture, ramp_shifted};
 pub use picture::{Vp9Frame, Vp9Reference, Vp9ReferenceSet, Vp9State, vp9_decline, vp9_is_new_frame, vp9_picture_record, vp9_slice_record};
+// AV1, the same three shapes for the same three reasons: `Av1State` is the per-decode reference
+// state (`refresh_frame_flags` has no member in the AV1 *decode* record — see `picture::av1`'s
+// module note for the header lines that is checked against), `Av1ReferenceSet` is the eight slots the
+// record's `ref_frame_map` is, and `av1_picture_record` is the record itself. `Av1State::picture_record`
+// is the entry point rather than the free function, because the surface the record names is only known
+// once the frame has been read — a re-show codes no picture and needs none.
+pub use av1::{AV1_FILM_GRAIN, AV1_LARGE_SCALE_TILE, Av1Frame, Av1ReferenceSet, Av1State, av1_entry_disagreement, av1_picture_record, av1_surface_pool};
 // What a caller outside this module needs to build a decoder: [`Display`] is the initialised libva
 // connection a session is created on; [`stream_info`] reads a sample entry into the codec-agnostic
 // `StreamInfo` the rest of the workspace speaks, and [`Stream`] is this backend's own view of a

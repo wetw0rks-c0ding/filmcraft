@@ -223,6 +223,68 @@ fn default_threads() -> usize {
     }
 }
 
+/// One tile's byte extent inside the tile-group OBU payload it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileExtent {
+    /// The tile's number in the frame's raster order (`TileNum`, 5.9.15).
+    pub tile_num: usize,
+    /// First byte of the tile's own payload, and one past its last — inside the payload given, not
+    /// inside the OBU.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The tiles of one `tile_group` OBU: the tile group's `tile_start_and_end_present_flag`, then each
+/// tile but the group's last preceded by a `tile_size_bytes`-byte little-endian length.
+///
+/// **This is the decoder's own split, not a second reading of it.** [`Decoder`] calls exactly this
+/// function (its `tile_group`), so a caller that walks a tile group itself has something to check
+/// against that is the code the pictures were actually decoded with. That check is worth having: the
+/// lengths are derived, and two walks that disagree do not raise an error — they produce a set of
+/// plausible-looking wrong tiles, which is precisely what a VA-API `VASliceParameterBufferAV1` built
+/// out of these offsets would then submit.
+///
+/// The extents cover only the tiles **this** OBU carries, which is what lets a frame whose tiles span
+/// several tile-group OBUs be walked OBU by OBU. `cols` and `rows` are the whole frame's grid, so a
+/// partial group yields a partial list whose last `tile_num` is below `cols * rows - 1`.
+pub fn tile_extents(data: &[u8], cols: usize, rows: usize, cols_log2: u32, rows_log2: u32, tile_size_bytes: u32) -> Result<Vec<TileExtent>> {
+    let num_tiles = cols.saturating_mul(rows);
+    if num_tiles == 0 {
+        return Err(Error::Invalid("tile grid"));
+    }
+    let mut r = BitReader::new(data);
+    let (mut tg_start, mut tg_end) = (0usize, num_tiles - 1);
+    if num_tiles > 1 && r.flag()? {
+        let bits = cols_log2.saturating_add(rows_log2);
+        tg_start = r.f(bits)? as usize;
+        tg_end = r.f(bits)? as usize;
+    }
+    r.byte_align();
+    if tg_end >= num_tiles || tg_start > tg_end {
+        return Err(Error::Invalid("tile group range"));
+    }
+    let tsb = tile_size_bytes as usize;
+    let mut out = Vec::with_capacity(tg_end - tg_start + 1);
+    let mut pos = r.byte_pos();
+    for tile_num in tg_start..=tg_end {
+        let size = if tile_num == tg_end {
+            data.len().checked_sub(pos).ok_or(Error::Truncated)?
+        } else {
+            let mut v = 0usize;
+            for i in 0..tsb {
+                let b = data.get(pos.checked_add(i).ok_or(Error::Truncated)?).copied().ok_or(Error::Truncated)?;
+                v |= (b as usize) << (8 * i);
+            }
+            pos = pos.checked_add(tsb).ok_or(Error::Truncated)?;
+            v.saturating_add(1)
+        };
+        let end = pos.checked_add(size).filter(|&e| e <= data.len()).ok_or(Error::Truncated)?;
+        out.push(TileExtent { tile_num, start: pos, end });
+        pos = end;
+    }
+    Ok(out)
+}
+
 /// Frames decoded concurrently with `threads` threads (each in-flight 1080p frame holds a few
 /// tens of MB of state).
 fn frame_threads(threads: usize) -> usize {
@@ -542,36 +604,17 @@ impl Decoder {
             let t = &job.fh.tile_info;
             (t.cols, t.rows, t.cols_log2, t.rows_log2, t.tile_size_bytes)
         };
-        let num_tiles = cols * rows;
-        let mut r = BitReader::new(data);
-        let mut tg_start = 0;
-        let mut tg_end = num_tiles - 1;
-        if num_tiles > 1 && r.flag()? {
-            let bits = cols_log2 + rows_log2;
-            tg_start = r.f(bits)? as usize;
-            tg_end = r.f(bits)? as usize;
+        let num_tiles = cols.saturating_mul(rows);
+        // The split itself is `tile_extents`, so that a caller outside this crate can check its own
+        // walk of a tile group against the one the decoder decodes with, rather than against a second
+        // reading of the same paragraph — which is the failure mode: two walks that disagree produce
+        // plausible tiles rather than an error.
+        let extents = tile_extents(data, cols, rows, cols_log2, rows_log2, tsb)?;
+        for e in &extents {
+            let bytes = data.get(e.start..e.end).ok_or(Error::Truncated)?;
+            job.tiles.push((e.tile_num, bytes.to_vec()));
         }
-        r.byte_align();
-        if tg_end >= num_tiles || tg_start > tg_end {
-            return Err(Error::Invalid("tile group range"));
-        }
-        let mut pos = r.byte_pos();
-        for tile_num in tg_start..=tg_end {
-            let size = if tile_num == tg_end {
-                data.len().checked_sub(pos).ok_or(Error::Truncated)?
-            } else {
-                let mut v = 0usize;
-                for i in 0..tsb as usize {
-                    v |= (*data.get(pos + i).ok_or(Error::Truncated)? as usize) << (8 * i);
-                }
-                pos += tsb as usize;
-                v + 1
-            };
-            let end = pos.checked_add(size).filter(|&e| e <= data.len()).ok_or(Error::Truncated)?;
-            job.tiles.push((tile_num, data[pos..end].to_vec()));
-            pos = end;
-        }
-        if tg_end != num_tiles - 1 {
+        if extents.last().map(|e| e.tile_num + 1) != Some(num_tiles) {
             self.pending = Some(job);
             return Ok(None);
         }

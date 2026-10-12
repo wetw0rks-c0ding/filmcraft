@@ -226,6 +226,16 @@ pub struct TileInfo {
     pub rows: usize,
     pub cols_log2: u32,
     pub rows_log2: u32,
+    /// The bitstream's own `uniform_tile_spacing_flag` (5.9.15), which the parse used to read and
+    /// discard.
+    ///
+    /// **Added because it cannot be recovered from the fields above.** `cols_log2` / `rows_log2` are
+    /// the *uniform* branch's log2 counts in that branch, and `ceil(log2(cols))` in the non-uniform
+    /// one (see `tile_info` below), so "more than one tile" and "uniform spacing" are two different
+    /// facts that happen to share a spelling. A VA-API caller that has to submit the flag itself
+    /// cannot guess it from these: a non-uniformly spaced three-column frame would be submitted as
+    /// uniform, and the driver would regenerate tile boundaries the bitstream never described.
+    pub uniform_tile_spacing: bool,
     pub mi_col_starts: Vec<u32>,
     pub mi_row_starts: Vec<u32>,
     pub context_update_tile_id: u32,
@@ -887,7 +897,10 @@ impl FrameHeader {
         let t = &mut self.tile_info;
         t.mi_col_starts.clear();
         t.mi_row_starts.clear();
-        if r.flag()? {
+        // 5.9.15's `uniform_tile_spacing_flag`, kept: see `TileInfo::uniform_tile_spacing`. The two
+        // branches below are what the bit selects, and nothing else in the struct says which ran.
+        t.uniform_tile_spacing = r.flag()?;
+        if t.uniform_tile_spacing {
             t.cols_log2 = min_log2_tile_cols;
             while t.cols_log2 < max_log2_tile_cols {
                 if r.flag()? {
