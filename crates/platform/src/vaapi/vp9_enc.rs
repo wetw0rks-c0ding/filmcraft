@@ -123,9 +123,17 @@
 //! the very next read in the same loop, for another codec, returns a populated word.
 //!
 //! `174` is also worth reading as what a *working* encoder looks like on this machine: H.264
-//! answered 20 of its 58 ids, HEVC 18, AV1 20. A codec the driver genuinely encodes does not
+//! answered 20 of its 58 ids, HEVC 19, AV1 20. A codec the driver genuinely encodes does not
 //! answer 58 of 58 — it answers the subset that applies to it and `VA_ATTRIB_NOT_SUPPORTED`
 //! (`0x80000000`) for the rest. VP9's answer is not a small subset. It is none of them.
+//!
+//! **These three counts are ids answered with a real value, not ids whose status was zero.** The
+//! status is `VA_STATUS_SUCCESS` for all 58 ids of every control, asked one id at a time and in a
+//! single batched call alike, so "the status was zero" would read 58/58/58 and say nothing. HEVC's
+//! 19 are ids `5, 10, 11, 13, 14, 15, 18, 19, 21, 23, 25, 27, 28, 29, 35, 39, 41, 50, 51`; the other
+//! 39 come back `0x80000000`. An earlier revision of this note said 18. Re-measuring the sweep
+//! gives 19 on every run, so 18 does not reproduce and is not the figure this file rests on — and
+//! either way it does not touch the VP9 answer, which is 0 of 696.
 //!
 //! ## 2a. The call a submission path cannot get past
 //!

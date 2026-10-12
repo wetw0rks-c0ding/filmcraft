@@ -309,7 +309,7 @@ encode entrypoints: `EncSlice` 6, `EncPicture` 7, `EncSliceLP` **8**), with the 
 none of the 174 is a VP9 one.** A `VA_STATUS_SUCCESS` that left the `0xDEADBEEF` poison in place happened
 **zero** times in 870 reads, so this is not "the driver answered some VP9 attributes and declined others" —
 it declines every id it knows while the next read in the same loop, for another codec, returns a populated
-word. The three controls are H.264 High, HEVC Main and AV1 profile 0, which between them answer 20, 18 and 20
+word. The three controls are H.264 High, HEVC Main and AV1 profile 0, which between them answer 20, 19 and 20
 of their 58 ids: a codec this driver really encodes answers the subset that applies to it and
 `VA_ATTRIB_NOT_SUPPORTED` for the rest, and VP9's answer is none of them. `vaCreateConfig` — the first call a
 submission path would make — likewise refuses every VP9 pair while succeeding for all three controls.
@@ -332,6 +332,16 @@ VP9 in the encoder module index and the `va_enc_vp9.h` record set is complete. T
 driver*. (libva exports no per-codec symbols at all — none of its 88 text symbols mentions any codec — so
 "is there a VP9 encode symbol" is the wrong question; the codec rides on the profile and entrypoint passed
 to `vaCreateConfig`.)
+
+**No new code is needed for a future driver to be picked up, because the capability check already
+exists.** `vaapi::stream::supports` (`crates/platform/src/vaapi/stream.rs:202`) is the
+"hardware is verified, not assumed" gate, and it is parameterised by profile **and entry point**
+rather than by codec — so "does this driver offer VP9 encode" is already answered by
+`display.entrypoints(Profile::Vp9(0))?.contains(&Entrypoint::EncSlice)` over the public `Display`
+API (`ffi.rs:2765`), which is a live `vaQueryConfigEntrypoints` rather than a table compiled into
+FilmCraft. It returns `false` for all four VP9 profiles on this machine (the `Vp9(0..3) … EncSlice:
+false` rows above), and it would return `true` on a driver that advertises one. `vaprobe --caps` is
+that same question printed for every profile the driver names.
 
 **What a VP9 encode path would still need**, if another driver advertised `EncSlice`: three records
 (`VAEncSequenceParameterBufferVP9`, `VAEncPictureParameterBufferVP9`,

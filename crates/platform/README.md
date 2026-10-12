@@ -271,7 +271,7 @@ config record; size and rate control land near what the settings asked for; and 
   `EncPicture` 7 and `EncSliceLP` **8** — across every attribute id the driver knows
   (`vaMaxNumConfigAttributes` = 59) returns `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`. The sweep is
   exhaustive and carries its own control: of 870 poisoned reads, 174 answered and **none** of them is a VP9
-  one, while H.264 High, HEVC Main and AV1 profile 0 answer 20, 18 and 20 of their 58 ids in the same pass.
+  one, while H.264 High, HEVC Main and AV1 profile 0 answer 20, 19 and 20 of their 58 ids in the same pass.
   `vaCreateConfig` refuses every VP9 pair and succeeds for all three controls. `va_enc_vp9.h` and
   `VAConfigAttribEncVP9` (58) **do** exist in the headers, so this is the driver declining a codec libva
   can express — a statement about **this machine**, not about VP9, libva, or FilmCraft's ability to decode
