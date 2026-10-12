@@ -11,24 +11,52 @@
 //!
 //! What this file asserts instead, which is the gate the plan states:
 //!
-//! 1. **The file decodes with ffmpeg to the right pictures, compared against the _source_**, within
-//!    a lossy tolerance ([`a_muxed_export_decodes_to_the_pictures_that_went_in`]). The comparison is
-//!    against what was rendered and encoded, not against another encode.
+//! 1. **The file decodes with ffmpeg to the right pictures, compared against the plane the encoder was
+//!    handed**, within a lossy tolerance — in both modes this backend runs in: the constant quantiser
+//!    ([`a_muxed_export_at_a_fixed_quantiser_decodes_to_the_pictures_that_went_in`]) and the bitrate an
+//!    export actually asks for ([`a_muxed_export_at_the_requested_bitrate_decodes_to_the_pictures_that_went_in`]).
+//!    The comparison is against what was rendered and encoded, not against another encode.
 //! 2. **The stream is well-formed** ([`the_sample_entry_describes_the_bitstream_that_was_written`]):
 //!    the `avcC`'s parameter sets parse and agree with the slices, the sample table has no gaps and
 //!    monotonic times, and the sample entry is refused rather than empty until a picture exists.
-//! 3. **Size and rate control land where the settings asked** — with the honest caveat that this
-//!    backend is **constant quantiser and sends no bitrate**, so the size claim is about the
-//!    quantiser, not the bitrate. See [`what_the_export_gate_declines_and_why`].
+//! 3. **Size and rate control land where the settings asked**: the samples' own bytes come within
+//!    0.80..=1.05 of the bitrate the settings name, on content that can carry it. See
+//!    [`a_muxed_export_at_the_requested_bitrate_decodes_to_the_pictures_that_went_in`] for why the
+//!    content is textured, and [`what_the_export_gate_declines_and_why`] for what the gate still
+//!    refuses.
 //!
 //! # What is *not* claimed
 //!
-//! - **Nothing is compared against a software encode.** There is no "matches ffmpeg" here.
+//! - **Nothing is compared against a software encode.** There is no "matches ffmpeg" here: ffmpeg is
+//!   used to *decode* the export and the pixels are compared against the plane the encoder was handed,
+//!   which is a claim about this encoder and not about ffmpeg's.
 //! - **No bitrate guarantee.** The gate declines any export that names one; see
 //!   [`what_the_export_gate_declines_and_why`].
-//! - **The pictures this backend produces are within a tolerance, not identical.** QP 26 on a
-//!   synthetic ramp measures about 9/255 mean absolute deviation, and every tolerance below is set
-//!   from that measurement rather than picked to make a test pass.
+//! - **The pictures this backend produces are within a tolerance, not identical.** On this machine the
+//!   corrected oracle measures **0/255** on a ramp at QP 26 and on a flat picture, and **5..19** on the
+//!   textured content a rate controller is driven at, and every bound below is set from those
+//!   measurements rather than picked to make a test pass.
+//!
+//! # The oracle, and how it was wrong
+//!
+//! The comparison is a **mean absolute deviation between ffmpeg's decoded luma plane and the luma
+//! plane that was uploaded to the encoder**, over every pixel of every picture. It was computed three
+//! ways wrong at once, and each mistake had to be fixed before the others could even be measured:
+//!
+//! 1. **It summed every fourth decoded pixel and divided by the full pixel count**, so the mean it
+//!    reported was about a quarter of a mean.
+//! 2. **It paired decoded pixel `4k` with uploaded pixel `k/4`** — the sampling stride was applied to
+//!    one side of the comparison and not the other.
+//! 3. **It took ffmpeg's decode as `-pix_fmt gray`.** `gray` is a *full-range* pixel format, so
+//!    swscale expands this backend's limited-range luma while converting to it: an uploaded `117` comes
+//!    back as `118`, an uploaded `16` as `0`. Over a 16..=235 ramp that is a mean offset of **about 9
+//!    levels**, which is the whole of the "about 9/255 mean absolute deviation" this file used to quote
+//!    as encoder loss. **It was a colour-range conversion, not an encoder.**
+//!
+//! The result was a statistic that reported 12 on the ramp, 17 on the textured stream, and **19 on a
+//! stream with no loss in it at all**, with a tolerance of 24 widened to accommodate it.
+//! [`a_lossless_stream_reads_zero_because_the_oracle_compares_like_for_like`] is the control that
+//! rules all of that out: it reads **0** where the answer is 0 and non-zero where the answer is not.
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -421,6 +449,14 @@ enum Content {
     /// Deterministic value noise over a moving base. High residual, so the content can hold the bits a
     /// rate controller is being asked to spend.
     Textured,
+    /// **One flat colour, and the only content here with nothing for a quantiser to lose.**
+    ///
+    /// A flat picture has nothing to predict and nothing left over, so every macroblock is coded as a
+    /// prediction with a zero residual and the reconstruction *is* the upload. It is therefore the one
+    /// fixture on which a lossless round trip and a correct oracle have to agree on **0** — which is
+    /// what makes it a control rather than another tolerance. It is not a picture test: it cannot see a
+    /// wrong reference, a moving picture or a quantiser, and nothing here asks it to.
+    Flat,
 }
 
 impl Content {
@@ -428,8 +464,25 @@ impl Content {
         match self {
             Content::Ramp => ramp_frame(w, h, index),
             Content::Textured => textured_frame(w, h, index),
+            Content::Flat => flat_frame(w, h),
         }
     }
+}
+
+/// A single flat colour for every picture, in RGBA.
+///
+/// **The colour is deliberately not gray.** It is the fixture on which the two possible references
+/// disagree most, so it can tell them apart: BT.709 limited range turns these channels into a luma of
+/// **117** (measured, `Y = round(16 + 219·luma′)`), while the red channel alone is **200**. An oracle
+/// that read the red channel as "the picture that went in" would report **83** on a stream that lost
+/// nothing at all, which is exactly the class of number that gets absorbed into a tolerance.
+fn flat_frame(w: u32, h: u32) -> Vec<u8> {
+    let area = (w as usize).checked_mul(h as usize).unwrap_or_else(|| panic!("a {w}x{h} picture does not fit a pixel count"));
+    let mut rgba = Vec::with_capacity(area.saturating_mul(4));
+    for _ in 0..area {
+        rgba.extend_from_slice(&[200, 100, 50, 255]);
+    }
+    rgba
 }
 
 /// A deterministic high-entropy picture. **No RNG**, so a failure here is reproducible: the same picture
@@ -513,37 +566,137 @@ fn mux_and_decode(
     // **ffmpeg decodes the file, and its own diagnostics are not ignored.** A stream ffmpeg decodes
     // *with* a warning has been accepted and is not necessarily right, and a test that reported a
     // deviation over it would be reporting a number computed from a stream nobody would trust.
+    //
+    // **The output is `yuv420p` and the luma plane is sliced out of it, rather than asking for
+    // `gray`** — and this is the third defect the oracle had, and the largest of the three.
+    //
+    // `gray` is a **full-range** pixel format, so `swscale` expands the limited-range luma this
+    // backend codes while converting to it: an uploaded `117` comes back as `118`, an uploaded `16`
+    // as `0` and an uploaded `235` as `255`. Measured on this machine, on a flat picture uploaded at
+    // 117 and reconstructed exactly by the encoder: `-pix_fmt gray` reports 118 and `-pix_fmt
+    // yuv420p` reports 117. Over the ramp's own 16..=235 range that expansion is a mean absolute
+    // offset of **about 9 levels** — which is the whole of the "about 9/255" this file's module
+    // comment used to quote as encoder loss. An oracle that subtracts a decoded full-range plane from
+    // an uploaded limited-range plane measures **a colour-range conversion, not an encoder**, and no
+    // tolerance makes that honest.
     let raw = std::process::Command::new(ffmpeg.as_os_str())
-        .args(["-v", "error", "-i", path.to_string_lossy().as_ref(), "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .args(["-v", "error", "-i", path.to_string_lossy().as_ref(), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
         .output()
         .unwrap_or_else(|e| panic!("ffmpeg: {e}"));
     assert!(raw.stderr.is_empty(), "ffmpeg decoded the export with a diagnostic: {}", String::from_utf8_lossy(&raw.stderr));
 
     // **A short decode is a short result, not a comparison of the ones that happened to line up.**
-    let one = (w as usize) * (h as usize);
-    assert_eq!(raw.stdout.len(), one * count, "ffmpeg returned {} bytes of luma for {count} pictures of {w}x{h} ({one} bytes each)", raw.stdout.len());
+    let (wu, hu) = (w as usize, h as usize);
+    let one = wu.checked_mul(hu).unwrap_or_else(|| panic!("a {w}x{h} picture does not fit a pixel count"));
+    let frame = {
+        let chroma = wu.div_ceil(2).checked_mul(hu.div_ceil(2)).unwrap_or_else(|| panic!("a {w}x{h} picture's chroma does not fit a plane"));
+        one.checked_add(chroma.saturating_mul(2)).unwrap_or_else(|| panic!("a {w}x{h} picture does not fit a frame"))
+    };
+    assert_eq!(
+        raw.stdout.len(),
+        frame.saturating_mul(count),
+        "ffmpeg returned {} bytes for {count} pictures of {w}x{h} ({one} luma bytes each)",
+        raw.stdout.len()
+    );
 
-    // The comparison: against the source, picture by picture, within the caller's lossy tolerance.
+    // The comparison: against the plane the encoder was handed, picture by picture, over every pixel.
+    let references: Vec<Vec<u8>> = sources.iter().map(|rgba| uploaded_luma(rgba, w, h)).collect();
     let mut deviations = Vec::with_capacity(count);
-    for (index, source) in sources.iter().enumerate() {
-        let Some(picture) = raw.stdout.get(index * one..(index + 1) * one) else { continue };
-        // The ramp_frame builds RGBA from luma, so the source luma is the red channel of every
-        // fourth byte — taken back out of the source rather than from the ramp directly, so the
-        // oracle compares what the muxer saw, not what the generator meant.
-        let sum: u64 =
-            picture.iter().enumerate().filter(|(i, _)| i % 4 == 0).map(|(i, decoded)| u64::from(decoded.abs_diff(*source.get(i / 4).unwrap_or(&0)))).sum();
-        let pixels = one as u64;
-        deviations.push(u8::try_from(sum / pixels).unwrap_or(u8::MAX));
+    for (index, reference) in references.iter().enumerate() {
+        let Some(at) = index.checked_mul(frame) else { continue };
+        let Some(picture) = raw.stdout.get(at..at.saturating_add(one)) else { continue };
+        deviations.push(mean_absolute_deviation(picture, reference));
     }
     (deviations, video_bytes, file_size)
 }
 
-/// **The constant-quantiser run: the oracle that was there before, unchanged in what it claims.**
+/// **The luma plane the encoder was handed**, computed by the function both encoder paths call.
 ///
-/// The tolerance is 24/255 and the spread bound is 4, both measured rather than guessed —
-/// `examples/vaencprobe.rs` measures **about 9/255 mean absolute deviation** on this ramp at QP 26,
-/// so 24 is roughly two and a half times the quantiser's own noise and still nowhere near a wrong
-/// picture (a wrong reference shows 200+, see the depth-two refusal).
+/// `VaEncoderExport::encode` and the fixed-quantiser adapter in this file both run
+/// `filmcraft_export::rgba_to_yuv420_8` over the RGBA before uploading, so running it here
+/// reproduces the exact bytes that went into the encoder — which is what "the pictures that went in"
+/// has to mean if the claim is to be about the encoder rather than about the generator.
+///
+/// **It is deliberately not the RGBA's red channel, which is what the oracle used to compare
+/// against.** That conversion is BT.709 *limited* range, so a pixel with `R=G=B=x` is uploaded as
+/// `Y = round(16 + 219·x/255)`, not as `x`: across the ramp's own range (16..=235) that is a
+/// systematic offset of up to 17 levels, peaking where the ramp is brightest. It is a real number, it
+/// is not encoder loss, and an oracle that reports it as encoder loss is worse than one that reports
+/// nothing — which is what [`a_lossless_stream_reads_zero_because_the_oracle_compares_like_for_like`]
+/// now exists to rule out.
+fn uploaded_luma(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (wu, hu) = (w as usize, h as usize);
+    let pixels = wu.checked_mul(hu).unwrap_or_else(|| panic!("a {w}x{h} picture does not fit a pixel count"));
+    assert_eq!(rgba.len(), pixels.saturating_mul(4), "the source picture is RGBA at the geometry the run is muxing");
+    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    filmcraft_export::rgba_to_yuv420_8(rgba, wu, hu, &mut y, &mut u, &mut v);
+    assert_eq!(y.len(), pixels, "the conversion produces one luma byte per pixel");
+    y
+}
+
+/// **The mean absolute deviation between a decoded picture and the plane that was uploaded: every
+/// pixel, divided by the number of pixels compared.**
+///
+/// **One plane, one pairing, one divisor.** `zip` pairs decoded pixel `p` with uploaded pixel `p` —
+/// the same raster position in both — and the divisor is `min` of the two lengths, so the number this
+/// returns *is* the mean absolute deviation of the picture and not a quarter of it.
+///
+/// The version this replaced sampled the decoded plane (`filter(|(i, _)| i % 4 == 0)`, one term in
+/// four) while dividing by the **full** pixel count, and read the source at `i / 4` — so it paired
+/// decoded pixel `4k` with uploaded pixel `k/4`, sixteen times too far left in the raster, and then
+/// divided the result by four times too many pixels. Two independent mistakes that partly cancelled
+/// in *magnitude* and neither of which cancelled in *meaning*: the number it printed was not a
+/// deviation of anything.
+///
+/// **What it printed, on this machine, on the fixtures in this file — recorded here because the
+/// arithmetic is deleted with it and `git log` is the only place it can be read from again.** With
+/// the mispairing, the over-large divisor and the full-range `gray` decode all in place, and the
+/// tolerance that was then widened to accommodate them:
+///
+/// | fixture | the old statistic | the corrected oracle |
+/// | --- | --- | --- |
+/// | ramp, QP 26, 24 pictures | 12 on every picture | **0** on every picture |
+/// | flat, QP 26, 20 pictures (no loss in it at all) | **19** on every picture | **0** on every picture |
+/// | textured, 2000 kbit/s, 300 pictures | 17 on the bulk of them | **5..19, mean 13** |
+///
+/// The 19 on a lossless stream is the whole argument: a statistic that cannot reach 0 when the answer
+/// *is* 0 is not measuring the encoder, and a tolerance set around it is a tolerance around a
+/// measurement artefact.
+fn mean_absolute_deviation(decoded: &[u8], reference: &[u8]) -> u8 {
+    let count = decoded.len().min(reference.len());
+    assert_eq!(decoded.len(), reference.len(), "the two planes are one luma byte per pixel of the same picture");
+    let sum: u64 = decoded.iter().zip(reference.iter()).map(|(d, r)| u64::from(d.abs_diff(*r))).sum();
+    u8::try_from(sum / count as u64).unwrap_or(u8::MAX)
+}
+
+/// **The constant-quantiser run: the pictures that went in come back, measured against the plane the
+/// encoder was handed.**
+///
+/// **The tolerance is 2/255 and the spread bound is 1, both re-derived after the oracle was fixed and
+/// both far tighter than the 24 and 4 they replace.** The old numbers were justified by
+/// `examples/vaencprobe.rs` measuring "about 9/255 mean absolute deviation on this ramp at QP 26" —
+/// and that 9 turned out not to be encoder loss at all (see the note on [`uploaded_luma`]: over a
+/// 16..=235 ramp the full-range `gray` decode the oracle used is about 9 levels away from the
+/// limited-range plane that was uploaded, which is where the 9 came from).
+///
+/// **What the corrected oracle measures on this fixture, on this machine: 0 on every one of the 24
+/// pictures.** A pure luma ramp has a near-zero residual — intra prediction reconstructs it almost
+/// exactly, which `vaencprobe.rs`'s own note on textured content says outright ("a pure ramp has a
+/// near-zero residual … the encoded picture is *just the prediction*") — so QP 26 reproduces it
+/// exactly. The bound is therefore not 0: the claim this test makes is "the pictures came back
+/// right", not "the encoder is bit-exact", and a driver whose quantiser floor rounds the picture by a
+/// level should not fail a picture test for it. 2 is one whole level of headroom over a measurement of
+/// 0, and it is still four times tighter than the 24 it replaces.
+///
+/// **And this fixture's own detection power is low, which the numbers say rather than the comment
+/// claiming.** `ramp_frame` carries the ramp in the red channel and a flat 128 in green and blue, so
+/// BT.709 conversion puts only 21% of the ramp's slope into luma: a *one-picture-stale* reference —
+/// exactly the failure this run exists to catch — measures **1** against this oracle, not the 200+ the
+/// old comment claimed. The bound of 2 is deliberately not tighter than that, because a test whose
+/// bound sits below what its own failure mode measures is a test that cannot fail. The discriminating
+/// power in this file is [`Content::Textured`] (13 measured against 28 for a stale reference) and the
+/// exactness in [`a_lossless_stream_reads_zero_because_the_oracle_compares_like_for_like`]; this run
+/// says what it can say, which is that the ramp survives the round trip at QP 26.
 #[test]
 fn a_muxed_export_at_a_fixed_quantiser_decodes_to_the_pictures_that_went_in() {
     let _one = lock();
@@ -569,14 +722,179 @@ fn a_muxed_export_at_a_fixed_quantiser_decodes_to_the_pictures_that_went_in() {
 
     let (deviations, video_bytes, file_size) = mux_and_decode(&mut encoder, w, h, count, &ffmpeg, "muxed-cqp.mp4", Content::Ramp);
     let worst = deviations.iter().copied().max().unwrap_or(u8::MAX);
-    assert!(deviations.iter().all(|d| *d < 24), "every picture is within a QP-26 tolerance of the source; deviations {deviations:?} (worst {worst})");
+    assert!(
+        deviations.iter().all(|d| *d <= 2),
+        "every picture is within a QP-26 tolerance of the plane that was uploaded; deviations {deviations:?} (worst {worst})"
+    );
     // **Flat, not merely small.** A drifting reference produces pictures that each look plausible
     // and get steadily worse; a run whose deviation is flat is what a correct reference chain looks
     // like. The assertion is on the *spread*, so a stream that quietly degraded would fail here even
-    // if every frame passed the absolute bound.
+    // if every frame passed the absolute bound. **Measured spread: 0** over 24 pictures, so the bound
+    // is 1 — down from 4. A stale reference would raise the later pictures above the earlier ones one
+    // level at a time, and a bound of 1 admits no growth at all beyond a single truncated step.
     let (lo, hi) = (deviations.iter().copied().min().unwrap_or(0), worst);
-    assert!(hi - lo <= 4, "the deviation is flat across the sequence, not drifting: {deviations:?}");
+    assert!(hi - lo <= 1, "the deviation is flat across the sequence, not drifting: {deviations:?}");
     eprintln!("muxed {count} pictures at QP 26 to {file_size} bytes ({video_bytes} of samples), mean absolute deviation {deviations:?}");
+}
+
+/// **The oracle reads 0 on a stream that loses nothing, and the reference it reads is provably the one
+/// that makes that possible.** This is the control the other two runs need.
+///
+/// The two picture runs in this file are bounded by tolerances, and a tolerance can always be met by
+/// an oracle that is measuring the wrong thing — which is exactly what this file's oracle was doing. It
+/// read **12** on the ramp and **17** on the textured stream, and it read **19 on a stream with no loss
+/// in it at all**, for three independent reasons: it paired decoded pixel `4k` with uploaded pixel
+/// `k/4`, it divided that sum by four times too many pixels, and it took ffmpeg's decode as `-pix_fmt
+/// gray`, which is a **full-range** pixel format and therefore a colour-range conversion away from the
+/// limited-range plane that was uploaded. A number that cannot reach 0 when the answer *is* 0 is not
+/// measuring the encoder, and a tolerance set around it is a tolerance set around a measurement
+/// artefact.
+///
+/// So this runs the oracle on [`Content::Flat`], where a flat picture makes the round trip exactly
+/// reconstructible — every macroblock is a prediction with a zero residual, so the reconstruction *is*
+/// the upload — and it makes **four** claims, each of which can fail on its own:
+///
+/// 1. **Every picture reads exactly 0.** A tolerance cannot produce this: 0 is not "small", it is the
+///    only number a lossless round trip can produce, so a non-zero value here is a finding about the
+///    oracle or the encode chain and is reported as one rather than absorbed into a threshold.
+/// 2. **The reference it uses is the uploaded luma plane, and the red channel is not.** Both are built
+///    from the real picture, and the gap between them is what an oracle reading the wrong plane would
+///    have reported on every picture of a stream that lost nothing. This is what makes claim 1
+///    evidence about the *reference* rather than about a statistic that happens to read small.
+/// 3. **`-pix_fmt gray` is not the luma plane, on this machine's ffmpeg, on this real file.** The
+///    control re-decodes the file it just wrote both ways: the `gray` plane is a *different* plane from
+///    the upload — the run prints how far apart they are — where the luma plane is equal to it. That
+///    is the third defect pinned on a real decode, so it cannot be reintroduced by someone who liked
+///    the shorter command line.
+/// 4. **The same oracle is not blind.** A control only discriminates if both of its outcomes are
+///    reachable, so this also runs the oracle over [`Content::Textured`], where there is real residual
+///    to lose, and requires it to read more than 0. A regression that made the oracle blind — comparing
+///    a plane with itself, or comparing two that agree — would read 0 on *both* fixtures and fail here.
+///    **The ramp cannot play this part and is not used for it:** the corrected oracle measures **0** on
+///    the ramp at QP 26 as well, because a pure luma ramp is predicted almost exactly, so it is not a
+///    lossy fixture at all.
+#[test]
+fn a_lossless_stream_reads_zero_because_the_oracle_compares_like_for_like() {
+    let _one = lock();
+    let Some(ffmpeg) = filmcraft_testkit::ffmpeg_or_skip("decoding the muxed export") else { return };
+    let Ok(display) = open_display() else {
+        eprintln!("SKIPPED: no VA-API display");
+        return;
+    };
+    let (w, h, count) = (320u32, 180u32, 20usize);
+
+    // 1. Zero, exactly, on a stream with nothing to lose — through the same encoder, muxer, ffmpeg
+    //    and oracle as the ramp run, with only the content changed.
+    let mut encoder = match build_constant_quantiser(&display, w, h) {
+        Ok(e) => e,
+        Err(why) => {
+            eprintln!("SKIPPED: {why}");
+            return;
+        }
+    };
+    let (deviations, video_bytes, file_size) = mux_and_decode(&mut encoder, w, h, count, &ffmpeg, "muxed-flat.mp4", Content::Flat);
+    assert!(
+        deviations.iter().all(|d| *d == 0),
+        "a flat picture has nothing to quantise, so this oracle must read 0 on it and read {deviations:?} instead — \
+         that is a finding about the oracle or the encode chain, not a tolerance to widen"
+    );
+
+    // 2. The reference is the uploaded luma plane, and on this fixture that is *not* the red channel.
+    //    Both planes come from the real picture; the gap between them is computed rather than asserted,
+    //    and it is what an oracle reading the wrong plane reports on a stream that lost nothing.
+    let rgba = flat_frame(w, h);
+    let uploaded = uploaded_luma(&rgba, w, h);
+    let red: Vec<u8> = rgba.iter().step_by(4).copied().collect();
+    let pixels = (w as usize).saturating_mul(h as usize);
+    assert_eq!(
+        (uploaded.len(), red.len()),
+        (pixels, pixels),
+        "one byte per pixel on both sides, or the comparison below is over a different number of pixels than the encode had"
+    );
+    assert!(uploaded.iter().all(|v| *v == uploaded[0]), "a flat picture uploads as one constant luma level, {}", uploaded[0]);
+    assert!(red.iter().all(|v| *v == red[0]), "and its red channel is a different constant, {}", red[0]);
+    let apart = u8::abs_diff(uploaded[0], red[0]);
+    assert_eq!(
+        apart, 83,
+        "BT.709 limited range puts (200,100,50) at luma {} where the red channel is {} — a pinned conversion FilmCraft ships, not a constant compared with itself",
+        uploaded[0], red[0]
+    );
+    assert_eq!(
+        mean_absolute_deviation(&uploaded, &red),
+        apart,
+        "and an oracle reading the red channel reports {apart} on this fixture, where this one reports 0"
+    );
+
+    // 3. `-pix_fmt gray` is not the luma plane: the same file, decoded both ways, on real bytes. `gray`
+    //    is a full-range format, so swscale expands the limited range while converting, and the plane it
+    //    produces is a colour conversion away from what the encoder was handed.
+    let path = scratch("muxed-flat.mp4");
+    let gray = decode_picture_luma(ffmpeg.as_os_str(), &path, "gray", count, w, h);
+    // The one picture the upload is, out of the `count` the decode returned.
+    let gray_first = gray.get(..uploaded.len()).unwrap_or_default();
+    assert_ne!(
+        gray_first, uploaded,
+        "the gray decode of a stream whose luma plane is the constant {} differs from it — which is why the oracle reads the yuv420p luma plane and not this",
+        uploaded[0]
+    );
+    let gray_deviation = mean_absolute_deviation(gray_first, &uploaded);
+    eprintln!("CONTROL: -pix_fmt gray reads {gray_deviation}/255 against -pix_fmt yuv420p's 0, on a stream the encoder reproduced exactly");
+
+    // 4. The other half of the control: the same oracle is not blind. Textured content has real
+    //    residual, so it must read more than 0 — if it ever read 0 the oracle would be comparing
+    //    something with itself, and claims 1 and 4 could not both hold.
+    let mut encoder = match build_constant_quantiser(&display, w, h) {
+        Ok(e) => e,
+        Err(why) => {
+            eprintln!("SKIPPED: {why}");
+            return;
+        }
+    };
+    let (textured, _, _) = mux_and_decode(&mut encoder, w, h, count, &ffmpeg, "muxed-textured-control.mp4", Content::Textured);
+    let textured_worst = textured.iter().copied().max().unwrap_or(0);
+    assert!(
+        textured_worst > 0,
+        "textured content has residual for the quantiser to lose, so the oracle must read more than 0 on it and reads {textured:?} — \
+         claims 1 and 4 cannot both be satisfied otherwise"
+    );
+
+    eprintln!(
+        "lossless control: flat reads {deviations:?} and textured reads {textured_worst}/255 at its worst (flat content is {video_bytes} bytes over {count} pictures, {file_size} on disk)"
+    );
+}
+
+/// **One decoded picture's luma plane, by pixel-format name.** `"yuv420p"` slices the luma out of
+/// ffmpeg's own output; `"gray"` takes what a full-range conversion makes of the same file.
+///
+/// It exists so the control can put the two decodes of the *same* file side by side. **The `yuv420p`
+/// path is the one [`mux_and_decode`] uses**; `gray` is here only as the counterexample, and the
+/// assertion made about it is that it is the wrong plane.
+fn decode_picture_luma(ffmpeg: &std::ffi::OsStr, path: &Path, format: &str, count: usize, w: u32, h: u32) -> Vec<u8> {
+    let (wu, hu) = (w as usize, h as usize);
+    let one = wu.checked_mul(hu).unwrap_or_else(|| panic!("a {w}x{h} picture does not fit a pixel count"));
+    let raw = std::process::Command::new(ffmpeg)
+        .args(["-v", "error", "-i", path.to_string_lossy().as_ref(), "-f", "rawvideo", "-pix_fmt", format, "-"])
+        .output()
+        .unwrap_or_else(|e| panic!("ffmpeg: {e}"));
+    assert!(raw.stderr.is_empty(), "ffmpeg decoded {path:?} as {format} with a diagnostic: {}", String::from_utf8_lossy(&raw.stderr));
+    let grey = format == "gray";
+    let frame = if grey {
+        one
+    } else {
+        let chroma = wu.div_ceil(2).checked_mul(hu.div_ceil(2)).unwrap_or_else(|| panic!("a {w}x{h} picture's chroma does not fit a plane"));
+        one.saturating_add(chroma.saturating_mul(2))
+    };
+    assert_eq!(
+        raw.stdout.len(),
+        frame.saturating_mul(count),
+        "ffmpeg returned {} bytes as {format} for {count} pictures of {w}x{h} ({one} luma bytes each)",
+        raw.stdout.len()
+    );
+    if grey {
+        return raw.stdout;
+    }
+    // Every `frame`-th run of `one` bytes, which is the luma plane of each picture in turn.
+    raw.stdout.chunks(frame).flat_map(|picture| picture.get(..one).unwrap_or_default()).copied().collect()
 }
 
 /// **A constant-quantiser [`VaEncoder`] wrapped as a [`VideoEncoder`]**, which is how the mode the
@@ -665,15 +983,22 @@ fn build_constant_quantiser(display: &std::sync::Arc<filmcraft_platform::vaapi::
 ///
 /// 1. **The pictures come back right**, within a tolerance measured in this mode rather than inherited
 ///    from the constant-quantiser run. A bitrate mode is free to pick a worse quantiser than QP 26, so
-///    the tolerance is the one measured for it.
+///    the tolerance is the one measured for it. **Measured: 5..19 over 300 pictures, mean 13**; the
+///    bound is 24. **It is a tolerance, not an equality** — a hardware encoder and a software encoder
+///    are different algorithms, so there is no bit-level claim available on this path at all, and none
+///    is made.
 /// 2. **The file's size lands near the bitrate asked for.** This is the plan's "size and rate control
 ///    land in the neighbourhood the settings asked for", and it is the claim the constant-quantiser run
 ///    cannot make at all. **It is a neighbourhood, not a point**, because a rate controller meets a
-///    target over a window and a 24-picture run is shorter than most of the windows involved: the
-///    bounds are ±50% and the assertion is on the *video* payload, which is what the bitrate names.
+///    target over a window and a 300-picture run is still shorter than some of the windows involved:
+///    the bounds are 0.80..=1.05 and the assertion is on the *video* payload, which is what the bitrate
+///    names.
 /// 3. **The driver's own reported quantiser moved.** Under a bitrate mode it must, because the
-///    controller is choosing per picture; a stream that reported one quantiser for all 24 pictures
-///    would say the rate control never ran, whatever its size.
+///    controller is choosing per picture; a stream that reported one quantiser for all 300 pictures
+///    would say the rate control never ran, whatever its size. **This is also why claim 1's companion
+///    assertion asks for a sequence that is not *drifting* rather than one that is *flat*** — a
+///    per-picture quantiser is supposed to make the per-picture deviation vary, and bounding that
+///    spread would be bounding the very thing claim 3 says must be true.
 #[test]
 fn a_muxed_export_at_the_requested_bitrate_decodes_to_the_pictures_that_went_in() {
     let _one = lock();
@@ -703,17 +1028,41 @@ fn a_muxed_export_at_the_requested_bitrate_decodes_to_the_pictures_that_went_in(
 
     let (deviations, video_bytes, file_size) = mux_and_decode(encoder.as_mut(), w, h, count, &ffmpeg, "muxed-bitrate.mp4", Content::Textured);
     let worst = deviations.iter().copied().max().unwrap_or(u8::MAX);
-    // **Measured, not inherited.** The constant-quantiser run at QP 26 gives about 9/255; this run's
-    // measured deviation on the same ramp is in the printed line below, so the bound is roughly twice
-    // whatever the quantiser the controller chose measures — and still nowhere near a wrong picture. **A
-    // different tolerance per mode is not a loosened test**: it is the same comparison with the number
-    // that mode measures, and the absolute bound is what would catch a wrong reference (200+, not 30).
+    // **Measured, not inherited, and re-derived when the oracle was fixed.** The old bound of 30 was
+    // justified against a statistic that was not a deviation; against the corrected oracle this run
+    // measures **5..19 over its 300 pictures, a mean of 13**, and the bound is **24** — about a quarter
+    // above the worst picture measured, which is the room a quantiser the *controller* chooses needs
+    // picture by picture. **A different bound per mode is not a loosened test**: it is the same
+    // comparison with the number that mode measures, and this mode's number is only obtainable by
+    // running it.
+    //
+    // **The bound is well clear of a wrong reference, and that is measured rather than asserted.** A
+    // *one-picture-stale* reference — the failure this is for — reads **28** against this same oracle
+    // on this same content, and grows from there. So 24 sits below the number a single stale picture
+    // produces: the test fails on the failure mode it exists for, rather than passing on it.
     assert!(
-        deviations.iter().all(|d| *d < 30),
-        "every picture is within the bitrate mode's measured tolerance of the source; deviations {deviations:?} (worst {worst})"
+        deviations.iter().all(|d| *d <= 24),
+        "every picture is within the bitrate mode's measured tolerance of the plane that was uploaded; deviations {deviations:?} (worst {worst})"
     );
-    let (lo, hi) = (deviations.iter().copied().min().unwrap_or(0), worst);
-    assert!(hi - lo <= 8, "the deviation is flat across the sequence, not drifting: {deviations:?}");
+
+    // **Not drifting, which is a different claim from being flat — and the corrected oracle made that
+    // necessary.** The old assertion was a spread bound of 8, and the corrected statistic *breaks* it:
+    // this run spans 5..19, a spread of 14. That is not a regression, it is claim 3 of this test being
+    // visible: the quantiser under a bitrate mode is the controller's and it varies per picture, which
+    // is exactly what a flatness bound forbids the oracle from seeing. A drifting reference is a
+    // *rising* sequence, so that is what is asserted instead: **the last quarter's mean must not sit
+    // more than 3 above the first quarter's.** Measured on this run, the first 75 pictures average
+    // 14.09 and the last 75 average 12.53 — the run settles slightly *downward* as the controller
+    // reaches its plateau — so the bound has about 4.5 of room in the failing direction, and a stale
+    // reference would blow through it long before the absolute bound.
+    let quarter = deviations.len() / 4;
+    let mean_of = |slice: &[u8]| slice.iter().map(|d| u64::from(*d)).sum::<u64>() as f64 / slice.len().max(1) as f64;
+    let (first, last) = (mean_of(&deviations[..quarter]), mean_of(&deviations[deviations.len() - quarter..]));
+    assert!(
+        last <= first + 3.0,
+        "the deviation does not grow along the sequence: the first {quarter} pictures average {first:.2} and the last {quarter} average {last:.2} — \
+         a drifting reference chain gets steadily worse rather than settling ({deviations:?})"
+    );
 
     // The size claim, on the video payload — the samples' own bytes, which is what the bitrate governs,
     // over the pictures' duration at the encoder's own rate.
