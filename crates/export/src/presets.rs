@@ -58,6 +58,87 @@ fn adaptive(bpp: f32) -> ExportSettings {
     ExportSettings { adaptive_bitrate: Some(bpp), max_bitrate_kbps: None, ..h264(None, 10_000, 0) }
 }
 
+/// The settings every HEVC preset starts from.
+///
+/// **It names no profile, for the same reason [`h264`] names none** — except that there is nothing
+/// here to delegate to. HEVC's profile is the encoder's own: this backend's derived parameter sets
+/// write `general_profile_idc = 1` (Main) and FilmCraft has no HEVC profile setting to be false
+/// about, so the file's `profile` field is whatever the machine produced.
+///
+/// # The three H.264 defaults that do not carry over, and why each is refused rather than faked
+///
+/// - **`BitrateMode::Vbr1Pass`, and never constant quality.** `ConstantQuality` states a quantiser
+///   and no rate; every fidelity the HEVC gate can submit is a rate, so both hardware gates decline
+///   that mode by name. **H.264 survives the decline** — the built-in encoder takes it and codes the
+///   quantiser asked for — **while HEVC has nothing to fall back to and the export becomes "encoder
+///   not available"**, which is a worse answer than a wrong file but still a worse answer than a
+///   working preset. So this is a rate, and no HEVC preset is built on a quantiser.
+/// - **One pass.** A two-pass export renders the sequence once to measure it and again to encode it,
+///   and this backend is handed each picture exactly once. `ExportSettings::validate` refuses
+///   HEVC + `Vbr2Pass` before an encoder is ever asked, so a preset naming it would fail at the
+///   settings layer rather than at the gate.
+/// - **The sequence's own frame rate, unrounded.** The gate refuses a fractional rate (23.976,
+///   29.97, 59.94) rather than rounding it to a stream nobody chose, and a preset cannot fix that:
+///   naming a whole rate here would export a 23.976 sequence at 24 fps, which is a file that runs
+///   fast. A whole-rate sequence is a **precondition of these presets, not a setting of them**.
+///
+/// # What is still true of every export through this path, and is the reason the preset is conditional
+///
+/// **The sequence's rate has to be one the stream can state.** The HEVC path writes the frame rate
+/// into the SPS's VUI, and it writes it from a fixed 30 fps (`DEFAULT_FRAME_RATE_FOR_LEVEL` in
+/// `crates/platform/src/vaapi/hevc_submit.rs`) rather than from the rate the caller stated, while the
+/// `hvcC` carries the rate the caller did state. The cross-check that compares the two
+/// (`check_hvcc_against_the_picture`) therefore **refuses every rate but 30 fps, by name**, rather
+/// than writing a container that contradicts its own bitstream. Measured on this machine: 30 fps
+/// exports (1920×1080, ffprobe `codec_name=hevc`, `nb_read_frames=30`, ffmpeg silent), and 24, 25
+/// and 60 fps all fail with `the hvcC states 60 fps … and the VUI in the SPS it carries states 30`.
+/// That is a defect in the encoder, not a property of HEVC, and it applies to every route to the
+/// format — the preset does not create it and cannot hide it.
+fn hevc(size: (u32, u32), kbps: u32, max_kbps: u32) -> ExportSettings {
+    ExportSettings {
+        format: Format::Hevc,
+        frame_size: Some(size),
+        bitrate_kbps: kbps,
+        max_bitrate_kbps: Some(max_kbps),
+        bitrate_mode: BitrateMode::Vbr1Pass,
+        audio: AudioSettings { codec: AudioCodec::Aac, sample_rate: Some(48_000), channels: 2, bitrate_kbps: 320, bits: 16 },
+        ..Default::default()
+    }
+}
+
+/// The HEVC presets — **and the machine, not this file, decides whether there are any**.
+///
+/// # Why the list is conditional
+///
+/// [`crate::available`] is the same question the format list asks before it offers `Format::Hevc` at
+/// all: a probe registered by `filmcraft_platform::register` that creates a real HEVC session and
+/// asks the driver. **FilmCraft has no built-in HEVC encoder**, so on a machine with no hardware one
+/// every use of these presets ends in `spawn_export`'s refusal — "H.265 export is not available (no
+/// encoder registered)" — before a frame is rendered. Offering a preset whose every use is that error
+/// would be a lie about what the preset does; **not offering it is the format list's own rule,
+/// applied one step earlier.** On this machine the probe passes, the preset is listed, and it is the
+/// same `Web & Social` entry the H.264 hardware presets are, so it is reachable from the same
+/// Quick Export and Export-mode paths.
+///
+/// **What it does not do is soften anything for machines that cannot.** The probe asks "can this
+/// machine encode HEVC at all", which is a weaker question than "can it encode *this* export"; a
+/// sequence this preset cannot serve (a 23.976 rate) still fails, with the reason, rather than being
+/// quietly dropped from the list.
+fn hevc_presets() -> Vec<ExportPreset> {
+    if !crate::available(Format::Hevc) {
+        return Vec::new();
+    }
+    vec![p(
+        "HEVC 1080p High Quality",
+        "Web & Social",
+        "H.265 1920×1080, VBR 1 pass, 10 Mbps target, AAC 320 kbps. Encoded by the machine's HEVC \
+         encoder — offered only where one exists, and there is no built-in HEVC encoder to fall back \
+         to. Needs a sequence at 30 fps: the hardware path states its frame rate in the stream, so \
+         another rate is refused rather than rounded.",
+        hevc((1920, 1080), 10_000, 15_000),
+    )]
+}
+
 fn mov(format: Format, profile: &str) -> ExportSettings {
     let mut s = ExportSettings {
         format,
@@ -105,7 +186,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
     let web = "Web & Social";
     let bc = "Broadcast";
     let vertical = ExportSettings { scaling: Scaling::ScaleToFill, ..h264(Some((1080, 1920)), 12_000, 16_000) };
-    vec![
+    let mut out = vec![
         p(DEFAULT_PRESET, ms, "H.264 at the sequence's frame size and rate; bitrate adapts to the frame size (0.2 bits per pixel)", adaptive(0.2)),
         p("Match Source – Adaptive Medium Bitrate", ms, "H.264 at the sequence's frame size and rate; 0.1 bits per pixel", adaptive(0.1)),
         p("Match Source – Adaptive Low Bitrate", ms, "H.264 at the sequence's frame size and rate; 0.05 bits per pixel", adaptive(0.05)),
@@ -117,15 +198,35 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
             "Vimeo 1080p Full HD",
             web,
             "H.264 1920×1080, VBR 2 pass, 18 Mbps",
+            // **This preset is declined by the hardware encoders, on purpose.** Two-pass VBR renders
+            // the sequence twice — once to measure it, once to encode it — and both hardware gates
+            // refuse it before any bitrate is read: "two-pass encoding" in the VA-API H.264 gate
+            // (`hardware_encode::vaapi_export::config_for`), and the same sentence with the reason
+            // spelled out in the HEVC gate. The backend is handed each picture once and has no
+            // `Pass` concept at all, so there is nothing to submit the measured rate control to:
+            // encoding it anyway would be a file at a rate nobody chose, which is exactly what the
+            // refusal is for.
+            //
+            // **So it exports, through FilmCraft's own encoder**, which takes the two passes and is
+            // the only thing that does. `filmcraft_engine::export_tests` probes this file's `h264`
+            // codec out of the MXF/H.264 formats and `h264_presets_hit_their_bitrates` checks this
+            // preset's measured rate — the preset works; it just does not work through the GPU.
             ExportSettings { bitrate_mode: BitrateMode::Vbr2Pass, ..h264(Some((1920, 1080)), 18_000, 24_000) },
         ),
         p(
             "Vimeo 2160p 4K Ultra HD",
             web,
             "H.264 3840×2160, VBR 2 pass, 50 Mbps",
+            // **Declined by the hardware encoders for the same reason as the 1080p Vimeo preset
+            // above**, and for the same reason: two passes, one picture at a time, no `Pass`.
             ExportSettings { bitrate_mode: BitrateMode::Vbr2Pass, ..h264(Some((3840, 2160)), 50_000, 65_000) },
         ),
         p("Social Vertical 1080×1920", web, "H.264 9:16 portrait for short-form social video, scaled to fill, 12 Mbps", vertical),
+    ];
+    // **HEVC lands at the end of "Web & Social"** rather than at the end of the list, because the
+    // browser groups by category and this preset belongs beside the delivery presets it sits next to.
+    out.extend(hevc_presets());
+    out.extend(vec![
         p("Apple ProRes 422 HQ", bc, "QuickTime, ProRes 422 HQ, 24-bit 48 kHz PCM", mov(Format::ProRes, "hq")),
         p("Apple ProRes 422", bc, "QuickTime, ProRes 422, 24-bit 48 kHz PCM", mov(Format::ProRes, "standard")),
         p("Apple ProRes 422 LT", bc, "QuickTime, ProRes 422 LT, 24-bit 48 kHz PCM", mov(Format::ProRes, "lt")),
@@ -137,6 +238,18 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
         p("APV 422-12", bc, "QuickTime, APV 422-12 (12-bit 4:2:2), 24-bit 48 kHz PCM", mov(Format::Apv, "422-12")),
         p("MXF OP1a DNxHR HQ", bc, "MXF OP1a, DNxHR HQ (8-bit 4:2:2), 24-bit 48 kHz PCM, start timecode", mxf(Format::MxfOp1a, MxfVideoCodec::Dnxhr, "hq")),
         p("MXF OP1a ProRes 422 HQ", bc, "MXF OP1a, ProRes 422 HQ, 24-bit 48 kHz PCM, start timecode", mxf(Format::MxfOp1a, MxfVideoCodec::ProRes, "hq")),
+        // **This preset is declined by the hardware encoder, on purpose.** MXF carries the H.264
+        // **Annex B** byte stream with in-band parameter sets and access units (ST 381-3), which is
+        // why the built-in encoder switches to `PacketFormat::AnnexB` and turns the AUDs on for
+        // exactly this container. The VA-API path has no such switch — the samples it hands the muxer
+        // are four-byte length-prefixed, which is the MP4 form — so the gate refuses by name: "MXF
+        // carries an Annex B stream, and this backend's samples are length-prefixed".
+        //
+        // **That is a property of the container, not of the codec**, so no choice in this file makes
+        // it export through the GPU: the only "fix" available here would be to stop shipping MXF
+        // H.264, which is a real broadcast deliverable and works today through FilmCraft's own
+        // encoder. The engine's preset test probes the `h264` codec inside an `mxf` container out of
+        // this very preset, so it is not a preset that stopped working.
         p("MXF OP1a H.264", bc, "MXF OP1a, H.264 High long GOP (0.3 bits per pixel), 24-bit 48 kHz PCM", mxf(Format::MxfOp1a, MxfVideoCodec::H264, "")),
         p(
             "MXF OP-Atom DNxHR (Avid)",
@@ -161,7 +274,8 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
         p("Waveform Audio 48 kHz 16-bit", "Audio Only", "WAV, stereo 48 kHz 16-bit PCM", audio_only(Format::Wav, 16)),
         p("Waveform Audio 48 kHz 24-bit", "Audio Only", "WAV, stereo 48 kHz 24-bit PCM", audio_only(Format::Wav, 24)),
         p("AIFF 48 kHz 16-bit", "Audio Only", "AIFF, stereo 48 kHz 16-bit PCM", audio_only(Format::Aiff, 16)),
-    ]
+    ]);
+    out
 }
 
 /// A built-in preset by name ([`preset_key`] comparison).
