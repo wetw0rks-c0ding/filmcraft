@@ -355,50 +355,80 @@ pub mod slice_types {
 
 /// `VA_RC_VCM` (`va.h:1114`): `0x00000008`.
 ///
-/// **It is in HEVC's rate-control mask and not H.264's, and this backend refuses it.**
+/// **It is in HEVC's rate-control mask and not H.264's, and the export gate does not offer it — but
+/// the reason has moved, because the first sweep's reason was falsified.**
 ///
-/// `VaEncoder::rate_control_names` lists H.264's eight modes and VCM is not among them, because
-/// VCM — variable-bit-rate with a per-picture cap — is not in the mask libva reports for
-/// `VAProfileH264Main` on this driver. For `VAProfileHEVCMain` the same query answers with
-/// `0x14de`, which **contains** `VA_RC_VCM` and therefore names it. (The full expansion of `0x14de`
-/// is on [`HEVC_RATE_CONTROL_MASK`]; it is eight modes, not the four this note used to claim.) A mode
-/// that appears in one codec's mask and not the other's is exactly the kind of thing that gets
-/// accepted silently: `RateControl` has no variant for it, so a caller cannot name it — but a caller
-/// who added one, or a future change that forwarded a mask bit into a config attribute, would be
-/// asking the driver for a mode this backend has no record to honour and no measurement to describe.
+/// `VaEncoder::rate_control_names` lists H.264's eight modes and VCM is not among them, because VCM
+/// is not in the mask libva reports for `VAProfileH264Main` on this driver. For `VAProfileHEVCMain`
+/// the same query answers with `0x14de`, which **contains** `VA_RC_VCM` and therefore names it (the
+/// full expansion is on [`HEVC_RATE_CONTROL_MASK`]).
 ///
-/// So it is a named refusal rather than a silent gap: [`HevcEncoder::refuses_vcm`] carries the
-/// mask it appears in and the test that catches an attempt to submit it.
+/// **What the first sweep concluded, and why it was wrong.** It read VCM's failure as the mode being
+/// unrunnable and recorded it as a refusal. **The re-taken sweep measures VCM *encoding*** — mean
+/// 9.1/255 from the source, ffmpeg silent, both with a rate-control record and with none. **So the
+/// driver runs it and the old reason is false.**
+///
+/// **What the gate declines now, and why that is still the right answer.** The decline is **not**
+/// "this driver cannot do VCM" — it can. It is that **nothing above this backend can ask for it**:
+/// [`super::encoder::RateControl`] has no variant for it, FilmCraft's `BitrateMode` has no mode that
+/// means "a variable bit rate with a per-picture cap", and `ExportSettings` has no field for the cap.
+/// A mode that appears in one codec's mask and not the other's, and that no setting above it can
+/// name, is exactly the kind of thing that gets accepted silently the moment a mask bit is forwarded
+/// into a config attribute — so it stays a **named refusal with a stated reason**, and the reason is
+/// now the absence of a way to ask for it rather than the driver's inability to answer.
 pub const VCM: u32 = 0x0000_0008;
 
+/// `VA_RC_MB` (`va.h:1125`): **`0x00000080`**, the mode that moves quantiser between macroblocks.
+///
+/// **Declared here rather than in [`super::ffi`] because `ffi.rs` is the FFI module and this
+/// constant exists only for the re-sweep**: the H.264 path has never submitted it, `RateControl` has
+/// no variant for it, and nothing outside this module names it. It is here because the re-sweep
+/// submits **every mode the driver advertises** — including the ones nobody here has a record for —
+/// and a sweep that could only name four of the eight would be reporting the modes it can spell.
+pub const MB: u32 = 0x0000_0080;
+
 /// **What each rate-control mode this driver advertises did**, measured by submitting the same
-/// records under each one — **and the measurement's own precondition, which is what this now says
-/// and did not before.**
+/// records under each one — **re-taken, because the first sweep's precondition no longer holds.**
 ///
-/// # The table was taken with a buffer set the driver refuses, and that is what it measured
+/// # Why this table was taken twice
 ///
-/// Every row below was taken **before** this path supplied a packed slice header, which is a buffer
-/// this driver refuses to encode without. **So the table answers "which mode encodes when the slice
-/// header is missing", not "which mode encodes"**, and the difference is the whole table: with the
-/// header supplied, **`VA_RC_CQP` — the mode [`RateControl::ConstantQuantiser`] names — encodes**.
-/// The other seven modes are **untested, not refuted**, and nothing here should be read as a
-/// measurement about them.
+/// The first sweep was taken **without a packed slice header**, which this driver refuses to encode
+/// without. **So it answered "which mode encodes when the slice header is missing", not "which mode
+/// encodes"** — it could not have told a rate-control problem from a missing buffer — and it recorded
+/// that limitation, concluding that `VA_RC_ICQ` and `VA_RC_QVBR` were **untested, not refuted**.
 ///
-/// | attribute | mode | outcome, **no packed slice header** |
-/// |---|---|---|
-/// | `0x02` | `VA_RC_CBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-/// | `0x04` | `VA_RC_VBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-/// | `0x08` | `VA_RC_VCM` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-/// | **`0x10`** | **`VA_RC_CQP`** — what [`RateControl::ConstantQuantiser`] names | **`vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL`**, **and a picture with the slice header supplied** |
-/// | `0x40` | `VA_RC_ICQ` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
-/// | `0x80` | `VA_RC_MB` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-/// | `0x400` | `VA_RC_QVBR` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
-/// | `0x1000` | `VA_RC_TCBRC` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-/// | `0x01`, `0x20`, `0x100`, `0x200`, `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses with `VA_STATUS_ERROR_INVALID_PARAMETER` |
+/// **A sweep whose precondition has changed is not carried forward.** The table below was re-taken
+/// with the same records, the same buffer set and the same buffer order a CBR export uses, changing
+/// **only** the `VAConfigAttribRateControl` value, and **each mode was submitted twice — once with a
+/// rate-control record and once with none — which is what separates a mode that fails from a record
+/// that fails.** Measured on iHD 26.3.5, six 320x240 pictures at 30 fps:
 ///
-/// **Two of the rows were not the rate control at all**, which is now established rather than
-/// suspected: `VA_RC_ICQ` and `VA_RC_QVBR` failed at `vaEndPicture` rather than at the readback,
-/// which is the signature of a buffer the driver wants and is not getting, not of a mode it dislikes.
+/// | attribute | mode | with CBR's record | with no record | what it is |
+/// |---|---|---|---|---|
+/// | `0x02` | `VA_RC_CBR` | encodes, mean 9.1/255 | encodes, mean 9.2/255 | works — what the export gate submits |
+/// | `0x04` | `VA_RC_VBR` | encodes, mean 9.1/255 | encodes, mean 9.1/255 | works — what the export gate submits |
+/// | `0x08` | `VA_RC_VCM` | **encodes**, mean 9.1/255 | encodes, mean 9.1/255 | **the driver runs it** |
+/// | **`0x10`** | **`VA_RC_CQP`** — what [`RateControl::ConstantQuantiser`] names | **not swept** | **not swept** | refused by [`HevcEncoder::at_swept_rate_control`]: it is submitted through the constructor that carries the quantiser's contract |
+/// | `0x40` | `VA_RC_ICQ` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **the same** | **refuted — the mode, not the record** |
+/// | `0x80` | `VA_RC_MB` | encodes, mean 9.1/255 | encodes, mean 9.1/255 | works |
+/// | `0x400` | `VA_RC_QVBR` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **the same** | **refuted — the mode, not the record** |
+/// | `0x1000` | `VA_RC_TCBRC` | **`vaRenderPicture` → invalid VABufferID for 9 encode buffers** | **encodes**, mean 9.2/255 | **fails on the record, not on the mode** |
+/// | `0x01`, `0x20`, `0x100`, `0x200`, `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses with `VA_STATUS_ERROR_INVALID_PARAMETER` | — | not offered |
+///
+/// **Three rows say something the first sweep could not.**
+///
+/// - **`VA_RC_ICQ` and `VA_RC_QVBR` are refuted, not untested.** They fail **both ways**, and that
+///   pair is the whole argument: removing the rate-control record the mode objected to changed
+///   nothing, so the failure is the **mode**. The first sweep's "untested, not refuted" was correct
+///   about its own evidence and has now been replaced by evidence.
+/// - **`VA_RC_TCBRC` fails on the *record*, not on the mode** — it encodes with no record at all and
+///   fails at `vaRenderPicture` with CBR's, which is the signature of a record this backend cannot
+///   build rather than a mode it cannot run.
+/// - **`VA_RC_VCM` encodes.** The old note called it a refusal because `RateControl` has no variant
+///   for it; **that reason is falsified** — the driver runs it. What is still true is that
+///   FilmCraft's settings and [`RateControl`] have no way to *name* it, so the export gate declines it
+///   as **unreachable rather than broken**. [`VCM`] keeps the constant and the mask measurement;
+///   **the refusal reason has moved.**
 ///
 /// # What this still rules out, so it is not tried again
 ///
@@ -410,16 +440,19 @@ pub const VCM: u32 = 0x0000_0008;
 pub mod hevc_rate_control_outcomes {
     /// **What the table adds up to, in one line**, so a reader does not have to re-derive it.
     ///
-    /// **It says what the sweep was, not what rate control is.** The nine-mode sweep was taken
-    /// *without* a packed slice header, which this driver refuses to encode without, so every mode
-    /// failed for one reason that had nothing to do with the mode. `VA_RC_CQP` — the mode a constant
-    /// quantiser names — encodes with the slice header supplied, and the other seven are untested
-    /// rather than refuted.
-    pub const SUMMARY: &str = "measured on iHD 26.3.5, with no packed slice header supplied -- which the driver refuses to encode without, \
-         so the sweep could not have distinguished a rate-control problem from a missing buffer: all 9 advertised modes \
-         failed (6 at vaMapBuffer, 2 at vaEndPicture, VA_RC_ICQ and VA_RC_QVBR being the two that failed earlier, \
-         all VA_STATUS_ERROR_INTERNAL). VA_RC_CQP -- the mode a constant quantiser names -- DOES encode once the \
-         slice header is supplied, which is how this path now works; the other 7 are untested, not refuted";
+    /// **This is the re-taken sweep.** The first one was taken without a packed slice header — which
+    /// this driver refuses to encode without — so every mode failed for one reason that had nothing
+    /// to do with the mode, and it could only say the other seven were *untested, not refuted*.
+    /// **That precondition no longer holds and the table was re-taken**, each mode submitted both
+    /// with a rate-control record and with none so that a mode that fails could be told from a record
+    /// that fails.
+    pub const SUMMARY: &str = "re-measured on iHD 26.3.5 with the packed slice header supplied, which the first sweep omitted and \
+         which is why it could only call seven modes untested: VA_RC_CBR, VA_RC_VBR, VA_RC_MB and VA_RC_VCM all ENCODE (mean 9.1/255 \
+         from the source, ffmpeg silent); VA_RC_CQP is not swept because it is submitted through the constructor that carries the \
+         quantiser; VA_RC_ICQ and VA_RC_QVBR are now REFUTED rather than untested -- both fail at vaEndPicture with \
+         VA_STATUS_ERROR_INTERNAL WITH AND WITHOUT a rate-control record, so the failure is the MODE and not the record; and \
+         VA_RC_TCBRC fails on the RECORD rather than the mode (vaRenderPicture, invalid VABufferID for 9 encode buffers with \
+         CBR's record, and it encodes with none)";
 }
 
 /// **The rate-control mask this driver reports for `VAProfileHEVCMain` / `VAEntrypointEncSlice`:**
@@ -637,7 +670,14 @@ pub struct HevcEncoder {
     since_key_frame: u32,
     /// The caller's key-frame interval in pictures, or [`u32::MAX`] for "not stated yet".
     keyframe_interval: u32,
-    rate_control: RateControl,
+    /// The record the encoder submits, `None` when it submits none — see
+    /// [`HevcEncoder::new_with_attribute`].
+    rate_control: Option<RateControl>,
+    /// **The `VAConfigAttribRateControl` value submitted to `vaCreateConfig`**, kept so a caller can
+    /// read back exactly what was asked of the driver. It is the same number as
+    /// `rate_control.config_attribute()` for every mode [`RateControl`] names, and the only thing
+    /// that names the mode for a swept one.
+    rate_control_attribute: u32,
     rate_control_buffer: Option<Vec<u8>>,
     /// The reference depth the caller asked for.
     refs: usize,
@@ -730,6 +770,78 @@ impl HevcEncoder {
     /// the frames that do not. HEVC *invites* the request (the driver reports l0 = 3, l1 = 3), which
     /// is exactly why it has to be measured rather than assumed.
     pub fn new(display: &Arc<Display>, size: (u32, u32), references: u32, rate_control: RateControl) -> Result<Self, String> {
+        Self::new_with_attribute(display, size, references, rate_control.config_attribute(), Some(rate_control))
+    }
+
+    /// **An encoder built under an arbitrary `VAConfigAttribRateControl` value — the re-sweep's
+    /// only entrance, and the reason the recorded sweep could be re-taken at all.**
+    ///
+    /// # Why this exists, and what it is careful about
+    ///
+    /// [`RateControl`] has three variants, so a caller cannot name `VA_RC_ICQ`, `VA_RC_QVBR`,
+    /// `VA_RC_MB`, `VA_RC_TCBRC` or `VA_RC_VCM` through it at all — which is what made the earlier
+    /// sweep a table of outcomes for modes nothing could submit. This takes the raw attribute
+    /// instead, so a mode the driver advertises can be **submitted and measured** instead of being
+    /// described.
+    ///
+    /// **The rate-control record it submits is CBR's**, taken from `bits_per_second`, and that is
+    /// stated here because it is the one thing a reader must know to read the result: the sweep
+    /// varies **the config attribute** and holds everything else — the records, the buffer set, the
+    /// order — identical to a CBR export, so a mode that works and one that does not differ in the
+    /// mode and nothing else. A driver that wants a different record for one of its modes (ICQ's
+    /// `icq_quality_factor`, say) is therefore measured against a record it did not ask for, and a
+    /// mode that fails here may be failing on the record rather than on the mode. **That is the
+    /// weaker claim and it is the one this sweep makes**; a mode that works here is a mode this
+    /// submission works, and a mode that fails is only "does not work with CBR's record".
+    /// [`HevcEncoder::at_swept_rate_control_without_a_record`] separates the two.
+    ///
+    /// **`VA_RC_CQP` is refused here.** It is the mode [`HevcEncoder::at_constant_quantiser`]
+    /// submits, through the constructor that carries the quantiser's own contract, and an encoder
+    /// built here would refuse every request that named one — which is exactly what a constant
+    /// quantiser needs.
+    pub fn at_swept_rate_control(display: &Arc<Display>, size: (u32, u32), references: u32, attribute: u32, bits_per_second: u32) -> Result<Self, String> {
+        if attribute == super::ffi::RC_CQP {
+            return Err("VA_RC_CQP is not swept: it is what HevcEncoder::at_constant_quantiser submits, and this entry point builds an \
+                        encoder whose requests cannot name the quantiser it needs"
+                .into());
+        }
+        Self::new_with_attribute(display, size, references, attribute, Some(RateControl::Cbr(bits_per_second)))
+    }
+
+    /// **A swept mode submitted with no rate-control record at all** — the control for
+    /// [`HevcEncoder::at_swept_rate_control`], and what tells a mode apart from a record.
+    ///
+    /// A mode that fails with a record and encodes without one is **failing on the record**, and the
+    /// honest refusal names that; a mode that fails both ways is failing on the mode. **Nothing else
+    /// about the submission changes**, so this isolates the one variable the two entry points differ
+    /// in — which is the whole reason it is a second function rather than a flag read three frames
+    /// away.
+    pub fn at_swept_rate_control_without_a_record(display: &Arc<Display>, size: (u32, u32), references: u32, attribute: u32) -> Result<Self, String> {
+        if attribute == super::ffi::RC_CQP {
+            return Err("VA_RC_CQP is not swept: it is what HevcEncoder::at_constant_quantiser submits".into());
+        }
+        Self::new_with_attribute(display, size, references, attribute, None)
+    }
+
+    /// **The encoder this module builds, under a `VAConfigAttribRateControl` of its own.**
+    ///
+    /// `rate_control` is the *record* the encoder submits ([`super::hevc_params::rate_control_record`]
+    /// reads it) and the fidelity it reports; `attribute` is the value handed to `vaCreateConfig`.
+    /// For every mode [`RateControl`] names the two are the same number, and they differ only where
+    /// this constructor is called directly with a swept mode — which is why
+    /// [`HevcEncoder::config_attribute`] exists and why `rate_control` is an `Option`.
+    ///
+    /// **`None` submits no record**, which is the shape a constant-quantiser submission has: the
+    /// picture record's `pic_init_qp` is then the only statement of the picture's quality, and under
+    /// a swept mode that statement is one the caller did not choose — which is why the re-sweep reads
+    /// such a result as "this mode runs on the picture record alone" and nothing more.
+    fn new_with_attribute(
+        display: &Arc<Display>,
+        size: (u32, u32),
+        references: u32,
+        attribute: u32,
+        rate_control: Option<RateControl>,
+    ) -> Result<Self, String> {
         let refs = references;
         if size.0 == 0 || size.1 == 0 {
             return Err(format!("{}x{} picture", size.0, size.1));
@@ -777,19 +889,13 @@ impl HevcEncoder {
         // `ctus` is already a `u32` by construction (see the `div_ceil` and the `filter` above), so
         // this is the record's own field width rather than a conversion.
         let ctus_u32 = ctus;
-        let encoder = Encoder::new(
-            display,
-            Profile::HevcMain,
-            RtFormat::Nv12,
-            size,
-            rate_control.config_attribute(),
-            PACKED_HEADERS_FOR_HEVC,
-            coded_buffer_for(size)?,
-            refs,
-        )?;
+        let encoder = Encoder::new(display, Profile::HevcMain, RtFormat::Nv12, size, attribute, PACKED_HEADERS_FOR_HEVC, coded_buffer_for(size)?, refs)?;
+        // **No record under `None` and none under `VA_RC_CQP`**, and the two are different reasons:
+        // the first was asked for, the second is the header's own (the picture record's `pic_init_qp`
+        // *is* the quality, so a bitrate beside it would be a second statement about one thing).
         let rate_control_buffer = match rate_control {
-            RateControl::ConstantQuantiser => None,
-            mode => Some(super::hevc_params::rate_control_record(mode, RATE_CONTROL_WINDOW_MS)?),
+            None | Some(RateControl::ConstantQuantiser) => None,
+            Some(mode) => Some(super::hevc_params::rate_control_record(mode, RATE_CONTROL_WINDOW_MS)?),
         };
         Ok(Self {
             encoder,
@@ -799,6 +905,7 @@ impl HevcEncoder {
             since_key_frame: 0,
             keyframe_interval: UNSET_INTERVAL,
             rate_control,
+            rate_control_attribute: attribute,
             rate_control_buffer,
             refs: refs as usize,
             references: Vec::new(),
@@ -839,9 +946,10 @@ impl HevcEncoder {
     /// straight into a config attribute is asking a question the driver answers with "yes" for a mode
     /// this backend has no record to honour. Returning the difference names it.
     ///
-    /// **This is a refusal of `VA_RC_VCM` alone and is not a statement that the rest work** — see
-    /// [`hevc_rate_control_outcomes`] for the measurement that says seven of the nine modes the
-    /// driver advertises do not produce a picture either, and why that is not in this list.
+    /// **This is a refusal of `VA_RC_VCM` alone and is not a statement that the rest work** — it is
+    /// a refusal of *naming*, and [`hevc_rate_control_outcomes`] measures the modes themselves: the
+    /// re-taken sweep has **CBR, VBR, MB and VCM all encoding**, so VCM is here because nothing above
+    /// this backend can ask for it rather than because the driver will not run it.
     pub fn refused_rate_control(mask: u32) -> Vec<&'static str> {
         let mut out = Vec::new();
         if mask & VCM != 0 {
@@ -850,14 +958,50 @@ impl HevcEncoder {
         out
     }
 
-    /// Which fidelity statement this encoder makes — the same [`RateControl`] it was built with.
-    pub fn rate_control(&self) -> RateControl {
+    /// The record this encoder submits, `None` when it submits none.
+    ///
+    /// **This is the record, not the mode** — the two are the same number for every mode
+    /// [`RateControl`] names and differ for a swept one, so a caller that wants to know what the
+    /// driver was asked for reads [`HevcEncoder::config_attribute`] instead.
+    pub fn rate_control(&self) -> Option<RateControl> {
         self.rate_control
     }
 
+    /// **The `VAConfigAttribRateControl` value this encoder was created with**, which is what the
+    /// driver was asked for and what the re-sweep varies.
+    pub fn config_attribute(&self) -> u32 {
+        self.rate_control_attribute
+    }
+
+    /// **One `VAConfigAttribRateControl` value by name**, for a refusal message and for the re-sweep's
+    /// output — the single-value form of [`super::encoder::VaEncoder::rate_control_names`], which
+    /// answers for a *mask*.
+    ///
+    /// A value in neither list is named by its number rather than guessed at, because the honest
+    /// answer for an unknown bit is that this tree has no name for it — which is also the answer a
+    /// driver offering a mode nobody here can read deserves.
+    pub fn rate_control_name(attribute: u32) -> &'static str {
+        match attribute {
+            super::ffi::RC_CQP => "VA_RC_CQP",
+            super::ffi::RC_CBR => "VA_RC_CBR",
+            super::ffi::RC_VBR => "VA_RC_VBR",
+            super::ffi::RC_ICQ => "VA_RC_ICQ",
+            super::ffi::RC_QVBR => "VA_RC_QVBR",
+            super::ffi::RC_TCBRC => "VA_RC_TCBRC",
+            VCM => "VA_RC_VCM",
+            MB => "VA_RC_MB",
+            _ => "a rate control",
+        }
+    }
+
     /// Whether the driver was told to pick a bitrate rather than being told a quantiser.
+    ///
+    /// **The attribute decides, not the record.** For every mode [`RateControl`] names the two
+    /// agree — only `VA_RC_CQP` names its own quantiser — and the attribute is the one that stays
+    /// true for a swept mode, where [`HevcEncoder::rate_control`] reports a record this path
+    /// submitted under a mode the record does not describe.
     pub fn rate_controlled(&self) -> bool {
-        !self.rate_control.names_its_own_quantiser()
+        self.rate_control_attribute != super::ffi::RC_CQP
     }
 
     /// **State this stream's frame rate**, which the driver is told per picture. Required, and
@@ -887,9 +1031,14 @@ impl HevcEncoder {
         }
         self.keyframe_interval = pictures;
         self.sequence = sequence_record(self.coded, self.coded.0 as u16, self.coded.1 as u16, pictures)?;
-        if let Some(record) = rate_control_record_for(self.rate_control) {
-            self.rate_control_buffer = Some(super::hevc_params::rate_control_record(record, rate_control_window_ms(pictures))?);
-        }
+        // **Rebuilt from the same record the encoder was built with**, so a window that changed
+        // reaches the driver for every bitrate mode and no constant-quantiser one. `None` and
+        // `Some(ConstantQuantiser)` both mean "no record", and the reason they are different states
+        // is at [`HevcEncoder::new_with_attribute`].
+        self.rate_control_buffer = match self.rate_control {
+            None | Some(RateControl::ConstantQuantiser) => None,
+            Some(mode) => Some(super::hevc_params::rate_control_record(mode, rate_control_window_ms(pictures))?),
+        };
         Ok(self)
     }
 
@@ -1078,11 +1227,14 @@ impl HevcEncoder {
     /// that fails leaves the sequence exactly where it was**, so a caller can retry the same picture.
     pub fn encode(&mut self, request: HevcEncodeRequest) -> Result<HevcEncodedPicture, String> {
         // The quantiser and the mode must agree — the same refusal the H.264 path makes, for the same
-        // reason: a number silently ignored is a picture at a quality nobody asked for.
-        if self.rate_control.names_its_own_quantiser() != request.qp.is_some() {
-            return Err(match (self.rate_control, request.qp) {
-                (mode, Some(qp)) => format!("a quantiser of {qp} into a {} encoder: the rate controller chooses this picture's quantiser", mode.name()),
-                (mode, None) => format!("no quantiser into a {} encoder: this encoder's quality is the picture record's pic_init_qp", mode.name()),
+        // reason: a number silently ignored is a picture at a quality nobody asked for. **The mode
+        // named in the message is the attribute's**, which is what was asked of the driver and is
+        // right for a swept mode where the record names something else.
+        if self.rate_controlled() == request.qp.is_some() {
+            let mode = Self::rate_control_name(self.rate_control_attribute);
+            return Err(match request.qp {
+                Some(qp) => format!("a quantiser of {qp} into a {mode} encoder: the rate controller chooses this picture's quantiser"),
+                None => format!("no quantiser into a {mode} encoder: this encoder's quality is the picture record's pic_init_qp"),
             });
         }
         if self.ended || self.last_marked {
@@ -1445,16 +1597,6 @@ fn rate_control_window_ms(pictures: u32) -> u32 {
         return 1000;
     };
     span.clamp(1, 1000)
-}
-
-/// The record for a rate-controlled encoder, or `None` under constant quantiser — **not** a record of
-/// zeroes, for the reason the H.264 path gives: under constant quantiser a bitrate record is a second
-/// and independent statement about the same fidelity.
-fn rate_control_record_for(mode: RateControl) -> Option<RateControl> {
-    match mode {
-        RateControl::ConstantQuantiser => None,
-        other => Some(other),
-    }
 }
 
 /// How large a coded buffer a picture of `coded` size needs, or why it cannot be derived.

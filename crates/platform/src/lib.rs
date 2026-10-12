@@ -86,12 +86,19 @@ pub fn register() -> Availability {
     }
     #[cfg(target_os = "linux")]
     {
-        // Export ▸ Hardware encoding (VA-API H.264): in front of the software encoder, taking an
-        // export only when asked for and when the slice encoder can do what the settings ask. The
-        // `Once` is the Windows arm's shape — `register_encoder` already ignores a factory it has,
-        // so this says "this happens once" rather than being what makes it true.
+        // Export ▸ Hardware encoding (VA-API H.264, and HEVC because the format is its own opt-in):
+        // in front of the software encoder, taking an export only when asked for and when the
+        // slice encoder can do what the settings ask. The `Once` is the Windows arm's shape —
+        // `register_encoder` already ignores a factory it has, so this says "this happens once"
+        // rather than being what makes it true.
         static ENCODERS: std::sync::Once = std::sync::Once::new();
         ENCODERS.call_once(|| filmcraft_export::register_encoder(hardware_encode::vaapi_encoder_factory));
+        // **HEVC is offered on the strength of a probe, and the probe is the same encoder the
+        // factory builds** — `vaapi::hevc_available` creates a small HEVC session and asks the
+        // driver for it. Registering it is what puts `Format::Hevc` in the format list at all:
+        // FilmCraft has no built-in HEVC encoder, so without a probe saying this machine has one,
+        // HEVC is not offered and there is nothing for the factory to be asked about.
+        filmcraft_export::register_format_probe(filmcraft_export::Format::Hevc, vaapi::hevc_available);
         filmcraft_codecs::register_video_decoder(vaapi_factory);
         filmcraft_codecs::hw::set_hw_backend("VA-API");
         Availability::Available("VA-API")

@@ -14,10 +14,13 @@
 //! configurations are declined, and a declined export fails with "encoder not available" instead of
 //! falling back; [`hevc_available`] tells the format list whether this machine can do it at all.
 //!
-//! **The Linux backend has no HEVC encoder and does not pretend to.** [`crate::vaapi::VaEncoder`]
-//! declares the H.264 encode records and nothing else, so a `Format::Hevc` export here is declined
-//! with the reason rather than producing a file whose container describes an HEVC stream and whose
-//! samples are H.264.
+//! **Linux has an HEVC encoder too, and a `Format::Hevc` export here is not declined.** This used to
+//! say the opposite, and it was true while it said it: [`crate::vaapi::VaEncoder`] declared the H.264
+//! encode records and nothing else, so a declined HEVC export failed with "encoder not available"
+//! rather than writing a file whose container described an HEVC stream and whose samples were H.264.
+//! **The second reason is now the first**: [`crate::vaapi::HevcEncoder`] encodes HEVC, and the two
+//! gates — [`vaapi_export::config_for`] for H.264 and [`crate::vaapi::hevc_config_for`] for HEVC —
+//! decline different things, each for a reason its own records can state.
 //!
 //! # The two backends do not accept the same exports, and the differences are measured
 //!
@@ -340,11 +343,23 @@ mod vaapi_export {
     /// before a config is made.
     pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Result<(u32, u32, u32, u32, ExportBitrate), String> {
         if format != Format::H264 {
-            // **No HEVC encoder here**, and the reason is the module's: `VaEncoder` declares the
-            // H.264 encode records and nothing else. Naming it here matters, because the software
-            // side has no HEVC encoder either — so a declined HEVC export fails with "encoder not
-            // available" rather than quietly becoming an H.264 file with an HEVC container.
-            return Err(if format == Format::Hevc { "HEVC".into() } else { format!("{format:?} is not H.264") });
+            // **HEVC is not declined here any more, and this message is what says so.** It used to
+            // read "HEVC: the Linux backend has no HEVC encoder", which was true then and is false
+            // now: `Format::Hevc` is served by [`crate::vaapi::hevc_config_for`], which has HEVC's own
+            // decline list (a picture size that is a whole number of 8-sample coding blocks, no
+            // H.264 `MaxFrameNum` ceiling, no H.264 profile). **The factory routes the two formats
+            // to the two gates**, so this one declines a format it has no records for and says which
+            // gate does — rather than reporting a machine that cannot encode HEVC at all.
+            //
+            // Naming the other gate matters: a reader who saw only "not H.264" could not tell a
+            // decline from a bug, and could not tell either that HEVC is taken by the *other* gate.
+            return Err(if format == Format::Hevc {
+                "HEVC: this is the H.264 gate, and a Format::Hevc export is served by the HEVC gate (crate::vaapi::hevc_config_for) \
+                 with HEVC's own decline list"
+                    .into()
+            } else {
+                format!("{format:?} is not H.264: the H.264 gate takes H.264, and Format::Hevc goes to the HEVC gate")
+            });
         }
         if s.hardware_encoding != HardwareEncoding::Auto {
             return Err("hardware encoding is off".into());
@@ -595,23 +610,60 @@ mod vaapi_export {
         }
     }
 
-    /// The Export encoder factory for the VA-API H.264 encoder.
+    /// The Export encoder factory for the VA-API encoders — **one factory, two gates**.
+    ///
+    /// # The shape, which is VideoToolbox's shape rather than a third one
+    ///
+    /// `let hevc = ...` is the same line the macOS side runs before its own decline list, and it is
+    /// here for the same reason: **HEVC has no built-in encoder in FilmCraft, so choosing the format
+    /// is the opt-in**, exactly as on macOS — while H.264 always has the software encoder behind it
+    /// and therefore needs the `Export ▸ Hardware encoding` flag as well. A factory that read the
+    /// flag for both would decline every HEVC export on a machine where the user had left the flag
+    /// off, which is the opposite of what choosing the format means.
+    ///
+    /// # What is shared and what is not
+    ///
+    /// **Shared, deliberately**: this function, the `declined` closure (the `perf.stats` counter),
+    /// the display, the one session counter, and the fact that a decline is `None` rather than an
+    /// `Err` — because a declined export is *not* a failed one: there is a software encoder behind
+    /// H.264 and no encoder at all behind HEVC, and the latter is what the export code reports as
+    /// "encoder not available".
+    ///
+    /// **Not shared**: the gate (`config_for` against [`crate::vaapi::hevc_config_for`]) and the
+    /// adapter ([`VaEncoderExport`] against [`crate::vaapi::HevcEncoderExport`]). HEVC's decline list
+    /// and H.264's are genuinely different documents — HEVC has no `frame_num` to run out of and no
+    /// crop to express a padded size, and both of those are H.264 gate rules.
     pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<filmcraft_export::Result<Box<dyn VideoEncoder>>> {
-        if format != Format::H264 || s.hardware_encoding != HardwareEncoding::Auto {
+        let hevc = format == Format::Hevc;
+        if !hevc && (format != Format::H264 || s.hardware_encoding != HardwareEncoding::Auto) {
             return None;
         }
         let declined = |why: &str| {
-            log::info!("VA-API hardware encoding declined: {why}");
+            log::info!("VA-API hardware {} encoding declined: {why}", if hevc { "HEVC" } else { "H.264" });
             filmcraft_export::note_hw_encode_declined();
             None
-        };
-        let (ew, eh, fps, gop, bitrate) = match config_for(format, w, h, rate, s) {
-            Ok(c) => c,
-            Err(why) => return declined(&why),
         };
         let display = match crate::vaapi::open_display() {
             Ok(d) => d,
             Err(why) => return declined(&format!("no VA-API display: {why}")),
+        };
+        // **HEVC first, and its own gate and adapter.** One reference picture on both sides, which is
+        // a measurement on each: `HevcEncoder::new` refuses a deeper one with HEVC's own numbers.
+        if hevc {
+            let config = match crate::vaapi::hevc_config_for(format, w, h, rate, s) {
+                Ok(c) => c,
+                Err(why) => return declined(&why),
+            };
+            let encoder = match crate::vaapi::HevcEncoderExport::build(config, display, rate) {
+                Ok(e) => e,
+                Err(why) => return declined(&why),
+            };
+            filmcraft_export::note_hw_encode_session();
+            return Some(Ok(Box::new(encoder)));
+        }
+        let (ew, eh, fps, gop, bitrate) = match config_for(format, w, h, rate, s) {
+            Ok(c) => c,
+            Err(why) => return declined(&why),
         };
         // One reference: the only depth measured to produce correct pictures, and the ceiling this
         // backend accepts (`VaEncoder::new` refuses deeper with the measurement in the message).

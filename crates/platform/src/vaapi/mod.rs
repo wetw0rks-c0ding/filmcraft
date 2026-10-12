@@ -77,6 +77,12 @@ mod vp9_enc;
 // earlier in this session, and `hevc_params` is a third file for the same reason.
 mod hevc_params;
 mod hevc_submit;
+// The HEVC **export gate**: what an `ExportSettings` object has to say before the HEVC submission
+// path will encode it, and `HevcEncoder` as a `filmcraft_export::VideoEncoder`. Its own file
+// because it is the second gate, not a second half of the first: `hardware_encode::vaapi_export`
+// is H.264's decline list and none of it is HEVC's, and one function answering for both codecs is
+// how a gate comes to decline what the other codec cannot do.
+mod hevc_export;
 
 pub use decoder::{Timings, VaDecoder};
 // VP9: the state one decode carries across its frames, and the record one frame is submitted as.
@@ -111,6 +117,12 @@ pub use hevc_submit::{CONFIG_ATTRIB_INTERLACED, H264_RATE_CONTROL_MASK, HEVC_RAT
 pub use hevc_enc::{PACKED_HEADER_SLICE as PACKED_HEADER_SLICE_BUFFER_TYPE, PACKED_SLICE_FLAG as PACKED_HEADER_SLICE_TYPE};
 pub use hevc_submit::PACKED_HEADERS_FOR_HEVC;
 pub use picture::{Vp9Frame, Vp9Reference, Vp9ReferenceSet, Vp9State, vp9_decline, vp9_is_new_frame, vp9_picture_record, vp9_slice_record};
+// The HEVC export gate, re-exported because `hardware_encode.rs`'s registered factory has to reach
+// it: the two are the two halves of "a user can export HEVC on Linux" — the gate that says what the
+// settings must be, and the factory that is asked. `HevcExportConfig` is the derived numbers,
+// `HevcBitrate` the fidelity, `hevc_config_for` the decline table, and
+// `check_hvcc_against_the_picture` the cross-check the `hvcC` gets on every picture.
+pub use hevc_export::{HevcBitrate, HevcEncoderExport, HevcExportConfig, check_hvcc_against_the_picture, config_for as hevc_config_for, hevc_available};
 // AV1, the same three shapes for the same three reasons: `Av1State` is the per-decode reference
 // state (`refresh_frame_flags` has no member in the AV1 *decode* record — see `picture::av1`'s
 // module note for the header lines that is checked against), `Av1ReferenceSet` is the eight slots the
