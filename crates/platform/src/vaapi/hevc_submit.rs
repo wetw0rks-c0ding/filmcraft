@@ -52,76 +52,94 @@
 //! literal: the two numbers come from one named place, and [`HevcEncoder::slice_type_encoding`] is
 //! the only way to reach any other value.
 //!
-//! # This path does not yet produce a picture, and the milestone's bar is not met
+//! # This path produces a picture, and the cause was the packed **slice header**, not a record
 //!
-//! **Every submission fails at the driver's own encode step**: `vaRenderPicture`, `vaEndPicture` and
-//! `vaSyncBuffer` all return success, and `vaMapBuffer` on the coded buffer then returns
-//! `VA_STATUS_ERROR_INTERNAL`. So there is no exported file, no P-frame prediction to measure,
-//! and none of Task 1's "one decodable NAL stream" has happened for HEVC.
+//! **One I frame followed by P frames that genuinely predict, and ffmpeg decodes the stream to the
+//! right pictures** (320x240, `VA_RC_CQP`, QP 26: I 184 bytes, P 43-55, mean 48; every picture
+//! within a mean absolute deviation of 9.1/255 of the **source** ramp, worst 21).
 //!
-//! # The failure is not in any record — it is the rate-control attribute, and that is measured
+//! **The driver writes no slice header of its own.** It writes the bytes the application supplies and
+//! then the slice *data*, which is why the submission path has to supply one — and why, not
+//! supplying it, every submission failed at `vaMapBuffer` with `VA_STATUS_ERROR_INTERNAL` while
+//! `vaRenderPicture`, `vaEndPicture` and `vaSyncBuffer` all returned success. **`va_enc_hevc.h:299-309`
+//! says so**, and so does a capture of ffmpeg's own `hevc_vaapi` submission: its coded bytes begin
+//! with the packed slice header it submitted, verbatim.
 //!
-//! **The record-by-record audit this branch's method depends on cannot reach this, because the field
-//! at fault is not in a record.** `VAConfigAttribRateControl` is a `vaCreateConfig` attribute, and it
-//! is the one thing this submission and a working one did not share. Establishing that took three
-//! steps, and each is recorded because the next reader should not repeat it:
+//! **What was *not* the cause**, and this is the correction to what two agents recorded: not any
+//! record (see below), not the rate control, and **not `VAConfigAttribEncPackedHeaders`** — the
+//! attribute reads 0x0, 0x2, 0x3 and 0x5 alike on this driver once the buffer is there. The table
+//! is on [`PACKED_HEADERS_FOR_HEVC`].
 //!
-//! 1. **Every field of all three records was swept**, one at a time, over the range
-//!    `va_enc_hevc.h` states for it and over the values a neighbouring implementation uses — the
-//!    quantiser, both `ref_pic_idx` counts, `max_num_merge_cand` over `1..=5`, `collocated_ref_pic_index`
-//!    over `0` and `0xFF`, `diff_cu_qp_delta_depth` over `0..=3`, `pic_init_qp` over `0..=51`,
-//!    `log2_*` block sizes over their driver's reported ranges, both `*_slice_*_flag` words over
-//!    every bit, `bits_per_second`, all three GOP periods, `slice_qp_delta` and the four offsets, and
-//!    `num_ctu_in_slice` over `1`, the whole count and more. **The failure moved for none of them**:
-//!    every one still answered `vaMapBuffer → VA_STATUS_ERROR_INTERNAL`.
+//! # What the two earlier searches established, and why they were right to stop where they did
+//!
+//! 1. **Every field of all three records was swept**, over the range `va_enc_hevc.h` states for it.
+//!    **The failure moved for none of them.** That is a real result and it still holds.
 //! 2. **The records were then made byte-for-byte identical to a submission this same driver
-//!    accepts.** ffmpeg's own `hevc_vaapi` encodes on this machine, so its `vaCreateConfig` and
-//!    `vaCreateBuffer` calls were captured at run time through the public libva entry points and
-//!    every byte of its sequence, picture and slice records compared with ours. **The failure did
-//!    not move when the records matched exactly.** That is the step that ends the search in the
-//!    records: not "each field is in range" but "the bytes are the bytes that work".
+//!    accepts.** **The failure did not move.** That step is still sound — *with one correction*:
+//!    re-capturing ffmpeg's `hevc_vaapi` submission through the public libva entry points and
+//!    comparing field by field shows the two record sets were never equal in the first place (ffmpeg
+//!    sets `sao_enabled_flag`, `sps_temporal_mvp_enabled_flag`, `transform_skip_enabled_flag` and
+//!    `pps_loop_filter_across_slices_enabled_flag` where this path does not, and leaves
+//!    `cu_qp_delta_enabled_flag` clear where the driver reports it `VA_FEATURE_REQUIRED`). **So the
+//!    conclusion "the records are not the cause" was right and the evidence for it was weaker than
+//!    claimed.** The corrected claim is the weaker, better one: *no difference between these records
+//!    accounted for the failure*, which is what re-running ffmpeg's own records through this
+//!    submission showed — they fail here exactly as ours do.
 //! 3. **The rate-control attribute was swept**, and this is the result:
 //!
-//! | `VAConfigAttribRateControl` | mode | outcome |
+//! | `VAConfigAttribRateControl` | mode | outcome, with **no packed slice header supplied** |
 //! |---|---|---|
 //! | `0x02` | `VA_RC_CBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 //! | `0x04` | `VA_RC_VBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 //! | `0x08` | `VA_RC_VCM` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 //! | **`0x10`** | **`VA_RC_CQP`** — the one [`RateControl::ConstantQuantiser`] names | **`vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL`** |
-//! | **`0x40`** | **`VA_RC_ICQ`** | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** |
+//! | `0x40` | `VA_RC_ICQ` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
 //! | `0x80` | `VA_RC_MB` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-//! | **`0x400`** | **`VA_RC_QVBR`** | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** |
+//! | `0x400` | `VA_RC_QVBR` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
 //! | `0x1000` | `VA_RC_TCBRC` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 //! | `0x01` / `0x20` / `0x100` / `0x200` / `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses them |
 //!
-//! **Seven of the nine modes the driver advertises fail, and the two that do not fail at a
-//! *different* call with no picture written either.** So the rate-control attribute **moved the
-//! failure and did not fix it**, and that is why nothing in this module was changed on the strength
-//! of it: swapping `VA_RC_CQP` for `VA_RC_ICQ` would trade a `vaMapBuffer` error for a `vaEndPicture`
-//! error and still produce no picture, and doing it silently would be the "a plausible wrong result
-//! rather than an error" trade this branch refuses everywhere else.
+//! **That table was real, and it is why the rate control was ruled out**: it was swept *with* a
+//! buffer set the driver refuses, so every mode failed for the same reason and the sweep could not
+//! have distinguished a rate-control problem from the packed-header one. **With the slice header
+//! supplied, `VA_RC_CQP` — the mode this path names — encodes**, and the table's other seven modes
+//! are untested rather than refuted. [`hevc_rate_control_outcomes`] says so.
 //!
-//! **What this rules out, so it is not re-tried:** a single out-of-range record field (every one was
-//! swept, and the records were made byte-identical to a working submission); `max_num_merge_cand`
-//! and the other zero-from-`Default` candidates; the surface pool and the context's render targets
-//! (both swept, and a working submission's shape was replicated); the picture size (ffmpeg encodes
-//! 320x240 and 320x256 on this driver, so neither is the cause); and the buffer set and its order.
+//! **What this rules out, so it is not re-tried:** a single out-of-range record field; the record set
+//! as a whole (ffmpeg's own records submitted through this path fail identically); the surface pool
+//! and the context's render targets; the picture size (ffmpeg encodes 320x240 and 320x256 on this
+//! driver); the rate-control attribute; **and route (b)** — configuring
+//! `VA_ENC_PACKED_HEADER_NONE` and letting the driver be asked for nothing it must supply also
+//! produces no picture.
 //!
-//! **Two earlier measurements were re-taken here and both still hold**, which is worth recording
-//! because they were the reason the search stayed in the records for as long as it did: the
-//! quantisation misc buffer is refused **on its own**, with nothing else present, so it is not a
-//! buffer-lifetime bug ([`refuses_the_quantization_misc_buffer`]); and `VA_RC_VCM` is in HEVC's mask
-//! and not H.264's ([`VCM`]).
+//! **Two earlier measurements were re-taken here and both still hold**: the quantisation misc buffer
+//! is refused **on its own**, with nothing else present, so it is not a buffer-lifetime bug
+//! ([`REFUSES_THE_QUANTIZATION_MISC_BUFFER`]); and `VA_RC_VCM` is in HEVC's mask and not H.264's
+//! ([`VCM`]).
 //!
 //! **What is established and pinned:** the three encode records' sizes, offsets and every hole
-//! against a C compile (`hevc_abi.rs`); the derived VPS/SPS/PPS parsing back through FilmCraft's own
-//! HEVC parsers with every field compared against the record it was written from; the rate-control
-//! mask, the `VA_RC_VCM` refusal and **the table above**; the quantisation-misc-buffer refusal; the
-//! level table; and `slice_type`. **What is not established:** why the driver refuses to encode, and
-//! therefore whether P frames predict at all.
+//! against a C compile (`hevc_abi.rs`); the derived VPS/SPS/PPS and slice header parsing back through
+//! FilmCraft's own HEVC parsers with every field compared against the record it was written from;
+//! the packed-header configuration and its measurement; the rate-control mask and the `VA_RC_VCM`
+//! refusal; the quantisation-misc-buffer refusal; the level table; and `slice_type`.
 //!
-//! **Three real bitstream bugs were found and fixed on the way, each of which had silently
-//! displaced a field rather than failing loudly** — see `hevc_params.rs`'s `sps` and the VUI block.
+//! # Four real bitstream bugs were found on the way, none of which failed loudly
+//!
+//! Every one of these is a mistake that parses, and three of the four produced a stream that
+//! **decoded to the right pictures anyway** — which is the argument for parsing the output rather
+//! than trusting it:
+//!
+//! - **the SPS wrote the VUI's bitstream restriction block's five fields outside its flag** (see
+//!   `hevc_params.rs`'s `sps`), which put five stray bits before `sps_extension_present_flag` and
+//!   made ffmpeg's `trace_headers` stop on the SPS;
+//! - **the Annex-B walk kept one of HEVC's two NAL-header bytes** ([`NalUnit`]), which read the
+//!   slice header one byte out of step and named a PPS id three fields away;
+//! - **`key_frame_interval_elapsed` did not exclude the interval 0**, so every picture after the
+//!   first was forced to be an IDR ([`HevcEncoder::key_frame_interval_elapsed`]);
+//! - and the slice header this path now writes was itself wrong twice — `slice_qp_delta` inside the
+//!   non-IDR chain, and `slice_loop_filter_across_slices_enabled_flag` present when the derived PPS
+//!   does not carry it. Both were caught by writing the header and reading it back with the
+//!   decoder's own parser before submitting it.
 //!
 //! # Verification is materially weaker here than for decode
 //!
@@ -133,15 +151,16 @@
 //! - the driver's bytes **parse** as the stream the records say they are — the derived VPS, SPS and
 //!   PPS are read back with [`filmcraft_hevc::params`]' parsers, the same ones the decode path trusts
 //!   for real streams, and every field is compared with the record the bits were written from;
-//! - the **slice header the driver wrote** agrees with the records: its NAL type, its `slice_type`,
-//!   its POC, its reference indices, parsed back out of the coded bytes by the same parser
-//!   ([`check_output_against_the_records`]);
+//! - the **slice header in the coded picture** agrees with the records: its NAL type, its
+//!   `slice_type`, its PPS id, its reference indices, parsed back out of the coded bytes by the same
+//!   parser ([`check_output_against_the_records`]). **What this is worth is narrower than it looks**:
+//!   the driver does not write that header, it passes the one this module supplied through verbatim,
+//!   so this checks FilmCraft's own header against FilmCraft's own records, and ffmpeg's
+//!   `trace_headers` over the stream is the independent read;
 //! - and the end-to-end claim, which is the only one that is really about pictures: the exported
 //!   file **decodes with ffmpeg to the right pictures**, within a lossy tolerance, against the
 //!   **source**. That is `crates/platform/tests/hevenc.rs` and `examples/vahevcprobe.rs`, and it is
-//!   the gate. **It is not reached**, for the reason given above: the first two are implemented and
-//!   run before every submission, and they are what caught the three displaced-field bugs, but they
-//!   check records that never became a picture.
+//!   the gate.
 
 /// The picture kinds an [`HevcEncodeRequest`] can name. Re-exported from [`super::encoder`] rather
 /// than redeclared, because HEVC's request type naming a *different* enum is exactly the drift the
@@ -149,9 +168,7 @@
 /// refusal of it is reachable rather than a type-level impossibility.
 pub use super::encoder::PictureKind;
 use super::encoder::{MAX_REFERENCES, RateControl};
-use super::ffi::{
-    self, Display, Encoder, PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PICTURE_HEVC_INVALID, PICTURE_HEVC_RPS_ST_CURR_BEFORE, Profile, RtFormat,
-};
+use super::ffi::{self, Display, Encoder, PICTURE_HEVC_INVALID, PICTURE_HEVC_RPS_ST_CURR_BEFORE, Profile, RtFormat};
 use super::hevc_enc::*;
 use std::sync::Arc;
 
@@ -175,8 +192,56 @@ const MIN_CB: u32 = 8;
 /// produces a picture rather than an error.
 const CTB: u32 = 64;
 
-/// `log2_max_pic_order_cnt_lsb_minus4` as this encoder writes it: **0**, so `MaxPicOrderCntLsb` is
-/// 16.
+/// **`VAConfigAttribEncPackedHeaders` for this path: `VA_ENC_PACKED_HEADER_SEQUENCE |
+/// VA_ENC_PACKED_HEADER_SLICE` (0x5) — chosen for what it states, and explicitly *not* the thing
+/// that fixed this path's readback failure.**
+///
+/// # What the measurement says, because the first version of this note said the opposite
+///
+/// | `VAConfigAttribEncPackedHeaders` | packed sequence + slice header buffers | outcome on iHD 26.3.5 |
+/// |---|---|---|
+/// | `0x5` `SEQUENCE \| SLICE` | **submitted** | **a picture comes back** |
+/// | `0x3` `SEQUENCE \| PICTURE` | submitted | **a picture comes back** |
+/// | `0x2` `PICTURE` | submitted | **a picture comes back** |
+/// | `0x0` `VA_ENC_PACKED_HEADER_NONE` | submitted | **a picture comes back** |
+/// | `0x5` `SEQUENCE \| SLICE` | **not** submitted | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+/// | `0x3` `SEQUENCE \| PICTURE` | not submitted | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+///
+/// **The driver does not read this attribute on this path. What it refuses to encode without is the
+/// packed slice header buffer**, and every row of the top half encodes identically (184 / 51 / 45 /
+/// 43 / 55 / 48 bytes) whatever the attribute says. So the value is here because it must *state*
+/// what the application supplies — and an attribute that lies about its own buffer set is a
+/// different kind of wrong from one that happens not to be enforced.
+///
+/// # Why `0x5` and not `0x3`, given that `0x3` also encodes
+///
+/// **Because `0x3` says this path supplies a packed *picture* header and it does not.** The PPS
+/// goes to the driver inside the packed *sequence* buffer with the VPS and SPS, which is what
+/// ffmpeg's own `hevc_vaapi` does on this driver (one `VAEncPackedHeaderSequence` data buffer
+/// carrying all three). Declaring `VA_ENC_PACKED_HEADER_PICTURE` claims a buffer nobody supplies,
+/// and **`VA_ENC_PACKED_HEADER_NONE` claims there are none.** `0x5` is the two flags that match the
+/// two pairs actually submitted.
+///
+/// ffmpeg's own `vaCreateConfig` for `VAProfileHEVCMain` / `VAEntrypointEncSlice` on this machine
+/// passes `0xd` — `SEQUENCE | SLICE | MISC`, the deprecated `VA_ENC_PACKED_HEADER_MISC` included.
+/// **`0x5` is that value less `MISC`**, and `MISC` is deprecated in favour of
+/// `VA_ENC_PACKED_HEADER_RAW_DATA`, which this path does not use.
+///
+/// **H.264's path configures `0x3` and needs no packed headers at all** — measured, on the same
+/// driver, with 8 of 11 presets exporting. A sibling that manages without them is exactly why the
+/// HEVC case had to be measured rather than copied from either direction.
+pub const PACKED_HEADERS_FOR_HEVC: u32 = super::ffi::PACKED_HEADER_SEQUENCE | super::hevc_enc::PACKED_SLICE_FLAG;
+
+/// `log2_max_pic_order_cnt_lsb_minus4` as this encoder writes it: **8**, so `MaxPicOrderCntLsb` is
+/// `2^(8+4)` = **4096** and `slice_pic_order_cnt_lsb` is a **12-bit** field.
+///
+/// **The value was 8 and the note said 0.** A reader who believed the note would expect a 4-bit
+/// field and a modulus of 16, and the slice header written by
+/// [`super::hevc_params::slice_header`] takes its width and its modulus from this constant — so the
+/// note was not a typo in a comment but a description of a different encoder, and ffmpeg's
+/// `trace_headers` over the stream this path produced reads
+/// `slice_pic_order_cnt_lsb 000000000001 = 1` and then `short_term_ref_pic_set_sps_flag` one field
+/// later, which is what a 12-bit field is.
 ///
 /// **The picture order count the records carry is a full `i32` and is not reduced modulo this**, and
 /// the reason is the record: `VAPictureHEVC::pic_order_cnt` is 32 bits (`va.h:5296-5298`), so the
@@ -295,72 +360,79 @@ pub mod slice_types {
 /// `VaEncoder::rate_control_names` lists H.264's eight modes and VCM is not among them, because
 /// VCM — variable-bit-rate with a per-picture cap — is not in the mask libva reports for
 /// `VAProfileH264Main` on this driver. For `VAProfileHEVCMain` the same query answers with
-/// `0x14de`, which **is** `CQP | VCM | QVBR | TCBRC` and therefore contains it. A mode that appears
-/// in one codec's mask and not the other's is exactly the kind of thing that gets accepted
-/// silently: `RateControl` has no variant for it, so a caller cannot name it — but a caller who
-/// added one, or a future change that forwarded a mask bit into a config attribute, would be asking
-/// the driver for a mode this backend has no record to honour and no measurement to describe.
+/// `0x14de`, which **contains** `VA_RC_VCM` and therefore names it. (The full expansion of `0x14de`
+/// is on [`HEVC_RATE_CONTROL_MASK`]; it is eight modes, not the four this note used to claim.) A mode
+/// that appears in one codec's mask and not the other's is exactly the kind of thing that gets
+/// accepted silently: `RateControl` has no variant for it, so a caller cannot name it — but a caller
+/// who added one, or a future change that forwarded a mask bit into a config attribute, would be
+/// asking the driver for a mode this backend has no record to honour and no measurement to describe.
 ///
 /// So it is a named refusal rather than a silent gap: [`HevcEncoder::refuses_vcm`] carries the
 /// mask it appears in and the test that catches an attempt to submit it.
 pub const VCM: u32 = 0x0000_0008;
 
-/// **What each rate-control mode this driver advertises actually did**, measured by submitting the
-/// same records under each one. This is the measurement that ended the search for the readback
-/// failure, and it is a table rather than a sentence because the answer is not a single mode.
+/// **What each rate-control mode this driver advertises did**, measured by submitting the same
+/// records under each one — **and the measurement's own precondition, which is what this now says
+/// and did not before.**
 ///
-/// # The method, because the result is only as good as it
+/// # The table was taken with a buffer set the driver refuses, and that is what it measured
 ///
-/// 1. **Every field of all three records was swept**, one at a time, over the range
-///    `va_enc_hevc.h` states for it. **The failure moved for none of them.**
-/// 2. **The records were then made byte-for-byte identical to a submission this driver accepts.**
-///    ffmpeg's `hevc_vaapi` encodes on this machine, so its `vaCreateConfig` and `vaCreateBuffer`
-///    calls were captured at run time through the public libva entry points and its sequence,
-///    picture and slice records compared byte for byte with ours. **The failure did not move when
-///    the bytes matched**, which is what ends the search in the records — not "every field is in
-///    range" but "the bytes are the bytes that work".
-/// 3. **Only then was the rate-control attribute swept**, which is the one value this submission and
-///    a working one did not share: it is a `vaCreateConfig` attribute, so no record audit reaches it.
+/// Every row below was taken **before** this path supplied a packed slice header, which is a buffer
+/// this driver refuses to encode without. **So the table answers "which mode encodes when the slice
+/// header is missing", not "which mode encodes"**, and the difference is the whole table: with the
+/// header supplied, **`VA_RC_CQP` — the mode [`RateControl::ConstantQuantiser`] names — encodes**.
+/// The other seven modes are **untested, not refuted**, and nothing here should be read as a
+/// measurement about them.
 ///
-/// # The table
-///
-/// | attribute | mode | outcome on iHD 26.3.5 |
+/// | attribute | mode | outcome, **no packed slice header** |
 /// |---|---|---|
 /// | `0x02` | `VA_RC_CBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 /// | `0x04` | `VA_RC_VBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 /// | `0x08` | `VA_RC_VCM` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-/// | **`0x10`** | **`VA_RC_CQP`** — what [`RateControl::ConstantQuantiser`] names | **`vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL`** |
-/// | **`0x40`** | **`VA_RC_ICQ`** | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** |
+/// | **`0x10`** | **`VA_RC_CQP`** — what [`RateControl::ConstantQuantiser`] names | **`vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL`**, **and a picture with the slice header supplied** |
+/// | `0x40` | `VA_RC_ICQ` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
 /// | `0x80` | `VA_RC_MB` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-/// | **`0x400`** | **`VA_RC_QVBR`** | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** |
+/// | `0x400` | `VA_RC_QVBR` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
 /// | `0x1000` | `VA_RC_TCBRC` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 /// | `0x01`, `0x20`, `0x100`, `0x200`, `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses with `VA_STATUS_ERROR_INVALID_PARAMETER` |
 ///
-/// **Seven of the nine advertised modes fail, and the two that fail differently still write no
-/// picture.** So the attribute **moved the failure and did not fix it** — and nothing in this module
-/// was changed on the strength of it. Substituting `VA_RC_ICQ` for `VA_RC_CQP` would trade a
-/// `vaMapBuffer` error for a `vaEndPicture` error and still produce nothing, and doing that quietly
-/// would be exactly the "a plausible wrong result rather than an error" trade this branch refuses.
+/// **Two of the rows were not the rate control at all**, which is now established rather than
+/// suspected: `VA_RC_ICQ` and `VA_RC_QVBR` failed at `vaEndPicture` rather than at the readback,
+/// which is the signature of a buffer the driver wants and is not getting, not of a mode it dislikes.
 ///
-/// # What this rules out, so it is not tried again
+/// # What this still rules out, so it is not tried again
 ///
 /// A single out-of-range record field; every zero-from-`Default` candidate including
 /// `max_num_merge_cand`; the surface pool and the context's render targets (both swept, and a
 /// working submission's shape replicated); the picture size (ffmpeg encodes 320x240 **and** 320x256
-/// here, so neither is the cause); and the buffer set and its order.
+/// here); **the rate-control attribute**; **and the whole record set** — ffmpeg's own records
+/// submitted through this path fail identically.
 pub mod hevc_rate_control_outcomes {
     /// **What the table adds up to, in one line**, so a reader does not have to re-derive it.
-    pub const SUMMARY: &str = "measured on iHD 26.3.5: 7 of the 9 rate-control modes the driver advertises fail to produce a \
-         picture (6 at vaMapBuffer, 1 at vaEndPicture, both VA_STATUS_ERROR_INTERNAL) and the other 2 (VA_RC_ICQ, \
-         VA_RC_QVBR) fail at vaEndPicture instead. VA_RC_CQP -- the mode a constant quantiser names -- fails with the \
-         vaMapBuffer error this branch was chasing. No mode produced a picture, so none was adopted";
+    ///
+    /// **It says what the sweep was, not what rate control is.** The nine-mode sweep was taken
+    /// *without* a packed slice header, which this driver refuses to encode without, so every mode
+    /// failed for one reason that had nothing to do with the mode. `VA_RC_CQP` — the mode a constant
+    /// quantiser names — encodes with the slice header supplied, and the other seven are untested
+    /// rather than refuted.
+    pub const SUMMARY: &str = "measured on iHD 26.3.5, with no packed slice header supplied -- which the driver refuses to encode without, \
+         so the sweep could not have distinguished a rate-control problem from a missing buffer: all 9 advertised modes \
+         failed (6 at vaMapBuffer, 2 at vaEndPicture, VA_RC_ICQ and VA_RC_QVBR being the two that failed earlier, \
+         all VA_STATUS_ERROR_INTERNAL). VA_RC_CQP -- the mode a constant quantiser names -- DOES encode once the \
+         slice header is supplied, which is how this path now works; the other 7 are untested, not refuted";
 }
 
 /// **The rate-control mask this driver reports for `VAProfileHEVCMain` / `VAEntrypointEncSlice`:**
-/// `0x14de`, which is `VA_RC_CQP | VA_RC_VCM | VA_RC_QVBR | VA_RC_TCBRC` (`va.h:1110-1164`).
+/// `0x14de`, which is **`VA_RC_CBR | VA_RC_VBR | VA_RC_VCM | VA_RC_CQP | VA_RC_ICQ | VA_RC_MB |
+/// VA_RC_QVBR | VA_RC_TCBRC`** (`va.h:1110-1164`).
+///
+/// **The expansion is eight modes, not four.** It was previously written `CQP | VCM | QVBR | TCBRC`,
+/// which is `0x1418` — a number this module does not have and the reader has no way to know that.
+/// `0x14de` is `0x14d6 | VA_RC_VCM`, and the eight bits are `CBR 0x02`, `VBR 0x04`, `VCM 0x08`,
+/// `CQP 0x10`, `ICQ 0x40`, `MB 0x80`, `QVBR 0x400`, `TCBRC 0x1000`.
 ///
 /// **A measurement, and it is the reason [`VCM`] is a named refusal.** H.264's mask on the same
-/// driver is `0x14d6` — the same four modes less `VA_RC_VCM` — so `VaEncoder::rate_control_names`
+/// driver is `0x14d6` — the same eight modes less `VA_RC_VCM` — so `VaEncoder::rate_control_names`
 /// never needed a name for it. Pinning the number here rather than only in the test is what lets a
 /// decline message say what the driver offered.
 pub const HEVC_RATE_CONTROL_MASK: u32 = 0x14de;
@@ -482,14 +554,36 @@ impl HevcEncodedPicture {
     /// Same reason as the H.264 twin: an `hvcC` states how long each NAL is, so handing a muxer
     /// Annex-B start codes under a configuration record that says four is a file that plays on
     /// nothing.
+    ///
+    /// # **The parameter sets are left out of the sample, and that is measured**
+    ///
+    /// The driver's coded buffer for the **first** picture carries the VPS, SPS and PPS — this path
+    /// handed them to it as a packed sequence header and it passes them through. **An `hvcC` already
+    /// carries those three NAL units**, so a sample that repeats them is a sample carrying its
+    /// configuration record inline, and ffmpeg answers with *"Two slices reporting being the first
+    /// in the same frame"* and **decodes one frame out of six**. The elementary stream is unaffected
+    /// — it is Annex-B and wants them — which is why this shows up only in the muxed file and why
+    /// the two access-unit forms are not the same bytes.
+    ///
+    /// **Only the VCL units go in**, which is what 7.4.2.4.1 defines an access unit as for this
+    /// purpose, and the parameter sets reach the decoder through the `hvcC` — which is also the
+    /// only way a decoder starting at an arbitrary sample can resolve them.
     pub fn mp4_sample(&self) -> Result<Vec<u8>, String> {
         let units = annex_b_units(&self.bytes)?;
         let mut out = Vec::new();
         for unit in &units {
+            // `nal_unit_type < 32` is the VCL range (HEVC Table 7-1): 0-31 are the coded slice NAL
+            // types, 32 and above are the parameter sets and the trailing units.
+            if !unit.is_vcl() {
+                continue;
+            }
             let nal = unit.nal_unit();
             let len = u32::try_from(nal.len()).map_err(|_| format!("a {}-byte NAL unit does not fit a four-byte length", nal.len()))?;
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(&nal);
+        }
+        if out.is_empty() {
+            return Err("this picture holds no coded slice NAL, so it is not an access unit".into());
         }
         Ok(out)
     }
@@ -551,6 +645,10 @@ pub struct HevcEncoder {
     references: Vec<HevcReference>,
     /// The sequence record, built once and submitted with every picture.
     sequence: Vec<u8>,
+    /// **The parameter sets last handed to the driver as a packed sequence header**, so the next
+    /// picture submits them only when they have actually changed. See
+    /// [`HevcEncoder::new_picture_has_new_parameter_sets`].
+    sent_sets: Option<HevcParameterSets>,
     /// The frame-rate misc buffer, `None` until [`HevcEncoder::at_rate`] has stated one.
     frame_rate: Option<Vec<u8>>,
     /// The derived parameter sets, `None` until a picture has been encoded and checked.
@@ -623,18 +721,26 @@ impl HevcEncoder {
     ///
     /// # The depth this encoder submits
     ///
-    /// **`references` above one is refused**, with the measurement — see
-    /// `tests/hevenc.rs::a_reference_depth_hevc_would_misbehave_is_refused_with_its_measurement`
-    /// and the note on [`HevcEncoder::encode`].
+    /// **`references` above one is refused, and for HEVC that refusal now rests on HEVC's own
+    /// measurement rather than on H.264's** — see `tests/hevenc.rs` for the numbers. Briefly: with
+    /// the depth-2 refusal lifted, a depth of 2 **renders, syncs, and decodes in ffmpeg with no
+    /// error at all**, and every picture from the third on is **wrong** — the mean absolute
+    /// deviation from the source ramp goes 9.1, 9.1, **16.8, 26.6, 36.9, 37.1**, and the third
+    /// picture is the first one that reads the second reference, at 137 bytes against the 43-55 of
+    /// the frames that do not. HEVC *invites* the request (the driver reports l0 = 3, l1 = 3), which
+    /// is exactly why it has to be measured rather than assumed.
     pub fn new(display: &Arc<Display>, size: (u32, u32), references: u32, rate_control: RateControl) -> Result<Self, String> {
         let refs = references;
         if size.0 == 0 || size.1 == 0 {
             return Err(format!("{}x{} picture", size.0, size.1));
         }
-        // **Depth greater than one: measured on this driver before it was refused here.** The
-        // HEVC driver reports `VAConfigAttribEncMaxRefFrames` as **l0 = 3, l1 = 3**, which is
-        // *more* than H.264's (3, 1) — so unlike H.264, HEVC invites the request. See
-        // `tests/hevenc.rs` for what was measured and what the refusal says.
+        // **Depth greater than one: measured on this driver before it was refused here.** The HEVC
+        // driver reports `VAConfigAttribEncMaxRefFrames` as **l0 = 3, l1 = 3**, which is *more* than
+        // H.264's (3, 1) — so unlike H.264, HEVC invites the request. **It was measured with the
+        // refusal lifted once a picture could be produced at all**: at depth 2 every call succeeds,
+        // ffmpeg decodes without a word of complaint, and every picture from the third on is wrong
+        // (mean absolute deviation from the source 9.1, 9.1, 16.8, 26.6, 36.9, 37.1). See
+        // `tests/hevenc.rs`.
         if refs > 1 {
             return Err(format!(
                 "{refs} reference pictures: see tests/hevenc.rs — this backend submits one reference for HEVC as it does for H.264, \
@@ -677,7 +783,7 @@ impl HevcEncoder {
             RtFormat::Nv12,
             size,
             rate_control.config_attribute(),
-            PACKED_HEADER_SEQUENCE | PACKED_HEADER_PICTURE,
+            PACKED_HEADERS_FOR_HEVC,
             coded_buffer_for(size)?,
             refs,
         )?;
@@ -697,6 +803,7 @@ impl HevcEncoder {
             refs: refs as usize,
             references: Vec::new(),
             sequence: sequence_record(size, width, height, 0)?,
+            sent_sets: None,
             frame_rate: None,
             sample_entry: None,
             stated_rate: None,
@@ -713,7 +820,8 @@ impl HevcEncoder {
     /// **The rate-control mask HEVC's encode entrypoint reports**, which is **not** H.264's.
     ///
     /// Measured on this machine: `0x14de` for `VAProfileHEVCMain` / `VAEntrypointEncSlice`, which is
-    /// `CQP | VCM | QVBR | TCBRC`. **H.264's is `0x14d6` on the same driver** — the same set without
+    /// eight modes (`CBR | VBR | VCM | CQP | ICQ | MB | QVBR | TCBRC` — see
+    /// [`HEVC_RATE_CONTROL_MASK`]). **H.264's is `0x14d6` on the same driver** — the same set without
     /// `VCM`. [`VCM`] explains what this backend does about the difference.
     pub fn driver_rate_control_modes(display: &Arc<Display>) -> u32 {
         ffi::Encoder::driver_rate_control_modes(display, Profile::HevcMain)
@@ -862,6 +970,28 @@ impl HevcEncoder {
         self.encoded
     }
 
+    /// **Whether this picture has to carry the packed sequence headers**, decided by comparing the
+    /// sets about to be submitted with the ones submitted last.
+    ///
+    /// **The driver passes them through**: on this driver the VPS, SPS and PPS handed to a
+    /// `VAEncPackedHeaderDataBuffer` come back in the coded buffer of the picture they were submitted
+    /// with (measured — ffmpeg's stream contains its own 97-byte packed sequence buffer verbatim). So
+    /// submitting them with every picture would put three parameter sets in every access unit, and a
+    /// stream with three parameter sets per picture is a stream whose second decoder starts at a
+    /// parameter set the first already used.
+    ///
+    /// **The test is the bytes, not a flag**, so a sequence record rebuilt by `at_rate` or
+    /// `key_frames_every` — the only two things that can change the sets, and both of which are
+    /// refused after the first picture — is caught whichever way it happens.
+    fn new_picture_has_new_parameter_sets(&mut self, sets: &HevcParameterSets) -> bool {
+        let same = self.sent_sets.as_ref().is_some_and(|sent| sent.vps == sets.vps && sent.sps == sets.sps && sent.pps == sets.pps);
+        if same {
+            return false;
+        }
+        self.sent_sets = Some(sets.clone());
+        true
+    }
+
     /// Whether the stream has been ended by a picture marked last.
     pub fn ended(&self) -> bool {
         self.ended
@@ -1001,10 +1131,42 @@ impl HevcEncoder {
         // with filmcraft_hevc's own parsers before the render** — a record this module cannot describe
         // is refused before a picture is encoded rather than after.
         let derived = super::hevc_params::parameter_sets(&sequence_read, &picture_read, self.stated_rate)?;
+        // **The slice header, written from the same three records and verified against the parameter
+        // sets it is submitted with.** This is not a nicety: under `VA_ENC_PACKED_HEADER_SLICE` the
+        // driver writes no slice header of its own — it writes the bytes it was given and then the
+        // slice *data* — so a header this module does not write is a stream whose slices name nothing.
+        let header = super::hevc_params::slice_header(&sequence_read, &picture_read, &slice_read, &derived)?;
         let seq_buf = self.encoder.buffer(ffi::ENC_SEQUENCE_PARAMETER_BUFFER, &self.sequence, 1)?;
+        // **The packed sequence header pair**, which `va_enc_hevc.h:333-340` says the driver expects
+        // in the *same* `vaRenderPicture` call as the sequence record whenever the pipeline was
+        // configured with `VA_ENC_PACKED_HEADER_SEQUENCE`.
+        //
+        // **Submitted with the first picture and again only if the sets change**, which is what
+        // ffmpeg's own `hevc_vaapi` does on this driver and what the driver's own pass-through
+        // implies: the VPS, SPS and PPS come back in the coded buffer of the picture they were
+        // submitted with, so submitting them with every picture would put three parameter sets in
+        // every picture. What "change" means is decided by the bytes, not by a flag: see
+        // [`HevcEncoder::new_picture_has_new_parameter_sets`].
+        let sets_sent = self.new_picture_has_new_parameter_sets(&derived);
+        let ph_seq_data = match sets_sent {
+            true => Some(self.encoder.buffer(PACKED_HEADER_DATA_BUFFER_TYPE as _, &parameter_sets_annex_b(&derived), 1)?),
+            false => None,
+        };
+        let ph_seq_param_buf = match sets_sent {
+            true => Some(self.encoder.buffer(
+                PACKED_HEADER_PARAMETER_BUFFER_TYPE as _,
+                &packed_header_parameter(super::hevc_enc::PACKED_HEADER_VPS_OR_SPS, &parameter_sets_annex_b(&derived)),
+                1,
+            )?),
+            false => None,
+        };
         let pic_buf = self.encoder.buffer(ffi::ENC_PICTURE_PARAMETER_BUFFER, &picture, 1)?;
         let slice_buf = self.encoder.buffer(ffi::ENC_SLICE_PARAMETER_BUFFER, &slice, 1)?;
         let fps_buf = self.encoder.buffer(ffi::ENC_MISC_PARAMETER_BUFFER, &frame_rate, 1)?;
+        // **The packed slice header pair**, with every slice, for the same reason and the same
+        // header's instruction (`va_enc_hevc.h:299-309`).
+        let ph_slice_data = self.encoder.buffer(PACKED_HEADER_DATA_BUFFER_TYPE as _, &header, 1)?;
+        let ph_slice_param = self.encoder.buffer(PACKED_HEADER_PARAMETER_BUFFER_TYPE as _, &packed_header_parameter(PACKED_HEADER_SLICE, &header), 1)?;
         let rc_buf = self.rate_control_buffer.as_ref().map(|record| self.encoder.buffer(ffi::ENC_MISC_PARAMETER_BUFFER, record, 1));
         let rc_buf = rc_buf.transpose()?;
         // **Every handle is alive across the render.** `Buffer::drop` destroys its libva buffer, and
@@ -1021,7 +1183,20 @@ impl HevcEncoder {
         // "this path has measured that it must not" are different claims and only the second one is
         // worth anything. Reading the decision from the constant means a change to the measurement
         // changes the submission, and the oracle test can see it.
-        let mut buffers = vec![seq_buf.id(), pic_buf.id(), slice_buf.id(), fps_buf.id()];
+        // **The order ffmpeg's own `hevc_vaapi` uses on this driver**, measured by capturing its
+        // `vaRenderPicture` calls: `[sequence, frame rate, picture, packed sequence parameter,
+        // packed sequence data, packed slice parameter, packed slice data, slice]`, dropping the two
+        // packed-sequence buffers on every picture after the first. The header does not state an
+        // order; this is what a submission this driver accepts looks like, and it is recorded as a
+        // measurement rather than a preference.
+        let mut buffers = vec![seq_buf.id(), fps_buf.id(), pic_buf.id()];
+        if let (Some(param_buf), Some(data)) = (&ph_seq_param_buf, &ph_seq_data) {
+            buffers.push(param_buf.id());
+            buffers.push(data.id());
+        }
+        buffers.push(ph_slice_param.id());
+        buffers.push(ph_slice_data.id());
+        buffers.push(slice_buf.id());
         if let Some(ref buf) = rc_buf {
             buffers.push(buf.id());
         }
@@ -1079,11 +1254,15 @@ impl HevcEncoder {
         while self.references.len() > self.refs {
             self.references.remove(0);
         }
-        let mut annex_b = parameter_sets_annex_b(&derived);
+        // **The coded bytes are the whole access unit, as the driver wrote it.** It passed our packed
+        // sequence header through verbatim into the first picture, so the VPS, SPS and PPS are already
+        // the first three NAL units of that picture — **prepending them again would put six
+        // parameter sets in a six-picture stream and a decoder would resolve its slices against the
+        // second set**, which is this path's own sets again and so would still decode, which is
+        // exactly why nothing would notice.
         self.sample_entry = Some(derived);
-        annex_b.extend_from_slice(coded.bytes());
         Ok(HevcEncodedPicture {
-            bytes: annex_b,
+            bytes: coded.bytes().to_vec(),
             driver_bytes: coded.len(),
             parameter_sets_from_driver: false,
             coded_size: self.coded,
@@ -1112,8 +1291,16 @@ impl HevcEncoder {
     }
 
     /// Whether the caller's key-frame interval has elapsed.
+    ///
+    /// **`> 0` is the load-bearing part, and it was missing.** An interval of 0 is the legal value
+    /// for "one key frame for the whole stream" that `key_frames_every` documents, and
+    /// `since_key_frame + 1 >= 0` is true for every picture — so every picture after the first was
+    /// forced to be an IDR. **This could not be seen until a picture came back**: with no picture
+    /// there was no stream to look at, and the six-frame probe reported six key frames where it was
+    /// asked for one I and five P. It is the H.264 path's test, unchanged, because that one has an
+    /// exported stream behind it.
     fn key_frame_interval_elapsed(&self) -> bool {
-        self.since_key_frame.saturating_add(1) >= self.keyframe_interval
+        self.keyframe_interval != UNSET_INTERVAL && self.keyframe_interval > 0 && self.since_key_frame >= self.keyframe_interval
     }
 }
 
@@ -1746,9 +1933,20 @@ pub const fn submits_the_quantization_misc_buffer() -> bool {
     !REFUSES_THE_QUANTIZATION_MISC_BUFFER
 }
 
-/// One NAL unit of an Annex-B run, as a header byte and the payload after it.
+/// One NAL unit of an Annex-B run, as its **two-byte** HEVC NAL header and the payload after it.
+///
+/// **Two bytes, and the second one is the whole point.** `nal_unit()` is what an `hvcC` stores and
+/// what the slice-header parser is handed, and it reads `(nal[0] >> 1) & 0x3f` for the type and then
+/// starts the RBSP at `nal[2]`. A walk that keeps only `nal[0]` therefore hands the parser a RBSP
+/// that begins one byte early — at the second header byte — so every syntax element after
+/// `nuh_temporal_id_plus1` is read one byte out of step.
+///
+/// **It read as `missing parameter set: picture parameter set 1` on a stream whose PPS is id 0**,
+/// which is the kind of error that names something three fields away from the mistake. It could not
+/// fire before this path produced a picture: `annex_b_units` is only ever called on a coded buffer,
+/// and no submission of this path had produced one.
 struct NalUnit<'a> {
-    header: u8,
+    header: [u8; 2],
     body: &'a [u8],
 }
 
@@ -1765,19 +1963,24 @@ impl NalUnit<'_> {
     /// This unit as a configuration record stores it: the two-byte NAL header followed by the
     /// payload. **HEVC's NAL header is two bytes**, the first of which is `forbidden_zero_bit(1) |
     /// nal_unit_type(6) | nuh_layer_id(6) | nuh_temporal_id_plus1(3)`, so the type is
-    /// `(header >> 1) & 0x3f` and the second byte is part of the unit. Dropping it — which the
-    /// H.264 walk's one-byte assumption does — would hand an `hvcC` a unit whose length does not
-    /// match its contents.
+    /// `(header[0] >> 1) & 0x3f` and the second byte belongs to the unit.
     fn nal_unit(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.body.len() + 2);
-        out.push(self.header);
+        out.extend_from_slice(&self.header);
         out.extend_from_slice(self.body);
         out
     }
 
     /// The NAL unit type, which for HEVC is six bits at offset 1 of the first header byte.
     fn unit_type(&self) -> u8 {
-        (self.header >> 1) & 0x3f
+        (self.header[0] >> 1) & 0x3f
+    }
+
+    /// Whether this is a **coded slice** NAL — `NAL_UNIT_TYPE` 0 to 31, the VCL range of HEVC's
+    /// Table 7-1. Everything from 32 up is a parameter set, a prefix SEI, an access-unit delimiter or
+    /// one of the trailing units, none of which is picture data.
+    fn is_vcl(&self) -> bool {
+        self.unit_type() < 32
     }
 }
 
@@ -1798,20 +2001,22 @@ fn annex_b_units(bytes: &[u8]) -> Result<Vec<NalUnit<'_>>, String> {
         // A four-byte code is the same three bytes one later, so the search resumes past the header
         // byte this one found rather than past the code.
         let start = at + found + 3;
-        let Some(&header) = bytes.get(start) else { break };
+        // **HEVC's NAL header is two bytes**, so both are taken: the second carries the low five bits
+        // of `nuh_layer_id` and `nuh_temporal_id_plus1`, and the payload begins after it.
+        let (Some(&first), Some(&second)) = (bytes.get(start), bytes.get(start + 1)) else { break };
         at = start + 2;
         let end = bytes.get(at..).and_then(|rest| rest.windows(3).position(|w| w == [0, 0, 1])).map_or(bytes.len(), |next| at + next);
         let Some(body) = bytes.get(at..end) else { break };
         // An empty body is legal only for the two types the specification defines as carrying
         // nothing; anything else with no payload is a truncated slice, which is what this readback
         // exists to catch.
-        if body.is_empty() && !matches!((header >> 1) & 0x3f, 35 | 36) {
+        if body.is_empty() && !matches!((first >> 1) & 0x3f, 35 | 36) {
             return Err(format!(
                 "the coded picture holds a NAL unit of type {} with no payload, which is a truncated slice rather than an end marker",
-                (header >> 1) & 0x3f
+                (first >> 1) & 0x3f
             ));
         }
-        units.push(NalUnit { header, body });
+        units.push(NalUnit { header: [first, second], body });
     }
     if units.is_empty() {
         return Err("the coded picture holds no NAL unit".into());
@@ -1824,6 +2029,27 @@ fn annex_b_units(bytes: &[u8]) -> Result<Vec<NalUnit<'_>>, String> {
 /// **The order is VPS, SPS, PPS**, which is the order 7.4.3.1 gives a decoder access: the SPS names a
 /// VPS id, so a decoder that meets the SPS first has nothing to resolve it against. (H.264 has no
 /// equivalent step, which is why its order is only two.)
+///
+/// **This is the *packed header* the driver is given, not an addition to the output.** The driver
+/// passes it through into the coded buffer verbatim (measured), so prepending it again would put a
+/// second copy of every parameter set in the first picture.
+/// The `VAEncPackedHeaderParameterBuffer` that names a packed header of `header_type` and says how
+/// long its data buffer is.
+///
+/// **`bit_length` is bits, not bytes** (`va.h:2450`), and ffmpeg's own submission on this driver
+/// measures it: a 97-byte VPS+SPS+PPS buffer is declared as 776 bits, and an 8-byte slice header as
+/// 64. A record carrying the byte count instead is a header the driver is told is eight times too
+/// long.
+///
+/// **`has_emulation_bytes` is 1**, because these headers are Annex-B with start codes and the
+/// payload has already been escaped by [`super::hevc_params`]' writers.
+fn packed_header_parameter(header_type: u32, data: &[u8]) -> Vec<u8> {
+    let bits = u32::try_from(data.len().saturating_mul(8)).unwrap_or(u32::MAX);
+    let record =
+        VaEncPackedHeaderParameterBuffer { header_type, bit_length: bits, has_emulation_bytes: 1, padding_and_reserved: [0; 3 + ffi::VA_PADDING_LOW * 4] };
+    ffi::record_bytes(&record)
+}
+
 fn parameter_sets_annex_b(sets: &HevcParameterSets) -> Vec<u8> {
     let mut out = Vec::with_capacity(sets.vps.len() + sets.sps.len() + sets.pps.len() + 12);
     for nal in [&sets.vps, &sets.sps, &sets.pps] {
@@ -1838,11 +2064,19 @@ fn parameter_sets_annex_b(sets: &HevcParameterSets) -> Vec<u8> {
 /// The same helper the H.264 path uses to prove a record it just built is one the driver will read
 /// whole: `size_of` bytes with no reading past the end, so a short buffer is `None` rather than a
 /// truncated record.
-/// **Parse the slice header the driver *wrote* and check it against the records this module
+/// **Parse the slice header in the coded picture and check it against the records this module
 /// submitted.**
 ///
-/// This is the strongest check available on this path, and it is what turns "the driver accepted the
-/// records" into "the driver encoded what the records say".
+/// **What this is worth is narrower than it looks, and saying so is the point.** The driver does not
+/// write this slice header: it writes the bytes this module supplied as a packed slice header and
+/// then the slice data. **So this checks FilmCraft's own header against FilmCraft's own records**,
+/// which is worth doing — it is a round trip through the decoder's parser on every single picture,
+/// and it is what catches a header whose bits do not say what the record says — but **it is not
+/// evidence about the driver**, and the independent read is ffmpeg's `trace_headers` over the
+/// exported stream (`examples/vahevcprobe.rs --trace`).
+///
+/// **It is still the strongest check available on this path**, because everything else this module
+/// submitted is a record the driver read and nothing comes back except the bitstream.
 ///
 /// **Why the slice header and not the picture.** Everything this module submitted is a record the
 /// driver read; nothing comes back except the bitstream. The slice header is the part of that
@@ -1879,10 +2113,10 @@ fn check_output_against_the_records(
     key_frame: bool,
 ) -> Result<(), String> {
     let units = annex_b_units(coded)?;
-    let pps = filmcraft_hevc::params::Pps::parse(&unescape_rbsp(&strip_nal(&sets.pps, NAL_PPS)?))
-        .map_err(|e| format!("the PPS the sample entry would carry does not parse: {e}"))?;
-    let sps = filmcraft_hevc::params::Sps::parse(&unescape_rbsp(&strip_nal(&sets.sps, NAL_SPS)?))
-        .map_err(|e| format!("the SPS the sample entry would carry does not parse: {e}"))?;
+    let pps =
+        filmcraft_hevc::params::Pps::parse(&rbsp_of(&sets.pps, NAL_PPS)?).map_err(|e| format!("the PPS the sample entry would carry does not parse: {e}"))?;
+    let sps =
+        filmcraft_hevc::params::Sps::parse(&rbsp_of(&sets.sps, NAL_SPS)?).map_err(|e| format!("the SPS the sample entry would carry does not parse: {e}"))?;
     // Exactly one VCL NAL is expected: this module submits one slice per picture and **refuses**
     // anything else (see the module note), so two would mean the driver cut the picture itself.
     let vcl: Vec<&NalUnit<'_>> = units.iter().filter(|u| u.unit_type() < 32).collect();
@@ -1934,24 +2168,49 @@ fn check_output_against_the_records(
         mismatches.push(format!("the slice names PPS {} and the record said {}", header.pps_id, slice_record.slice_pic_parameter_set_id));
     }
     // **The reference index count is `num_ref_idx[0]` in the header and
-    // `num_ref_idx_l0_active_minus1 + 1` in the record.** A slice told to read one reference when the
-    // driver put two in its list is a slice reading a picture the caller never chose.
-    if header.num_ref_idx[0] != u32::from(slice_record.num_ref_idx_l0_active_minus1) + 1 {
-        mismatches.push(format!(
-            "the slice header reads {} reference(s) and the record said {}",
-            header.num_ref_idx[0],
-            u32::from(slice_record.num_ref_idx_l0_active_minus1) + 1
-        ));
-    }
-    // **A key frame must not read a reference at all.** 8.3.1: an IDR empties the decoded picture
-    // buffer, so an IDR whose header names a reference is a header over a list that should be empty.
-    if key_frame && header.num_ref_idx[0] != 1 {
-        mismatches.push(format!("an IDR whose slice header reads {} reference(s)", header.num_ref_idx[0] - 1));
+    // `num_ref_idx_l0_active_minus1 + 1` in the record**, and it is **only comparable on a predicted
+    // picture**: `num_ref_idx` is inside the `slice_type == P || slice_type == B` chain, so an I
+    // slice's header has none at all and the parser leaves it at 0. Comparing it anyway reads that 0
+    // as "a key frame that reads no reference" — which is not a finding, it is the syntax the record
+    // asked for.
+    //
+    // **And a key frame must not read a reference at all** (8.3.1: an IDR empties the decoded picture
+    // buffer), which is stated by refusing a non-I slice on an IDR when the header is built rather
+    // than by counting references in a header that cannot carry them.
+    if written != 2 {
+        if header.num_ref_idx[0] != u32::from(slice_record.num_ref_idx_l0_active_minus1) + 1 {
+            mismatches.push(format!(
+                "the slice header reads {} reference(s) and the record said {}",
+                header.num_ref_idx[0],
+                u32::from(slice_record.num_ref_idx_l0_active_minus1) + 1
+            ));
+        }
+        if key_frame {
+            mismatches.push("an IDR whose slice header carries a reference index".into());
+        }
     }
     if mismatches.is_empty() {
         return Ok(());
     }
     Err(format!("the slice the driver wrote disagrees with the records this module submitted: {} — {} mismatch(es)", mismatches.join(", "), mismatches.len()))
+}
+
+/// **The RBSP of the NAL unit of type `nal_type` inside `unit`: header stripped, emulation prevention
+/// bytes removed.** What [`filmcraft_hevc::params`]' parsers take, and *not* what
+/// [`unescape_rbsp`] takes.
+///
+/// **The two are different and the difference is a two-byte shift of every syntax element.**
+/// `strip_nal` returns the unit *including* its two-byte NAL header, which is what a writer needs and
+/// what an Annex-B parser wants; feeding that straight to a parser reads `nal_unit_type` as the first
+/// `ue(v)` and every field after it off by sixteen bits. **It read as `chroma QP offset out of
+/// range`, thirty-odd fields from the mistake** — and it could not fire before, because this
+/// function only runs on a coded picture and no submission of this path had ever produced one.
+fn rbsp_of(unit: &[u8], nal_type: u8) -> Result<Vec<u8>, String> {
+    let full = strip_nal(unit, nal_type)?;
+    let Some(payload) = full.get(2..) else {
+        return Err(format!("the {nal_type} NAL unit is a one-byte header, and HEVC's is two"));
+    };
+    Ok(unescape_rbsp(payload))
 }
 
 /// The NAL unit in `unit` whose header carries `nal_type` — two header bytes plus payload, no start

@@ -14,12 +14,22 @@
 //!
 //! - the exported elementary stream **decodes with ffmpeg to the right pictures**, against the
 //!   *source* ramp, within a lossy tolerance;
+//! - **the muxed MP4 decodes to every picture**, counted by `ffprobe -count_frames` — a container
+//!   can lose pictures silently and an elementary stream cannot show it;
+//! - the **P frames are smaller than the I frame**, which is the size-side evidence they are coded
+//!   inter rather than intra pictures that happen to be small;
 //! - the **error curve is flat across the sequence**, which is what distinguishes a correct
 //!   reference chain from a drifting one — a wrong reference shows as drift, not noise;
-//! - the **picture sizes drop** from the I frame's to the P frames', which is the size-side evidence
-//!   that the P frames are coded inter and not as intra pictures that happen to be small;
-//! - the **slice headers ffmpeg reads back** say what the records said (`--trace`);
-//! - the **`hvcC`** parses and carries the same parameter sets the stream's slices resolve.
+//! - the **slice headers ffmpeg reads back** say what the records said (`--trace`), and the VPS,
+//!   SPS and PPS parse through to their `rbsp_stop_one_bit` with no stray bit;
+//! - the **`hvcC`** names the geometry the pictures were encoded at and carries the same parameter
+//!   sets the stream's slices resolve.
+//!
+//! **Two things about this encoder were the bug, and both were found by measuring against ffmpeg's
+//! own submission rather than by reading the header**: the driver writes no slice header of its own,
+//! so one has to be supplied, and `VAConfigAttribEncPackedHeaders` has to say so. See
+//! `hevc_submit.rs`'s `PACKED_HEADERS_FOR_HEVC` — including the part of that note that corrects an
+//! earlier, wrong conclusion about which of the two was the cause.
 
 use filmcraft_platform::vaapi::{
     CONFIG_ATTRIB_INTERLACED, Display, Entrypoint, H264_RATE_CONTROL_MASK, HEVC_RATE_CONTROL_MASK, HevcEncodeRequest, HevcEncoder, Profile, VCM,
@@ -246,7 +256,7 @@ fn run(display: &Arc<Display>, elementary: &str, trace: bool) -> Result<String, 
     );
 
     let mut stream = Vec::new();
-    let mut samples = Vec::new();
+    let mut samples: Vec<Vec<u8>> = Vec::new();
     let mut sizes = Vec::new();
     println!();
     println!("{:>4}  {:>6}  {:>8}  {:>5}  {:>5}  {:>9}  {:>4}  note", "frame", "shift", "slice_t", "bytes", "QP", "ref pic", "nal");
@@ -277,7 +287,7 @@ fn run(display: &Arc<Display>, elementary: &str, trace: bool) -> Result<String, 
         let picture = encoder.encode(if last { request.last() } else { request })?;
         let qp = picture.status.first().map(|s| s & 0xff).unwrap_or(0);
         stream.extend_from_slice(&picture.bytes);
-        samples.extend_from_slice(&picture.mp4_sample()?);
+        samples.push(picture.mp4_sample()?);
         sizes.push(picture.bytes.len());
         println!(
             "{frame:>4}  {:>6}  {:>8}  {:>5}  {:>5}  {:>9}  {:>4}  {}",
@@ -334,50 +344,57 @@ fn run(display: &Arc<Display>, elementary: &str, trace: bool) -> Result<String, 
 /// **the `mp4_sample()` of each picture** — each NAL behind a four-byte length — because an `hvcC`
 /// states `length_size == 4` and handing a muxer Annex-B start codes under it is a file that plays
 /// on nothing.
-fn mux(encoder: &HevcEncoder, samples: &[u8], elementary: &str, pictures: u32) -> Result<String, String> {
+///
+/// **One sample per picture, and the boundary comes from the loop that made them.** It used to
+/// concatenate every picture's sample and then split the run back apart by walking its four-byte
+/// length prefixes — and the walk consumed *everything remaining* into the first sample, so the file
+/// carried one 334-byte sample and five empty ones, and ffmpeg decoded **one frame out of six**
+/// without an error. A muxer that silently writes five zero-length samples is worse than one that
+/// refuses: the container is well-formed and the pictures are gone. Keeping the samples apart is the
+/// only way the two views cannot disagree about where a picture ends.
+fn mux(encoder: &HevcEncoder, samples: &[Vec<u8>], elementary: &str, pictures: u32) -> Result<String, String> {
     use filmcraft_isobmff::{Brand, Mp4Writer, TrackConfig, WriteSample, WriterOptions};
     let entry = encoder.sample_entry()?;
     let path = format!("{}.mp4", elementary.strip_suffix(".h265").unwrap_or(elementary));
     let file = std::fs::File::create(&path).map_err(|e| format!("writing {path}: {e}"))?;
     let mut writer = Mp4Writer::new(file, WriterOptions::new(Brand::Mp4)).map_err(|e| format!("a writer: {e}"))?;
     let track = writer.add_track(TrackConfig::new(entry.clone(), 30)).map_err(|e| format!("a video track: {e}"))?;
-    // **One sample per picture, split back out of the concatenated stream by walking its length
-    // prefixes** — the samples were concatenated in picture order and `mp4_sample()` made each one a
-    // sequence of four-byte-length-prefixed NALs, so the split is the same walk in reverse. It is
-    // done here rather than kept per picture so that the concatenation and the split cannot disagree
-    // about what a picture is: both read the same prefixes.
-    let mut rest: &[u8] = samples;
-    for index in 0..pictures {
-        let mut taken = 0usize;
-        while taken < rest.len() {
-            let Some(len_bytes) = rest.get(taken..taken + 4) else {
-                return Err(format!("picture {index}: a NAL length prefix runs off the end of the sample"));
-            };
-            let len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
-            if len == 0 || len > rest.len().saturating_sub(taken + 4) {
-                return Err(format!("picture {index}: a NAL claims {len} bytes and {} of {} are accounted for", taken + 4, rest.len()));
-            }
-            taken += 4 + len;
+    // **One sample per picture, and a sample with nothing in it is an error rather than a write.**
+    // The walk that used to split them swallowed every remaining picture into the first, which is a
+    // well-formed container holding five empty samples — the shape of bug that passes a "the file
+    // exists" check and loses the movie.
+    if samples.len() != pictures as usize {
+        return Err(format!("{} samples for {pictures} pictures", samples.len()));
+    }
+    for (index, one) in samples.iter().enumerate() {
+        if one.is_empty() {
+            return Err(format!("picture {index} has an empty sample"));
         }
-        let Some(one) = rest.get(..taken) else {
-            return Err(format!("picture {index}: the sample is shorter than its NALs claim"));
-        };
         writer
             .write_sample(track, WriteSample { data: one, duration: 1, composition_offset: 0, is_sync: index == 0 })
             .map_err(|e| format!("sample {index}: {e}"))?;
-        rest = &rest[taken..];
-    }
-    if !rest.is_empty() {
-        return Err(format!("{} bytes of sample data are left over after {pictures} pictures", rest.len()));
     }
     writer.finish().map_err(|e| format!("finishing {path}: {e}"))?;
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    // **And the file is checked to actually hold the pictures**, because the muxer accepts an empty
+    // sample without a murmur and ffmpeg then reports one frame and no error.
+    let verdict = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", &path])
+        .output();
+    match verdict {
+        Ok(out) => {
+            let frames = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if frames != pictures.to_string() {
+                return Err(format!("{path} holds {frames} decodable frame(s) for {pictures} pictures"));
+            }
+        }
+        Err(why) => eprintln!("ffprobe could not be run to count the frames in {path}: {why}"),
+    }
     Ok(format!(
-        "an hvcC for {}x{} carrying the VPS/SPS/PPS the stream's slices resolve, muxed into {} ({} bytes) with {} sample(s)",
+        "an hvcC for {}x{} carrying the VPS/SPS/PPS the stream's slices resolve, muxed into {path} ({bytes} bytes) with {pictures} sample(s), \
+         all {pictures} of which ffprobe decodes",
         encoder.sizes().1.0,
         encoder.sizes().1.1,
-        path,
-        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-        pictures
     ))
 }
 
@@ -412,30 +429,54 @@ fn decode_back(elementary: &str) -> Result<String, String> {
 }
 
 /// ffmpeg's own reading of the slice headers, which is the evidence behind [`slice_types`].
+///
+/// **`-bsf:v trace_headers` and not `-v verbose`**: ffmpeg's verbosity prints its *decoder's*
+/// summary, which does not include the bitstream's syntax elements. The bitstream filter is what
+/// prints them, and it prints them from the bytes without decoding — so it can be pointed at a
+/// stream that does not decode, which is what makes it evidence rather than an echo of the decoder.
 fn trace_headers(elementary: &str) {
-    let Ok(out) = Command::new("ffmpeg").args(["-v", "verbose", "-f", "hevc", "-i", elementary, "-c", "copy", "-f", "null", "-"]).output() else {
+    let Ok(out) = Command::new("ffmpeg")
+        .args(["-hide_banner", "-v", "trace", "-f", "hevc", "-i", elementary, "-c:v", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+        .output()
+    else {
         println!("trace: ffmpeg could not be run");
         return;
     };
     let text = String::from_utf8_lossy(&out.stderr);
     println!("trace_headers (ffmpeg's reading of the bitstream):");
+    let mut shown = 0usize;
     for line in text.lines().filter(|l| {
         let l = l.trim_start();
-        l.starts_with("nal_unit_type")
-            || l.starts_with("slice_type")
-            || l.starts_with("Slice/pic")
-            || l.contains("first_slice_in_pic_flag")
-            || l.contains("pps_id")
-            || l.contains("num_ref_idx")
-            || l.contains("short_term_ref_pic_set")
-            || l.contains("DeltaPocS0")
-            || l.contains("UsedByCurrPicS0")
-            || l.contains("log2_parallel_merge_level")
-            || l.contains("qp_delta")
-            || l.contains("poc_lsb")
-            || l.contains("pic_width")
-            || l.contains("pic_height")
+        let t = l.split_whitespace().last().unwrap_or("");
+        l.contains("trace_headers")
+            && (l.contains("nal_unit_type")
+                || l.contains("slice_type")
+                || l.contains("first_slice_segment_in_pic_flag")
+                || l.contains("no_output_of_prior_pics_flag")
+                || l.contains("slice_pic_parameter_set_id")
+                || l.contains("slice_pic_order_cnt_lsb")
+                || l.contains("short_term_ref_pic_set_sps_flag")
+                || l.contains("num_negative_pics")
+                || l.contains("delta_poc_s0_minus1")
+                || l.contains("used_by_curr_pic_s0_flag")
+                || l.contains("num_ref_idx_active_override_flag")
+                || l.contains("five_minus_max_num_merge_cand")
+                || l.contains("slice_qp_delta")
+                || l.contains("slice_loop_filter_across_slices_enabled_flag")
+                || l.contains("pic_width_in_luma_samples")
+                || l.contains("pic_height_in_luma_samples")
+                || l.contains("conformance_window")
+                || l.contains("general_level_idc")
+                || l.contains("st_ref_pic_set")
+                || t.is_empty() && l.contains("Slice"))
     }) {
         println!("  {}", line.trim());
+        shown += 1;
+    }
+    if shown == 0 {
+        println!("  (ffmpeg's trace_headers printed nothing for this stream — see the raw output below)");
+        for line in text.lines().filter(|l| l.contains("trace_headers")).take(20) {
+            println!("  {}", line.trim());
+        }
     }
 }

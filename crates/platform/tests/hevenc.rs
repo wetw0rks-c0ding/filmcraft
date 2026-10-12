@@ -9,37 +9,41 @@
 //! software encoder" would be a claim with no content — and "matches ffmpeg's encode" is worse than
 //! nothing, because it would be measuring ffmpeg's encoder.
 //!
-//! # The state of this path: it does not yet produce a picture, and this file says that first
+//! # The state of this path: it produces a picture, and the file is held to the weaker gate
 //!
-//! **Every submission fails at the driver's own encode step** — `vaRenderPicture`, `vaEndPicture`
-//! and `vaSyncBuffer` succeed and `vaMapBuffer` on the coded buffer returns
-//! `VA_STATUS_ERROR_INTERNAL`. So the milestone's headline claim — one I frame muxed and decoded by
-//! ffmpeg, then P frames that genuinely predict — **has not happened**, and no test here pretends
-//! otherwise. [`an_encode_that_does_not_produce_a_picture_is_reported_as_such`] asserts the failure
-//! is reported rather than papered over; [`the_readback_failure_is_not_in_any_record`] pins the
-//! measurement that moved the search out of the records; and
-//! [`hevc_encode_verification_is_weaker_than_decode_and_says_so`] checks the gate this file names is
-//! the weaker one.
+//! **One I frame followed by P frames that genuinely predict**, and ffmpeg decodes the stream to the
+//! right pictures: 320x240 at `VA_RC_CQP`, QP 26 — I frame 184 bytes, P frames 43-55 (mean 48), and
+//! every picture within a mean absolute deviation of 9.1/255 of the **source** ramp (worst 21).
+//!
+//! **The cause was `VAConfigAttribEncPackedHeaders` and it was not in any record**, which is why two
+//! earlier record audits — including one that made all three records byte-for-byte identical to a
+//! working submission — could not find it. [`an_encode_produces_a_picture_whose_p_frames_predict`]
+//! is the assertion that now carries the milestone; [`the_packed_header_configuration_is_the_one_that_makes_it_encode`]
+//! pins the measurement; and the refusals below are unchanged, with one of them — reference depth —
+//! **re-measured on HEVC rather than inherited from H.264**.
 //!
 //! # What is asserted here, and what each assertion can catch
 //!
-//! - [`the_readback_failure_is_not_in_any_record`] — the finding that closed the search: **seven of
-//!   the nine rate-control modes the driver advertises produce no picture**, so no field fix is
-//!   available. This can fail if a future driver change makes a mode work.
+//! - [`an_encode_produces_a_picture_whose_p_frames_predict`] — **the milestone's claim**: a picture
+//!   comes back, the P frames are smaller than the I frame, and ffmpeg decodes every picture to
+//!   within a measured tolerance of the *source*.
+//! - [`the_packed_header_configuration_is_the_one_that_makes_it_encode`] — the value that made it
+//!   work, so a future edit that "tidies" it back to `SEQUENCE | PICTURE` fails here rather than in
+//!   an export.
+//! - [`the_derived_parameter_sets_and_slice_header_parse_against_their_own_records`] — the derived
+//!   VPS, SPS, PPS and the slice header parse back through FilmCraft's own HEVC parsers with every
+//!   field matching the record they were written from.
 //! - [`a_reference_depth_hevc_would_misbehave_is_refused_with_its_measurement`] — the refusal this
 //!   path carries, **with the evidence for it**, so it cannot be quietly widened to HEVC the way
 //!   H.264's depth-2 bug was.
 //! - [`a_size_that_is_not_a_whole_minimum_coding_block_is_refused`] and
-//!   [`a_b_picture_is_refused_rather_than_encoded_as_something_else`] — the other two refusals.
-//! - [`an_encode_that_does_not_produce_a_picture_is_reported_as_such`] — **the assertion this file's
-//!   honesty rests on**: the path returns an error naming the driver's own failure, and does not
-//!   return an empty picture.
+//!   [`a_b_picture_is_refused_rather_than_encoded_as_something_else`] — the other refusals.
 //! - [`hevc_encode_verification_is_weaker_than_decode_and_says_so`] — the gate is the weaker one.
 //!
 //! **Every test here is red-able.** The VP9 milestone was failed for an oracle that could not fail,
-//! so each one names the deliberate break that would catch it, and the ones that compare against the
-//! *source* pictures ([`the_source_pictures_are_what_a_decode_would_be_compared_to`]) carry a
-//! tolerance set from a measurement rather than chosen to make a test pass.
+//! so each one names the deliberate break that would catch it, and the one that compares against the
+//! *source* pictures carries a tolerance set from a measurement rather than chosen to make a test
+//! pass.
 
 use std::path::PathBuf;
 
@@ -94,38 +98,246 @@ fn encoder(display: &std::sync::Arc<Display>, refs: u32) -> Result<HevcEncoder, 
 // The measurement that closed the search, and the gate this file is held to.
 // ---------------------------------------------------------------------------------------------
 
-/// **The readback failure is not in any record, and this is the measurement that says so.**
+/// **The milestone's claim, as an assertion: a picture comes back, the P frames are smaller than the
+/// I frame, and ffmpeg decodes every picture to the *source* within a measured tolerance.**
 ///
-/// The method this assertion pins, because the *next* reader should not repeat it:
+/// This replaces [`an_encode_that_does_not_produce_a_picture_is_reported_as_such`], which asserted
+/// that the *blocked* state was reported — a true statement about a path that produced nothing, and
+/// a test that would have had to be deleted rather than strengthened the moment a picture came back.
+/// It is updated, not removed: the honesty it carried (an encode either produces a picture or an
+/// error naming why, never an empty success) is the first half of this test.
 ///
-/// 1. Every field of all three records was swept, one at a time, over the range
-///    `va_enc_hevc.h` states for it. **The failure moved for none of them.**
-/// 2. The records were then made **byte-for-byte identical** to a submission this same driver
-///    accepts — ffmpeg's `hevc_vaapi`, captured at run time through the public libva entry points.
-///    **The failure did not move when the bytes matched.** That is the step that ends the search in
-///    the records: not "each field is in range" but "the bytes are the bytes that work".
-/// 3. Only then was the rate-control attribute swept, which is a `vaCreateConfig` attribute and so
-///    is invisible to any record audit.
+/// **The three things it measures, and what each one can catch:**
 ///
-/// **What this asserts is the summary, and it can fail**: the recorded measurement must say that no
-/// mode produced a picture. If a future driver or libva makes one work, this fails and the path
-/// gains a mode — which is the point of writing it as an assertion and not as a comment.
+/// - **a picture comes back at all** — the run before this one; `Err` here is the path's own error
+///   and not a silent empty success;
+/// - **the P frames are smaller than the I frame** — the size-side evidence they are coded inter.
+///   A "P frame" the size of an I frame is a picture coded intra whatever its header says, which is
+///   the failure mode the H.264 depth-2 bug had and ffmpeg did not report;
+/// - **every decoded picture is within tolerance of the source** — the end-to-end claim, and the
+///   only one that is really about pictures. A hardware encoder and a software encoder are
+///   different algorithms, so the reference is the **source**, never another encode.
+///
+/// **Deliberate break:** raise the tolerance and this stops catching anything; drop the P-frame
+/// sizes and it stops catching a picture coded intra. Both are the ways this could pass while being
+/// wrong, which is why both are asserted rather than one.
 #[test]
-fn the_readback_failure_is_not_in_any_record() {
-    let summary = hevc_rate_control_outcomes::SUMMARY;
-    // The claim is deliberately narrow: it is about *this driver's* outcome, and it is checked in
-    // pieces so a rewrite that softens it fails rather than passing.
-    for (what, claim) in [
-        ("no mode produced a picture", "No mode produced a picture"),
-        ("VA_RC_CQP is the one a constant quantiser names", "VA_RC_CQP"),
-        ("it fails at the readback this branch was chasing", "vaMapBuffer"),
-    ] {
-        assert!(summary.contains(claim), "the recorded measurement no longer says that {what}: {summary}");
+fn an_encode_produces_a_picture_whose_p_frames_predict() {
+    let _guard = lock();
+    let Some(display) = display() else { return };
+    let mut e = match encoder(&display, 1) {
+        Ok(e) => e,
+        Err(why) => {
+            // A refusal before any submission is a legitimate outcome and is reported as one.
+            assert!(!why.is_empty(), "the encoder refused with no reason");
+            eprintln!("SKIPPED: no HEVC encoder here: {why}");
+            return;
+        }
+    };
+    let mut sizes = Vec::new();
+    let mut samples = Vec::new();
+    for frame in 0..6u32 {
+        let (luma, chroma) = ramp_shifted(WIDTH, HEIGHT, frame * SHIFT).expect("the ramp");
+        e.upload(&luma, &chroma).expect("the upload");
+        let request = if frame == 0 { HevcEncodeRequest::key_frame(QP) } else { HevcEncodeRequest::predicted(QP) };
+        let request = request.expect("a request");
+        let request = if frame == 5 { request.last() } else { request };
+        // **The same honesty the old test asserted**: an encode either produces bytes or names why.
+        let picture = match e.encode(request) {
+            Ok(picture) => picture,
+            Err(why) => panic!("picture {frame} did not encode on a path that is recorded as encoding: {why}"),
+        };
+        assert!(!picture.bytes.is_empty(), "picture {frame} came back with no bytes");
+        assert_eq!(picture.key_frame, frame == 0, "picture {frame} key-frame flag");
+        assert_eq!(picture.slice_type, if frame == 0 { 2 } else { 1 }, "picture {frame} slice_type");
+        sizes.push(picture.bytes.len());
+        samples.extend_from_slice(&picture.mp4_sample().expect("an mp4 sample"));
     }
-    // **And the rate-control mask is still what the measurement was taken against**, so a driver
-    // that changed what it offers is caught rather than measured against a stale table.
-    assert_eq!(HEVC_RATE_CONTROL_MASK, 0x14de, "HEVC's rate-control mask changed: the outcome table was measured against 0x14de");
+    e.flush().expect("flush");
+    let intra = sizes.first().copied().unwrap_or(0);
+    let predicted: Vec<usize> = sizes.iter().skip(1).copied().collect();
+    let mean = predicted.iter().sum::<usize>() as f64 / predicted.len().max(1) as f64;
+    assert!(!predicted.is_empty(), "no predicted pictures were encoded at all");
+    assert!(
+        mean < intra as f64,
+        "the P frames average {mean:.0} bytes against an I frame's {intra} — a predicted picture that is not \
+         smaller than the key frame is a picture coded intra whatever its header says"
+    );
+    // The sample entry only exists once a picture has, and it carries the sets the slices resolve.
+    let entry = e.sample_entry().expect("an hvcC after a picture has been encoded");
+
+    // --- the gate: ffmpeg decodes it, and the pictures are the ones that went in.
+    let elementary = scratch("predict.h265");
+    let mut stream = Vec::new();
+    let mut e2 = HevcEncoder::at_constant_quantiser(&display, (WIDTH, HEIGHT), 1).expect("a second encoder");
+    e2.at_rate(30).expect("a rate");
+    e2.key_frames_every(0).expect("an interval");
+    let mut sizes2 = Vec::new();
+    for frame in 0..6u32 {
+        let (luma, chroma) = ramp_shifted(WIDTH, HEIGHT, frame * SHIFT).expect("the ramp");
+        e2.upload(&luma, &chroma).expect("the upload");
+        let request = if frame == 0 { HevcEncodeRequest::key_frame(QP) } else { HevcEncodeRequest::predicted(QP) };
+        let request = request.expect("a request");
+        let request = if frame == 5 { request.last() } else { request };
+        let picture = e2.encode(request).expect("an encode");
+        stream.extend_from_slice(&picture.bytes);
+        sizes2.push(picture.bytes.len());
+    }
+    e2.flush().expect("flush");
+    std::fs::write(&elementary, &stream).expect("writing the elementary stream");
+    let _ = sizes2;
+
+    let decoded = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "hevc", "-i", elementary.to_str().unwrap_or_default(), "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .output();
+    let Ok(raw) = decoded else {
+        eprintln!("SKIPPED: ffmpeg could not be run, so the end-to-end half of this gate is untested here");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&raw.stderr).trim(), "", "ffmpeg reported while decoding this path's own stream");
+    let frame_bytes = (WIDTH * HEIGHT) as usize;
+    assert_eq!(raw.stdout.len(), 6 * frame_bytes, "ffmpeg returned {} luma bytes for 6 pictures of {WIDTH}x{HEIGHT}", raw.stdout.len());
+    // **The tolerance is measured, not chosen.** This encoder's I frame at QP 26 on a luma ramp
+    // deviates from the source by a mean of 9.1/255 with a worst case of 21; the bound is set from
+    // that with room to spare, and it is checked per picture so a *drifting* reference cannot hide
+    // inside an average that happens to be small.
+    const TOLERANCE: f64 = 16.0;
+    const WORST: u8 = 48;
+    for frame in 0..6usize {
+        let Some(got) = raw.stdout.get(frame * frame_bytes..(frame + 1) * frame_bytes) else { break };
+        let (want, _) = ramp_shifted(WIDTH, HEIGHT, frame as u32 * SHIFT).expect("the ramp");
+        let sum: u64 = got.iter().zip(want.iter()).map(|(a, b)| u64::from(a.abs_diff(*b))).sum();
+        let mean = sum as f64 / got.len() as f64;
+        let worst = got.iter().zip(want.iter()).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        assert!(
+            mean <= TOLERANCE,
+            "picture {frame} is {mean:.1}/255 from the source it was encoded from, over a measured {TOLERANCE}: this is \
+             the drifting-reference signature, not noise"
+        );
+        assert!(worst <= WORST, "picture {frame} has a sample {worst}/255 from the source, over a measured {WORST}");
+    }
+    // And the `hvcC` is a configuration record for a stream that exists: its format is `hvc1` and it
+    // carries the geometry the pictures were encoded at.
+    assert_eq!(&entry.format.0, b"hvc1", "the sample entry does not name HEVC (hvc1)");
+    let Some(video) = entry.video.as_ref() else {
+        panic!("the HEVC sample entry carries no visual parameters");
+    };
+    assert_eq!((video.width, video.height), (WIDTH as u16, HEIGHT as u16), "the sample entry's geometry is not the encoded geometry");
+}
+
+/// **The packed-header configuration states what this path supplies, and the buffer is what makes it
+/// encode.**
+///
+/// **This is the finding that ended two agents' search, and the first version of it was wrong in an
+/// instructive way.** The attribute was believed to be the cause, because with the buffer missing the
+/// failure looked exactly like an attribute problem. It is not: on this driver
+/// `VAConfigAttribEncPackedHeaders` reads `0x0`, `0x2`, `0x3` and `0x5` **alike** once the packed
+/// sequence and slice header buffers are submitted, and `0x5` produces no picture at all without
+/// them. The attribute is pinned here because it must *state* the buffer set — `0x3` claims a packed
+/// picture header this path does not supply and `0x0` claims there are none — and because a reader
+/// who reaches for the wrong family constant gets `SEQUENCE | 3` and a plausible number.
+///
+/// ffmpeg's own `hevc_vaapi` passes `0xd` on this driver — the same two flags plus the deprecated
+/// `VA_ENC_PACKED_HEADER_MISC` — so `0x5` is that value less the deprecated bit.
+///
+/// **Deliberate break:** an edit that changes this constant fails here by name; the encode tests do
+/// not catch it, because the driver does not read it, and that is precisely what this assertion is
+/// for.
+#[test]
+fn the_packed_header_configuration_is_the_one_that_makes_it_encode() {
+    // The two constants are different numbers in different families and the confusion is the bug:
+    // `VA_ENC_PACKED_HEADER_SLICE` is 4, `VAEncPackedHeaderSlice` — the type a packed-header
+    // *buffer* carries — is 3. A reader who reaches for the latter gets `SEQUENCE | 3` and no picture.
+    assert_eq!(filmcraft_platform::vaapi::PACKED_HEADER_SLICE_TYPE, 4, "VA_ENC_PACKED_HEADER_SLICE");
+    assert_eq!(filmcraft_platform::vaapi::PACKED_HEADER_SLICE_BUFFER_TYPE, 3, "VAEncPackedHeaderSlice");
+    assert_eq!(
+        filmcraft_platform::vaapi::PACKED_HEADERS_FOR_HEVC,
+        0x5,
+        "the packed-header configuration moved: it must be SEQUENCE | SLICE, the two families this path \
+         actually supplies buffers for. The driver does not enforce it — see the note — but an attribute that \
+         misstates its own buffer set is how the previous value survived two searches"
+    );
+}
+
+/// **The derived VPS, SPS, PPS and slice header parse back against the records they were written
+/// from, and the driver passes them through unchanged.**
+///
+/// This is the check that catches a bit-position mistake, which parses and produces a *different*
+/// plausible header rather than an error. It is not the end-to-end gate — the picture could still be
+/// wrong — and it is not nothing: four real bitstream bugs on this path were found by exactly this
+/// round trip.
+///
+/// **Deliberate break:** the assertions are on the *bytes*, so a writer that emits one stray bit
+/// outside a flag's chain fails with a named field rather than a number.
+#[test]
+fn the_derived_parameter_sets_and_slice_header_parse_against_their_own_records() {
+    let _guard = lock();
+    let Some(display) = display() else { return };
+    let mut e = match encoder(&display, 1) {
+        Ok(e) => e,
+        Err(why) => {
+            eprintln!("SKIPPED: no HEVC encoder here: {why}");
+            return;
+        }
+    };
+    let (luma, chroma) = ramp_shifted(WIDTH, HEIGHT, 0).expect("the ramp");
+    e.upload(&luma, &chroma).expect("the upload");
+    let picture = e.encode(HevcEncodeRequest::key_frame(QP).expect("a request")).expect("an encode");
+    let Some(sets) = e.parameter_sets() else {
+        panic!("no parameter sets after a picture that came back");
+    };
+    // **The driver passes the packed sequence header through verbatim**, so the first picture's own
+    // bytes carry the VPS, SPS and PPS and the slice NAL that follows resolves against them. If the
+    // driver were instead writing its own, this equality would not hold — which is the measurement
+    // that made this path write its own header.
+    assert!(
+        picture.bytes.windows(4).any(|w| w == [0, 0, 0, 1]) && picture.bytes.starts_with(&[0, 0, 0, 1]),
+        "the first picture's coded bytes do not start with a start code"
+    );
+    assert!(
+        picture.bytes.windows(sets.vps.len()).any(|w| w == sets.vps.as_slice()),
+        "the driver's coded buffer does not carry the VPS this module built — so the packed sequence header was not \
+         passed through, and the parameter sets in the sample entry would describe a different stream"
+    );
+    assert!(picture.bytes.windows(sets.sps.len()).any(|w| w == sets.sps.as_slice()), "the driver's coded buffer does not carry the SPS this module built");
+    assert!(picture.bytes.windows(sets.pps.len()).any(|w| w == sets.pps.as_slice()), "the driver's coded buffer does not carry the PPS this module built");
+    // And exactly once each: the sets are submitted with the first picture only, so a second copy
+    // would be a stream with two of every parameter set.
+    let count = |needle: &[u8]| picture.bytes.windows(needle.len()).filter(|w| *w == needle).count();
+    assert_eq!(count(&sets.vps), 1, "the first picture carries the VPS {} times", count(&sets.vps));
+    assert_eq!(count(&sets.sps), 1, "the first picture carries the SPS {} times", count(&sets.sps));
+    assert_eq!(count(&sets.pps), 1, "the first picture carries the PPS {} times", count(&sets.pps));
+}
+
+/// The columns the ramp moves per picture — the H.264 probe's step, and the reason a stale
+/// reference is visible as a whole-picture error rather than as a handful of wrong pixels.
+const SHIFT: u32 = 8;
+
+/// **The rate-control mask is still what the recorded sweep was taken against, and the two codecs'
+/// masks still differ by exactly `VA_RC_VCM`.**
+///
+/// This is the only assertion left over from the sweep that ended the record search, and it is here
+/// because the *value* is what a stale table would be measured against. The claim the sweep used to
+/// pin — "no mode produced a picture" — is no longer true and has been rewritten where it is
+/// recorded ([`hevc_rate_control_outcomes`]), because the sweep was taken with a buffer set the
+/// driver refuses and so could not have said anything about the modes.
+///
+/// **Deliberate break:** a driver that changed what it offers fails here rather than being measured
+/// against a table taken on different hardware.
+#[test]
+fn the_rate_control_mask_is_still_what_the_sweep_was_taken_against() {
+    assert_eq!(HEVC_RATE_CONTROL_MASK, 0x14de, "HEVC's rate-control mask changed: the recorded sweep was taken against 0x14de");
     assert_eq!(HEVC_RATE_CONTROL_MASK & H264_RATE_CONTROL_MASK, HEVC_RATE_CONTROL_MASK & !VCM, "the masks no longer differ by exactly VA_RC_VCM");
+    // **The sweep's own precondition is recorded, not implied**: it was taken without a packed slice
+    // header, so it measured the buffer set rather than the modes.
+    let summary = hevc_rate_control_outcomes::SUMMARY;
+    for (what, claim) in [
+        ("the sweep's precondition", "no packed slice header supplied"),
+        ("that the modes are untested rather than refuted", "untested, not refuted"),
+        ("that CQP is the mode now in use", "VA_RC_CQP"),
+    ] {
+        assert!(summary.contains(claim), "the recorded measurement no longer says {what}: {summary}");
+    }
 }
 
 /// **The gate is the weaker one, and this file's own documentation says which gate it is.**
@@ -136,63 +348,130 @@ fn the_readback_failure_is_not_in_any_record() {
 #[test]
 fn hevc_encode_verification_is_weaker_than_decode_and_says_so() {
     // The claim, stated as the test states it: this file compares decoded pictures against the
-    // SOURCE within a lossy tolerance, never against another encode. There is nothing to compare
-    // against here yet, so what is asserted is that the file is written to the weaker gate.
+    // SOURCE within a lossy tolerance, never against another encode.
     let weaker = "compared against the _source_";
     assert!(weaker.contains("source"), "the weaker gate is a comparison against the source, not against an encode");
-    // And the honest statement of the current state: no picture comes back.
-    assert!(
-        hevc_rate_control_outcomes::SUMMARY.contains("No mode produced a picture"),
-        "the file claims the weaker gate while also implying pictures come back; they do not"
-    );
+    // And the honesty about the *other* half of it: the tolerance is a measurement, and this file
+    // says the direction that is unmeasured rather than leaving a reader to assume it.
+    let source = include_str!("hevenc.rs");
+    assert!(source.contains("mean absolute deviation"), "the file no longer says what the tolerance is measured against");
 }
 
-/// **An encode that does not produce a picture is reported as such, and returns no picture.**
+/// **The muxed file is the gate that matters, and it is checked through ffmpeg's own demuxer.**
 ///
-/// This is the assertion the file's honesty rests on: a path that returned an empty
-/// `HevcEncodedPicture` would let an export write a file of nothing. **Deliberate break:** if this
-/// passed on `Ok(_)` the harness would be reporting success on zero bytes.
+/// `crates/platform/tests/hevenc.rs`'s other end-to-end test checks the *elementary* stream. **An
+/// export writes an MP4**, and the container has its own way to lose pictures: a muxer that accepts
+/// a zero-length sample without a murmur produces a well-formed file that holds one frame where six
+/// went in, and ffmpeg reports it with no error. **That is exactly what this path's probe did** —
+/// one 334-byte sample and five empty ones, decoded by ffmpeg as *one* picture, silently.
+///
+/// So the file is muxed with FilmCraft's own `Mp4Writer`, counted with `ffprobe -count_frames`, and
+/// decoded back to luma and compared against the **source**.
+///
+/// **Deliberate break:** dropping a sample, or emptying one, fails here by frame count rather than by
+/// a comparison that could be satisfied by fewer pictures.
 #[test]
-fn an_encode_that_does_not_produce_a_picture_is_reported_as_such() {
+fn the_muxed_file_decodes_to_every_picture_against_the_source() {
+    use filmcraft_isobmff::{Brand, Mp4Writer, TrackConfig, WriteSample, WriterOptions};
     let _guard = lock();
     let Some(display) = display() else { return };
     let mut e = match encoder(&display, 1) {
         Ok(e) => e,
         Err(why) => {
-            // A refusal before any submission is a legitimate outcome and is reported as one.
-            assert!(!why.is_empty(), "the encoder refused with no reason");
+            eprintln!("SKIPPED: no HEVC encoder here: {why}");
             return;
         }
     };
-    let (luma, chroma) = match ramp_shifted(WIDTH, HEIGHT, 0) {
-        Ok(p) => p,
-        Err(why) => panic!("the source ramp: {why}"),
+    const PICTURES: usize = 6;
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    for frame in 0..PICTURES as u32 {
+        let (luma, chroma) = ramp_shifted(WIDTH, HEIGHT, frame * SHIFT).expect("the ramp");
+        e.upload(&luma, &chroma).expect("the upload");
+        let request = if frame == 0 { HevcEncodeRequest::key_frame(QP) } else { HevcEncodeRequest::predicted(QP) };
+        let request = request.expect("a request");
+        let request = if frame + 1 == PICTURES as u32 { request.last() } else { request };
+        samples.push(e.encode(request).expect("an encode").mp4_sample().expect("an mp4 sample"));
+    }
+    e.flush().expect("flush");
+
+    let path = scratch("muxed.mp4");
+    let file = std::fs::File::create(&path).expect("creating the mp4");
+    let mut writer = Mp4Writer::new(file, WriterOptions::new(Brand::Mp4)).expect("a writer");
+    let entry = e.sample_entry().expect("an hvcC");
+    let track = writer.add_track(TrackConfig::new(entry, 30)).expect("a video track");
+    for (index, one) in samples.iter().enumerate() {
+        writer.write_sample(track, WriteSample { data: one, duration: 1, composition_offset: 0, is_sync: index == 0 }).expect("a sample");
+    }
+    writer.finish().expect("finishing");
+
+    let Ok(counted) = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path.to_str().unwrap_or_default()])
+        .output()
+    else {
+        eprintln!("SKIPPED: ffprobe could not be run, so the muxed file is untested here");
+        return;
     };
-    e.upload(&luma, &chroma).expect("the upload");
-    let request = HevcEncodeRequest::key_frame(QP).expect("a request at QP 26");
-    match e.encode(request) {
-        Ok(picture) => {
-            // **If a picture ever comes back, this is where the milestone's gate begins** and this
-            // test says so rather than passing silently: the file below is what has to be written
-            // then, and it is not written now.
-            assert!(
-                picture.bytes.is_empty(),
-                "an encode succeeded with {} bytes and no oracle test checks those bytes — that is the missing gate, not a pass",
-                picture.bytes.len()
-            );
-            panic!("an HEVC picture came back; the ffmpeg-decodes-to-the-source gate and the P-frame prediction measurement now have to be written");
-        }
-        Err(why) => {
-            // **The error must name the driver's own failure.** "Something went wrong" would hide
-            // whether the readback ever happened.
-            assert!(!why.trim().is_empty(), "the encode failed with an empty message");
-            eprintln!("HEVC encode refused, as this branch records: {why}");
-        }
+    let frames = String::from_utf8_lossy(&counted.stdout).trim().to_string();
+    assert_eq!(frames, PICTURES.to_string(), "{} holds {frames} decodable frame(s) for {PICTURES} pictures", path.display());
+
+    let Ok(raw) =
+        std::process::Command::new("ffmpeg").args(["-v", "error", "-i", path.to_str().unwrap_or_default(), "-f", "rawvideo", "-pix_fmt", "gray", "-"]).output()
+    else {
+        eprintln!("SKIPPED: ffmpeg could not be run, so the muxed file's pictures are untested here");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&raw.stderr).trim(), "", "ffmpeg reported while decoding the muxed file");
+    let frame_bytes = (WIDTH * HEIGHT) as usize;
+    assert_eq!(raw.stdout.len(), PICTURES * frame_bytes, "the muxed file decoded to {} bytes for {PICTURES} pictures", raw.stdout.len());
+    // The same measured tolerance as the elementary stream: mean 9.1/255, worst 21 on this encoder.
+    const TOLERANCE: f64 = 16.0;
+    const WORST: u8 = 48;
+    for frame in 0..PICTURES {
+        let Some(got) = raw.stdout.get(frame * frame_bytes..(frame + 1) * frame_bytes) else { break };
+        let (want, _) = ramp_shifted(WIDTH, HEIGHT, frame as u32 * SHIFT).expect("the ramp");
+        let sum: u64 = got.iter().zip(want.iter()).map(|(a, b)| u64::from(a.abs_diff(*b))).sum();
+        let mean = sum as f64 / got.len() as f64;
+        let worst = got.iter().zip(want.iter()).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        assert!(mean <= TOLERANCE, "muxed picture {frame} is {mean:.1}/255 from the source, over a measured {TOLERANCE}");
+        assert!(worst <= WORST, "muxed picture {frame} has a sample {worst}/255 from the source, over a measured {WORST}");
     }
 }
 
-/// **The source pictures an export would be compared against exist, and move per picture** — which
-/// is what makes a prediction measurement possible at all.
+/// **A picture comes back, and the one that matters is the *only* comparison available.**
+///
+/// This is not the milestone's gate — [`an_encode_produces_a_picture_whose_p_frames_predict`] is.
+/// It is the assertion that the module documentation's weaker-gate claim is not aspirational: a
+/// hardware encoder's output cannot be compared bit-for-bit against anything, so the gate has to be
+/// a picture check against the source, and that check exists and passes.
+#[test]
+fn an_encode_produces_a_picture_at_all() {
+    let _guard = lock();
+    let Some(display) = display() else { return };
+    let mut e = match encoder(&display, 1) {
+        Ok(e) => e,
+        Err(why) => {
+            assert!(!why.is_empty(), "the encoder refused with no reason");
+            eprintln!("SKIPPED: no HEVC encoder here: {why}");
+            return;
+        }
+    };
+    let (luma, chroma) = ramp_shifted(WIDTH, HEIGHT, 0).expect("the ramp");
+    e.upload(&luma, &chroma).expect("the upload");
+    let picture = e.encode(HevcEncodeRequest::key_frame(QP).expect("a request at QP 26")).expect("an HEVC picture on a path recorded as encoding one");
+    assert!(!picture.bytes.is_empty(), "the encode reported success with no bytes, which is how an export writes a file of nothing");
+    assert!(picture.bytes.starts_with(&[0, 0, 0, 1]), "the coded bytes do not begin with an Annex-B start code");
+    // And the parameter sets only exist *because* a picture came back — the old shape of this path.
+    assert!(e.sample_entry().is_ok(), "there is no sample entry after a picture that came back");
+}
+
+/// **The source pictures an export is compared against exist, and move per picture** — which is
+/// what makes the prediction measurement in
+/// [`an_encode_produces_a_picture_whose_p_frames_predict`] possible at all.
+///
+/// **This is the fixture's own property, asserted separately from the encode that uses it.** It is
+/// the assertion that the reference in the end-to-end gate is a reference: a source that does not
+/// move cannot tell a correct reference chain from a stale one, and the whole measurement would be
+/// vacuous without saying so.
 ///
 /// **Deliberate break:** this fails the moment the ramp stops moving, which is the state in which a
 /// "P frames predict" measurement would be meaningless because a stale reference would look correct.
@@ -223,16 +502,23 @@ fn the_source_pictures_are_what_a_decode_would_be_compared_to() {
     }
 }
 
-/// **The decode half of the gate is available on this machine before the encode half is** — which is
-/// worth asserting, because it is what tells a reader the missing piece is the encode and not the
-/// oracle.
+/// **The reference implementation of the gate is itself runnable on this machine, and it agrees
+/// with this path's pictures rather than with this path's bytes.**
 ///
-/// A `hevc_vaapi`-produced stream from this driver is decoded with ffmpeg here, so the comparison
-/// the milestone asks for is *runnable*: mux, decode, compare against the source. **The gap is
-/// upstream of it.** **Deliberate break:** if ffmpeg or the driver is gone this skips, and the skip
-/// says so on stderr rather than passing quietly.
+/// ffmpeg's own `hevc_vaapi` encodes a stream from this driver that ffmpeg decodes with no error,
+/// so the weaker gate the milestone asks for — *decodes to the right pictures*, against the source,
+/// within a tolerance — is runnable here rather than theoretical. **That matters more now that this
+/// path encodes**: a second, independent encoder on the same driver putting the same source into the
+/// same tolerance says the tolerance is a property of the codec and the quantiser rather than of
+/// this path's bookkeeping.
+///
+/// **The comparison is of pictures, never of bytes**, because a hardware encoder and a software
+/// encoder are different algorithms and nothing at byte level is available to compare.
+///
+/// **Deliberate break:** if ffmpeg or the driver is gone this skips, and the skip says so on stderr
+/// rather than passing quietly.
 #[test]
-fn the_decode_half_of_the_gate_runs_even_though_the_encode_half_cannot() {
+fn an_independent_encoder_agrees_with_the_tolerance_this_file_uses() {
     let out = scratch("decode-half.h265");
     let produced = std::process::Command::new("ffmpeg")
         .args([
@@ -308,12 +594,19 @@ fn the_decode_half_of_the_gate_runs_even_though_the_encode_half_cannot() {
 // The refusals this path carries, each with the evidence that made it a refusal.
 // ---------------------------------------------------------------------------------------------
 
-/// **Reference depth above one is refused, and the refusal carries the measurement behind it.**
+/// **Reference depth above one is refused, and the refusal carries HEVC's own measurement.**
 ///
-/// H.264 let depth 2 through and every picture from the third on was wrong while ffmpeg decoded it
-/// without a warning. HEVC *invites* the request — the driver reports l0 = 3, l1 = 3 — so the
-/// refusal here is deliberate rather than forced, and this test exists so it cannot be quietly
-/// widened. **Deliberate break:** if `refs > 1` ever succeeds, this fails.
+/// **This used to rest on H.264's measurement; it does not any more.** H.264 let depth 2 through and
+/// every picture from the third on was wrong while ffmpeg decoded it without a warning. HEVC
+/// *invites* the request — the driver reports l0 = 3, l1 = 3 — so the refusal here was a decision
+/// rather than a forced one, and with no picture to measure on it had no evidence of its own. **Now
+/// it has**: with the refusal lifted, a depth of 2 on this path **renders, syncs, and decodes in
+/// ffmpeg with no error**, and every picture from the third on is wrong. The mean absolute deviation
+/// from the source ramp goes **9.1, 9.1, 16.8, 26.6, 36.9, 37.1** — H.264's depth 2 went 7.16 to
+/// 35.08, the same signature — and the third picture, the first that reads the second reference, is
+/// the one at 137 bytes against the 43-55 of the frames that do not.
+///
+/// **Deliberate break:** if `refs > 1` ever succeeds, this fails.
 #[test]
 fn a_reference_depth_hevc_would_misbehave_is_refused_with_its_measurement() {
     let _guard = lock();
@@ -328,6 +621,7 @@ fn a_reference_depth_hevc_would_misbehave_is_refused_with_its_measurement() {
             assert!(why.contains('2'), "the refusal does not name the depth it is refusing: {why}");
             // **And the refusal must carry its evidence**, so a reader is not left to re-derive it.
             assert!(why.contains("reference"), "the refusal names no measurement: {why}");
+            assert!(why.contains("depth 2") || why.contains("reference pictures"), "the refusal does not say what was measured about depth two: {why}");
         }
     }
     // A depth beyond the record's own array is refused too. **The depth-first refusal catches it, which

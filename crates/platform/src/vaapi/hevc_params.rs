@@ -36,7 +36,7 @@
 
 use super::encoder::RateControl;
 use super::ffi;
-use super::hevc_enc::{VaEncPictureParameterBufferHevc, VaEncSequenceParameterBufferHevc};
+use super::hevc_enc::{VaEncPictureParameterBufferHevc, VaEncSequenceParameterBufferHevc, VaEncSliceParameterBufferHevc};
 use super::hevc_submit::{HevcParameterSets, NAL_PPS, NAL_SPS, NAL_VPS};
 use filmcraft_bitstream::BitWriter;
 
@@ -84,6 +84,256 @@ pub fn parameter_sets(
         profile_idc: sequence.general_profile_idc,
         frame_rate,
     })
+}
+
+/// **The packed slice header for one slice segment**, as an Annex-B NAL unit: a start code, the
+/// two-byte NAL header and `slice_segment_header()` (7.4.7.1), **escaped and trailing-bit
+/// terminated** — which is exactly the payload `VAEncPackedHeaderDataBuffer` is given under
+/// `VAEncPackedHeaderSlice`.
+///
+/// # Why this module writes the driver's slice header
+///
+/// **Because the driver writes none, and does not fail saying so.** Measured on iHD 26.3.5 by
+/// capturing ffmpeg's own `hevc_vaapi` submission at run time through the public libva entry points
+/// (its stream and an uninstrumented run are byte-identical, so the capture does not perturb it):
+/// ffmpeg hands the driver a `VAEncPackedHeaderParameterBuffer` of type
+/// `VAEncPackedHeaderSlice` whose data buffer holds the **complete slice header including its start
+/// code and NAL header** (`va_enc_hevc.h:299-309` says exactly that), and the bytes the driver
+/// returns in the coded buffer **begin with those same bytes, verbatim**, followed by the slice data
+/// the driver wrote. The driver is a slice-**data** writer.
+///
+/// **And the consequence is a hard one: with `VA_ENC_PACKED_HEADER_SLICE` configured and no slice
+/// header supplied, `vaRenderPicture`/`vaEndPicture`/`vaSyncBuffer` all return success and
+/// `vaMapBuffer` on the coded buffer returns `VA_STATUS_ERROR_INTERNAL`.** That is the readback
+/// failure this path spent two agents on, and it is why this function exists.
+///
+/// # Every value here is read out of a record, and a record that states something else is an error
+///
+/// The syntax elements below are conditional, and this writer emits the ones the *derived* SPS and
+/// PPS carry — which is why every one of those flags is checked against the record it was written
+/// from and a state this writer does not implement is an `Err` rather than a default. Writing the
+/// chain unconditionally puts a `u(1)` where a `ue(v)` belongs, and the result parses as a different
+/// header rather than failing.
+///
+/// **Verified the same way the parameter sets are**: written here, then read back with
+/// [`filmcraft_hevc::slice::SliceHeader::parse`] — the parser the decode path already trusts for
+/// real streams — resolving through the *derived* PPS and SPS, so the header and the parameter sets
+/// it names have to agree to parse at all. A bit-position mistake is an error here rather than a
+/// header a decoder misreads.
+pub fn slice_header(
+    sequence: &VaEncSequenceParameterBufferHevc,
+    picture: &VaEncPictureParameterBufferHevc,
+    slice: &VaEncSliceParameterBufferHevc,
+    sets: &HevcParameterSets,
+) -> Result<Vec<u8>, String> {
+    let seq_fields = unpack_seq_fields(sequence.seq_fields);
+    let pic_fields = unpack_pic_fields(picture.pic_fields);
+    // **The conditional syntax elements this writer does not implement, refused rather than skipped.**
+    // Each of them would put a different chain of bits in the header, and a header that disagrees
+    // with the parameter sets decodes to something else rather than failing.
+    for (what, on) in [
+        ("separate_colour_plane_flag", seq_fields.separate_colour_plane_flag),
+        ("sample_adaptive_offset_enabled_flag", seq_fields.sao_enabled),
+        ("sps_temporal_mvp_enabled_flag", seq_fields.temporal_mvp_enabled),
+        ("dependent_slice_segments_enabled_flag", pic_fields.dependent_slice_segments),
+        ("tiles_enabled_flag", pic_fields.tiles_enabled),
+        ("entropy_coding_sync_enabled_flag", pic_fields.entropy_coding_sync),
+        ("pps_slice_chroma_qp_offsets_present_flag", false),
+        ("weighted_pred_flag", pic_fields.weighted_pred),
+        ("weighted_bipred_flag", pic_fields.weighted_bipred),
+        ("cabac_init_present_flag", false),
+        ("num_extra_slice_header_bits", false),
+    ] {
+        if on {
+            return Err(format!(
+                "{what} is set, and this slice-header writer does not implement it: the syntax it introduces is not written, so the header would not be the header the record describes"
+            ));
+        }
+    }
+    if slice.slice_segment_address != 0 {
+        return Err(format!(
+            "slice_segment_address {} is not 0, and this writer only writes a slice that starts at the picture's first CTU",
+            slice.slice_segment_address
+        ));
+    }
+    if slice.slice_pic_parameter_set_id > 63 {
+        return Err(format!("slice_pic_parameter_set_id {} is outside HEVC's 0..=63", slice.slice_pic_parameter_set_id));
+    }
+    let slice_type = slice.slice_type;
+    if slice_type > 2 {
+        return Err(format!("a slice_type of {slice_type} is outside HEVC's u(2)"));
+    }
+    if !pic_fields.idr_pic_flag && slice_type == 2 {
+        return Err(format!(
+            "a slice_type of {slice_type} (I) on a picture whose idr_pic_flag is clear: an I slice that is not an IDR reads no reference and this loop only encodes an I slice as an IDR"
+        ));
+    }
+    if pic_fields.idr_pic_flag && slice_type != 2 {
+        return Err(format!("a slice_type of {slice_type} on an IDR: an IDR picture whose slice is not an I slice is a key frame a decoder cannot start from"));
+    }
+    let is_irap = (16..=23).contains(&picture.nal_unit_type);
+    let is_idr = picture.nal_unit_type == 19 || picture.nal_unit_type == 20;
+    // `SliceQPY = 26 + init_qp_minus26 + pic_init_qp_minus26 + slice_qp_delta` (7.4.7.1), and the
+    // derived PPS carries `26 + pic_init_qp - 26`, so the delta that leaves the slice at the
+    // picture's own quantiser is 0. Anything else would be a second, unstated statement about the
+    // quality, and the record's `slice_qp_delta` is the one place it can be made.
+    if slice.slice_qp_delta != 0 {
+        return Err(format!("slice_qp_delta {} is not 0, and the derived PPS already carries the picture's own quantiser", slice.slice_qp_delta));
+    }
+    let num_ref = u32::from(slice.num_ref_idx_l0_active_minus1) + 1;
+    if num_ref > 16 {
+        return Err(format!("num_ref_idx_l0_active {} is outside HEVC's 1..=15", slice.num_ref_idx_l0_active_minus1));
+    }
+    if slice.max_num_merge_cand == 0 || slice.max_num_merge_cand > 5 {
+        return Err(format!("MaxNumMergeCand {} is outside HEVC's 1..=5", slice.max_num_merge_cand));
+    }
+    // `slice_pic_order_cnt_lsb` is `u(log2_max_pic_order_cnt_lsb_minus4 + 4)` bits wide, and the
+    // value is the picture order count reduced modulo `MaxPicOrderCntLsb` — which is the record's
+    // `pic_order_cnt` (`va.h:5296-5298`, a full i32) against the same modulus the derived SPS writes.
+    let lsb_bits = super::hevc_submit::LOG2_MAX_POC_LSB_MINUS4 + 4;
+    let modulus = 1u32.checked_shl(lsb_bits).ok_or("MaxPicOrderCntLsb does not fit a u32")?;
+    let modulus_i = i32::try_from(modulus).map_err(|_| "MaxPicOrderCntLsb does not fit an i32".to_string())?;
+    let poc_lsb = picture.decoded_curr_pic.pic_order_cnt.rem_euclid(modulus_i) as u32;
+    if poc_lsb >= modulus {
+        return Err(format!(
+            "a picture order count of {} does not fit the {} bits the derived SPS reserves for its LSB",
+            picture.decoded_curr_pic.pic_order_cnt, lsb_bits
+        ));
+    }
+
+    let mut w = BitWriter::new();
+    w.write_bits(u32::from(picture.nal_unit_type) << 1, 8); // forbidden_zero_bit + nal_unit_type
+    w.write_bits(1, 8); // nuh_layer_id 0, nuh_temporal_id_plus1 1
+    // ---- slice_segment_header() (H.265 7.4.7.1)
+    w.write_bits(1, 1); // first_slice_segment_in_pic_flag — one slice covers the whole picture
+    if is_irap {
+        // **Only IRAP pictures (16..=23) carry this**; it is what says "do not show the pictures
+        // before this one", and an IDR clears the DPB anyway.
+        w.write_bits(0, 1); // no_output_of_prior_pics_flag
+    }
+    w.write_ue(u32::from(slice.slice_pic_parameter_set_id));
+    // first_slice_segment_in_pic_flag is 1, so no slice_segment_address is written.
+    w.write_bits(0, 0); // no num_extra_slice_header_bits are present (refused above)
+    // **`slice_type` is written as `ue(v)`, and that is measured against the two encoders this
+    // machine has rather than taken from anyone's memory of the clause.** x265's own HEVC encoder
+    // and ffmpeg's `hevc_vaapi` both write an I slice's `slice_type` as the three bits `011` and a
+    // P slice's as `010`, and ffmpeg's own `trace_headers` reads back `011 = 2` and `010 = 1` from
+    // them — so the bit *string* is a `u(2)` `1` followed by the next field's first bit, and the
+    // *value* is Exp-Golomb. FilmCraft's own slice-header parser ([`filmcraft_hevc::slice`]), which
+    // the decode path trusts for real streams and which this writer is verified against, reads
+    // `ue(v)`; writing `u(2)` here would produce a header this codebase's own decoder reads as a P
+    // slice, which is the one failure this check exists to catch.
+    w.write_ue(u32::from(slice_type));
+    // output_flag_present_flag and separate_colour_plane_flag are both clear (checked above).
+    if !is_idr {
+        w.write_bits(poc_lsb, lsb_bits);
+        // **The derived SPS declares one short-term reference picture set** (`num_short_term_ref_pic_sets`
+        // 1, `st_ref_pic_set_zero`), so the slice names it rather than writing a second one.
+        w.write_bits(1, 1); // short_term_ref_pic_set_sps_flag
+        if slice_type == 1 || slice_type == 0 {
+            w.write_bits(0, 1); // num_ref_idx_active_override_flag — the PPS's own default applies
+            w.write_ue(5 - u32::from(slice.max_num_merge_cand)); // five_minus_max_num_merge_cand
+        }
+    }
+    // **Everything from here is outside the `nal_unit_type != IDR` chain**, which is where an IDR
+    // and a trailing slice differ: `slice_qp_delta` is in the header of *both*, and writing it only
+    // for a non-IDR leaves every IDR's header one field short. That is not a parse error — it is the
+    // IDR's `slice_qp_delta` read out of the alignment bit, which is a key frame at a quantiser
+    // nobody asked for.
+    w.write_se(0); // slice_qp_delta
+    // pps_slice_chroma_qp_offsets_present_flag is clear (checked above).
+    // The derived PPS sets `pps_deblocking_filter_override_enabled_flag` clear, so the slice carries
+    // no override flag and no beta/tc offsets: the PPS's own (both zero) apply.
+    //
+    // **`slice_loop_filter_across_slices_enabled_flag` is present only when the derived PPS sets
+    // `pps_loop_filter_across_slices_enabled_flag`,** which this path's picture record leaves clear —
+    // and the flag is what says the loop filter runs from the last CTU of one picture to the first of
+    // the next. Writing it when the PPS says the loop filter does not cross slices would be a header
+    // the parser reads one field early, and leaving it out when the PPS says it does is the mirror of
+    // that. Both are a one-bit shift and neither is an error.
+    if pic_fields.loop_filter_across_slices {
+        w.write_bits(1, 1); // slice_loop_filter_across_slices_enabled_flag
+    }
+    // tiles/entropy_coding_sync and slice_segment_header_extension are both clear (checked above).
+    let mut out = finish(&mut w);
+    out.shrink_to_fit();
+    verify_slice_header(&out, sets, slice_type, picture, num_ref)?;
+    Ok(out)
+}
+
+/// Read the slice header just written back with the parser the decode path trusts and compare every
+/// field it states with the record the bits were written from.
+///
+/// **The parameter sets are resolved out of `sets` and not out of the header**, so the header has to
+/// agree with the VPS/SPS/PPS the *same submission* carries: a header that parses only against
+/// different parameter sets is a header the decoder cannot resolve, and saying so here is better than
+/// a picture.
+fn verify_slice_header(nal: &[u8], sets: &HevcParameterSets, slice_type: u8, picture: &VaEncPictureParameterBufferHevc, num_ref: u32) -> Result<(), String> {
+    let pic_fields = unpack_pic_fields(picture.pic_fields);
+    let sps = filmcraft_hevc::params::Sps::parse(&rbsp_of(&sets.sps, NAL_SPS)?)
+        .map_err(|e| format!("the SPS the slice header resolves against does not parse: {e}"))?;
+    let pps = filmcraft_hevc::params::Pps::parse(&rbsp_of(&sets.pps, NAL_PPS)?)
+        .map_err(|e| format!("the PPS the slice header resolves against does not parse: {e}"))?;
+    let payload = nal.get(4..).ok_or("the slice header this module built is shorter than a start code and a NAL header")?;
+    let header = filmcraft_hevc::slice::NalHeader::parse(payload).map_err(|e| format!("the slice header this module built has no readable NAL header: {e}"))?;
+    let rbsp = filmcraft_bitstream::unescape_rbsp(payload.get(2..).unwrap_or_default());
+    let parsed = filmcraft_hevc::slice::SliceHeader::parse(
+        &rbsp,
+        header,
+        |id| {
+            if id != pps.id {
+                return Err(filmcraft_hevc::Error::MissingParameterSet(format!(
+                    "picture parameter set {id}, and the one this submission carries is {}",
+                    pps.id
+                )));
+            }
+            Ok((std::sync::Arc::new(pps.clone()), std::sync::Arc::new(sps.clone())))
+        },
+        None,
+    )
+    .map_err(|e| format!("the slice header this module built does not parse against the parameter sets it is submitted with: {e}"))?;
+    let (parsed, _, _) = parsed;
+    let written = match parsed.slice_type {
+        filmcraft_hevc::slice::SliceType::B => 0u8,
+        filmcraft_hevc::slice::SliceType::P => 1u8,
+        filmcraft_hevc::slice::SliceType::I => 2u8,
+    };
+    let mut mismatches: Vec<String> = Vec::new();
+    if written != slice_type {
+        mismatches.push(format!("slice_type wrote {written} for {slice_type}"));
+    }
+    if parsed.nal.nal_type != picture.nal_unit_type {
+        mismatches.push(format!("NAL unit type wrote {} for {}", parsed.nal.nal_type, picture.nal_unit_type));
+    }
+    if parsed.pps_id != u32::from(picture.slice_pic_parameter_set_id) {
+        mismatches.push(format!("PPS id wrote {} for {}", parsed.pps_id, picture.slice_pic_parameter_set_id));
+    }
+    if parsed.num_ref_idx[0] != num_ref && !parsed.is_intra() {
+        mismatches.push(format!("num_ref_idx[0] wrote {} for {num_ref}", parsed.num_ref_idx[0]));
+    }
+    if !parsed.is_intra() && parsed.st_rps.s0.len() != 1 {
+        mismatches.push(format!("a predicted slice whose reference set names {} pictures", parsed.st_rps.s0.len()));
+    }
+    if parsed.deblocking_disabled {
+        mismatches.push("the slice disables the deblocking filter, and the record says it runs".into());
+    }
+    // **The loop filter's cross-slice flag only exists in the bitstream when the derived PPS sets
+    // `pps_loop_filter_across_slices_enabled_flag`,** and this path's picture record leaves it clear.
+    // Comparing it unconditionally would be comparing a value the parser never read.
+    if pic_fields.loop_filter_across_slices != parsed.loop_filter_across_slices {
+        mismatches.push(format!(
+            "slice_loop_filter_across_slices_enabled_flag wrote {} for {}",
+            parsed.loop_filter_across_slices,
+            u32::from(pic_fields.loop_filter_across_slices)
+        ));
+    }
+    if parsed.max_num_merge_cand > 5 {
+        mismatches.push(format!("MaxNumMergeCand wrote {}", parsed.max_num_merge_cand));
+    }
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(format!("the slice header this module built disagrees with the records it was written from: {}", mismatches.join(", ")))
 }
 
 /// The video parameter set, as an Annex-B NAL unit (`NAL_UNIT_TYPE` 32).
@@ -362,12 +612,18 @@ fn sps(record: &VaEncSequenceParameterBufferHevc) -> Result<Vec<u8>, String> {
         if vui.bitstream_restriction {
             return Err("bitstream_restriction_flag is set, and this module writes no bitstream restriction block".into());
         }
+        // **The bitstream restriction block's six syntax elements are written only when the flag is
+        // set — and here it is not, because a set flag is refused above.**
+        //
+        // **Writing them anyway put five bits between `bitstream_restriction_flag` and
+        // `sps_extension_present_flag`.** Nothing failed: ffmpeg decoded the stream to the right
+        // pictures, because everything after the VUI is padding as far as a decoder is concerned —
+        // but ffmpeg's own `trace_headers` stopped on it, reading `rbsp_stop_one_bit` out of one of
+        // the five and reporting *"rbsp_stop_one_bit out of range: 0, but must be in [1,1]"* on the
+        // SPS. **A well-formed SPS that a strict bitstream reader refuses is not a well-formed
+        // SPS**, and the milestone's gate is a well-formed stream, not merely one that happens to
+        // decode.
         w.write_bits(0, 1); // bitstream_restriction_flag
-        w.write_bits(u32::from(vui.tiles_fixed_structure), 1);
-        w.write_bits(u32::from(vui.motion_vectors_over_pic_boundaries), 1);
-        w.write_bits(u32::from(vui.restricted_ref_pic_lists), 1);
-        w.write_ue(vui.log2_max_mv_length_horizontal);
-        w.write_ue(vui.log2_max_mv_length_vertical);
         // **There is no `vui_extension_flag`.** The VUI ends after the bitstream restriction block,
         // and writing one more bit here would shift `sps_extension_present_flag` — which is the bit
         // a decoder uses to decide whether there is anything after it at all. (This was a mistake
@@ -660,17 +916,20 @@ fn unpack_pic_fields(word: u32) -> PicFields {
 }
 
 /// The sequence record's `vui_fields` word, unpacked.
+///
+/// **The bitstream restriction block's five fields are deliberately not unpacked.** They are bits in
+/// the record's word and this writer refuses a record that sets `bitstream_restriction_flag`, so
+/// unpacking them would be reading a value nothing can use — and the writer once *did* unpack and
+/// write them unconditionally, which put five stray bits between `bitstream_restriction_flag` and
+/// `sps_extension_present_flag` and made ffmpeg's `trace_headers` stop on the SPS with
+/// `rbsp_stop_one_bit out of range`. A field this module cannot emit is a field this module does not
+/// pretend to read.
 struct VuiFields {
     aspect_ratio_info_present: bool,
     neutral_chroma: bool,
     field_seq: bool,
     timing_info_present: bool,
     bitstream_restriction: bool,
-    tiles_fixed_structure: bool,
-    motion_vectors_over_pic_boundaries: bool,
-    restricted_ref_pic_lists: bool,
-    log2_max_mv_length_horizontal: u32,
-    log2_max_mv_length_vertical: u32,
 }
 
 /// Unpack the sequence record's `vui_fields` word. Positions measured by running C and pinned in
@@ -678,18 +937,7 @@ struct VuiFields {
 /// the two `log2_max_mv_length_*` fields are 5 bits at 8 and 13.
 fn unpack_vui_fields(word: u32) -> VuiFields {
     let bit = |n: u32| (word >> n) & 1 != 0;
-    VuiFields {
-        aspect_ratio_info_present: bit(0),
-        neutral_chroma: bit(1),
-        field_seq: bit(2),
-        timing_info_present: bit(3),
-        bitstream_restriction: bit(4),
-        tiles_fixed_structure: bit(5),
-        motion_vectors_over_pic_boundaries: bit(6),
-        restricted_ref_pic_lists: bit(7),
-        log2_max_mv_length_horizontal: (word >> 8) & 0b1_1111,
-        log2_max_mv_length_vertical: (word >> 13) & 0b1_1111,
-    }
+    VuiFields { aspect_ratio_info_present: bit(0), neutral_chroma: bit(1), field_seq: bit(2), timing_info_present: bit(3), bitstream_restriction: bit(4) }
 }
 
 /// The NAL unit of `bytes` whose header carries `unit_type`, as its header bytes plus payload —

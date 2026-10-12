@@ -1,19 +1,27 @@
 //! HEVC **encode** records: what to hand a VA-API driver so it encodes an HEVC/H.265 picture.
 //!
-//! # Why this file exists and is empty of behaviour
+//! # What is here, and what it is used for
 //!
-//! libva declares three HEVC encode records in `va_enc_hevc.h` and this is where they are
-//! declared here. **Nothing submits them yet.** The HEVC submission path is a later task and
-//! this is its foundation: a record that is declared, measured against the installed header and
-//! pinned is a record the next task can build a submission out of, where a record that is *both*
-//! declared and used is a record whose every field is load-bearing the day it is written. The
-//! H.264 encode records in [`super::ffi`] are the reference for **shape and conventions** — a
-//! record here is thin, named, and its holes are named — not for values.
+//! Three records — sequence, picture and slice — plus the packed-header constants the submission
+//! path needs, all measured with a C compiler against `/usr/include/va/va_enc_hevc.h` rather than
+//! transcribed from it, and pinned by [`hevc_abi`].
 //!
-//! So what is deliberately *absent* is the point: there is no `encode()` here, no rate control, no
-//! submission and no settings wiring. Rate control is the dependency — a wrong QP or frame type is
-//! a silently wrong picture, the same failure class as the H.264 weight bug — and it is being
-//! fixed in its own change before this one is built on.
+//! **All three are submitted on every picture by [`super::hevc_submit`], which encodes.** An earlier
+//! version of this note said "nothing submits them yet", which was true when it was written and is
+//! the kind of sentence that outlives its truth; it is kept in the next paragraph only because the
+//! *shape* of the file — plain `#[repr(C)]` data, no `unsafe`, the holes named — is still what the
+//! submission path depends on.
+//!
+//! So what is deliberately *absent* is the point: there is no `encode()` here, no rate control and no
+//! settings wiring. **A record here is thin, named, and its holes are named** — the H.264 encode
+//! records in [`super::ffi`] are the reference for shape and conventions, not for values.
+//!
+//! **The two packed-header families are both declared here and they are different numbers**, which is
+//! the one thing in this file a caller gets wrong most easily: [`PACKED_HEADER_SLICE`] is 3 (the
+//! type a `VAEncPackedHeaderParameterBuffer` carries) and [`PACKED_SLICE_FLAG`] is 4 (the
+//! `vaCreateConfig` attribute that says slice headers will be supplied). `SEQUENCE | PICTURE` is 3 in
+//! *both* families, so the wrong one reads as a plausible constant and produces a stream with no
+//! picture in it.
 //!
 //! # Why a separate file rather than more of `ffi.rs`
 //!
@@ -469,8 +477,83 @@ pub const PACKED_HEADER_PPS: u32 = 2;
 /// - **Which buffers a sequence record must be accompanied by, and when**, is the header's own note
 ///   at `va_enc_hevc.h:333-344`: in packed-sequence mode the driver expects a
 ///   `VAEncPackedHeaderParameterBuffer` and a `VAEncPackedHeaderDataBuffer` in the *same*
-///   `vaRenderPicture` call. That call is a later task.
+///   `vaRenderPicture` call. That is [`VaEncPackedHeaderParameterBuffer`] and the header bytes it
+///   describes; see [`super::hevc_submit`] for the submission.
 pub const PACKED_HEADER_SLICE: u32 = 3;
+
+/// `VA_ENC_PACKED_HEADER_SLICE` (`va.h:1220`): **4**, the *config attribute* that says the driver
+/// will be handed packed slice headers — **a different number from [`PACKED_HEADER_SLICE`], and the
+/// two are easy to confuse because both are named "slice".**
+///
+/// The attribute is a set of flags the application advertises support for at `vaCreateConfig` time;
+/// the packed-header *type* in a `VAEncPackedHeaderParameterBuffer` is what the application's buffer
+/// turns out to carry. `VA_ENC_PACKED_HEADER_SEQUENCE` is 1 and `VA_ENC_PACKED_HEADER_PICTURE` is 2
+/// in both families, which is exactly why the divergence goes unnoticed until the driver refuses to
+/// encode: `SEQUENCE | PICTURE` is `0x3` in both, and it is the *third* bit that HEVC needs.
+pub const PACKED_SLICE_FLAG: u32 = 4;
+
+/// `VAEncPackedHeaderParameterBufferType` (`va.h:2065`): 25 — the buffer that *names* a packed
+/// header and says how long it is, paired with an [`PACKED_HEADER_DATA_BUFFER_TYPE`] holding the
+/// bytes.
+///
+/// **This record is not in [`super::ffi`]** — that file is the shared FFI layer four codecs'
+/// decode reads, and adding an HEVC-encode-only constant to it is a change to a file this work does
+/// not own. It is declared here for that reason, and pinned against the header by
+/// [`hevc_abi`](super::hevc_abi).
+pub const PACKED_HEADER_PARAMETER_BUFFER_TYPE: u32 = 25;
+
+/// `VAEncPackedHeaderDataBufferType` (`va.h:2066`): 26 — the packed header's own bytes.
+///
+/// **A variable-length buffer**: the header declares it as `uint8_t data[1]` (`va.h:2462-2468`), so
+/// the record's `size` is the byte length of the header data and nothing in it is a fixed-size
+/// struct. [`super::ffi::ENC_PACKED_HEADER_DATA_BUFFER`] already carries the same value for H.264;
+/// this one is the HEVC-side declaration of the same number, kept beside the HEVC packed-header
+/// types it is submitted with.
+pub const PACKED_HEADER_DATA_BUFFER_TYPE: u32 = 26;
+
+/// `VAEncPackedHeaderParameterBuffer` (`va.h:2446`): **28 bytes**, alignof 4.
+///
+/// The buffer `va_enc_hevc.h:333-340` says the driver expects beside the sequence record in packed
+/// sequence mode: it names *which* header this is ([`PACKED_HEADER_VPS_OR_SPS`],
+/// [`PACKED_HEADER_PPS`] or [`PACKED_HEADER_SLICE`]) and how long the matching data buffer is.
+///
+/// **It is a `u32` + `u32` + `u8` + `VA_PADDING_LOW` words, and the three holes after
+/// `has_emulation_bytes` are declared as one array**, because the header's own trailing array
+/// starts at the byte C lays them at — so there is one hole, not four, and naming it as four would
+/// be a record that disagrees with a C compiler on its size.
+///
+/// ```text
+/// $ cc -w -o hevcenc_measure hevcenc_measure.c && ./hevcenc_measure
+/// == VAEncPackedHeaderParameterBuffer sizeof=28 alignof=4
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaEncPackedHeaderParameterBuffer {
+    /// `type`: a [`PACKED_HEADER_VPS_OR_SPS`], [`PACKED_HEADER_PPS`] or [`PACKED_HEADER_SLICE`].
+    ///
+    /// **It does not say whether a packed header is a VPS or an SPS** — the header assigns
+    /// `VAEncPackedHeaderHEVC_VPS = VAEncPackedHeaderHEVC_SPS = VAEncPackedHeaderSequence`, so the
+    /// driver takes them as the first and second buffers of that type.
+    pub header_type: u32,
+    /// `bit_length`: **the size of the data buffer in *bits*, not bytes** (`va.h:2450`).
+    ///
+    /// `bit_length` is 776 for ffmpeg's 97-byte VPS+SPS+PPS buffer on this driver — measured, and it
+    /// is the one field in these records where writing bytes where the header says bits would still
+    /// produce a stream and no error.
+    pub bit_length: u32,
+    /// `has_emulation_bytes`: whether `data` already carries start-code emulation prevention bytes
+    /// (`va.h:2452`). Annex-B with `00 00 01` start codes does.
+    pub has_emulation_bytes: u8,
+    /// **The hole after `has_emulation_bytes` and the header's own `va_reserved`, as one array.**
+    ///
+    /// The C layout is `u32`, `u32`, `u8` then `uint32_t va_reserved[4]`, so three bytes of padding
+    /// sit between the flag and the array and the record ends at 28. Declaring the padding as its
+    /// own field and the array as another gives the same layout; declaring the padding as four `u8`
+    /// — one per word, as a reader's first guess suggests — gives **24** bytes and a record the
+    /// driver rejects with `VA_STATUS_ERROR_INVALID_BUFFER` while reporting success, which is the
+    /// worst of both answers.
+    pub padding_and_reserved: [u8; 3 + VA_PADDING_LOW * 4],
+}
 
 /// `VAConfigAttribEncHEVCFeatures` (`va.h:1002`): the HEVC encoder's feature set, read through
 /// `vaGetConfigAttributes` and answered with a [`HevcFeatures`] word.

@@ -103,6 +103,13 @@ pub use hevc_submit::{
 // the crate never sees; these four are the numbers a caller needs to check a driver against what
 // this path assumes, and `examples/vahevcprobe.rs` prints all of them.
 pub use hevc_submit::{CONFIG_ATTRIB_INTERLACED, H264_RATE_CONTROL_MASK, HEVC_RATE_CONTROL_MASK, VCM};
+// **The packed-header constants, re-exported because they are the two numbers this milestone turned
+// on and they are easy to confuse with each other**: `VA_ENC_PACKED_HEADER_SLICE` (4) is the config
+// attribute that says slice headers will be *supplied*, and `VAEncPackedHeaderSlice` (3) is the type
+// a packed-header *buffer* carries. `SEQUENCE | PICTURE` is 3 in both families, which is why the
+// wrong flag reads as a plausible number and produces no picture at all.
+pub use hevc_enc::{PACKED_HEADER_SLICE as PACKED_HEADER_SLICE_BUFFER_TYPE, PACKED_SLICE_FLAG as PACKED_HEADER_SLICE_TYPE};
+pub use hevc_submit::PACKED_HEADERS_FOR_HEVC;
 pub use picture::{Vp9Frame, Vp9Reference, Vp9ReferenceSet, Vp9State, vp9_decline, vp9_is_new_frame, vp9_picture_record, vp9_slice_record};
 // AV1, the same three shapes for the same three reasons: `Av1State` is the per-decode reference
 // state (`refresh_frame_flags` has no member in the AV1 *decode* record — see `picture::av1`'s
