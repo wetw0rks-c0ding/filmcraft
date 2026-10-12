@@ -3,19 +3,19 @@
 //! # Why this file exists, and what it does not contain
 //!
 //! libva declares six AV1 encode records in `va_enc_av1.h` and this is where they are declared.
-//! **Nothing submits them yet.** Declaring a record is this change; building a submission from it
-//! is a later one. The H.264 encode records in [`super::ffi`] are the reference for **shape and
-//! conventions**, not for values.
+//! **The submission that hands them to a driver is a sibling of this file, not a child of it** —
+//! `super::av1_submit` — beside `super::av1_params`, which builds the two OBUs the driver will not
+//! write for itself. That is the shape `hevc_enc` / `hevc_params` / `hevc_submit` already has, and
+//! it is the shape that makes the path reachable from `tests/`. The H.264 encode records in
+//! [`super::ffi`] are the reference for **shape and conventions**, not for values.
 //!
-//! ~~So what is deliberately absent is the point: there is no `encode()` here, no rate control, no
-//! settings wiring and no `vaCreateSurface`/`vaCreateBuffer` call.~~ **That is now superseded.**
-//! [`submit`] is the AV1 submission path: the records below, the packed sequence and frame headers
-//! [`params`] builds from the specification, the buffer list, and the frame loop. **It reaches
-//! `vaRenderPicture` and the driver refuses `VAEncPictureParameterBufferAV1`** — measured over
-//! rate-control modes, packed-header modes, surface counts and field variants, and reproduced by
-//! this crate's own test. See [`submit::driver_outcomes`] for the numbers and
-//! [`submit::DRIVER_REFUSES_THE_AV1_PICTURE_RECORD`] for what the path says about it. There is no
-//! export wiring and no settings surface, and `crates/export/` was not touched.
+//! What this file itself does **not** contain is still the point, and it is now exactly three
+//! things: there is no settings wiring, no export wiring, and `crates/export/` is untouched. The
+//! driver refuses every `VAEncPictureParameterBufferAV1` it is handed — measured over rate-control
+//! modes, packed-header modes, surface counts and field variants, and reproduced by this crate's own
+//! tests from inside the module and from `tests/av1enc.rs` outside it. See
+//! [`super::av1_submit::driver_outcomes`] for the numbers and
+//! [`super::av1_submit::DRIVER_REFUSES_THE_AV1_PICTURE_RECORD`] for what the path says about it.
 //!
 //! # This driver advertises AV1 encode, and that is measured, not assumed
 //!
@@ -123,8 +123,8 @@
 //!
 //!    Read from it (`03.symbols.md:124`, and `global_motion_params()`'s initialiser), the identity
 //!    warp's six parameters are **`[0, 0, 1 << 16, 0, 0, 1 << 16]`** — so `WARPEDMODEL_PREC_BITS`
-//!    is 16 and the diagonal is 65536. See [`params::WARPEDMODEL_PREC_BITS`] and
-//!    [`params::IDENTITY_WARP`].
+//!    is 16 and the diagonal is 65536. See [`super::av1_params::WARPEDMODEL_PREC_BITS`] and
+//!    [`super::av1_params::IDENTITY_WARP`].
 //!
 //!    **The stronger answer is that this record never needs the scale.** `global_motion_params()`
 //!    reads nothing when `is_global` is 0, and [`transformation::parameters`] says the identity
@@ -132,7 +132,7 @@
 //!    writes `is_global = 0` and no parameters at all — and `wm[].wmmat` is left zero, which is the
 //!    only value correct for a transform that reads no parameters. No `WMMAT_SCALE_*` constant is
 //!    declared here, because none is needed; what is declared is `IDENTITY_WARP`, in
-//!    [`params`], and it is a value rather than an invented scale.
+//!    [`super::av1_params`], and it is a value rather than an invented scale.
 //! 2. **Per-tile slice records.** AV1's picture record has `tile_cols`, `tile_rows`,
 //!    `num_tile_groups_minus1`, `width_in_sbs_minus_1[63]`, `height_in_sbs_minus_1[63]` and a
 //!    `context_update_tile_id` (0..127), and a *separate* [`VaEncTileGroupBufferAv1`] record with
@@ -961,28 +961,3 @@ pub mod ext2 {
 #[cfg(test)]
 #[path = "av1_abi.rs"]
 mod av1_abi;
-
-/// The AV1 **bitstream** the encode submission path hands the driver: the `sequence_header_obu()`
-/// and `frame_header_obu()` built from the AV1 Bitstream & Decoding Process Specification and
-/// checked by parsing them back with FilmCraft's own parser.
-///
-/// Its own file for the same reason `hevc_params` is beside `hevc_submit`: declaring a record and
-/// *writing the bits the driver will not write for itself* are different jobs, and the second one
-/// is a specification task rather than a libva one. **This is the AV1 analogue of HEVC's packed
-/// slice header** — see `params`'s module note, which opens with `va_enc_av1.h:213-230` on why the
-/// driver cannot supply these.
-///
-/// It also carries the answer to this file's first open question. **The `wmmat` scale is stated by
-/// the specification, and a submission of this shape never needs it**: identity global motion reads
-/// none of the eight entries. See `WMMAT_SCALE_IS_SPECIFIED` and `IDENTITY_WARP`.
-#[path = "av1_params.rs"]
-mod params;
-
-/// The submission path: the records this module declares, assembled per picture and handed to the
-/// driver, together with **what this driver measurably does with them**.
-///
-/// Beside `params` and not inside it because the two can be wrong independently: the bitstream can
-/// be right while the driver refuses the record, and the record can be right while the bitstream is
-/// wrong. `driver_outcomes` records which of the two this machine answered.
-#[path = "av1_submit.rs"]
-mod submit;

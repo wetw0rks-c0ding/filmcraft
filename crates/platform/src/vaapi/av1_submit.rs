@@ -48,7 +48,7 @@
 //! stream "contains an obu header, a 4-byte long `obu_size` field, `frame_header_obu()` syntax chain,
 //! and a trailing bit", and `bit_offset_qindex`, `byte_offset_frame_hdr_obu_size` and
 //! `size_in_bits_frame_hdr_obu` are **offsets into a packed frame header the application supplies**.
-//! The bytes are built by [`super::params`] from the AV1 specification and read back through
+//! The bytes are built by [`super::av1_params`] from the AV1 specification and read back through
 //! FilmCraft's own parser before they are handed to anything.
 //!
 //! # Verification, and what it is worth
@@ -57,24 +57,23 @@
 //! and **on this driver no bitstream comes back at all**. So the checks that exist are:
 //!
 //! - the two OBUs are parsed back with `filmcraft_av1`'s own parser and every field compared with the
-//!   records they were written from (`params::check_*`), on **every** submission;
+//!   records they were written from (`av1_params::check_*`), on **every** submission;
 //! - the buffer list is a value — [`Av1Submission`] — so "what was sent, in what order" can be
 //!   inspected and tested without a display, and every buffer created is named in it.
 //!
 //! **Neither is evidence about the driver.** That is stated here rather than left for a reader to
 //! discover, and it is why [`Av1Encoder::encode`] never reports a picture it cannot show bytes for.
 
-use super::params::{Av1Plan, FrameKind};
-use crate::vaapi::av1_enc::{
+use super::av1_enc::{
     PACKED_HEADER_PPS as AV1_PACKED_HEADER_PPS, PACKED_HEADER_SPS as AV1_PACKED_HEADER_SPS, VaEncPictureParameterBufferAv1, VaEncSequenceParameterBufferAv1,
-    params,
 };
-use crate::vaapi::ffi::{self, Display, Encoder, Profile, RtFormat};
-use crate::vaapi::hevc_enc::{PACKED_HEADER_PARAMETER_BUFFER_TYPE, VaEncPackedHeaderParameterBuffer};
+use super::av1_params::{self, Av1Plan, FrameKind};
+use super::ffi::{self, Display, Encoder, Profile, RtFormat};
+use super::hevc_enc::{PACKED_HEADER_PARAMETER_BUFFER_TYPE, VaEncPackedHeaderParameterBuffer};
 use std::sync::Arc;
 
 /// `VAConfigAttribEncPackedHeaders` for this path: **`VA_ENC_PACKED_HEADER_SEQUENCE |
-/// VA_ENC_PACKED_HEADER_PICTURE` (`0x3`)** — the two headers [`super::params`] writes and nothing
+/// VA_ENC_PACKED_HEADER_PICTURE` (`0x3`)** — the two headers [`super::av1_params`] writes and nothing
 /// else.
 ///
 /// **Chosen for what the driver itself advertises, and the measurement is
@@ -186,8 +185,8 @@ pub const AV1_NO_SURFACE: u32 = 0xFF;
 /// (`super::av1_enc::transformation::parameters`). **A submission whose global motion is identity does
 /// not depend on the `wmmat` scale at all** — which is why this file can be complete while
 /// `super::av1_enc`'s first open question says the scale is unstated. See
-/// [`super::params::WMMAT_SCALE_IS_SPECIFIED`].
-pub const AV1_IDENTITY_WARP: u32 = crate::vaapi::av1_enc::transformation::IDENTITY;
+/// [`super::av1_params::WMMAT_SCALE_IS_SPECIFIED`].
+pub const AV1_IDENTITY_WARP: u32 = super::av1_enc::transformation::IDENTITY;
 
 /// **`VAConfigAttribEncInterlaced` (11) for AV1 on this driver: `0`.** Progressive only, so the frame
 /// header this path writes has no field picture structure to state — which is also why [`FrameKind`]
@@ -374,7 +373,7 @@ impl Av1Encoder {
     /// **`VA_RC_CQP` and not a bitrate mode**, for the reason [`AV1_DRIVER_RATE_CONTROL_MASK`] gives:
     /// `CQP` is the mode in which `bit_offset_qindex`, `byte_offset_frame_hdr_obu_size` and
     /// `size_in_bits_frame_hdr_obu` are "set to 0 and ignored" by the driver, so the frame header
-    /// [`super::params`] wrote is the frame header that is coded. Under `CBR` or `VBR` the driver
+    /// [`super::av1_params`] wrote is the frame header that is coded. Under `CBR` or `VBR` the driver
     /// **rewrites `base_q_idx` in the middle of the application-supplied header**, through an offset
     /// this path would have to state exactly right.
     pub fn at_constant_quantiser(display: &Arc<Display>, plan: Av1Plan) -> Result<Self, String> {
@@ -453,7 +452,7 @@ impl Av1Encoder {
         };
         // The sequence header is sent with the first picture and again only if it changes, for the
         // reason the HEVC path gives and by the same test: the bytes, not a flag.
-        let sequence_header_obu = params::sequence_header_obu(&self.plan)?;
+        let sequence_header_obu = av1_params::sequence_header_obu(&self.plan)?;
         let sequence_header_changed = self.sent_sequence_header.as_ref().is_none_or(|sent| *sent != sequence_header_obu);
         if sequence_header_changed {
             self.sent_sequence_header = Some(sequence_header_obu);
@@ -586,10 +585,10 @@ pub fn build_submission(
             ));
         }
     }
-    let sequence_header_obu = params::sequence_header_obu(plan)?;
-    params::check_sequence_header(plan, &sequence_header_obu)?;
-    let frame_header_obu = params::frame_header_obu(plan, kind)?;
-    params::check_frame_header(plan, kind, &frame_header_obu, reference_state)?;
+    let sequence_header_obu = av1_params::sequence_header_obu(plan)?;
+    av1_params::check_sequence_header(plan, &sequence_header_obu)?;
+    let frame_header_obu = av1_params::frame_header_obu(plan, kind)?;
+    av1_params::check_frame_header(plan, kind, &frame_header_obu, reference_state)?;
 
     let picture = picture_record(plan, reconstruction, coded_buffer, key_frame, order_hint)?;
     let mut buffers = Vec::with_capacity(9);
@@ -671,7 +670,7 @@ fn coded_buffer_for(size: (u32, u32)) -> Result<u32, String> {
 /// - **`enable_order_hint` is 1**, and this one is not in the feature union at all — the record
 ///   carries `order_hint` and `order_hint_bits_minus_1`, so the stream is expected to state an order.
 ///
-/// That is why the sequence header [`super::params`] writes and this record agree, field for field.
+/// That is why the sequence header [`super::av1_params`] writes and this record agree, field for field.
 fn sequence_record(plan: &Av1Plan) -> Result<Vec<u8>, String> {
     let mut record = VaEncSequenceParameterBufferAv1 {
         seq_profile: 0,
@@ -742,7 +741,7 @@ fn picture_record(plan: &Av1Plan, reconstruction: u32, coded_buffer: u32, key_fr
     // A key frame refreshes every slot — the syntax infers allFrames for a shown key frame — and a
     // predicted frame keeps exactly the one reference it predicts from.
     record.refresh_frame_flags =
-        if key_frame { u8::try_from((1u32 << filmcraft_av1::NUM_REF_FRAMES) - 1).unwrap_or(u8::MAX) } else { params::REFRESH_LAST_ONLY as u8 };
+        if key_frame { u8::try_from((1u32 << filmcraft_av1::NUM_REF_FRAMES) - 1).unwrap_or(u8::MAX) } else { av1_params::REFRESH_LAST_ONLY as u8 };
     record.base_qindex = plan.base_qindex;
     // **CQP is the mode, so `min_base_qindex`/`max_base_qindex` bound a range the caller chose rather
     // than one the rate controller is given.** They are set to the record's own documented range
@@ -750,10 +749,10 @@ fn picture_record(plan: &Av1Plan, reconstruction: u32, coded_buffer: u32, key_fr
     // range is asking the driver for something it has not been offered.
     record.min_base_qindex = 1;
     record.max_base_qindex = 255;
-    record.filter_level[0] = params::LOOP_FILTER_LEVEL[0];
-    record.filter_level[1] = params::LOOP_FILTER_LEVEL[1];
-    record.filter_level_u = params::LOOP_FILTER_LEVEL[2];
-    record.filter_level_v = params::LOOP_FILTER_LEVEL[3];
+    record.filter_level[0] = av1_params::LOOP_FILTER_LEVEL[0];
+    record.filter_level[1] = av1_params::LOOP_FILTER_LEVEL[1];
+    record.filter_level_u = av1_params::LOOP_FILTER_LEVEL[2];
+    record.filter_level_v = av1_params::LOOP_FILTER_LEVEL[3];
     // `superres_scale_denominator` is documented as 9..=16 and unused when superres is off; 9 is the
     // documented minimum, so the record is inside its own stated range whatever the driver does.
     record.superres_scale_denominator = 9;
@@ -933,14 +932,14 @@ mod tests {
         // `03.symbols.md:124` and `global_motion_params()` writes `(i % 3 == 2) ? 1 <<
         // WARPEDMODEL_PREC_BITS : 0`, which is this array. Asserting the specification's value rather
         // than the constant against itself is the difference between a pin and a tautology.
-        assert_eq!(params::WARPEDMODEL_PREC_BITS, 16, "av1-spec 03.symbols.md:124: WARPEDMODEL_PREC_BITS = 16");
+        assert_eq!(av1_params::WARPEDMODEL_PREC_BITS, 16, "av1-spec 03.symbols.md:124: WARPEDMODEL_PREC_BITS = 16");
         assert_eq!(
-            params::IDENTITY_WARP,
-            [0, 0, 1 << params::WARPEDMODEL_PREC_BITS, 0, 0, 1 << params::WARPEDMODEL_PREC_BITS],
+            av1_params::IDENTITY_WARP,
+            [0, 0, 1 << av1_params::WARPEDMODEL_PREC_BITS, 0, 0, 1 << av1_params::WARPEDMODEL_PREC_BITS],
             "the specification's own initialiser for gm_params: (i % 3 == 2) ? 1 << WARPEDMODEL_PREC_BITS : 0"
         );
-        assert_eq!(params::IDENTITY_WARP[2], 65_536, "the identity warp's diagonal is 1 << 16 = 65536");
-        eprintln!("the wmmat scale, which a submission of this shape does not depend on: {}", params::WMMAT_SCALE_IS_SPECIFIED);
+        assert_eq!(av1_params::IDENTITY_WARP[2], 65_536, "the identity warp's diagonal is 1 << 16 = 65536");
+        eprintln!("the wmmat scale, which a submission of this shape does not depend on: {}", av1_params::WMMAT_SCALE_IS_SPECIFIED);
         // And the two halves of the claim joined: the transform reads zero parameters, and the
         // specification's own initialiser for it is what `IDENTITY_WARP` says.
         assert_eq!(
@@ -955,7 +954,7 @@ mod tests {
     #[test]
     fn the_packed_header_parameter_record_states_its_length_in_bits() {
         let p = plan();
-        let obu = params::sequence_header_obu(&p).unwrap_or_else(|e| panic!("the sequence header OBU: {e}"));
+        let obu = av1_params::sequence_header_obu(&p).unwrap_or_else(|e| panic!("the sequence header OBU: {e}"));
         let pair = packed_header_pair(AV1_PACKED_HEADER_SPS, &obu).unwrap_or_else(|e| panic!("the packed header pair: {e}"));
         let parameter: crate::vaapi::hevc_enc::VaEncPackedHeaderParameterBuffer =
             ffi::record_in(&pair[0].bytes).unwrap_or_else(|| panic!("the packed header parameter record does not read back"));
@@ -1023,16 +1022,16 @@ mod tests {
     #[test]
     fn the_level_is_derived_and_is_the_lowest_that_fits_the_picture() {
         // Annex A: level 2.0 is 147,456 samples with a 4,423,680 samples/sec display rate.
-        assert_eq!(params::level_for(320, 240, 30).unwrap_or(200), 0, "320x240 at 30 fits level 2.0 (seq_level_idx 0)");
-        assert_eq!(params::level_for(426, 240, 30).unwrap_or(200), 0, "426x240 at 30 is the annex's own level 2.0 example");
-        assert_eq!(params::level_for(1920, 1080, 30).unwrap_or(200), 8, "1920x1080 at 30 needs level 4.0 (seq_level_idx 8)");
-        assert_eq!(params::level_for(3840, 2160, 60).unwrap_or(200), 13, "3840x2160 at 60 needs level 5.1 (seq_level_idx 13)");
+        assert_eq!(av1_params::level_for(320, 240, 30).unwrap_or(200), 0, "320x240 at 30 fits level 2.0 (seq_level_idx 0)");
+        assert_eq!(av1_params::level_for(426, 240, 30).unwrap_or(200), 0, "426x240 at 30 is the annex's own level 2.0 example");
+        assert_eq!(av1_params::level_for(1920, 1080, 30).unwrap_or(200), 8, "1920x1080 at 30 needs level 4.0 (seq_level_idx 8)");
+        assert_eq!(av1_params::level_for(3840, 2160, 60).unwrap_or(200), 13, "3840x2160 at 60 needs level 5.1 (seq_level_idx 13)");
         // **A picture above every level in the annex is refused, not given the largest one.**
-        let too_big = params::level_for(40_000, 40_000, 30);
+        let too_big = av1_params::level_for(40_000, 40_000, 30);
         assert!(too_big.is_err(), "a picture past the annex's largest level is refused, and it returned {too_big:?}");
         // **And the level the plan writes is the one the sequence header says.**
         let p = plan();
-        assert_eq!(p.level_idx, params::level_for(W, H, 30).unwrap_or(200), "the plan's level is the one level_for derives for its picture");
+        assert_eq!(p.level_idx, av1_params::level_for(W, H, 30).unwrap_or(200), "the plan's level is the one level_for derives for its picture");
     }
 
     /// **The sequence record's `seq_fields` word says exactly the flags this file's rule names, and
@@ -1059,7 +1058,7 @@ mod tests {
         }
         assert_eq!(record.seq_level_idx, p.level_idx, "the record states the level the annex's table derives");
         assert_ne!(record.bits_per_second, 0, "iHD rejects a sequence record whose bitrate is 0 (measured on the H.264 path)");
-        assert_eq!(record.order_hint_bits_minus_1, params::ORDER_HINT_BITS as u8 - 1, "the record and the sequence header state the same OrderHintBits");
+        assert_eq!(record.order_hint_bits_minus_1, av1_params::ORDER_HINT_BITS as u8 - 1, "the record and the sequence header state the same OrderHintBits");
         assert_eq!(record.seq_profile, 0, "seq_profile 0 is the only profile this driver advertises");
     }
 

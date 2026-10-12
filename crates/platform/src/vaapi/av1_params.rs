@@ -53,10 +53,10 @@
 //!
 //! # What this file does not do
 //!
-//! It does not call libva and it does not submit anything; [`super::submit`] does that. Every
+//! It does not call libva and it does not submit anything; [`super::av1_submit`] does that. Every
 //! function here is pure, and **every submission is checked by parsing the bytes back with
 //! `filmcraft_av1`'s own parser** — `check_sequence_header` and `check_frame_header` below run inside
-//! [`super::submit::build_submission`], so a header this module cannot describe is refused before any
+//! [`super::av1_submit::build_submission`], so a header this module cannot describe is refused before any
 //! display is touched. The tests in `submit` exercise both, for a key frame and for a predicted one.
 //! That is the same round-trip discipline `hevc_params.rs` uses for its derived VPS/SPS/PPS, and the
 //! reason to prefer FilmCraft's parsers over a second transcription of the syntax is the same: **a bit
@@ -322,7 +322,7 @@ fn obu_header(obu_type: u8, extension: bool, has_size: bool) -> Result<u8, Strin
 /// What a picture is coded as, and — for a predicted picture — what it predicts from.
 ///
 /// **Two cases, not three.** `INTRA_ONLY_FRAME` and `SWITCH_FRAME` exist in the syntax but are
-/// refused here for the reasons [`super::submit`] gives: an intra-only frame needs a reference for
+/// refused here for the reasons [`super::av1_submit`] gives: an intra-only frame needs a reference for
 /// the propagated segment ids and context tables, and a switch frame needs an error-resilient
 /// header this module does not write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -987,7 +987,7 @@ pub fn check_frame_header(
     }
     // And the record's own end of it: the transform reads no parameters, so the eight `wmmat`
     // entries stay zero.
-    let identity_parameters = super::transformation::parameters(super::transformation::IDENTITY);
+    let identity_parameters = super::av1_enc::transformation::parameters(super::av1_enc::transformation::IDENTITY);
     if identity_parameters != Some(0) {
         return Err(format!("the identity transform reads {identity_parameters:?} wmmat entries, and this module says it reads none"));
     }

@@ -59,11 +59,24 @@ mod encoder;
 // module on its merits either. `hevc_abi`'s pins live inside it rather than in the shared
 // `abi_guard.rs`, for the same reason.
 mod hevc_enc;
-// AV1 encode records, declared and pinned but **not yet submitted** — the six records of
-// `va_enc_av1.h`, measured against the installed header. Its own file for the same reasons as
-// `hevc_enc`: zero overlap with `ffi.rs` and with the shared `abi_guard.rs`, and declaring a record
-// needs no `unsafe`.
+// AV1 encode records — the six of `va_enc_av1.h`, measured against the installed header. Its own
+// file for the same reasons as `hevc_enc`: zero overlap with `ffi.rs` and with the shared
+// `abi_guard.rs`, and declaring a record needs no `unsafe`.
 mod av1_enc;
+// The AV1 **bitstream** the submission hands the driver — the `sequence_header_obu()` and
+// `frame_header_obu()` built from the AV1 specification and parsed back with FilmCraft's own parser
+// — and the **submission path** itself, beside `hevc_params` and `hevc_submit` for the same two
+// reasons: writing the bits the driver will not write for itself is a specification task rather than
+// a libva one, and the two files can be wrong independently (the bitstream can be right while the
+// driver refuses the record, and the record can be right while the bitstream is wrong).
+//
+// **Declared here rather than inside `av1_enc`, which is what `#[path]` was doing.** They were
+// written while `av1_enc` held records and nothing else, so a submission path lived as a child of
+// the record file and `Av1Encoder` was crate-internal: nothing in `tests/` or `examples/` could
+// reach it, so the one thing that was measured about it was pinned only by a test inside it. They are
+// modules of this one now, exactly as `hevc_params` and `hevc_submit` are.
+mod av1_params;
+mod av1_submit;
 // **No VP9 encode records**, because a `dlopen` probe of this driver found no VP9 encoder: all four
 // `VAProfileVP9Profile0`..`3` advertise `VAEntrypointVLD` and nothing else, and every
 // `vaGetConfigAttributes` read against `VAEntrypointEncSlice`/`EncSliceLP` returns
@@ -130,6 +143,33 @@ pub use hevc_export::{HevcBitrate, HevcEncoderExport, HevcExportConfig, check_hv
 // is the entry point rather than the free function, because the surface the record names is only known
 // once the frame has been read — a re-show codes no picture and needs none.
 pub use av1::{AV1_FILM_GRAIN, AV1_LARGE_SCALE_TILE, Av1Frame, Av1ReferenceSet, Av1State, av1_entry_disagreement, av1_picture_record, av1_surface_pool};
+// The AV1 **encode** path, re-exported for the reasons the HEVC one above is: `av1_submit` is a
+// private module, and a `pub` item in a private module is dead code the rest of the crate never
+// sees. `Av1Encoder` is the counterpart of `HevcEncoder` and `Av1Plan` the counterpart of HEVC's
+// `(width, height)` pair — a **struct**, because the sequence header and the frame header have to
+// agree about the geometry and the rate and a pair of independent argument lists is how they stop
+// agreeing. `FrameKind` is **not** re-exported under that name: `PictureKind` is H.264 and HEVC's,
+// and an AV1 frame type is a different enum with a different refusal set, so it is named
+// `Av1FrameKind` here rather than allowed to collide or to pass for the other two.
+//
+// **Exported, not wired.** Nothing in the workspace asks for an AV1 encoder yet: `Format::Av1` has
+// no encoder behind it and `crates/export/` was not touched, because a format the list offers and
+// no encoder answers for fails an export with "encoder not available" — the trap `hevc_available`
+// and `register_format_probe` exist to close. What reaches this surface today is
+// `tests/av1enc.rs`, which is the point: the refusal below is pinned from outside the module that
+// made it.
+//
+// **The constants are exported for the same reason the HEVC ones above are**: they are the numbers a
+// caller needs to check a driver against what this path assumes. That is not a rationalisation —
+// while `av1_submit` was an unreachable child of an unreachable module, rustc never descended into
+// it, so the items only its own tests used were invisible; making the module reachable is what
+// showed them, and exporting the measured driver facts is the honest answer rather than an
+// `allow(dead_code)`.
+pub use av1_params::{Av1Plan, FrameKind as Av1FrameKind, WMMAT_SCALE_IS_SPECIFIED};
+pub use av1_submit::{
+    AV1_DRIVER_INTERLACED, AV1_DRIVER_PACKED_HEADERS, AV1_DRIVER_RATE_CONTROL_MASK, AV1_MAX_REFERENCES, AV1_PACKED_HEADERS, AV1_RC_CQP, Av1Buffer, Av1EncodeRequest,
+    Av1EncodedPicture, Av1Encoder, Av1Submission, DRIVER_REFUSES_THE_AV1_PICTURE_RECORD, build_submission, driver_outcomes, seq_fields, the_tile_group_buffer,
+};
 // What a caller outside this module needs to build a decoder: [`Display`] is the initialised libva
 // connection a session is created on; [`stream_info`] reads a sample entry into the codec-agnostic
 // `StreamInfo` the rest of the workspace speaks, and [`Stream`] is this backend's own view of a
