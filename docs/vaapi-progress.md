@@ -484,9 +484,10 @@ the encoder does not advertise it.
 
 **A shipped HEVC preset now exists** (`29affc43`), so this subsection's earlier statement that FilmCraft
 shipped none is superseded by **§3.10**, which is the current per-preset table. The preset is conditional on
-`available(Format::Hevc)` and **exports at 30 fps only** — every other rate is refused by name, because the
-encoder writes a fixed 30 into the SPS VUI while the `hvcC` carries the rate the caller stated. That refusal is
-an encoder defect (§3.7 of this file's HEVC notes and `hevc_submit.rs`), not a property of HEVC.
+`available(Format::Hevc)` and **exports at the sequence's own rate**: the encoder writes the caller's exact
+rational into the VUI of **both** parameter sets (§3.10, "#12"), so 24, 25, 30, 60 and 30000/1001 all
+export at the rate asked for. That was not true at any point on this branch — the rate was fixed at 30 and
+every other rate was refused by name.
 `hevc_is_offered_on_this_machine_and_which_presets_it_reaches` reads the real preset list, so a preset added
 later is caught rather than silently missing.
 
@@ -569,7 +570,7 @@ sequence's size and rate, so those numbers move with the sequence.
 | 9 | Vimeo 2160p 4K Ultra HD | `H264` | H264 | `two-pass encoding` | no |
 | 10 | Social Vertical 1080×1920 | `H264` | H264 | — (taken) | **yes** |
 | 11 | MXF OP1a H.264 | `H264` | H264 | `MXF carries an Annex B stream, and this backend's samples are length-prefixed` | no |
-| 12 | HEVC 1080p High Quality | `Hevc` | HEVC | gate takes it; at any rate but 30 fps `check_hvcc_against_the_picture` refuses with `the hvcC states {avg} fps (constantFrameRate {}) and the VUI in the SPS it carries states {30}: a player reads the container and a decoder reads the SPS` | **yes, at 30 fps only** |
+| 12 | HEVC 1080p High Quality | `Hevc` | HEVC | — (taken) | **yes, at the sequence's own rate** |
 | 13 | Apple ProRes 422 HQ | `ProRes` | none | routing `None`; H264 gate would say `ProRes is not H.264: …` | no (built-in) |
 | 14 | Apple ProRes 422 | `ProRes` | none | routing `None` | no (built-in) |
 | 15 | Apple ProRes 422 LT | `ProRes` | none | routing `None` | no (built-in) |
@@ -610,7 +611,7 @@ off") }`. The preset list does not set it, so "exports" here means *under the op
 |---|--------|---------|-----|
 | 8, 9 | Vimeo 1080p Full HD, Vimeo 2160p 4K Ultra HD | **Refused for a real reason** | See below. |
 | 11 | MXF OP1a H.264 | **Refused for a real reason** | See below. |
-| 12 | HEVC 1080p High Quality | **Exports at 30 fps. Refused for a fixable reason at every other rate** — and the fix is in the encoder, outside this branch's two files | See below. |
+| 12 | HEVC 1080p High Quality | **Exports, at the sequence's own rate** | The rate was a fixed 30 and every other rate was refused by name; it is now the caller's rational, written into both parameter sets. See below. |
 | 13–31 | all nineteen remaining presets | **Refused for a real reason** (by routing, not by a gate) | No VA-API encoder exists for these formats in FilmCraft. Nothing is declining a capability; there is no encoder to decline with. The built-in encoders are the deliverable. |
 | — | *no preset on this list* | **Ambiguous** | There are none. Every row resolved to one of the two verdicts above. |
 
@@ -641,42 +642,61 @@ form and hands the muxer four-byte length-prefixed samples, which is the MP4 for
 would be to stop shipping MXF H.264, which is a real broadcast deliverable that works today through
 FilmCraft's own encoder. Left refused, already commented at the preset.
 
-**#12, the HEVC rate constraint — fixable, but not in a file this branch may edit.** The *gate* accepts
-24, 25 and 60 fps; the refusal happens later and is in the encoder:
+**#12, the HEVC rate — fixed, and the fix turned out to be two defects of the same arithmetic.**
 
-- `hevc_submit.rs`'s `sequence_record(size, width, height, keyframe_interval)` takes **no frame-rate
-  argument**, and writes `vui_num_units_in_tick: 1` with `vui_time_scale: 2 * DEFAULT_FRAME_RATE_FOR_LEVEL`
-  where `const DEFAULT_FRAME_RATE_FOR_LEVEL: u32 = 30`. So `time_scale / (2 * num_units_in_tick)` is
-  **30 fps in every stream this path writes.**
-- `at_rate(fps)` stores the caller's rate and *rebuilds* the sequence record — but passes no rate to
-  it, so the rebuild keeps the fixed 30.
-- The `hvcC` carries the caller's rate, and `check_hvcc_against_the_picture` compares the two and
-  refuses the mismatch by name.
+The *gate* always accepted any rate; the refusal happened later, in the encoder, and there were **two**
+places writing a fixed 30 and each applied **H.264's** convention, which HEVC does not have:
 
-**The fix is real and is a genuine improvement rather than a weakening**: thread the rate through
-`sequence_record` from `at_rate` into `vui_num_units_in_tick`/`vui_time_scale`, which makes the stream
-state the rate the caller asked for and leaves the cross-check — a good check — exactly as strict. It
-also matches what the code around it already claims: the comment above those two fields reads *"the
-timing in it is the frame rate the caller stated — not a guess"*, and the constant's own doc says
-*"never reaches a stream"* — **both are false today**, which is why the two comments and the code
-disagree. **Not applied here**: the change is in `crates/platform/src/vaapi/hevc_submit.rs`, outside
-this task's two files. So **HEVC presets are a 30 fps export on this branch**, which is a defect in the
-encoder and applies to every route to the format, not a property of the preset or of HEVC.
+- `sequence_record(size, width, height, keyframe_interval)` took **no frame-rate argument** and wrote
+  `vui_num_units_in_tick: 1` with `vui_time_scale: 2 * DEFAULT_FRAME_RATE_FOR_LEVEL` where the constant is
+  30 — **60**, so `time_scale / (2 * num_units_in_tick)`, which is **H.264's** arithmetic. HEVC's is
+  `time_scale / num_units_in_tick`: a 30 fps stream so written declares **60 fps in its own SPS**.
+  `at_rate(fps)` rebuilt the record without passing a rate, so the rebuild kept the fixed 60.
+- **The same doubling was in the VPS**, which nothing had mentioned. `hevc_params::vps` took a whole
+  `frame_rate` and wrote `time_scale = 2 * fps` for the same reason — so the SPS said 30 and the VPS said
+  60, and **the two parameter sets of one stream disagreed by a factor of two.**
+  This is the half that reaches a reader: ffmpeg's HEVC parser prefers the VPS, and on this path's own
+  24 fps elementary stream it read **`48/1`**. Patching only the VPS's `time_scale` 48 → 24 — every other
+  bit untouched — made it read **`24/1`**, which is what makes this a measured finding and not an
+  inference. (`filmcraft_hevc::params::Vps` stops after profile/tier/level and cannot see the timing, so
+  the VPS's bits are read directly; the offsets are ffmpeg's own `trace_headers` output for a VPS this
+  path wrote — flag at 155, `num_units_in_tick` at 156, `time_scale` at 188 — and the tests pin them.)
+- The `hvcC` carried the caller's rate and `check_hvcc_against_the_picture` compared the two. **It made
+  the same mistake as the writer**, so it endorsed the doubling: a 30 fps export passed with an SPS
+  declaring 60.
 
-#### Two things this table could not measure, stated rather than guessed
+**What landed.** `vui_timing(rate)` computes `(num_units_in_tick, time_scale)` once, from the caller's
+rational, and **both parameter sets are given that one pair** — a single argument threaded from
+`at_rate_exact` through `parameter_sets`, so the VPS and the SPS cannot state two rates. The cross-check
+uses HEVC's arithmetic and cross-multiplies (`scale == avg * units`) rather than dividing, which makes it
+**stricter**: it refuses doubled pairs the old check accepted. `hvcC` states no rate at all for a
+fractional one (30000/1001), because `avgFrameRate` is a 16-bit integer and 0 is ISO/IEC 14496-15's own
+"not carried here" — the bitstream and the track's timescale carry it exactly.
 
-- **The HEVC row is conditional on the machine, and no test exercises it.** `hevc_presets()` returns
+**Verified red before trusted.** Re-introducing `time_scale = 2 * fps` in the VPS fails the unit test
+(`left: (1, 60), right: (1, 30)`) and the integration test (`24 fps: the VPS states (1, 48) and the SPS's
+VUI states (1, 24)`), and dropping `hevc_mp4toannexb` from the test's own extraction fails it again with
+`the elementary stream carries NAL types [9], which has no VPS (32) or SPS (33)` — see below.
+
+#### A test that was measuring a guess, and is now measuring a bitstream
+
+`every_rate_the_gate_takes_states_that_rate_in_the_bitstream_and_in_the_container` extracted the
+elementary stream with `-c copy -f hevc`. **The parameter sets live in the `hvcC` and in no sample**, so
+that produced a **525-byte file holding one access-unit delimiter and nothing else** — ffprobe read it
+with a diagnostic (*"missing picture in access unit with size 525"*) and an `r_frame_rate` of
+**`1200000/1`**, which is not this path's rate doubled or mangled but what a reader falls back to for a
+stream that states nothing. `-bsf:v hevc_mp4toannexb` is what prepends the extradata; with it the file
+carries VPS, SPS, PPS and the slices, and ffprobe reads the rate the test meant to assert. **The
+assertion itself is unchanged** — it still says the bitstream states the rate the caller asked for — and
+what changed is that there is now a bitstream to say it.
+
+#### One thing this table could not measure, now that it can
+
+- **The HEVC row is now measured, not read off the gate's checks.** `hevc_presets()` returns
   empty unless `available(Format::Hevc)`, which is `vaapi::hevc_available` registered by
-  `filmcraft_platform::register()`. `tests/hevenc.rs` does not call `register()`, so on this machine it
-  reports **`HEVC presets exported through the gate: 0 of 0`** and **`note: FilmCraft ships 0 HEVC
-  preset(s)`** — the preset is not in the list it is testing. That is a **coverage hole, not a
-  disagreement**: `vaapi::hevc_available()` returns true here (the same test asserts it directly), and
-  the same settings shape encodes end to end through the registered factory at 30 fps
-  (`a_hevc_export_through_the_gate_decodes_to_the_pictures_that_went_in` — **ok**). But the preset's
-  *own* settings have never been put through `hevc_config_for` by any test. Its row above is read from
-  the gate's checks, every one of which it passes: `Vbr1Pass`, 10 000/15 000 kbps, 1920×1080 (both
-  multiples of 8), progressive, SDR, square pixels, `H264Pass::Single`. **A test that calls `register()`
-  before reading the preset list would close this, and it belongs in `tests/hevenc.rs`.**
+  `filmcraft_platform::register()`, so **`tests/hevenc.rs` calls `register()` first** — without it the
+  preset is not in the list the test reads and it reports `0 of 0`. `hevc_is_offered_on_this_machine_and_
+  which_presets_it_reaches` asserts the list is non-empty for exactly that reason.
 - **§3.9's "No shipped preset changed status" is now stale** for the same reason: it says FilmCraft
   "ships no HEVC preset at all", and `29affc43` added one. The sentence above is the corrected claim.
 

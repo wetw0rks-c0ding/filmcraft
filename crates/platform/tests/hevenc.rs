@@ -1257,24 +1257,40 @@ fn the_export_gate_takes_what_it_can_express_and_declines_the_rest_with_its_reas
     };
     assert!(why_cq.contains("30"), "the decline names the quantiser the settings stated, not just the mode: {why_cq}");
 
-    // **A fractional frame rate is refused, not rounded**, and a whole rate written as an awkward
-    // fraction is taken — because the check is on the *ratio*, not on whether the numbers look simple.
-    let Err(why_frac) = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::new(24_000, 1_001), &base) else {
-        panic!("23.976 was accepted: this backend submits whole frames per second");
-    };
-    assert!(why_frac.contains("fractional"), "and it says why: {why_frac}");
-    assert!(why_frac.contains("24000/1001"), "and it names the rate the caller asked about, not a fixed example: {why_frac}");
-    // **25000/1001 is 24.975 and is equally refused** — the message's worked example follows the input,
-    // so this also catches a hardcoded "23.976 to 24" printed beside a different rate.
-    let Err(why_frac2) = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::new(25_000, 1_001), &base) else {
-        panic!("24.975 was accepted");
-    };
-    assert!(why_frac2.contains("25"), "and the rounded figure in the message is this rate's, not a fixed one: {why_frac2}");
+    // **A fractional frame rate is taken, not rounded**, because the VUI states an exact rational:
+    // `rate` carries 24000/1001 and `fps` is the whole number the *driver's* misc buffer carries,
+    // which is 24. Both numbers are asserted, because the test that only checked `fps` could not see
+    // a gate that threw the caller's rate away and re-rounded.
+    //
+    // **Deliberate break:** rounding `rate` into `fps` and keeping it (or refusing a rate that is not
+    // a whole one) fails here — `rate` would come back as 24/1 and the export's VUI would state 24
+    // fps for a 23.976 timeline.
+    let frac = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::new(24_000, 1_001), &base).expect("23.976 is a rate the VUI can state exactly");
+    assert_eq!(frac.rate, FrameRate::new(24_000, 1_001), "the caller's rate is carried through the gate untouched");
+    assert_eq!(frac.fps, 24, "the driver is told the nearest whole frame per second, rounded rather than truncated");
+    // **25000/1001 is 24.975 and rounds to 25** — a gate that floored would still pass the 24000/1001
+    // case and fail this one.
+    let frac2 = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::new(25_000, 1_001), &base).expect("24.975 is a rate the VUI can state exactly");
+    assert_eq!((frac2.rate, frac2.fps), (FrameRate::new(25_000, 1_001), 25), "24.975 rounds up to 25 for the driver");
+    // **A whole rate written as an awkward fraction is taken as what it is**, because the check is on
+    // the ratio, not on how the numbers are written.
     assert_eq!(
         hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::new(50_000, 2_000), &base).map(|c| c.fps),
         Ok(25),
         "50000/2000 is exactly 25 fps and is taken as such: the check is on the ratio, not on how the numbers are written"
     );
+    assert_eq!(
+        hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::new(50_000, 2_000), &base).map(|c| c.rate),
+        Ok(FrameRate::new(50_000, 2_000)),
+        "and the rate the stream is timed at is the caller's own numbers, not a re-derived 25/1"
+    );
+    // **A rate that is not positive is still refused, by name and with its numbers.**
+    for bad in [FrameRate::new(0, 1), FrameRate::new(-24, 1), FrameRate::new(24, 0), FrameRate::new(24, -1)] {
+        let Err(why_bad) = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, bad, &base) else {
+            panic!("a frame rate of {} was accepted", bad.num as f64 / bad.den as f64);
+        };
+        assert!(why_bad.contains("invalid frame rate"), "and it says the rate is invalid: {why_bad}");
+    }
 
     // **Interlaced**, because nothing in these records can state a field sequence.
     let mut inter = hevc_settings(String::new());
@@ -1751,23 +1767,28 @@ fn a_hevc_export_through_the_gate_decodes_to_the_pictures_that_went_in() {
 /// encoder and does not pretend to"; that claim is now false and every preset that asked for HEVC was
 /// **not exportable**.
 ///
+/// **`register()` runs first, and that is the point of the ordering.** `hevc_available` is registered
+/// as `Format::Hevc`'s format probe by `register()`, so without it the probe is not in the list and
+/// this file measures **`0 of 0`** — a coverage hole that reads like "no preset asks for HEVC" and is
+/// actually "nothing was asked". Registering first makes the count a measurement of the preset list
+/// this branch ships.
+///
 /// **What it asserts, and why each part:**
 ///
 /// - **`Format::Hevc` is available** — i.e. the probe registered in `lib.rs` says this machine has an
 ///   HEVC encoder. Without it HEVC is not in the format list at all and the factory is never asked,
 ///   so this is the difference between "wired" and "reachable".
 /// - **Every HEVC preset either exports or is declined for a reason the gate documents**, and the
-///   count is reported rather than asserted, because **FilmCraft currently ships no HEVC preset at
-///   all** — so on this tree the honest answer to "which presets changed status" is *none*, and the
-///   loop's value is that a preset added later is taken rather than silently declined. Each one is
-///   read out of the real preset list, read through `resolve` as `Exporter::new` would.
+///   count is reported *and* asserted to be the whole list, so a preset added later cannot be quietly
+///   dropped.
 /// - **The H.264 preset statuses did not move.** That is the half that must *not* change: this gate
 ///   is reached for `Format::Hevc` only, and a change to H.264's `taken > 0` would be a regression.
 ///   `tests/vaenc.rs`'s own `taken > 0` assertion is left exactly as it was, and is re-asserted here
 ///   so "the H.264 gate still reaches presets" is checked from both suites.
 ///
 /// **Deliberate break:** a preset with no gate that resolves would make `taken` zero and fail here;
-/// a gate that accidentally accepted H.264 would fail the second half.
+/// a gate that accidentally accepted H.264 would fail the second half; and a `register()` moved below
+/// the preset list would report `0 of 0` and fail the assertion that the list is not empty.
 #[test]
 fn hevc_is_offered_on_this_machine_and_which_presets_it_reaches() {
     let _guard = lock();
@@ -1775,9 +1796,16 @@ fn hevc_is_offered_on_this_machine_and_which_presets_it_reaches() {
         eprintln!("SKIPPED: no VA-API display");
         return;
     }
+    // **Before the preset list is read, and before anything asks whether HEVC is offered.** This is
+    // what registers `vaapi::hevc_available` as `Format::Hevc`'s probe; the probe is then asserted
+    // directly, because the function behind the registry entry is what the format list calls.
+    filmcraft_platform::register();
     // **The probe is the thing that puts HEVC in the format list**, so this is asserted directly rather
-    // than through `filmcraft_export::available`, which needs the registration this test file does not do.
+    // than through `filmcraft_export::available`, which needs the registration this test file now does.
     assert!(hevc_available(), "this machine has a VA-API HEVC session for the probe but hevc_available said it did not");
+    // **And through the registry itself**, which is the route a user takes: without the `register()`
+    // above, `available(Format::Hevc)` is false however well the driver behaves.
+    assert!(filmcraft_export::available(Format::Hevc), "Format::Hevc is not in the format list, so nothing can ask for an HEVC export at all");
 
     let presets = filmcraft_export::builtin_presets();
     let hevc_presets: Vec<_> = presets.iter().filter(|p| p.settings.video_format() == Format::Hevc).collect();
@@ -1807,13 +1835,13 @@ fn hevc_is_offered_on_this_machine_and_which_presets_it_reaches() {
         eprintln!("HEVC preset declined by a documented rule: {line}");
     }
     eprintln!("HEVC presets exported through the gate: {taken} of {}", hevc_presets.len());
-    // **No HEVC preset is asserted to be taken**, and that is a measurement of the preset list rather
-    // than a gap in the gate: FilmCraft ships H.264, ProRes, DNxHR, APV and image-sequence presets and
-    // **no HEVC one**, so before this gate HEVC was simply not among the things a user could pick from
-    // a preset. `Format::Hevc` is reachable *as a format* — which is what the probe above asserts — and
-    // adding a preset that asks for it is now a matter of the preset list rather than of the encoder.
-    // What **is** asserted is that every HEVC preset either exports or is declined for a documented
-    // reason, so a preset added later cannot be quietly dropped.
+    // **The list is not empty, and that is the assertion `0 of 0` would have failed.** This file
+    // measured `0 of 0` for a long time because it never called `register()`, and the count was
+    // reported rather than asserted so the hole looked like a measurement. A count of zero HEVC
+    // presets in a tree that ships one is a hole in the test, not a fact about the presets.
+    assert!(!hevc_presets.is_empty(), "no HEVC preset was listed, so this measured nothing: `register()` must run before the list is read");
+    // Every HEVC preset is either exported or declined by a documented rule, so a preset added later
+    // cannot be quietly dropped.
     assert_eq!(taken + refused.len(), hevc_presets.len(), "an HEVC preset was neither exported nor declined by a documented rule");
     eprintln!("note: FilmCraft ships {} HEVC preset(s); {taken} export through this backend", hevc_presets.len());
 
@@ -1840,4 +1868,223 @@ fn hevc_is_offered_on_this_machine_and_which_presets_it_reaches() {
         panic!("the H.264 gate accepted a Format::Hevc request: the two gates must stay separate, or a decline in one becomes a decline in the other");
     };
     assert!(why.contains("HEVC gate"), "and the H.264 gate says where HEVC is served: {why}");
+}
+
+/// **Every rate this backend exports states that rate — in the SPS's VUI, in the container, and to a
+/// decoder reading the SPS — and the file holds every picture that went in.**
+///
+/// # What this is the gate for
+///
+/// **The defect it closes:** `sequence_record` took no rate and wrote `vui_time_scale: 2 * 30` into
+/// every stream, while the `hvcC` carried the rate the caller asked for. `check_hvcc_against_the_picture`
+/// refused the disagreement by name, so **24, 25 and 60 fps were refused by the encoder and 30 fps
+/// "worked"** — with the SPS declaring *twice* the rate the container claimed, because the check made
+/// the same arithmetic mistake as the writer (H.264's `time_scale / (2 * num_units_in_tick)` where
+/// HEVC's is `time_scale / num_units_in_tick`). A rate that exports while its bitstream says
+/// something else is worse than a refusal, and that is why each half is checked separately here.
+///
+/// # The four places a rate is visible, and all four are asserted
+///
+/// 1. **The VUI pair, parsed back out of the `hvcC`'s own SPS** — `(num_units_in_tick, time_scale)`,
+///    compared against the caller's rational exactly. This is what a decoder reads.
+/// 2. **The `hvcC`'s `avgFrameRate` / `constantFrameRate`** — what a player reads *instead of* parsing
+///    the SPS, which is a 16-bit integer field: a whole rate is stated, and 30000/1001 is stated as
+///    **0 / not-constant**, ISO/IEC 14496-15's own "not carried here", because no integer is 29.97.
+/// 3. **ffprobe on the muxed file** — the container's own timing (`r_frame_rate`, and the frame
+///    count, so a file that holds one picture out of six cannot pass).
+/// 4. **ffprobe on the extracted elementary stream** — what a *decoder* reads from the SPS alone,
+///    with no container to fall back on. This is the half that catches the factor of two: before the
+///    fix it reported 60/1 for a 30 fps file.
+///
+/// # What is deliberately *not* claimed
+///
+/// **No picture is compared against anything here.** A hardware encoder and a software encoder are
+/// different algorithms, so bit-equality is unavailable at any level between them; the picture claim
+/// lives in [`a_hevc_export_through_the_gate_decodes_to_the_pictures_that_went_in`], and this test
+/// asserts only that the frames are *there* and that the timing is right.
+///
+/// **Deliberate break:** writing a fixed `vui_time_scale` again fails (1) and (4); rounding 30000/1001
+/// to 30 in the VUI fails (1); putting 30 into the `hvcC` for a 29.97 export fails (2) and the gate's
+/// own cross-check; dropping a sample fails (3).
+#[test]
+fn every_rate_the_gate_takes_states_that_rate_in_the_bitstream_and_in_the_container() {
+    use filmcraft_isobmff::{Brand, Mp4Writer, TrackConfig, WriteSample, WriterOptions};
+    let _guard = lock();
+    let Some(ffmpeg) = filmcraft_testkit::ffmpeg_or_skip("decoding an HEVC export at each rate") else { return };
+    let Some(ffprobe) = filmcraft_testkit::ffprobe_or_skip("reading an HEVC export's timing at each rate") else { return };
+    if open_display().is_err() {
+        eprintln!("SKIPPED: no VA-API display");
+        return;
+    }
+    const PICTURES: usize = 6;
+
+    // `(name, the rate the caller stated, the VUI pair a decoder must read, what the hvcC may say)`.
+    //
+    // **The pair is the caller's own rational**, not a literal fps: 30000/1001 is `(1001, 30000)`,
+    // which is what x265 writes and what ARIB STD-B32 Attachment 3 §2.2.2's
+    // `time_scale / num_units_in_tick` gives. A test that wrote `time_scale: 60` for 30000/1001 would
+    // assert the doubling this whole change exists to remove.
+    let cases: [(&str, FrameRate, (u32, u32), Option<u16>); 5] = [
+        ("24", FrameRate::FPS_24, (1, 24), Some(24)),
+        ("25", FrameRate::FPS_25, (1, 25), Some(25)),
+        ("30", FrameRate::FPS_30, (1, 30), Some(30)),
+        ("60", FrameRate::FPS_60, (1, 60), Some(60)),
+        ("29.97", FrameRate::FPS_29_97, (1001, 30000), None),
+    ];
+    for (name, rate, pair, hvcc_rate) in cases {
+        let settings = hevc_settings(String::new());
+        let config = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, rate, &settings)
+            .unwrap_or_else(|why| panic!("{name} fps: the HEVC gate declined a rate it can state exactly: {why}"));
+        assert_eq!(config.rate, rate, "{name} fps: the gate did not carry the caller's rate through");
+        let Some(built) = vaapi_encoder_factory(Format::Hevc, WIDTH, HEIGHT, rate, &settings) else {
+            panic!("{name} fps: the registered factory declined the settings the HEVC gate accepts");
+        };
+        let mut encoder = built.unwrap_or_else(|e| panic!("{name} fps: the factory's encoder: {e}"));
+
+        let mut packets = Vec::new();
+        let mut entry = None;
+        for index in 0..PICTURES {
+            let rgba = ramp_frame(WIDTH, HEIGHT, index as u32);
+            let frame = EncoderFrame { width: WIDTH, height: HEIGHT, rgba: &rgba, hdr: None, index: index as u64 };
+            let out = encoder.encode(&frame).unwrap_or_else(|e| panic!("{name} fps: picture {index} did not encode: {e}"));
+            assert_eq!(out.len(), 1, "{name} fps: picture {index} produced {} samples", out.len());
+            packets.extend(out);
+            if entry.is_none() {
+                entry = Some(encoder.sample_entry());
+            }
+        }
+        for out in encoder.flush().expect("flush") {
+            packets.push(out);
+        }
+        let entry = entry.expect("a picture was encoded");
+
+        // **(2) What the container says, before the file exists.** `avgFrameRate` is a 16-bit integer
+        // field, so 30000/1001 cannot be in it; `None` here is the `0` plus a cleared
+        // `constantFrameRate`, which is the specification's "not stated here" rather than a rate.
+        let CodecConfig::Hevc(hvc) = &entry.codec else { panic!("{name} fps: not an HEVC sample entry") };
+        assert_eq!(u32::from(hvc.avg_frame_rate), u32::from(hvcc_rate.unwrap_or(0)), "{name} fps: the hvcC's avgFrameRate");
+        assert_eq!(hvc.constant_frame_rate != 0, hvcc_rate.is_some(), "{name} fps: the hvcC's constantFrameRate");
+
+        // **(1) What the decoder reads**, parsed back out of the `hvcC`'s own bytes with this
+        // project's parser rather than read off the struct that wrote it.
+        let sps_nal =
+            hvc.arrays.iter().find(|a| a.nal_type == 33).and_then(|a| a.nalus.first()).unwrap_or_else(|| panic!("{name} fps: the hvcC carries no SPS"));
+        let rbsp = filmcraft_bitstream::unescape_rbsp(sps_nal.get(2..).unwrap_or_default());
+        let sps = filmcraft_hevc::params::Sps::parse(&rbsp).unwrap_or_else(|e| panic!("{name} fps: the SPS the hvcC carries does not parse: {e}"));
+        let timing = sps.vui.as_ref().and_then(|v| v.timing).unwrap_or_else(|| panic!("{name} fps: the SPS carries a VUI with no timing"));
+        assert_eq!(timing, pair, "{name} fps: the VUI states (num_units_in_tick, time_scale)");
+        assert_eq!(f64::from(timing.1) / f64::from(timing.0), rate.as_f64(), "{name} fps: what the VUI states, read the way a decoder reads it");
+
+        // **The VPS states the same pair, and it is read with a bit reader** because
+        // `filmcraft_hevc::params::Vps` stops after the profile/tier/level and cannot see it. The
+        // offsets are ffmpeg's own `trace_headers` output for a VPS this path wrote — flag at bit
+        // 155, `vps_num_units_in_tick` at 156, `vps_time_scale` at 188 — and `unescape_rbsp` above
+        // drops the two-byte NAL header that those positions include, so they are 16 lower here.
+        //
+        // **This is the assertion that pins the rate a decoder actually reads.** The VPS used to be
+        // written with `time_scale = 2 * fps` under H.264's arithmetic, so every stream declared
+        // twice its own rate there while its SPS said otherwise, and ffmpeg — which prefers the VPS
+        // — reported the doubled number for a perfectly correct export.
+        let vps_nal =
+            hvc.arrays.iter().find(|a| a.nal_type == 32).and_then(|a| a.nalus.first()).unwrap_or_else(|| panic!("{name} fps: the hvcC carries no VPS"));
+        let vps_rbsp = filmcraft_bitstream::unescape_rbsp(vps_nal.get(2..).unwrap_or_default());
+        let mut vps = filmcraft_bitstream::BitReader::new(&vps_rbsp);
+        vps.seek_bits(139);
+        let vps_says_timing = vps.read_flag().expect("{name} fps: vps_timing_info_present_flag");
+        assert!(vps_says_timing, "{name} fps: the VPS carries no timing, so it states no rate");
+        let vps_units = vps.read_bits(32).expect("{name} fps: vps_num_units_in_tick");
+        let vps_scale = vps.read_bits(32).expect("{name} fps: vps_time_scale");
+        assert_eq!(
+            (vps_units, vps_scale),
+            timing,
+            "{name} fps: the VPS states ({vps_units}, {vps_scale}) and the SPS's VUI states {timing:?}; a decoder that reads one and a player that reads the other get two different rates"
+        );
+
+        // **(3) The file**, muxed with the rate the caller stated as its timescale.
+        let path = scratch(&format!("hevc-{name}.mp4"));
+        let file = std::fs::File::create(&path).unwrap_or_else(|e| panic!("{name} fps: creating the mp4: {e}"));
+        let mut writer = Mp4Writer::new(file, WriterOptions::new(Brand::Mp4)).expect("a writer");
+        let timescale = u32::try_from(rate.num).unwrap_or(u32::MAX);
+        let duration = u32::try_from(rate.den).unwrap_or(u32::MAX);
+        let track = writer.add_track(TrackConfig::new(entry, timescale)).expect("a video track");
+        for (index, p) in packets.iter().enumerate() {
+            writer
+                .write_sample(track, WriteSample { data: &p.data, duration, composition_offset: 0, is_sync: p.key })
+                .unwrap_or_else(|e| panic!("{name} fps: sample {index}: {e}"));
+        }
+        writer.finish().expect("finishing the file");
+
+        let probe = std::process::Command::new(ffprobe.as_os_str())
+            .args(["-v", "error", "-count_frames", "-show_entries", "stream=nb_read_frames,r_frame_rate", "-of", "csv=p=0", "-i"])
+            .arg(&path)
+            .output()
+            .expect("ffprobe");
+        let said = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+        assert_eq!(
+            said,
+            format!("{}/{den},{PICTURES}", rate.num, den = rate.den),
+            "{name} fps: {} says {said:?} where ffprobe was asked for r_frame_rate and nb_read_frames",
+            path.display()
+        );
+        assert!(probe.stderr.is_empty(), "{name} fps: ffprobe reported {}", String::from_utf8_lossy(&probe.stderr));
+
+        let decoded = std::process::Command::new(ffmpeg.as_os_str()).args(["-v", "error", "-i"]).arg(&path).args(["-f", "null", "-"]).output().expect("ffmpeg");
+        assert!(decoded.stderr.is_empty(), "{name} fps: ffmpeg decoded the export with a diagnostic: {}", String::from_utf8_lossy(&decoded.stderr));
+
+        // **(4) The elementary stream**, with no container to say anything: this is the bitstream's
+        // own statement, read by ffmpeg's parser.
+        //
+        // **`hevc_mp4toannexb` is what makes this an elementary stream at all.** The parameter sets
+        // live in this file's `hvcC` and in no sample, so `-c copy -f hevc` on its own emits a file
+        // with **no VPS and no SPS in it** — measured: 525 bytes holding one access-unit delimiter
+        // and nothing else, which ffprobe reads with a diagnostic (*"missing picture in access unit
+        // with size 525"*) and a `r_frame_rate` of 1200000/1. That number was not this path's rate
+        // doubled or mangled; it was what a reader falls back to for a stream that states nothing,
+        // and asserting against it would have pinned a guess rather than a bitstream. The filter is
+        // what prepends the extradata, so the file the assertion reads does carry the rate.
+        //
+        // **What the reader gets is a rate, not an equality.** ffmpeg and this path are different
+        // encoders in the sense that matters here: the bits are written by this module and parsed by
+        // ffmpeg's parser, so the check is that the two agree on the number the SPS and the VPS
+        // state — not that any bytes are shared.
+        let raw_path = scratch(&format!("hevc-{name}.h265"));
+        let extract = std::process::Command::new(ffmpeg.as_os_str())
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-y"])
+            .arg(&raw_path)
+            .output()
+            .expect("ffmpeg -c copy -bsf:v hevc_mp4toannexb");
+        assert!(extract.status.success(), "{name} fps: extracting the elementary stream failed: {}", String::from_utf8_lossy(&extract.stderr));
+        // **The file really does carry the parameter sets**, so the assertion below is about a rate
+        // rather than about a reader's guess. An access-unit delimiter alone is what the missing
+        // filter produced, and saying so is the difference between the two.
+        let sets_in_stream = std::fs::read(&raw_path).unwrap_or_else(|e| panic!("{name} fps: reading the elementary stream: {e}"));
+        let nal_types: Vec<u8> = sets_in_stream
+            .windows(3)
+            .enumerate()
+            .filter(|(_, w)| *w == [0, 0, 1])
+            .filter_map(|(i, _)| sets_in_stream.get(i + 3).map(|b| b >> 1 & 0x3f))
+            .collect();
+        assert!(
+            nal_types.contains(&32) && nal_types.contains(&33),
+            "{name} fps: the elementary stream carries NAL types {nal_types:?}, which has no VPS (32) or SPS (33), so there is nothing in it to read a rate from"
+        );
+        let elementary = std::process::Command::new(ffprobe.as_os_str())
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", "-i"])
+            .arg(&raw_path)
+            .output()
+            .expect("ffprobe");
+        assert!(
+            String::from_utf8_lossy(&elementary.stderr).trim().is_empty(),
+            "{name} fps: ffprobe reported a diagnostic on the elementary stream: {}",
+            String::from_utf8_lossy(&elementary.stderr)
+        );
+        let said_rate = String::from_utf8_lossy(&elementary.stdout).trim().to_string();
+        assert_eq!(
+            said_rate,
+            format!("{}/{}", rate.num, rate.den),
+            "{name} fps: ffmpeg read the elementary stream as {said_rate}, which is the rate a decoder gets from this bitstream alone"
+        );
+    }
 }

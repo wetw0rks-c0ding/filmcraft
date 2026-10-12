@@ -84,16 +84,22 @@ fn adaptive(bpp: f32) -> ExportSettings {
 ///
 /// # What is still true of every export through this path, and is the reason the preset is conditional
 ///
-/// **The sequence's rate has to be one the stream can state.** The HEVC path writes the frame rate
-/// into the SPS's VUI, and it writes it from a fixed 30 fps (`DEFAULT_FRAME_RATE_FOR_LEVEL` in
-/// `crates/platform/src/vaapi/hevc_submit.rs`) rather than from the rate the caller stated, while the
-/// `hvcC` carries the rate the caller did state. The cross-check that compares the two
-/// (`check_hvcc_against_the_picture`) therefore **refuses every rate but 30 fps, by name**, rather
-/// than writing a container that contradicts its own bitstream. Measured on this machine: 30 fps
-/// exports (1920×1080, ffprobe `codec_name=hevc`, `nb_read_frames=30`, ffmpeg silent), and 24, 25
-/// and 60 fps all fail with `the hvcC states 60 fps … and the VUI in the SPS it carries states 30`.
-/// That is a defect in the encoder, not a property of HEVC, and it applies to every route to the
-/// format — the preset does not create it and cannot hide it.
+/// **The sequence's rate has to be one the stream can state — and it now is, whatever it is.** The
+/// HEVC path writes the frame rate into the VUI of *both* parameter sets, from the rate the caller
+/// stated, as an exact rational: `vui_num_units_in_tick` is the denominator and `vui_time_scale` the
+/// numerator, and the frame rate is their quotient (`hevc_submit::vui_timing` in
+/// `crates/platform/src/vaapi/hevc_submit.rs`). 30000/1001 is therefore 29.97 fps in the bitstream
+/// rather than a rounded 30, and the `hvcC` states no rate at all for it, because
+/// `avgFrameRate` is a 16-bit integer that cannot carry a fraction — `check_hvcc_against_the_picture`
+/// treats that as the specification's "not stated here" and refuses any rate the container *does*
+/// state that the SPS's VUI does not.
+///
+/// **This was a defect, not a property of HEVC, and it is why the preset used to be 30 fps only.** A
+/// fixed 30 went into the SPS's VUI whatever the caller asked for, and the cross-check correctly
+/// refused every other rate with `the hvcC states 60 fps … and the VUI in the SPS it carries states
+/// 30`. The path writes the caller's rate now, so the precondition this paragraph describes is gone;
+/// what remains is the one above it, that the rate must be a whole number of frames per second for
+/// a *preset* whose own text names a rate.
 fn hevc(size: (u32, u32), kbps: u32, max_kbps: u32) -> ExportSettings {
     ExportSettings {
         format: Format::Hevc,
@@ -133,8 +139,8 @@ fn hevc_presets() -> Vec<ExportPreset> {
         "Web & Social",
         "H.265 1920×1080, VBR 1 pass, 10 Mbps target, AAC 320 kbps. Encoded by the machine's HEVC \
          encoder — offered only where one exists, and there is no built-in HEVC encoder to fall back \
-         to. Needs a sequence at 30 fps: the hardware path states its frame rate in the stream, so \
-         another rate is refused rather than rounded.",
+         to. The hardware path states the sequence's own frame rate in the stream, so any rate \
+         exports at the rate asked for rather than at a rounded one.",
         hevc((1920, 1080), 10_000, 15_000),
     )]
 }
@@ -194,7 +200,7 @@ fn p(name: &str, category: &str, description: &str, settings: ExportSettings) ->
 ///   `Vimeo` presets (**`BitrateMode::Vbr2Pass`**, refused with `two-pass encoding`) and
 ///   `MXF OP1a H.264` (**`MXF carries an Annex B stream, and this backend's samples are
 ///   length-prefixed`**). Each carries its own comment below saying the refusal is deliberate.
-/// - **The HEVC preset is taken at 30 fps only**, for the encoder reason `hevc()` documents, and it is
+/// - **The HEVC preset is taken**, for the encoder reason `hevc()` documents, and it is
 ///   *conditional on this machine having an HEVC encoder* — see `hevc_presets`.
 /// - **The other nineteen presets are not declined by a gate at all, because no gate is asked.**
 ///   ProRes, DNxHR, APV, the MXF containers that carry them, the image sequences, GIF and the audio

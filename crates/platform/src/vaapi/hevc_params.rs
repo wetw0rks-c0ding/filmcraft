@@ -66,12 +66,19 @@ pub const fn compatibility_flags(profile_idc: u8) -> u32 {
 /// with [`filmcraft_hevc::params`]' parsers and every field the encoder cares about is compared with
 /// the record they were written from. A bit-position mistake, a wrong unit or a missing syntax
 /// element fails here rather than producing a stream that decodes into a plausible wrong picture.
+///
+/// **The VUI timing pair is one value, not one per parameter set.** `vui_timing` is
+/// `(num_units_in_tick, time_scale)` — it is taken here rather than recomputed inside [`vps`], so
+/// the VPS and the SPS cannot state two different rates. They used to: the VPS was written under
+/// H.264's arithmetic (`time_scale = 2 * fps`) while the SPS's VUI was corrected to HEVC's, and a
+/// decoder that reads the VPS — which is the one ffmpeg's HEVC reader prefers — got twice the
+/// stream's rate. Passing the pair in is what makes that unrepresentable.
 pub fn parameter_sets(
     sequence: &VaEncSequenceParameterBufferHevc,
     picture: &VaEncPictureParameterBufferHevc,
-    frame_rate: Option<u32>,
+    timing: Option<(u32, u32)>,
 ) -> Result<HevcParameterSets, String> {
-    let vps_bytes = vps(sequence, frame_rate)?;
+    let vps_bytes = vps(sequence, timing)?;
     let sps_bytes = sps(sequence)?;
     let pps_bytes = pps(picture)?;
     verify(&vps_bytes, &sps_bytes, &pps_bytes, sequence, picture)?;
@@ -82,7 +89,7 @@ pub fn parameter_sets(
         from_driver: false,
         level_idc: sequence.general_level_idc,
         profile_idc: sequence.general_profile_idc,
-        frame_rate,
+        timing,
     })
 }
 
@@ -363,7 +370,7 @@ fn is_a_level(level_idc: u8) -> bool {
     matches!(level_idc, 30 | 60 | 63 | 90 | 93 | 120 | 123 | 150 | 153 | 156 | 180 | 183 | 186)
 }
 
-fn vps(record: &VaEncSequenceParameterBufferHevc, frame_rate: Option<u32>) -> Result<Vec<u8>, String> {
+fn vps(record: &VaEncSequenceParameterBufferHevc, timing: Option<(u32, u32)>) -> Result<Vec<u8>, String> {
     let profile = record.general_profile_idc;
     if profile != 1 && profile != 2 {
         return Err(format!("general_profile_idc {profile} is neither Main (1) nor Main 10 (2), and this builds a VPS for neither"));
@@ -411,16 +418,25 @@ fn vps(record: &VaEncSequenceParameterBufferHevc, frame_rate: Option<u32>) -> Re
     w.write_ue(0); // vps_max_latency_increase_plus1[0]
     w.write_bits(0, 6); // vps_max_layer_id
     w.write_ue(0); // vps_num_layer_sets_minus1
-    match frame_rate {
-        // The timing the caller stated, in the specification's own units: the frame rate is
-        // `time_scale / (2 * num_units_in_tick)` for a progressive frame, so the tick count is 1 and
-        // the scale is twice the rate. **`None` is a refusal rather than a default**: a VPS that
-        // claims a timing the caller never stated is a stream whose speed nobody chose.
-        Some(fps) => {
-            let scale = fps.checked_mul(2).ok_or_else(|| format!("a frame rate of {fps} fps overflows the VPS's 32-bit time scale"))?;
+    match timing {
+        // **The caller's rate, in the same units and the same pair the SPS's VUI carries** — the
+        // frame rate is `time_scale / num_units_in_tick` for HEVC (`super::hevc_submit::vui_timing`
+        // for the arithmetic and the evidence), and `vps_num_units_in_tick` /
+        // `vps_time_scale` mean what `sps_num_units_in_tick` / `sps_time_scale` mean.
+        //
+        // **This used to write `time_scale = 2 * fps` with `num_units_in_tick = 1`, applying H.264's
+        // `time_scale / (2 * num_units_in_tick)`,** and so every stream declared twice its own rate in
+        // its VPS while its SPS said the right thing. Measured: ffmpeg 9.0.2's HEVC reader prefers the
+        // VPS, and on this path's own 24 fps elementary stream it read `48/1` — patching only the
+        // VPS's `time_scale` 48 → 24, leaving every other bit alone, made it read `24/1`.
+        //
+        // **`None` is a refusal rather than a default**: a VPS that claims a timing the caller never
+        // stated is a stream whose speed nobody chose. It is also what a stream that names no rate
+        // carries, and libx265 writes no VPS timing at all, so nothing needs this to be present.
+        Some((num_units_in_tick, time_scale)) => {
             w.write_bits(1, 1); // vps_timing_info_present_flag
-            w.write_bits(1, 32); // num_units_in_tick
-            w.write_bits(scale, 32);
+            w.write_bits(num_units_in_tick, 32);
+            w.write_bits(time_scale, 32);
             w.write_bits(0, 1); // poc_proportional_to_timing_flag
             w.write_ue(0); // num_ticks_poc_diff_one_minus1
             w.write_ue(0); // vps_max_layer_id's companion: vps_num_hrd_parameters
@@ -1173,12 +1189,72 @@ mod tests {
         }
     }
 
+    /// **The two parameter sets must state one rate, and this reads both out of the written bits.**
+    ///
+    /// `filmcraft_hevc::params::Vps` stops after the profile/tier/level, so the VPS's timing is read
+    /// here with a `BitReader` walking to the fields rather than through a parser that cannot see
+    /// it. **The offsets are ffmpeg's own `trace_headers` output for a VPS this writer produced:
+    /// the flag at bit 155, `vps_num_units_in_tick` at 156 and `vps_time_scale` at 188 — measured
+    /// on this machine, not derived.** `rbsp_of` strips the two-byte NAL header, which those
+    /// positions include, so they are 16 lower here: 139, 140, 172.
+    ///
+    /// **This is the test that would have caught the doubled rate.** The VPS was written with
+    /// `time_scale = 2 * fps` under H.264's arithmetic while the SPS's VUI stated the rate plainly,
+    /// so a stream's two parameter sets disagreed by exactly a factor of two and ffmpeg — which
+    /// reads the VPS — reported twice the rate. Nothing here compares against a literal of the same
+    /// value: the expectation is the pair handed in, and the two sets are compared with **each
+    /// other**, which is the property the defect broke.
+    #[test]
+    fn the_vps_and_the_sps_state_the_same_rate_and_the_reader_agrees_with_both() {
+        // The same `vui_fields` bit the real sequence record sets (`1 << 3`, the
+        // `vui_timing_info_present_flag` among the eight single-bit flags in header order) and the
+        // two timing fields, so the SPS this writes is the SPS the encoder writes.
+        let seq = VaEncSequenceParameterBufferHevc { vui_fields: 1 << 3, vui_num_units_in_tick: 1, vui_time_scale: 30, ..a_sequence_record() };
+        let pic = a_picture_record();
+        for timing in [(1u32, 30u32), (1, 24), (1001, 30_000)] {
+            // **The SPS's VUI comes from the record, so a record carrying the caller's pair is what
+            // the two sets have to agree about** — this is `sequence_record`'s job, and it is why
+            // the assertion below compares the VPS with the SPS rather than with a literal.
+            let seq = VaEncSequenceParameterBufferHevc { vui_num_units_in_tick: timing.0, vui_time_scale: timing.1, ..seq };
+            let sets = match parameter_sets(&seq, &pic, Some(timing)) {
+                Ok(s) => s,
+                Err(why) => panic!("the parameter sets for {timing:?} did not build: {why}"),
+            };
+
+            // The VPS, read back with a bit reader at the offsets the syntax puts these fields.
+            let vps_rbsp = rbsp_of(&sets.vps, NAL_VPS).expect("the VPS payload");
+            let mut r = filmcraft_bitstream::BitReader::new(&vps_rbsp);
+            r.seek_bits(139);
+            let present = r.read_flag().expect("vps_timing_info_present_flag");
+            assert!(present, "{timing:?}: the VPS says it carries no timing, so nothing states a rate");
+            let units = r.read_bits(32).expect("vps_num_units_in_tick");
+            let scale = r.read_bits(32).expect("vps_time_scale");
+            assert_eq!((units, scale), timing, "{timing:?}: what the VPS's own bits state");
+
+            // The SPS's VUI, read with FilmCraft's own parser, and the two must agree.
+            let sps_rbsp = rbsp_of(&sets.sps, NAL_SPS).expect("the SPS payload");
+            let sps = filmcraft_hevc::params::Sps::parse(&sps_rbsp).expect("the SPS parses");
+            assert_eq!(sps.vui.as_ref().and_then(|v| v.timing), Some(timing), "{timing:?}: the SPS's VUI and the VPS state different rates");
+
+            // **And the rate a decoder computes from either is the rate that was asked for.**
+            let (units, scale) = timing;
+            assert!(units > 0 && scale > 0, "{timing:?}: a rate a decoder cannot divide");
+            assert_eq!(
+                f64::from(scale) / f64::from(units),
+                f64::from(timing.1) / f64::from(timing.0),
+                "{timing:?}: the pair states {scale}/{units}, not {}/{}",
+                timing.1,
+                timing.0
+            );
+        }
+    }
+
     /// The round trip the encoder depends on: our bits, our records, FilmCraft's own parsers.
     #[test]
     fn the_derived_parameter_sets_parse_and_agree_with_their_records() {
         let seq = a_sequence_record();
         let pic = a_picture_record();
-        let sets = match parameter_sets(&seq, &pic, Some(30)) {
+        let sets = match parameter_sets(&seq, &pic, Some((1, 30))) {
             Ok(s) => s,
             Err(why) => panic!("the parameter sets did not build: {why}"),
         };

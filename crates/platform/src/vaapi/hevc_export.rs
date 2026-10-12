@@ -100,8 +100,14 @@ pub struct HevcExportConfig {
     pub w: u32,
     /// The encoded picture height, in whole 8-sample minimum coding blocks.
     pub h: u32,
-    /// Whole frames per second, which is what the frame-rate misc buffer carries.
+    /// Whole frames per second, which is what the frame-rate misc buffer carries — **the rate the
+    /// *driver* is told, which for a rate like 30000/1001 is the rounded 30**. The rate the stream
+    /// states is [`rate`](Self::rate), and the two differ only because the driver's field is an
+    /// integer numerator over a denominator of one.
     pub fps: u32,
+    /// **The rate the caller stated, exactly**, which is what the SPS's VUI and the track's
+    /// timescale carry.
+    pub rate: FrameRate,
     /// Pictures between key frames.
     pub gop: u32,
     /// The fidelity, as the settings stated it.
@@ -125,13 +131,22 @@ pub struct HevcExportConfig {
 /// - **A picture size that is not a whole number of 8-sample minimum coding blocks**, because HEVC's
 ///   sequence record has **no crop** (H.264's does, which is why its gate only needs even sides).
 /// - **Interlaced**, because nothing in these records can state a field sequence.
-/// - **A fractional frame rate**, because `VAEncMiscParameterFrameRate`'s numerator here is whole
-///   frames per second.
 /// - **Non-square pixels**, because the derived SPS writes `aspect_ratio_idc = 0` — HEVC's
 ///   `EXTENDED_SAR`, which is only read when the aspect-ratio flag is set, and it is not.
 /// - **HDR**, because this backend codes 4:2:0 8-bit and writes no `colr`.
 /// - **MXF**, which carries an Annex B stream while these samples are length-prefixed.
 /// - **Two passes**, which need the sequence rendered twice.
+///
+/// # What is *not* refused, and used to be: a fractional frame rate
+///
+/// 30000/1001 is a rate users pick, and the VUI states a rate as an exact rational
+/// (`super::hevc_submit::vui_timing`), so the stream can say 29.97 fps exactly. **This gate used to
+/// refuse it by name** — *"rounding this to 30 is a stream at a rate nobody chose"* — and that was
+/// true while the encoder wrote a fixed 30 into every VUI. It is not true now: nothing in the file is
+/// rounded. The track's timescale and sample durations carry 30000/1001, the VUI carries
+/// `(1001, 30000)`, and the picture count is the caller's. The one place a whole number appears is
+/// `VAEncMiscParameterFrameRate`, whose numerator is whole frames per second and which sizes the
+/// driver's rate control — **an input to the controller, not a statement in the stream**.
 ///
 /// **What is *not* here, and why.** H.264's gate refuses a key-frame interval past its
 /// `MaxFrameNum`; **HEVC has no such limit**, because there is no `frame_num` — the picture order
@@ -209,36 +224,28 @@ pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
     if s.field_order != filmcraft_export::FieldOrder::Progressive {
         return Err("interlaced output: this encoder writes a progressive stream and cannot express a field sequence".into());
     }
-    // **The frame rate as whole frames per second, refused rather than rounded.** The check is on
-    // the integers: `num / den` as an `f64` cannot tell 24 from 23.976 at these sizes, and the
-    // answer has to be exactly right because it becomes the misc buffer's numerator.
+    // **The rate, exactly as the caller stated it, plus the whole frames per second the driver is
+    // told.** Both are checked on the integers: `num / den` as an `f64` cannot tell 24 from 23.976
+    // at these sizes, and the VUI pair is derived from the rational, not from a float.
+    //
+    // **A rate that is not a whole number of frames per second is no longer refused here.** The VUI
+    // states the exact rational (`super::hevc_submit::vui_timing`), so 30000/1001 is 29.97 fps in the
+    // bitstream and 30000/1001 in the track's timescale; the whole number below is only what
+    // `VAEncMiscParameterFrameRate` can be given, and it is what the driver's rate control is sized
+    // with. What *is* still refused is a rate that is not positive, or one whose numerator or
+    // denominator does not fit the 32-bit fields it would be written into, or one that rounds to no
+    // frames at all.
     if rate.num <= 0 || rate.den <= 0 {
         return Err(format!("an invalid frame rate of {}/{}", rate.num, rate.den));
     }
-    if rate.num % rate.den != 0 {
-        // **The example in the message is this rate, not a fixed one.** A hardcoded "23.976 to 24"
-        // would be a true statement printed next to a number it does not describe — and a decline
-        // that names an example the caller did not ask about is harder to act on than one that
-        // names what they asked for.
-        return Err(format!(
-            "a fractional frame rate of {}/{}: this backend submits whole frames per second, and rounding this to {} is a stream at a \
-             rate nobody chose",
-            rate.num,
-            rate.den,
-            (rate.num as f64 / rate.den as f64).round() as i64
-        ));
-    }
-    let fps = u32::try_from(rate.num / rate.den).map_err(|_| format!("a frame rate of {} fps", rate.num / rate.den))?;
-    if fps == 0 {
-        return Err("a frame rate of 0 fps".into());
-    }
+    let fps = super::hevc_submit::whole_frames_per_second(rate)?;
     // **The key-frame interval as stated, with no ceiling of the H.264 kind.** HEVC has no
     // `frame_num`: the picture order count is a full `i32` in the record and the slice header's LSB
     // is 12 bits wide with a 4096 modulus the driver applies, so there is no counter here that runs
     // out. A gate that carried the H.264 ceiling over would decline an interval this backend
     // encodes.
     let gop = s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (f64::from(fps) * 2.0).round().max(1.0) as u32);
-    Ok(HevcExportConfig { w, h, fps, gop, bitrate })
+    Ok(HevcExportConfig { w, h, fps, rate, gop, bitrate })
 }
 
 /// [`HevcEncoder`] as a [`VideoEncoder`]: RGBA pictures in, MP4 samples out.
@@ -265,7 +272,7 @@ impl HevcEncoderExport {
     /// built. This is the only place a libva session is created for an export.
     pub fn build(config: HevcExportConfig, display: Arc<Display>, rate: FrameRate) -> Result<Self, String> {
         let mut encoder = config.bitrate.build(&display, (config.w, config.h))?;
-        encoder.at_rate(config.fps)?;
+        encoder.at_rate_exact(config.rate)?;
         encoder.key_frames_every(config.gop)?;
         // **The gate's own question, asked here rather than answered again.** A [`HevcBitrate`] that
         // named its own quantiser would need a request that carries one, and building an encoder
@@ -389,7 +396,7 @@ impl VideoEncoder for HevcEncoderExport {
 pub fn hevc_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        let probe = HevcExportConfig { w: 320, h: 240, fps: 30, gop: 30, bitrate: HevcBitrate::Cbr(2_000_000) };
+        let probe = HevcExportConfig { w: 320, h: 240, fps: 30, rate: FrameRate::FPS_30, gop: 30, bitrate: HevcBitrate::Cbr(2_000_000) };
         let rate = FrameRate::FPS_30;
         let result = crate::vaapi::open_display().and_then(|display| HevcEncoderExport::build(probe, display, rate).map(|_| ()));
         if let Err(why) = &result {
@@ -600,24 +607,57 @@ pub fn check_hvcc_against_the_picture(entry: &SampleEntry, coded: &[u8], key_fra
     // `avgFrameRate` and the SPS's VUI are two statements of one fact, and a player reading the
     // container and a decoder reading the SPS must be told the same rate.
     //
-    // **E.2.1's arithmetic, read off `Vui::timing`'s own order** — `Option<(num_units_in_tick,
-    // time_scale)>`, so the *tick count comes first* and `fps = time_scale / (2 *
-    // num_units_in_tick)` (A.1: `time_scale / (num_units_in_tick * 2)`). A `num_units_in_tick` of 0
-    // is the division this must not do: `checked_div` returns `None` and the timing is then treated
-    // as carrying no rate, which is what it is.
+    // # `fps = time_scale / num_units_in_tick`, and not H.264's arithmetic
+    //
+    // **There is no factor of two here, and there is one in the H.264 path** (which is why the twin
+    // check divides by `2 * num_units_in_tick`). H.264's tick is a *field*, so a progressive frame is
+    // two ticks; HEVC's `sps_num_units_in_tick` counts the ticks in a frame itself. ARIB STD-B32
+    // Part 1 Attachment 3 §2.2.2 gives the HEVC form (`time_scale/num_units_in_tick`, Table 4-9:
+    // 59.94/P as 60 000 over 1 001) and its H.264 attachment gives `time_scale / num_units_in_tick /
+    // 2`; libx265 writes `(1, 24)` for 24 fps, and ffmpeg 9.0.2 reads that pair back as 24/1.
+    //
+    // **Applying H.264's factor to HEVC is not a cosmetic error.** Every stream this path wrote
+    // before the fix declared *twice* its own rate in the SPS — a 30 fps export carrying
+    // `time_scale = 60, num_units_in_tick = 1` — and this check endorsed it, because the check made
+    // the same mistake. Correcting the arithmetic is what makes the gate stricter, not weaker: it
+    // refuses doubled pairs the old one accepted.
+    //
+    // **The comparison is exact, by cross-multiplication.** `scale / units == avg` in integers is
+    // `scale == avg * units` in integers, and that is the form used: a truncating division would
+    // read `(1001, 30000)` as 29 fps and agree with a container that says 29, which is a rate
+    // neither the caller nor the VUI stated. A tick count of 0 is the division this must not do —
+    // no rate divides by zero, so a VUI carrying one is treated as carrying no rate.
     if let Some(vui) = sps.vui.as_ref() {
-        let vui_fps = vui.timing.and_then(|(units, scale)| units.checked_mul(2).and_then(|t| scale.checked_div(t)).filter(|f| *f > 0));
-        match (vui_fps, stored.avg_frame_rate) {
-            (Some(fps), avg) if u32::from(avg) == fps && stored.constant_frame_rate != 0 => {}
-            (Some(fps), avg) => {
+        let vui_rate = vui.timing.filter(|(units, scale)| *units > 0 && *scale > 0);
+        match (vui_rate, stored.avg_frame_rate, stored.constant_frame_rate) {
+            // **The container states a rate, so it must be the SPS's rate, exactly.**
+            (Some((units, scale)), avg, constant) if constant != 0 && avg > 0 => {
+                if u32::from(avg).checked_mul(units) != Some(scale) {
+                    return Err(format!(
+                        "the hvcC states {avg} fps (constantFrameRate {constant}) and the VUI in the SPS it carries states {scale}/{} \
+                         fps: a player reads the container and a decoder reads the SPS",
+                        units
+                    ));
+                }
+            }
+            // **The container states no rate, so it states nothing that can disagree.** ISO/IEC
+            // 14496-15's `avgFrameRate` is a 16-bit integer and 0 means the average frame rate is not
+            // carried here — which is the only honest value for a rate like 30000/1001, which no
+            // integer carries. The bitstream does state it (the VUI, exactly) and so does the track
+            // (its timescale and sample durations), and ffmpeg's own mp4 muxer writes these two
+            // fields as 0 for every HEVC file. **This is the one case the check accepts that it
+            // previously refused**, and it accepts nothing that disagrees: `constantFrameRate` is
+            // cleared, so the container claims neither a rate nor a fixed one.
+            (Some(_), 0, 0) => {}
+            (Some((units, scale)), avg, constant) => {
                 return Err(format!(
-                    "the hvcC states {avg} fps (constantFrameRate {}) and the VUI in the SPS it carries states {}: a player reads the \
-                     container and a decoder reads the SPS",
-                    stored.constant_frame_rate, fps
+                    "the hvcC states {avg} fps (constantFrameRate {constant}) and the VUI in the SPS it carries states {scale}/{} fps: a \
+                     player reads the container and a decoder reads the SPS",
+                    units
                 ));
             }
-            (None, 0) => {}
-            (None, avg) => return Err(format!("the hvcC claims {avg} fps and its SPS's VUI carries no timing")),
+            (None, 0, 0) => {}
+            (None, avg, _) => return Err(format!("the hvcC claims {avg} fps and its SPS's VUI carries no timing")),
         }
     } else if stored.constant_frame_rate != 0 {
         return Err("the hvcC claims a constant frame rate and the SPS it carries has no VUI".into());

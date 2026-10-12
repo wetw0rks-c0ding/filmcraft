@@ -170,6 +170,7 @@ pub use super::encoder::PictureKind;
 use super::encoder::{MAX_REFERENCES, RateControl};
 use super::ffi::{self, Display, Encoder, PICTURE_HEVC_INVALID, PICTURE_HEVC_RPS_ST_CURR_BEFORE, Profile, RtFormat};
 use super::hevc_enc::*;
+use filmcraft_time::FrameRate;
 use std::sync::Arc;
 
 /// The minimum coding block size, in luma samples: `Log2MinCbSizeY = log2_min_luma_coding_block_size_minus3 + 3`, and this
@@ -644,10 +645,12 @@ pub struct HevcParameterSets {
     pub level_idc: u8,
     /// `general_profile_idc`, which is the *bitstream's* 5-bit value: 1 = Main, 2 = Main 10.
     pub profile_idc: u8,
-    /// The frame rate the VUI states, in frames per second, when the VUI carries timing. Kept
-    /// because an `hvcC`'s `avgFrameRate` and `constantFrameRate` are the only place the container
-    /// gets it, and a value nobody can derive is a value this module refuses to write.
-    pub frame_rate: Option<u32>,
+    /// The VUI timing pair both parameter sets carry — `(num_units_in_tick, time_scale)`, the
+    /// caller's exact rational, or `None` when the caller has stated no rate. The frame rate is
+    /// `time_scale / num_units_in_tick` (see [`vui_timing`]); it is **not** stored as a `u32`
+    /// frames-per-second because that is a different number for every rate that is not a whole one,
+    /// and a `u32` here is exactly how the rate used to be halved on its way into the container.
+    pub timing: Option<(u32, u32)>,
 }
 
 /// A configured HEVC encoder: one I frame, then the P frames that genuinely predict from it.
@@ -695,6 +698,14 @@ pub struct HevcEncoder {
     sample_entry: Option<HevcParameterSets>,
     /// The frame rate the caller stated, kept for the VUI and for the `hvcC`.
     stated_rate: Option<u32>,
+    /// **`(num_units_in_tick, time_scale)` — the pair the sequence record's VUI carries**, `None`
+    /// until [`HevcEncoder::at_rate`] has stated a rate.
+    ///
+    /// **This is the caller's rate as an exact rational**, and it is kept as the pair rather than as
+    /// a [`FrameRate`] because the pair is what the record holds and what the bitstream will carry:
+    /// [`stated_rate`](Self::stated_rate) is the *whole* frames per second the driver's misc buffer
+    /// takes, which is a different number for every rate that is not a whole one.
+    vui_timing: Option<(u32, u32)>,
     encoded: u64,
     ended: bool,
     last_marked: bool,
@@ -909,11 +920,12 @@ impl HevcEncoder {
             rate_control_buffer,
             refs: refs as usize,
             references: Vec::new(),
-            sequence: sequence_record(size, width, height, 0)?,
+            sequence: sequence_record(size, width, height, 0, None)?,
             sent_sets: None,
             frame_rate: None,
             sample_entry: None,
             stated_rate: None,
+            vui_timing: None,
             encoded: 0,
             ended: false,
             last_marked: false,
@@ -1007,17 +1019,59 @@ impl HevcEncoder {
     /// **State this stream's frame rate**, which the driver is told per picture. Required, and
     /// refused rather than defaulted, for the reason the H.264 path gives: a frame rate invented here
     /// is a stream whose timing nobody asked for.
+    ///
+    /// **This is [`at_rate_exact`](Self::at_rate_exact) with a denominator of one**, and every
+    /// frame rate this path can express is better stated through that: a rate like 30000/1001 is a
+    /// real rate a user picks, and this function cannot carry it — it would have to round it to 30,
+    /// and the VUI would then state a rate nobody asked for.
     pub fn at_rate(&mut self, frames_per_second: u32) -> Result<&mut Self, String> {
+        self.at_rate_exact(FrameRate::new(i64::from(frames_per_second), 1))
+    }
+
+    /// **State this stream's frame rate as the exact rational it was given**, so the VUI in the SPS
+    /// states `num`/`den` frames per second rather than a rounded whole number.
+    ///
+    /// # The two rates this is not one rate for
+    ///
+    /// - **The VUI pair** is the caller's rational, reduced and written exactly: 30000/1001 becomes
+    ///   `num_units_in_tick = 1001, time_scale = 30000` (see [`vui_timing`]), which is what x265
+    ///   writes for that rate and what every decoder reads back as 29.97 fps.
+    /// - **The driver is told a whole number of frames per second**, rounded to nearest, because
+    ///   `hevc_params::frame_rate_record` builds `VAEncMiscParameterFrameRate`'s numerator over a
+    ///   denominator of one. **That number is an input to the rate controller and appears nowhere in
+    ///   the stream**: the picture count, the track's timescale and the VUI are all the caller's rate.
+    ///
+    /// Both are refused rather than invented: a rate that is not positive, or one whose numerator or
+    /// denominator does not fit the VUI's 32-bit fields, is an error naming the numbers.
+    pub fn at_rate_exact(&mut self, rate: FrameRate) -> Result<&mut Self, String> {
         if self.encoded != 0 {
             return Err(format!("this encoder has already encoded {} picture(s), so its frame rate can no longer be changed", self.encoded));
         }
-        self.frame_rate = Some(super::hevc_params::frame_rate_record(frames_per_second)?);
-        self.stated_rate = Some(frames_per_second);
+        // Reduced once, here, so the pair and every derived number come from the same rational:
+        // `FrameRate`'s fields are public and a caller can hand over 60000/2002.
+        let rate = FrameRate::new(rate.num, rate.den);
+        let timing = vui_timing(rate)?;
+        let whole = whole_frames_per_second(rate)?;
+        self.frame_rate = Some(super::hevc_params::frame_rate_record(whole)?);
+        self.stated_rate = Some(whole);
+        self.vui_timing = Some(timing);
         // The VUI carries the timing, and the VUI lives in the sequence record, so the record is
         // rebuilt. `at_rate` is therefore only legal before the first picture — which is what the
         // check above enforces.
-        self.sequence = sequence_record(self.coded, self.coded.0 as u16, self.coded.1 as u16, self.keyframe_interval)?;
+        self.sequence = self.sequence_record()?;
         Ok(self)
+    }
+
+    /// This encoder's sequence record, rebuilt from the state it currently holds.
+    ///
+    /// **One place, so `at_rate` and `key_frames_every` cannot drift**: both of them change a field
+    /// the record carries, and a record rebuilt from stale state is a stream whose timing and whose
+    /// key-frame interval describe different sequences.
+    fn sequence_record(&self) -> Result<Vec<u8>, String> {
+        let (Ok(width), Ok(height)) = (u16::try_from(self.coded.0), u16::try_from(self.coded.1)) else {
+            return Err(format!("a {}x{} picture does not fit the sequence record's 16-bit dimensions", self.coded.0, self.coded.1));
+        };
+        sequence_record(self.coded, width, height, self.keyframe_interval, self.vui_timing)
     }
 
     /// **State this stream's key-frame interval**, in pictures. `0` is legal and means one key frame
@@ -1030,7 +1084,7 @@ impl HevcEncoder {
             return Err(format!("this encoder has already encoded {} picture(s), so its key-frame interval can no longer be changed", self.encoded));
         }
         self.keyframe_interval = pictures;
-        self.sequence = sequence_record(self.coded, self.coded.0 as u16, self.coded.1 as u16, pictures)?;
+        self.sequence = self.sequence_record()?;
         // **Rebuilt from the same record the encoder was built with**, so a window that changed
         // reaches the driver for every bitrate mode and no constant-quantiser one. `None` and
         // `Some(ConstantQuantiser)` both mean "no record", and the reason they are different states
@@ -1161,6 +1215,22 @@ impl HevcEncoder {
         self.sample_entry.as_ref()
     }
 
+    /// **The whole frames per second the `hvcC` can state exactly, or `None` when the caller's rate
+    /// is not one.**
+    ///
+    /// `avgFrameRate` is a 16-bit integer, so it can carry a whole number of frames per second and
+    /// nothing else. The rate is `time_scale / num_units_in_tick` (see [`vui_timing`]), so it *is* a
+    /// whole number exactly when the tick count divides the scale — 30/1 gives `(1, 30)` and
+    /// `Some(30)`, and 30000/1001 gives `(1001, 30000)` and `None`.
+    ///
+    /// **The divisor is tested, never assumed**, so a record whose tick count were 0 divides nothing:
+    /// a `%` by zero is a panic, and a state that cannot be built is still a state a check has to
+    /// survive reading.
+    fn container_rate(&self) -> Option<u32> {
+        let (units, scale) = self.vui_timing?;
+        (units != 0 && scale % units == 0).then(|| scale / units)
+    }
+
     /// **The `hvcC` for this stream**, or why it is not there yet.
     ///
     /// **"Not yet" is the answer until a picture has come back**, because on this driver the VPS, SPS
@@ -1195,8 +1265,16 @@ impl HevcEncoder {
             // `avgFrameRate` and `constantFrameRate` are the container's only statement of timing, so
             // they come from the rate the caller stated. **`None` is a refusal, not a zero**: an
             // `hvcC` claiming 0 fps is a track every player shows as broken.
-            avg_frame_rate: u16::try_from(sets.frame_rate.unwrap_or(0)).unwrap_or(u16::MAX),
-            constant_frame_rate: if sets.frame_rate.is_some() { 1 } else { 0 },
+            //
+            // **And for a rate that is not a whole number of frames per second it is 0, which is the
+            // field's own "not stated here"** (ISO/IEC 14496-15's `avgFrameRate` is an `unsigned
+            // int(16)`, and 0 means the average frame rate is not carried here). The VUI states the
+            // exact rational and the track's timescale states it exactly, so the file is fully timed
+            // — and an integer that cannot carry 30000/1001 would have to be 29 or 30, and one of
+            // those is a rate the caller did not ask for. `check_hvcc_against_the_picture` compares
+            // what the container states against what the SPS states and refuses a disagreement.
+            avg_frame_rate: u16::try_from(self.container_rate().unwrap_or(0)).unwrap_or(u16::MAX),
+            constant_frame_rate: if self.container_rate().is_some() { 1 } else { 0 },
             num_temporal_layers: 1,
             temporal_id_nested: true,
             length_size: 4,
@@ -1282,7 +1360,9 @@ impl HevcEncoder {
         // The parameter sets, derived from the records just built and **verified by parsing them back
         // with filmcraft_hevc's own parsers before the render** — a record this module cannot describe
         // is refused before a picture is encoded rather than after.
-        let derived = super::hevc_params::parameter_sets(&sequence_read, &picture_read, self.stated_rate)?;
+        // **The VUI timing pair, not a frame rate**, so the VPS and the SPS are given one number and
+        // cannot state two different rates — see [`super::hevc_params::parameter_sets`].
+        let derived = super::hevc_params::parameter_sets(&sequence_read, &picture_read, self.vui_timing)?;
         // **The slice header, written from the same three records and verified against the parameter
         // sets it is submitted with.** This is not a nicety: under `VA_ENC_PACKED_HEADER_SLICE` the
         // driver writes no slice header of its own — it writes the bytes it was given and then the
@@ -1638,8 +1718,13 @@ fn coded_buffer_for(coded: (u32, u32)) -> Result<u32, String> {
 ///   stops the next reader treating it as a default bitrate.
 /// - **`min_spatial_segmentation_idc` is 0**, which is a real value (no extra NAL units carried in
 ///   slices) and not an absent one. `hvcC`'s `min_spatial_segmentation_idc` is written from it.
-fn sequence_record(size: (u32, u32), width: u16, height: u16, keyframe_interval: u32) -> Result<Vec<u8>, String> {
+/// - **`timing` is `(num_units_in_tick, time_scale)`, the caller's rate** (see [`vui_timing`]), or
+///   `None` for a record built before one was stated — which is [`DEFAULT_FRAME_RATE_FOR_LEVEL`] and
+///   never reaches a stream, because [`HevcEncoder::encode`] refuses until [`HevcEncoder::at_rate`]
+///   has run.
+fn sequence_record(size: (u32, u32), width: u16, height: u16, keyframe_interval: u32, timing: Option<(u32, u32)>) -> Result<Vec<u8>, String> {
     let level_idc = level_for(size, DEFAULT_FRAME_RATE_FOR_LEVEL)?;
+    let (num_units_in_tick, time_scale) = timing.unwrap_or((1, DEFAULT_FRAME_RATE_FOR_LEVEL));
     let record = VaEncSequenceParameterBufferHevc {
         general_profile_idc: PROFILE_MAIN,
         general_level_idc: level_idc,
@@ -1674,13 +1759,14 @@ fn sequence_record(size: (u32, u32), width: u16, height: u16, keyframe_interval:
         pcm_sample_bit_depth_chroma_minus1: 0,
         log2_min_pcm_luma_coding_block_size_minus3: 0,
         log2_max_pcm_luma_coding_block_size_minus3: 0,
-        // **The VUI is on**, and the timing in it is the frame rate the caller stated. **Where it is
-        // not** — the constructor path below, before `at_rate` has been called — it is
-        // `DEFAULT_FRAME_RATE_FOR_LEVEL`, which is why `at_rate` rebuilds this record before any picture
-        // is encoded. `check_hvcc_against_the_picture` refuses the mismatch rather than letting it ship.
-        // HEVC's sequence record has no separate timing field, so this is the only place the frame
-        // rate reaches the bitstream, and a decoder given an `hvcC` whose `avgFrameRate` disagrees
-        // with the SPS's VUI is a container describing two different streams.
+        // **The VUI is on**, and the timing in it is the frame rate the caller stated — the exact
+        // rational, as `(num_units_in_tick, time_scale)`. **Where it is not** — the constructor path
+        // below, before `at_rate` has been called — it is `DEFAULT_FRAME_RATE_FOR_LEVEL`, which
+        // `encode` refuses to encode without. `check_hvcc_against_the_picture` refuses a mismatch
+        // against the `hvcC` rather than letting it ship. HEVC's sequence record has no separate
+        // timing field, so this is the only place the frame rate reaches the bitstream, and a
+        // decoder given an `hvcC` whose `avgFrameRate` disagrees with the SPS's VUI is a container
+        // describing two different streams.
         vui_parameters_present_flag: 1,
         padding_after_vui_parameters_present_flag: [0; 3],
         // `vui_fields`: measured positions, the eight single-bit flags are bits 0-7 in header order,
@@ -1692,11 +1778,13 @@ fn sequence_record(size: (u32, u32), width: u16, height: u16, keyframe_interval:
         padding_after_aspect_ratio_idc: [0; 3],
         sar_width: 1,
         sar_height: 1,
-        // `time_scale / (2 * num_units_in_tick)` is the frame rate. Rebuilt by `at_rate`, which is
-        // the only thing that writes these two, and the neutral values below are only ever seen by a
-        // constructor that refuses to encode before a rate is stated.
-        vui_num_units_in_tick: 1,
-        vui_time_scale: 2 * DEFAULT_FRAME_RATE_FOR_LEVEL,
+        // **The caller's rate, in the VUI's own two fields.** `time_scale / num_units_in_tick` is the
+        // frame rate for HEVC — see [`vui_timing`] for the arithmetic, the evidence and the factor
+        // of two that H.264 has and HEVC does not. `at_rate`/`at_rate_exact` are the only things that
+        // set `timing`, so the values below are the placeholder a constructor holds until one of
+        // them runs, and `encode` refuses to encode a picture without a stated rate.
+        vui_num_units_in_tick: num_units_in_tick,
+        vui_time_scale: time_scale,
         // A real value: no extra NAL units are carried inside slice segments.
         min_spatial_segmentation_idc: 0,
         // Only meaningful when `bitstream_restriction_flag` is set, and it is not.
@@ -1772,16 +1860,86 @@ fn coding_type(is_intra: bool) -> u32 {
     if is_intra { 1 } else { 2 }
 }
 
-/// The frame rate used for the VUI and for [`level_for`] **until `at_rate` supplies the caller's own**.
+/// The frame rate a sequence record carries **before the caller has stated one**, and the value
+/// [`level_for`] is handed.
 ///
-/// **This number does reach a stream.** The sequence record's `vui_time_scale` is written as
-/// `2 * DEFAULT_FRAME_RATE_FOR_LEVEL`, so a record built before `at_rate` states a rate carries 30 fps in
-/// its VUI whatever the caller asked for. `at_rate` rebuilds the record with the caller's rate before any
-/// picture is encoded, and `check_hvcc_against_the_picture` refuses a sequence whose `hvcC` rate and SPS VUI
-/// rate disagree — so the defect is caught rather than shipped, but it is a defect, not a neutral default.
-/// Measured: 30 fps exports; 24, 25 and 60 all fail by name. Fixing it means threading the rate through
-/// `sequence_record`, not widening a check.
+/// **It is a placeholder, and the difference from what it used to be is the whole point.** It used
+/// to be described as "does reach a stream", because `sequence_record` took no rate and every
+/// record carried `2 * 30` in its VUI whatever the caller asked for — so 24, 25 and 60 fps exports
+/// were refused by `check_hvcc_against_the_picture` against a `hvcC` that carried the caller's rate.
+/// The rate is now threaded from [`HevcEncoder::at_rate_exact`] (see [`vui_timing`]), and this
+/// number survives only as the record a constructor holds: **`encode` refuses a picture until a rate
+/// has been stated** (`crates/platform/tests/hevenc.rs`,
+/// `an_unstated_frame_rate_or_key_frame_interval_is_refused`), and a record built from here that
+/// somehow reached a stream would put 30 fps in an `hvcC` that says 0, which the cross-check
+/// refuses by name rather than shipping.
 const DEFAULT_FRAME_RATE_FOR_LEVEL: u32 = 30;
+
+/// The VUI pair — `(num_units_in_tick, time_scale)` — that states `rate` frames per second, or why
+/// it cannot.
+///
+/// # The arithmetic, and why there is no factor of two in it
+///
+/// **HEVC's frame rate is `time_scale / num_units_in_tick`** (H.265's VUI timing information,
+/// `sps_num_units_in_tick` with `sps_time_scale`). H.264's is `time_scale / (2 *
+/// num_units_in_tick)`, because H.264's tick is a *field* and a progressive frame is two of them —
+/// and this path used to apply H.264's arithmetic to HEVC, which made every stream it wrote
+/// declare twice its rate. Three independent checks, all measured or cited:
+///
+/// - **ARIB STD-B32 Part 1 Attachment 3 §2.2.2** ("Frame rate shall be integer times of 1000/1001,
+///   calculating as = time_scale/num_units_in_tick by using variables of VUI Parameters"), with
+///   Table 4-9 giving 59.94/P as `vui_time_scale` 60 000 over `vui_num_units_in_tick` 1 001. The
+///   same document's H.264 attachment states the same quantity as `time_scale / num_units_in_tick /
+///   2`, which is where the factor of two belongs.
+/// - **libx265 writes `time_scale = fps`, `num_units_in_tick = 1`** at 24, 25 and 30 fps, and
+///   `(1001, 30000)` at 30000/1001 — measured on this machine by reading its own SPS back with
+///   ffmpeg's `trace_headers`.
+/// - **ffmpeg 9.0.2 reads that pair as 24 fps** from `(1, 24)` on a raw HEVC stream. (It reads
+///   H.264's pair the same way — 48/1 from libx264's `(1, 48)` — so the *H.264* reading is not the
+///   oracle here; the spec and libx265 are.)
+///
+/// # The pair, for any rate
+///
+/// **The rate is written as an exact rational, reduced, with the denominator first**: 30000/1001
+/// becomes `(1001, 30000)`, 24/1 becomes `(1, 24)`. Both fields are 32-bit syntax elements, so both
+/// ends are `u32::try_from`'d and a rate that does not fit is refused with the number in the
+/// message rather than truncated — a truncated denominator states a different rate, and a truncated
+/// numerator states a rate near enough to look right.
+fn vui_timing(rate: FrameRate) -> Result<(u32, u32), String> {
+    if rate.num <= 0 || rate.den <= 0 {
+        return Err(format!("a frame rate of {}/{}, which is not a positive number of frames per second", rate.num, rate.den));
+    }
+    let scale = u32::try_from(rate.num).map_err(|_| format!("a frame rate numerator of {}, which does not fit the VUI's 32-bit time_scale", rate.num))?;
+    let units =
+        u32::try_from(rate.den).map_err(|_| format!("a frame rate denominator of {}, which does not fit the VUI's 32-bit num_units_in_tick", rate.den))?;
+    Ok((units, scale))
+}
+
+/// The whole frames per second the **driver** is told, for a caller who stated a rational rate.
+///
+/// **Rounded to nearest, half up, and never invented.** `hevc_params::frame_rate_record` builds
+/// `VAEncMiscParameterFrameRate` as a numerator over a denominator of one, so 30000/1001 can only
+/// reach the driver as 30 — **and this number is an input to the rate controller, not a statement in
+/// the stream**: the picture count, the track's timescale and the VUI pair are all the caller's exact
+/// rate. Truncation rather than rounding is what this replaces, and it understated 29.97 as 29.
+pub(crate) fn whole_frames_per_second(rate: FrameRate) -> Result<u32, String> {
+    if rate.num <= 0 || rate.den <= 0 {
+        return Err(format!("a frame rate of {}/{}, which is not a positive number of frames per second", rate.num, rate.den));
+    }
+    let num = u32::try_from(rate.num).map_err(|_| format!("a frame rate numerator of {} does not fit the driver's frame-rate field", rate.num))?;
+    let den = u32::try_from(rate.den).map_err(|_| format!("a frame rate denominator of {} does not fit the driver's frame-rate field", rate.den))?;
+    // `(2*num + den) / (2*den)` is round-half-up without a multiply that can overflow: `den / 2` is
+    // the half that has to be added, and it is smaller than `den`, so the addition is at most `2*num`.
+    let half = den / 2;
+    let rounded = num
+        .checked_add(half)
+        .and_then(|n| n.checked_div(den))
+        .ok_or_else(|| format!("a frame rate of {rate:?} overflows the driver's whole-frame-rate field"))?;
+    if rounded == 0 {
+        return Err(format!("a frame rate of {}/{}: fewer than half a frame per second rounds to no frames at all", rate.num, rate.den));
+    }
+    Ok(rounded)
+}
 
 /// `MaxLumaSr` for each HEVC level, in luma samples (ITU-T H.265 Table A.1, `level_idc = 30 *
 /// level`).
