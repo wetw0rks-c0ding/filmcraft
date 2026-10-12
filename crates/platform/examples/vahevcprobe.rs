@@ -23,7 +23,7 @@
 
 use filmcraft_platform::vaapi::{
     CONFIG_ATTRIB_INTERLACED, Display, Entrypoint, H264_RATE_CONTROL_MASK, HEVC_RATE_CONTROL_MASK, HevcEncodeRequest, HevcEncoder, Profile, VCM,
-    max_reference_frames, open_display, ramp_shifted, slice_types,
+    hevc_rate_control_outcomes, max_reference_frames, open_display, ramp_shifted, slice_types,
 };
 use std::process::Command;
 use std::sync::Arc;
@@ -145,6 +145,13 @@ fn capabilities(display: &Arc<Display>) {
         if H264_RATE_CONTROL_MASK & VCM != 0 { "" } else { "not " }
     );
     println!("  refused by this path: {}", HevcEncoder::refused_rate_control(rc).join(", ").as_str());
+    // **The rate-control outcomes, printed where the mask is.** The mask says which modes the driver
+    // offers and this says which of them produce a picture, and the two together are why the readback
+    // failure is not in any record: the records were made byte-for-byte identical to a submission
+    // this driver accepts and the failure did not move, and the rate-control attribute is what it did
+    // move. **Seven of the nine advertised modes fail, and the two that fail differently still write
+    // no picture** — see `hevc_rate_control_outcomes`.
+    println!("  what each mode did: {}", hevc_rate_control_outcomes::SUMMARY);
     let (l0, l1) = max_reference_frames_for_hevc(display);
     println!("VAConfigAttribEncMaxRefFrames = l0 {l0}, l1 {l1}");
 }
@@ -249,6 +256,11 @@ fn run(display: &Arc<Display>, elementary: &str, trace: bool) -> Result<String, 
         // **The request has to name the quantiser or not, according to the encoder's own fidelity.**
         // A constant-quantiser encoder takes `Some(qp)` and a rate-controlled one takes `None`;
         // `encode` refuses a mismatch in both directions rather than ignoring a number it was given.
+        // **The request names the quantiser only when the encoder's fidelity is a constant quantiser.**
+        // `HevcEncoder::encode` refuses a mismatch in both directions rather than ignoring a number
+        // it was handed, so a probe that passed `key_frame_at_rate()` into a constant-quantiser
+        // encoder was refused before it reached the driver — and a probe that passed
+        // `key_frame(QP)` into a rate-controlled one would be refused for the same reason.
         let request = if encoder.rate_controlled() {
             if frame == 0 { HevcEncodeRequest::key_frame_at_rate() } else { HevcEncodeRequest::predicted_at_rate() }
         } else if frame == 0 {
@@ -256,7 +268,13 @@ fn run(display: &Arc<Display>, elementary: &str, trace: bool) -> Result<String, 
         } else {
             HevcEncodeRequest::predicted(QP)?
         };
-        let picture = encoder.encode(request.last())?;
+        // **`last` on the final picture only.** `HevcEncodeRequest::last` sets
+        // `HEVC_LAST_PICTURE_EOSTREAM` in the picture record, which is the driver's statement that
+        // this picture ends the *stream*. Calling it on every picture told the driver the very first
+        // picture ended it; `tests/hevenc.rs::a_last_picture_only_on_the_last_one_is_encoded` is what
+        // keeps it that way.
+        let last = frame + 1 == PICTURES;
+        let picture = encoder.encode(if last { request.last() } else { request })?;
         let qp = picture.status.first().map(|s| s & 0xff).unwrap_or(0);
         stream.extend_from_slice(&picture.bytes);
         samples.extend_from_slice(&picture.mp4_sample()?);

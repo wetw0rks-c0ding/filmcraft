@@ -56,15 +56,69 @@
 //!
 //! **Every submission fails at the driver's own encode step**: `vaRenderPicture`, `vaEndPicture` and
 //! `vaSyncBuffer` all return success, and `vaMapBuffer` on the coded buffer then returns
-//! `VA_STATUS_ERROR_ENCODING_ERROR`. So there is no exported file, no P-frame prediction to measure,
+//! `VA_STATUS_ERROR_INTERNAL`. So there is no exported file, no P-frame prediction to measure,
 //! and none of Task 1's "one decodable NAL stream" has happened for HEVC.
+//!
+//! # The failure is not in any record — it is the rate-control attribute, and that is measured
+//!
+//! **The record-by-record audit this branch's method depends on cannot reach this, because the field
+//! at fault is not in a record.** `VAConfigAttribRateControl` is a `vaCreateConfig` attribute, and it
+//! is the one thing this submission and a working one did not share. Establishing that took three
+//! steps, and each is recorded because the next reader should not repeat it:
+//!
+//! 1. **Every field of all three records was swept**, one at a time, over the range
+//!    `va_enc_hevc.h` states for it and over the values a neighbouring implementation uses — the
+//!    quantiser, both `ref_pic_idx` counts, `max_num_merge_cand` over `1..=5`, `collocated_ref_pic_index`
+//!    over `0` and `0xFF`, `diff_cu_qp_delta_depth` over `0..=3`, `pic_init_qp` over `0..=51`,
+//!    `log2_*` block sizes over their driver's reported ranges, both `*_slice_*_flag` words over
+//!    every bit, `bits_per_second`, all three GOP periods, `slice_qp_delta` and the four offsets, and
+//!    `num_ctu_in_slice` over `1`, the whole count and more. **The failure moved for none of them**:
+//!    every one still answered `vaMapBuffer → VA_STATUS_ERROR_INTERNAL`.
+//! 2. **The records were then made byte-for-byte identical to a submission this same driver
+//!    accepts.** ffmpeg's own `hevc_vaapi` encodes on this machine, so its `vaCreateConfig` and
+//!    `vaCreateBuffer` calls were captured at run time through the public libva entry points and
+//!    every byte of its sequence, picture and slice records compared with ours. **The failure did
+//!    not move when the records matched exactly.** That is the step that ends the search in the
+//!    records: not "each field is in range" but "the bytes are the bytes that work".
+//! 3. **The rate-control attribute was swept**, and this is the result:
+//!
+//! | `VAConfigAttribRateControl` | mode | outcome |
+//! |---|---|---|
+//! | `0x02` | `VA_RC_CBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//! | `0x04` | `VA_RC_VBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//! | `0x08` | `VA_RC_VCM` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//! | **`0x10`** | **`VA_RC_CQP`** — the one [`RateControl::ConstantQuantiser`] names | **`vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL`** |
+//! | **`0x40`** | **`VA_RC_ICQ`** | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** |
+//! | `0x80` | `VA_RC_MB` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//! | **`0x400`** | **`VA_RC_QVBR`** | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** |
+//! | `0x1000` | `VA_RC_TCBRC` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//! | `0x01` / `0x20` / `0x100` / `0x200` / `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses them |
+//!
+//! **Seven of the nine modes the driver advertises fail, and the two that do not fail at a
+//! *different* call with no picture written either.** So the rate-control attribute **moved the
+//! failure and did not fix it**, and that is why nothing in this module was changed on the strength
+//! of it: swapping `VA_RC_CQP` for `VA_RC_ICQ` would trade a `vaMapBuffer` error for a `vaEndPicture`
+//! error and still produce no picture, and doing it silently would be the "a plausible wrong result
+//! rather than an error" trade this branch refuses everywhere else.
+//!
+//! **What this rules out, so it is not re-tried:** a single out-of-range record field (every one was
+//! swept, and the records were made byte-identical to a working submission); `max_num_merge_cand`
+//! and the other zero-from-`Default` candidates; the surface pool and the context's render targets
+//! (both swept, and a working submission's shape was replicated); the picture size (ffmpeg encodes
+//! 320x240 and 320x256 on this driver, so neither is the cause); and the buffer set and its order.
+//!
+//! **Two earlier measurements were re-taken here and both still hold**, which is worth recording
+//! because they were the reason the search stayed in the records for as long as it did: the
+//! quantisation misc buffer is refused **on its own**, with nothing else present, so it is not a
+//! buffer-lifetime bug ([`refuses_the_quantization_misc_buffer`]); and `VA_RC_VCM` is in HEVC's mask
+//! and not H.264's ([`VCM`]).
 //!
 //! **What is established and pinned:** the three encode records' sizes, offsets and every hole
 //! against a C compile (`hevc_abi.rs`); the derived VPS/SPS/PPS parsing back through FilmCraft's own
 //! HEVC parsers with every field compared against the record it was written from; the rate-control
-//! mask and the `VA_RC_VCM` refusal; the quantisation-misc-buffer refusal; the level table; and
-//! `slice_type`. **What is not established:** why the driver refuses to encode, and therefore
-//! whether P frames predict at all.
+//! mask, the `VA_RC_VCM` refusal and **the table above**; the quantisation-misc-buffer refusal; the
+//! level table; and `slice_type`. **What is not established:** why the driver refuses to encode, and
+//! therefore whether P frames predict at all.
 //!
 //! **Three real bitstream bugs were found and fixed on the way, each of which had silently
 //! displaced a field rather than failing loudly** — see `hevc_params.rs`'s `sps` and the VUI block.
@@ -89,7 +143,12 @@
 //!   run before every submission, and they are what caught the three displaced-field bugs, but they
 //!   check records that never became a picture.
 
-use super::encoder::{MAX_REFERENCES, PictureKind, RateControl};
+/// The picture kinds an [`HevcEncodeRequest`] can name. Re-exported from [`super::encoder`] rather
+/// than redeclared, because HEVC's request type naming a *different* enum is exactly the drift the
+/// module note warns about — and the `B` case stays constructible so [`HevcEncoder::encode`]'s
+/// refusal of it is reachable rather than a type-level impossibility.
+pub use super::encoder::PictureKind;
+use super::encoder::{MAX_REFERENCES, RateControl};
 use super::ffi::{
     self, Display, Encoder, PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PICTURE_HEVC_INVALID, PICTURE_HEVC_RPS_ST_CURR_BEFORE, Profile, RtFormat,
 };
@@ -245,6 +304,57 @@ pub mod slice_types {
 /// So it is a named refusal rather than a silent gap: [`HevcEncoder::refuses_vcm`] carries the
 /// mask it appears in and the test that catches an attempt to submit it.
 pub const VCM: u32 = 0x0000_0008;
+
+/// **What each rate-control mode this driver advertises actually did**, measured by submitting the
+/// same records under each one. This is the measurement that ended the search for the readback
+/// failure, and it is a table rather than a sentence because the answer is not a single mode.
+///
+/// # The method, because the result is only as good as it
+///
+/// 1. **Every field of all three records was swept**, one at a time, over the range
+///    `va_enc_hevc.h` states for it. **The failure moved for none of them.**
+/// 2. **The records were then made byte-for-byte identical to a submission this driver accepts.**
+///    ffmpeg's `hevc_vaapi` encodes on this machine, so its `vaCreateConfig` and `vaCreateBuffer`
+///    calls were captured at run time through the public libva entry points and its sequence,
+///    picture and slice records compared byte for byte with ours. **The failure did not move when
+///    the bytes matched**, which is what ends the search in the records — not "every field is in
+///    range" but "the bytes are the bytes that work".
+/// 3. **Only then was the rate-control attribute swept**, which is the one value this submission and
+///    a working one did not share: it is a `vaCreateConfig` attribute, so no record audit reaches it.
+///
+/// # The table
+///
+/// | attribute | mode | outcome on iHD 26.3.5 |
+/// |---|---|---|
+/// | `0x02` | `VA_RC_CBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+/// | `0x04` | `VA_RC_VBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+/// | `0x08` | `VA_RC_VCM` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+/// | **`0x10`** | **`VA_RC_CQP`** — what [`RateControl::ConstantQuantiser`] names | **`vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL`** |
+/// | **`0x40`** | **`VA_RC_ICQ`** | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** |
+/// | `0x80` | `VA_RC_MB` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+/// | **`0x400`** | **`VA_RC_QVBR`** | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** |
+/// | `0x1000` | `VA_RC_TCBRC` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+/// | `0x01`, `0x20`, `0x100`, `0x200`, `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses with `VA_STATUS_ERROR_INVALID_PARAMETER` |
+///
+/// **Seven of the nine advertised modes fail, and the two that fail differently still write no
+/// picture.** So the attribute **moved the failure and did not fix it** — and nothing in this module
+/// was changed on the strength of it. Substituting `VA_RC_ICQ` for `VA_RC_CQP` would trade a
+/// `vaMapBuffer` error for a `vaEndPicture` error and still produce nothing, and doing that quietly
+/// would be exactly the "a plausible wrong result rather than an error" trade this branch refuses.
+///
+/// # What this rules out, so it is not tried again
+///
+/// A single out-of-range record field; every zero-from-`Default` candidate including
+/// `max_num_merge_cand`; the surface pool and the context's render targets (both swept, and a
+/// working submission's shape replicated); the picture size (ffmpeg encodes 320x240 **and** 320x256
+/// here, so neither is the cause); and the buffer set and its order.
+pub mod hevc_rate_control_outcomes {
+    /// **What the table adds up to, in one line**, so a reader does not have to re-derive it.
+    pub const SUMMARY: &str = "measured on iHD 26.3.5: 7 of the 9 rate-control modes the driver advertises fail to produce a \
+         picture (6 at vaMapBuffer, 1 at vaEndPicture, both VA_STATUS_ERROR_INTERNAL) and the other 2 (VA_RC_ICQ, \
+         VA_RC_QVBR) fail at vaEndPicture instead. VA_RC_CQP -- the mode a constant quantiser names -- fails with the \
+         vaMapBuffer error this branch was chasing. No mode produced a picture, so none was adopted";
+}
 
 /// **The rate-control mask this driver reports for `VAProfileHEVCMain` / `VAEntrypointEncSlice`:**
 /// `0x14de`, which is `VA_RC_CQP | VA_RC_VCM | VA_RC_QVBR | VA_RC_TCBRC` (`va.h:1110-1164`).
@@ -620,6 +730,10 @@ impl HevcEncoder {
     /// A refusal list rather than an acceptance list, because a caller who passes this module's mask
     /// straight into a config attribute is asking a question the driver answers with "yes" for a mode
     /// this backend has no record to honour. Returning the difference names it.
+    ///
+    /// **This is a refusal of `VA_RC_VCM` alone and is not a statement that the rest work** — see
+    /// [`hevc_rate_control_outcomes`] for the measurement that says seven of the nine modes the
+    /// driver advertises do not produce a picture either, and why that is not in this list.
     pub fn refused_rate_control(mask: u32) -> Vec<&'static str> {
         let mut out = Vec::new();
         if mask & VCM != 0 {
@@ -900,9 +1014,24 @@ impl HevcEncoder {
         //
         // **No `VAEncMiscParameterTypeQuantization` buffer, which H.264's path submits and this one
         // measured as refused** — see [`REFUSES_THE_QUANTIZATION_MISC_BUFFER`].
+        //
+        // **The refusal is a branch rather than an absence**, and that is deliberate: a buffer this
+        // driver refuses is one whose submission would turn every encode into
+        // `vaRenderPicture → VA_STATUS_ERROR_INVALID_BUFFER`, so "this path does not submit one" and
+        // "this path has measured that it must not" are different claims and only the second one is
+        // worth anything. Reading the decision from the constant means a change to the measurement
+        // changes the submission, and the oracle test can see it.
         let mut buffers = vec![seq_buf.id(), pic_buf.id(), slice_buf.id(), fps_buf.id()];
         if let Some(ref buf) = rc_buf {
             buffers.push(buf.id());
+        }
+        if submits_the_quantization_misc_buffer() {
+            // **Unreachable on any driver measured so far**, and the `Err` rather than a `panic!` or
+            // a silent skip is the point: if a driver ever accepts the buffer, the submission must
+            // be *built* for it, and this says so rather than half-implementing a fourth record.
+            return Err("this driver was measured to accept VAEncMiscParameterTypeQuantization for HEVC, so the \
+                        submission path has to build and submit it. That is a new measurement and a new buffer, not a flag"
+                .into());
         }
         self.encoder.render(&buffers)?;
         // Mandatory before the read: the encode is asynchronous and an unsynchronised read of the
@@ -1247,83 +1376,6 @@ fn sequence_record(size: (u32, u32), width: u16, height: u16, keyframe_interval:
         ..Default::default()
     };
     let _ = size;
-    // TEMPORARY bisect harness — removed before the commit.
-    let mut record = record;
-    if let Ok(v) = std::env::var("FC_SEQ_LEVEL") {
-        record.general_level_idc = v.parse().unwrap_or(record.general_level_idc);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_BPS") {
-        record.bits_per_second = v.parse().unwrap_or(record.bits_per_second);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_INTRA_PERIOD") {
-        record.intra_period = v.parse().unwrap_or(record.intra_period);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_IDR_PERIOD") {
-        record.intra_idr_period = v.parse().unwrap_or(record.intra_idr_period);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_IP_PERIOD") {
-        record.ip_period = v.parse().unwrap_or(record.ip_period);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_FIELDS") {
-        record.seq_fields = u32::from_str_radix(&v, 16).unwrap_or(record.seq_fields);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_MINCB") {
-        record.log2_min_luma_coding_block_size_minus3 = v.parse().unwrap_or(record.log2_min_luma_coding_block_size_minus3);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_DIFFCB") {
-        record.log2_diff_max_min_luma_coding_block_size = v.parse().unwrap_or(record.log2_diff_max_min_luma_coding_block_size);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_MINTB") {
-        record.log2_min_transform_block_size_minus2 = v.parse().unwrap_or(record.log2_min_transform_block_size_minus2);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_DIFFTB") {
-        record.log2_diff_max_min_transform_block_size = v.parse().unwrap_or(record.log2_diff_max_min_transform_block_size);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_THIER_INTER") {
-        record.max_transform_hierarchy_depth_inter = v.parse().unwrap_or(record.max_transform_hierarchy_depth_inter);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_THIER_INTRA") {
-        record.max_transform_hierarchy_depth_intra = v.parse().unwrap_or(record.max_transform_hierarchy_depth_intra);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_VUI") {
-        record.vui_parameters_present_flag = v.parse().unwrap_or(record.vui_parameters_present_flag);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_VUI_FIELDS") {
-        record.vui_fields = u32::from_str_radix(&v, 16).unwrap_or(record.vui_fields);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_ARIDC") {
-        record.aspect_ratio_idc = v.parse().unwrap_or(record.aspect_ratio_idc);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_SARW") {
-        record.sar_width = v.parse().unwrap_or(record.sar_width);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_SARH") {
-        record.sar_height = v.parse().unwrap_or(record.sar_height);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_TICK") {
-        record.vui_num_units_in_tick = v.parse().unwrap_or(record.vui_num_units_in_tick);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_SCALE") {
-        record.vui_time_scale = v.parse().unwrap_or(record.vui_time_scale);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_SEG") {
-        record.min_spatial_segmentation_idc = v.parse().unwrap_or(record.min_spatial_segmentation_idc);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_SCC") {
-        record.scc_fields = u32::from_str_radix(&v, 16).unwrap_or(record.scc_fields);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_TIER") {
-        record.general_tier_flag = v.parse().unwrap_or(record.general_tier_flag);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_PROFILE") {
-        record.general_profile_idc = v.parse().unwrap_or(record.general_profile_idc);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_W") {
-        record.pic_width_in_luma_samples = v.parse().unwrap_or(record.pic_width_in_luma_samples);
-    }
-    if let Ok(v) = std::env::var("FC_SEQ_H") {
-        record.pic_height_in_luma_samples = v.parse().unwrap_or(record.pic_height_in_luma_samples);
-    }
     Ok(ffi::record_bytes(&record))
 }
 
@@ -1566,62 +1618,6 @@ fn picture_record(
         hierarchical_level_plus1: 0,
         ..Default::default()
     };
-    // TEMPORARY bisect harness — removed before the commit.
-    let mut record = record;
-    if let Ok(v) = std::env::var("FC_PIC_FIELDS") {
-        record.pic_fields = u32::from_str_radix(&v, 16).unwrap_or(record.pic_fields);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_NAL") {
-        record.nal_unit_type = v.parse().unwrap_or(record.nal_unit_type);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_COLLOC") {
-        record.collocated_ref_pic_index = v.parse().unwrap_or(record.collocated_ref_pic_index);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_QP") {
-        record.pic_init_qp = v.parse().unwrap_or(record.pic_init_qp);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_CUQPD") {
-        record.diff_cu_qp_delta_depth = v.parse().unwrap_or(record.diff_cu_qp_delta_depth);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_CBQP") {
-        record.pps_cb_qp_offset = v.parse().unwrap_or(record.pps_cb_qp_offset);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_CRQP") {
-        record.pps_cr_qp_offset = v.parse().unwrap_or(record.pps_cr_qp_offset);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_TC") {
-        record.num_tile_columns_minus1 = v.parse().unwrap_or(record.num_tile_columns_minus1);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_TR") {
-        record.num_tile_rows_minus1 = v.parse().unwrap_or(record.num_tile_rows_minus1);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_PARMERGE") {
-        record.log2_parallel_merge_level_minus2 = v.parse().unwrap_or(record.log2_parallel_merge_level_minus2);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_CTUBITS") {
-        record.ctu_max_bitsize_allowed = v.parse().unwrap_or(record.ctu_max_bitsize_allowed);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_L0") {
-        record.num_ref_idx_l0_default_active_minus1 = v.parse().unwrap_or(record.num_ref_idx_l0_default_active_minus1);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_L1") {
-        record.num_ref_idx_l1_default_active_minus1 = v.parse().unwrap_or(record.num_ref_idx_l1_default_active_minus1);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_PPSID") {
-        record.slice_pic_parameter_set_id = v.parse().unwrap_or(record.slice_pic_parameter_set_id);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_HIER") {
-        record.hierarchical_level_plus1 = v.parse().unwrap_or(record.hierarchical_level_plus1);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_SCC") {
-        record.scc_fields = u16::from_str_radix(&v, 16).unwrap_or(record.scc_fields);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_LAST") {
-        record.last_picture = v.parse().unwrap_or(record.last_picture);
-    }
-    if let Ok(v) = std::env::var("FC_PIC_CWP") {
-        record.decoded_curr_pic.flags = v.parse().unwrap_or(record.decoded_curr_pic.flags);
-    }
     Ok(ffi::record_bytes(&record))
 }
 
@@ -1696,59 +1692,6 @@ fn slice_record(ctus: u32, slice_type: u8, references: &[HevcReference]) -> Resu
         slice_fields,
         ..Default::default()
     };
-    // TEMPORARY bisect harness — removed before the commit.
-    let mut record = record;
-    if let Ok(v) = std::env::var("FC_SLI_ADDR") {
-        record.slice_segment_address = v.parse().unwrap_or(record.slice_segment_address);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_CTUS") {
-        record.num_ctu_in_slice = v.parse().unwrap_or(record.num_ctu_in_slice);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_TYPE") {
-        record.slice_type = v.parse().unwrap_or(record.slice_type);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_PPSID") {
-        record.slice_pic_parameter_set_id = v.parse().unwrap_or(record.slice_pic_parameter_set_id);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_L0") {
-        record.num_ref_idx_l0_active_minus1 = v.parse().unwrap_or(record.num_ref_idx_l0_active_minus1);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_L1") {
-        record.num_ref_idx_l1_active_minus1 = v.parse().unwrap_or(record.num_ref_idx_l1_active_minus1);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_MERGE") {
-        record.max_num_merge_cand = v.parse().unwrap_or(record.max_num_merge_cand);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_QPDELTA") {
-        record.slice_qp_delta = v.parse().unwrap_or(record.slice_qp_delta);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_CBQP") {
-        record.slice_cb_qp_offset = v.parse().unwrap_or(record.slice_cb_qp_offset);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_CRQP") {
-        record.slice_cr_qp_offset = v.parse().unwrap_or(record.slice_cr_qp_offset);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_BETA") {
-        record.slice_beta_offset_div2 = v.parse().unwrap_or(record.slice_beta_offset_div2);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_TCOFF") {
-        record.slice_tc_offset_div2 = v.parse().unwrap_or(record.slice_tc_offset_div2);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_FIELDS") {
-        record.slice_fields = u32::from_str_radix(&v, 16).unwrap_or(record.slice_fields);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_PWTOFF") {
-        record.pred_weight_table_bit_offset = v.parse().unwrap_or(record.pred_weight_table_bit_offset);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_PWTLEN") {
-        record.pred_weight_table_bit_length = v.parse().unwrap_or(record.pred_weight_table_bit_length);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_DENOM") {
-        record.luma_log2_weight_denom = v.parse().unwrap_or(record.luma_log2_weight_denom);
-    }
-    if let Ok(v) = std::env::var("FC_SLI_L0FLAGS") {
-        record.ref_pic_list0[0].flags = v.parse().unwrap_or(record.ref_pic_list0[0].flags);
-    }
     Ok(ffi::record_bytes(&record))
 }
 
@@ -1785,6 +1728,23 @@ fn slice_record(ctus: u32, slice_type: u8, references: &[HevcReference]) -> Resu
 /// kind of thing this milestone's brief warned about: a result that transfers from one codec is a
 /// hypothesis until it has been measured on the other.
 pub const REFUSES_THE_QUANTIZATION_MISC_BUFFER: bool = true;
+
+/// Whether this submission will carry a `VAEncMiscParameterTypeQuantization` buffer — **which is
+/// [`REFUSES_THE_QUANTIZATION_MISC_BUFFER`] saying no, read through the value the submission path
+/// itself branches on** rather than a constant quoted in a comment.
+///
+/// It exists so the refusal is a *value the code consults* and not only a note: a caller that wants
+/// to know whether the trellis-control buffer is in play asks this, and a change that started
+/// submitting one would change the answer and be caught by the oracle test rather than by a reader
+/// who happens to scroll to the right paragraph.
+///
+/// **It is a constant and not a query**, because the measurement is of *this driver*, not of the
+/// record: re-asking it would mean a `vaRenderPicture` per picture, which is not a measurement but a
+/// cost. The honest shape is the one H.264's path has — the decision is made once, named, and
+/// documented — and this is that decision with a getter.
+pub const fn submits_the_quantization_misc_buffer() -> bool {
+    !REFUSES_THE_QUANTIZATION_MISC_BUFFER
+}
 
 /// One NAL unit of an Annex-B run, as a header byte and the payload after it.
 struct NalUnit<'a> {

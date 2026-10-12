@@ -90,7 +90,14 @@ pub use encoder::{Current, EncodeRequest, EncodedPicture, MAX_REFERENCES, Refere
 // HEVC has no `frame_num` to carry, no crop to report, and a `slice_type` whose encoding is not
 // H.264's. `h264_slice_type_sweep_is_not_an_hevc_answer` in `tests/hevenc.rs` is what keeps them
 // from drifting into each other.
-pub use hevc_submit::{HevcEncodeRequest, HevcEncodedPicture, HevcEncoder, HevcReference, REFUSES_THE_QUANTIZATION_MISC_BUFFER, slice_types};
+// `PictureKind` is re-exported because `HevcEncodeRequest::new` takes one: **HEVC's own request type
+// naming H.264's enum would be the drift this very comment warns about**, so the enum is shared and
+// shared *on purpose* — it is `encoder::PictureKind`, the same one `EncodeRequest` takes, and the
+// refusal of `B` lives in `HevcEncoder::encode` rather than in the type, so it stays reachable.
+pub use hevc_submit::{
+    HevcEncodeRequest, HevcEncodedPicture, HevcEncoder, HevcReference, PictureKind, REFUSES_THE_QUANTIZATION_MISC_BUFFER, hevc_rate_control_outcomes,
+    slice_types,
+};
 // The constants the probe and the oracle test ask the driver about. Re-exported because
 // `hevc_submit` is a private module, and a `pub` item in a private module is dead code the rest of
 // the crate never sees; these four are the numbers a caller needs to check a driver against what
