@@ -110,7 +110,7 @@ pub enum HardwareEncoding {
 /// **It is not a Linux-only mode.** [`ExportSettings`] is one structure read by every backend, so a
 /// mode added here is offered on macOS and Windows too, and each backend either takes it or declines
 /// it by name. That is why [`Self::ALL`] exists: a backend's list of modes is a list of *its* modes,
-/// and the settings surface lists all four.
+/// and the settings surface lists all five.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BitrateMode {
@@ -130,11 +130,51 @@ pub enum BitrateMode {
     /// [`ExportSettings::constant_quantiser`] is the checked way to read the quantiser, and every
     /// encoder that takes this mode refuses a value outside H.264's 0..=51 rather than clamping it.
     ConstantQuality,
+    /// **Video conference mode** — `VA_RC_VCM`, `0x00000008`, `va.h:1114`:
+    ///
+    /// ```c
+    /// /** \brief Variable bitrate. */
+    /// #define VA_RC_VBR                       0x00000004
+    /// /** \brief Video conference mode. */
+    /// #define VA_RC_VCM                       0x00000008
+    /// /** \brief Constant QP. */
+    /// #define VA_RC_CQP                       0x00000010
+    /// ```
+    ///
+    /// **It is here because the driver advertises it and FilmCraft had no way to name it**, which is
+    /// the reason every other variant here is. A driver's rate-control attribute is a *set*, and
+    /// this machine's H.265 encoder reports `0x14de` for it — eight modes, and exactly this bit is
+    /// the difference from the `0x14d6` the same driver reports for H.264, so H.264's set has no
+    /// name for it anywhere in FilmCraft and H.265's does
+    /// (`crates/platform/src/vaapi/hevc_abi.rs:703`, a measurement of this driver, pinned). A
+    /// capability nobody can spell is a capability that either never reaches a driver or reaches it
+    /// unnamed.
+    ///
+    /// **What it states: a bitrate, and a cap on any one picture.** `va.h:3894` gives
+    /// `VA_CODED_BUF_STATUS_BITRATE_HIGH` the note *"(VCM only)"* — a frame closing on its maximum
+    /// size — beside `VA_CODED_BUF_STATUS_BITRATE_OVERFLOW` at `va.h:3900`, *"The peak bitrate was
+    /// exceeded for this frame"*. So `bitrate_kbps` and `max_bitrate_kbps` are read by this mode,
+    /// the size estimate has something to compute from, and the summary prints a rate for it.
+    /// **It states no quantiser**: `constant_qp` means nothing here, and unlike
+    /// [`BitrateMode::ConstantQuality`] this mode is not the case of a mode that names no rate.
+    ///
+    /// **It is one pass** — nothing about the mode asks for a second rendering of the sequence.
+    ///
+    /// **A note on the placement, for the next reader.** VCM is a *latency* concept filed among
+    /// rates: what it buys is a bounded delay, pictures not being held back to hit an average, and
+    /// that is a property of how the encoder spends time rather than of the bitrate schedule
+    /// itself. It sits here because it answers the same question the others answer — what this
+    /// export promises about fidelity — and a settings file carrying a latency choice beside a rate
+    /// choice would have two answers to one question. `Realtime` and `LowLatency` were considered
+    /// and rejected as the name for exactly the same reason: they describe what the mode *buys*
+    /// rather than what it *is*, and would later read as a preset or as a render mode.
+    VideoConference,
 }
 
 impl BitrateMode {
     /// Every mode, in the order a settings panel lists them.
-    pub const ALL: [BitrateMode; 4] = [BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass, BitrateMode::ConstantQuality];
+    pub const ALL: [BitrateMode; 5] =
+        [BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass, BitrateMode::ConstantQuality, BitrateMode::VideoConference];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -142,6 +182,7 @@ impl BitrateMode {
             BitrateMode::Vbr1Pass => "VBR, 1 pass",
             BitrateMode::Vbr2Pass => "VBR, 2 pass",
             BitrateMode::ConstantQuality => "Constant quality",
+            BitrateMode::VideoConference => "Video conference (VCM)",
         }
     }
 
@@ -152,11 +193,35 @@ impl BitrateMode {
     /// settings the estimate came from — are made by the same branch. A summary that printed
     /// "Target 20.00 Mbps" beside a constant-quality export would be quoting a number the export
     /// does not use.
+    ///
+    /// **The arms are spelled out rather than written as "everything but `ConstantQuality`".** The
+    /// catch-all is the wrong default in this one place: a new mode would silently answer `true`,
+    /// the summary would quote a bitrate it does not submit, and nothing would fail. Written this
+    /// way, the sixth mode does not compile until someone has decided what it states.
+    ///
+    /// **[`BitrateMode::VideoConference`] answers `true`, and it is worth being explicit about why
+    /// that is not the [`BitrateMode::ConstantQuality`] answer.** Both sound like "a mode that names
+    /// no rate", and they are opposites. `ConstantQuality` states a quantiser and no rate, which is
+    /// why both hardware gates refuse it rather than encoding it at a rate nobody chose.
+    /// `VA_RC_VCM` states a rate *and* adds a per-picture ceiling to it — `va.h:3894` marks
+    /// `VA_CODED_BUF_STATUS_BITRATE_HIGH` "(VCM only)" and `va.h:3900` describes the peak bitrate
+    /// being exceeded — so it is driven by the very numbers this predicate asks about, and saying
+    /// `false` here would print `QP {constant_qp}` beside an export that submits no quantiser at
+    /// all. The reason to name it separately is that the two modes are refused or accepted for
+    /// **opposite** reasons; they are not two flavours of the same gap.
     pub fn names_a_bitrate(self) -> bool {
-        !matches!(self, BitrateMode::ConstantQuality)
+        match self {
+            BitrateMode::Cbr | BitrateMode::Vbr1Pass | BitrateMode::Vbr2Pass | BitrateMode::VideoConference => true,
+            BitrateMode::ConstantQuality => false,
+        }
     }
 
     /// Whether the mode needs the sequence rendered twice before it is encoded.
+    ///
+    /// Unlike [`Self::names_a_bitrate`] this one keeps its catch-all, and that is deliberate: a
+    /// mode that does not ask to be named `Vbr2Pass` is single-pass, so landing in a new variant is
+    /// the conservative answer rather than the aggressive one. VCM is among them — it changes what
+    /// the encoder does with a picture, not how many times the sequence is rendered.
     pub fn is_two_pass(self) -> bool {
         matches!(self, BitrateMode::Vbr2Pass)
     }
@@ -463,6 +528,10 @@ impl ExportSettings {
             _ => self.bitrate_kbps,
         }
         .max(100);
+        // Only `Cbr` pins the rate exactly; every other mode gets a ceiling above the target, which
+        // is what `VideoConference` wants too — it caps a rate rather than fixing one. Written as a
+        // catch-all because the default (a variable rate with a headroom ceiling) is the right one
+        // for a new mode, unlike `names_a_bitrate`'s.
         let max = match self.bitrate_mode {
             BitrateMode::Cbr => target,
             _ => self.max_bitrate_kbps.filter(|m| *m >= target).unwrap_or(target * 3 / 2),
@@ -658,6 +727,9 @@ impl ExportSettings {
                         };
                     } else {
                         // The quantiser, and the fact that it is what makes the size unknowable here.
+                        // `ConstantQuality` is the only mode that gets here — `names_a_bitrate` is an
+                        // exhaustive match, so `VideoConference` cannot reach a line that would quote
+                        // `constant_qp` for a mode that states no quantiser.
                         v += &format!(", QP {}", self.constant_qp);
                     }
                     v += &format!(", keyframe every {} frames", r.keyint);

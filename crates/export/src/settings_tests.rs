@@ -603,3 +603,130 @@ fn h265_is_a_format_that_needs_a_registered_encoder() {
     HERE.store(false, Ordering::SeqCst);
     assert!(!available(Format::Hevc));
 }
+
+/// **The mode `VA_RC_VCM` names, and that the vocabulary actually carries it.**
+///
+/// `va.h:1114` — `/** \brief Video conference mode. */ #define VA_RC_VCM 0x00000008` — sits between
+/// `VA_RC_VBR` (1112) and `VA_RC_CQP` (1116), and it is a distinct rate-control bit rather than a
+/// synonym for either. A driver can advertise it, so FilmCraft can be asked for it, so there has to
+/// be a variant that means it.
+///
+/// The assertions are against the enum's whole contents rather than one lookup, because the failure
+/// this guards is a *silent* one: an `ALL` that merely grew, or one whose new entry duplicated an
+/// old one, would satisfy a `contains` alone.
+#[test]
+fn video_conference_is_a_mode_the_vocabulary_carries() {
+    // Spelled out as a set: the five, each named, no more and no fewer. Compared as a sorted copy so
+    // the panel order in `ALL` is not part of the claim, while a duplicate or a removal still fails.
+    let mut got: Vec<BitrateMode> = BitrateMode::ALL.to_vec();
+    got.sort_by_key(|m| m.label());
+    let mut want = vec![BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass, BitrateMode::ConstantQuality, BitrateMode::VideoConference];
+    want.sort_by_key(|m| m.label());
+    assert_eq!(got, want, "the modes FilmCraft can name, and `ALL` is how many a panel lists");
+    // `5` is a real count, not a restatement of the array: it would read 4 before this change.
+    assert_eq!(BitrateMode::ALL.len(), 5, "a fifth mode");
+    assert!(BitrateMode::ALL.contains(&BitrateMode::VideoConference), "and it is the one just added");
+
+    // A label is what the settings panel and the summary print. Distinct for every mode, so a panel
+    // listing all five cannot show the same word twice, and non-empty so nothing prints a gap.
+    let mut labels: Vec<&str> = BitrateMode::ALL.iter().map(|m| m.label()).collect();
+    labels.sort_unstable();
+    let count = labels.len();
+    labels.dedup();
+    assert_eq!(labels.len(), count, "every mode prints its own words: {labels:?}");
+    assert!(labels.iter().all(|l| !l.trim().is_empty()), "{labels:?}");
+    assert_eq!(BitrateMode::VideoConference.label(), "Video conference (VCM)");
+}
+
+/// **`VA_RC_VCM` states a rate, and `ConstantQuality` does not. They are not the same gap.**
+///
+/// This is the one answer the mode gets wrong by accident. `ConstantQuality` states a quantiser and
+/// no rate, so both hardware gates refuse it; a reader who has just met that rule will reach for
+/// `false` here too, and `false` is a lie with consequences — `estimate_bytes` returns 0 and the
+/// summary prints `QP {constant_qp}` for an export that submits no quantiser.
+///
+/// So the claim is tested from both sides, against the settings rather than against a copy of the
+/// predicate: every mode but `ConstantQuality` names a rate, `ConstantQuality` alone does not, and
+/// the two summary statements about the file's size come out right for the new mode.
+#[test]
+fn video_conference_names_a_bitrate_and_constant_quality_does_not() {
+    for mode in BitrateMode::ALL {
+        assert_eq!(mode.names_a_bitrate(), mode != BitrateMode::ConstantQuality, "{mode:?}: only constant quality states a quantiser and no rate");
+    }
+    assert!(BitrateMode::VideoConference.names_a_bitrate(), "VCM holds a rate and caps a picture against it");
+    assert!(!BitrateMode::ConstantQuality.names_a_bitrate(), "CQP states QP n and nothing else");
+
+    // **The consequence, read off a real settings object.** H.265 is the format this mode exists for
+    // — it is the one whose driver's mask contains the bit — so its summary branch is the one checked.
+    // **Audio is off in both**, because `estimate_bytes` adds the audio rate to a zero video rate: the
+    // claim under test is about the video, and an H.265 constant-quality export carries no audio, so
+    // the estimate really is 0 and the size really is unknowable before the pictures are encoded.
+    let ten = Tick(10 * TICKS_PER_SECOND);
+    let vcm = ExportSettings {
+        format: Format::Hevc,
+        bitrate_mode: BitrateMode::VideoConference,
+        bitrate_kbps: 20_000,
+        max_bitrate_kbps: Some(30_000),
+        include_audio: false,
+        ..Default::default()
+    };
+
+    let summary = vcm.summary(1920, 1080, FrameRate::FPS_25, 48_000, ten);
+    assert!(summary.video.contains("Video conference (VCM)"), "the mode is named: {}", summary.video);
+    assert!(summary.video.contains("Target 20.00 Mbps") && summary.video.contains("Max 30.00 Mbps"), "the rate it was given: {}", summary.video);
+    assert!(!summary.video.contains("QP "), "VCM states no quantiser, so `constant_qp` must not be quoted: {}", summary.video);
+
+    // **The first of the two statements about size: a number, computed from the rate that was given.**
+    let bytes = vcm.estimate_bytes(1920, 1080, FrameRate::FPS_25, 48_000, ten);
+    let cq = ExportSettings { bitrate_mode: BitrateMode::ConstantQuality, ..vcm.clone() };
+    assert_eq!(cq.estimate_bytes(1920, 1080, FrameRate::FPS_25, 48_000, ten), 0, "a constant-quality file has no size to compute before it is encoded");
+    assert!(bytes > 0, "a VCM export names a rate, so its size is computable: {bytes}");
+
+    // **The second: what the estimate was called.** Not the constant-quality wording, and not a zero
+    // rounded up to "1 KB" by `format_bytes`.
+    assert_ne!(summary.estimated_size, "not known in constant quality", "VCM names a rate, so its size is not the constant-quality gap");
+    assert_ne!(summary.estimated_size, "1 KB", "a zero estimate must not be dressed up as a size: {}", summary.estimated_size);
+
+    // **One pass.** Nothing about VCM renders the sequence twice.
+    assert!(!BitrateMode::VideoConference.is_two_pass());
+    for mode in BitrateMode::ALL {
+        assert_eq!(mode.is_two_pass(), mode == BitrateMode::Vbr2Pass, "{mode:?}");
+    }
+}
+
+/// **A settings file can ask for VCM by name, and that is what makes the variant reachable.**
+///
+/// A variant nothing can name in a stored file is a variant no backend is ever handed, and the
+/// spelling is the whole contract with older settings files — so it is asserted in both directions
+/// and against a file that carries nothing else.
+#[test]
+fn video_conference_survives_a_settings_file() {
+    let s: ExportSettings =
+        serde_json::from_value(serde_json::json!({ "bitrateMode": "videoConference" })).unwrap_or_else(|e| panic!("a settings file naming VCM: {e}"));
+    assert_eq!(s.bitrate_mode, BitrateMode::VideoConference);
+    assert_eq!(serde_json::to_value(&s).unwrap()["bitrateMode"], "videoConference", "and it round-trips under the same name");
+
+    // Every spelling `ALL` can produce parses, so no mode in the vocabulary is unreachable.
+    for mode in BitrateMode::ALL {
+        let back = serde_json::to_value(&ExportSettings { bitrate_mode: mode, ..Default::default() }).unwrap()["bitrateMode"].clone();
+        let got: ExportSettings = serde_json::from_value(serde_json::json!({ "bitrateMode": back })).unwrap_or_else(|e| panic!("{mode:?} wrote {back}: {e}"));
+        assert_eq!(got.bitrate_mode, mode, "{mode:?} must be able to describe itself");
+    }
+
+    // **A file written before this change is untouched.** Naming no mode at all still loads, and a
+    // file naming one of the four older spellings still reads as itself rather than as VCM.
+    let old: ExportSettings = serde_json::from_value(serde_json::json!({ "format": "hevc" })).unwrap();
+    assert_eq!(old.bitrate_mode, BitrateMode::Vbr1Pass, "no mode named means the default, never the newest variant");
+    for (name, want) in
+        [("cbr", BitrateMode::Cbr), ("vbr1Pass", BitrateMode::Vbr1Pass), ("vbr2Pass", BitrateMode::Vbr2Pass), ("constantQuality", BitrateMode::ConstantQuality)]
+    {
+        let s: ExportSettings = serde_json::from_value(serde_json::json!({ "bitrateMode": name })).unwrap_or_else(|e| panic!("\"{name}\": {e}"));
+        assert_eq!(s.bitrate_mode, want, "\"{name}\" is still {want:?}");
+    }
+
+    // **No built-in preset starts asking for it.** The mode exists to be *available*; no preset
+    // ships with a file that selects a rate control its target hardware may not offer.
+    for p in builtin_presets() {
+        assert_ne!(p.settings.bitrate_mode, BitrateMode::VideoConference, "{} selects a mode no default export should", p.name);
+    }
+}
