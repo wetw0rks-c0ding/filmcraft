@@ -2523,7 +2523,7 @@ fn rate_control_record(mode: RateControl, window_ms: u32) -> Result<Vec<u8>, Str
             // `ceil`, not `floor`: a percentage that rounds *down* asks for less than the caller said.
             // The correction is `max(1)` — a target below 1% of the ceiling is still a target, and the
             // field has no zero.
-            let percentage = percentage.max(1).min(100);
+            let percentage = percentage.clamp(1, 100);
             (max, percentage)
         }
     };
@@ -3545,7 +3545,7 @@ mod tests {
         // Every reported quantiser is a legal one, which is the range the self-check enforces in a
         // bitrate mode and the only thing about the quantiser this backend can still say.
         for qp in &qps {
-            assert!(*qp as u32 <= u32::from(H264_MAX_QP), "a reported quantiser of {qp} is outside H.264's 0..={H264_MAX_QP}");
+            assert!(*qp <= u32::from(H264_MAX_QP), "a reported quantiser of {qp} is outside H.264's 0..={H264_MAX_QP}");
         }
         // **And the sample entry still describes the stream**, which is what the `avcC` has to do
         // under a bitrate mode too: the derived sets are byte-identical picture to picture because

@@ -215,7 +215,12 @@ fn resolve_mode(qp: u8, kbps: u32, max_kbps: u32, vbr: bool) -> Result<Mode, Str
 /// afterwards. The two bitrate modes go through `VaEncoder`'s named constructors rather than a
 /// `RateControl` value, so this file does not have to name a type it only passes along.
 #[cfg(target_os = "linux")]
-fn build(api: &std::sync::Arc<filmcraft_platform::vaapi::Display>, size: (u32, u32), refs: u32, mode: Mode) -> Result<filmcraft_platform::vaapi::VaEncoder, String> {
+fn build(
+    api: &std::sync::Arc<filmcraft_platform::vaapi::Display>,
+    size: (u32, u32),
+    refs: u32,
+    mode: Mode,
+) -> Result<filmcraft_platform::vaapi::VaEncoder, String> {
     use filmcraft_platform::vaapi::VaEncoder;
     match mode {
         Mode::ConstantQuantiser(_) => VaEncoder::at_constant_quantiser(api, size, refs),
@@ -365,8 +370,14 @@ fn run(
         let seconds = frames as f64 / f64::from(fps);
         let achieved = total as f64 * 8.0 / seconds / 1000.0;
         match mode {
-            Mode::ConstantQuantiser(_) => println!("bit rate: {achieved:.0} kbit/s over {frames} pictures — no target; this mode states a quantiser, not a rate"),
-            Mode::Cbr(bps) => println!("bit rate: {achieved:.0} kbit/s against a {target:.0} kbit/s CBR target ({ratio:.0}% of it)", target = bps as f64 / 1000.0, ratio = achieved / (bps as f64 / 1000.0) * 100.0),
+            Mode::ConstantQuantiser(_) => {
+                println!("bit rate: {achieved:.0} kbit/s over {frames} pictures — no target; this mode states a quantiser, not a rate")
+            }
+            Mode::Cbr(bps) => println!(
+                "bit rate: {achieved:.0} kbit/s against a {target:.0} kbit/s CBR target ({ratio:.0}% of it)",
+                target = bps as f64 / 1000.0,
+                ratio = achieved / (bps as f64 / 1000.0) * 100.0
+            ),
             Mode::Vbr { target, max } => println!(
                 "bit rate: {achieved:.0} kbit/s against a {target_k:.0} kbit/s VBR target and a {max_k:.0} kbit/s ceiling",
                 target_k = target as f64 / 1000.0,
@@ -414,10 +425,13 @@ fn run(
         // stream at a moving quantiser against an intra stream at `-qp`, which is a weaker statement —
         // and it says so, rather than printing a ratio that reads as if it were the same comparison.
         println!();
-        println!("control: the same pictures, every one coded as an IDR at QP {qp}{}", match mode {
-            Mode::ConstantQuantiser(_) => "",
-            _ => " (the run above is at a bit rate, so this compares across qualities — the decode check above is the stronger evidence)",
-        });
+        println!(
+            "control: the same pictures, every one coded as an IDR at QP {qp}{}",
+            match mode {
+                Mode::ConstantQuantiser(_) => "",
+                _ => " (the run above is at a bit rate, so this compares across qualities — the decode check above is the stronger evidence)",
+            }
+        );
         let mut control = VaEncoder::at_constant_quantiser(&api, (width, height), 1).map_err(|e| format!("control encoder: {e}"))?;
         control.at_rate(fps)?;
         control.key_frames_every(1)?;

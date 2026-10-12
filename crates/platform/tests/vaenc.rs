@@ -31,7 +31,7 @@
 //!   from that measurement rather than picked to make a test pass.
 #![cfg(target_os = "linux")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use filmcraft_export::{BitrateMode, EncoderFrame, ExportSettings, FieldOrder, Format, H264Pass, H264Profile, HardwareEncoding};
 use filmcraft_isobmff::{Brand, Mp4Writer, TrackConfig, WriteSample, WriterOptions};
@@ -226,12 +226,7 @@ fn what_the_export_gate_declines_and_why() {
             // are listed rather than skipped so that a *new* decline appearing here fails the test rather
             // than joining a silent list. The list is deliberately exhaustive over the gate's own reasons —
             // a preset the gate refuses for a reason the gate documents is a working decline, not a gap.
-            Err(why)
-                if why.contains("state Main")
-                    || why.contains("MaxFrameNum")
-                    || why.contains("two-pass")
-                    || why.contains("Annex B") =>
-            {
+            Err(why) if why.contains("state Main") || why.contains("MaxFrameNum") || why.contains("two-pass") || why.contains("Annex B") => {
                 refused.push(format!("{}: {why}", preset.name))
             }
             Err(why) => panic!("the preset {:?} is declined for a reason the gate does not document as one of its own: {why}", preset.name),
@@ -262,8 +257,7 @@ fn what_the_export_gate_declines_and_why() {
     }
 
     // An odd picture size needs its own geometry, so it is not in the table above.
-    let why = vaapi_config_for(Format::H264, 641, 361, FrameRate::FPS_30, &bitrate_settings(String::new()))
-        .expect_err("641x361 is not 4:2:0 encodable");
+    let why = vaapi_config_for(Format::H264, 641, 361, FrameRate::FPS_30, &bitrate_settings(String::new())).expect_err("641x361 is not 4:2:0 encodable");
     assert!(why.contains("4:2:0"), "and it says why: {why}");
 
     // The key-frame ceiling, which needs its own settings because it is a number.
@@ -312,7 +306,10 @@ fn the_factory_is_registered_and_its_declines_are_counted() {
     let settings = hw_settings(scratch("declined.mp4").to_string_lossy().to_string());
     let got = vaapi_encoder_factory(Format::H264, 640, 360, FrameRate::FPS_30, &settings);
     let after = filmcraft_export::hw_encode_stats();
-    assert!(got.is_none(), "FilmCraft's default H.264 settings are declined: they ask for the High profile and a 60-picture GOP, and this backend states Main and wraps at 16");
+    assert!(
+        got.is_none(),
+        "FilmCraft's default H.264 settings are declined: they ask for the High profile and a 60-picture GOP, and this backend states Main and wraps at 16"
+    );
     assert_eq!(after.declined, before.declined + 1, "and the decline is counted for perf.stats");
     assert_eq!(after.sessions, before.sessions, "with no encoder created");
     assert_eq!(after.frames, before.frames, "and no picture encoded");
@@ -413,7 +410,7 @@ fn textured_frame(w: u32, h: u32, index: u32) -> Vec<u8> {
             // still has large-scale structure to be wrong about and the noise is not the only residual.
             let base = (x * 255) / u64::from(w.max(1));
             let luma = ((base + ((n >> 40) / 2)).min(255)) as u8;
-            let chroma = (((n >> 33) & 0x7f) as u64 + 64) as u8;
+            let chroma = ((n >> 33) & 0x7f) as u8 + 64;
             rgba.extend_from_slice(&[luma, chroma, chroma.wrapping_add(1), 255]);
         }
     }
@@ -425,7 +422,7 @@ fn mux_and_decode(
     w: u32,
     h: u32,
     count: usize,
-    ffmpeg: &PathBuf,
+    ffmpeg: &Path,
     name: &str,
     content: Content,
 ) -> (Vec<u8>, usize, u64) {
@@ -563,7 +560,11 @@ impl filmcraft_export::VideoEncoder for ConstantQuantiserExport {
             Ok(entry) => entry,
             Err(why) => {
                 log::info!("VA-API (fixed quantiser, test adapter): no sample entry yet: {why}");
-                filmcraft_isobmff::SampleEntry::avc(filmcraft_isobmff::AvcConfig::new(Vec::new(), Vec::new(), 4), u16::try_from(self.w).unwrap_or(u16::MAX), u16::try_from(self.h).unwrap_or(u16::MAX))
+                filmcraft_isobmff::SampleEntry::avc(
+                    filmcraft_isobmff::AvcConfig::new(Vec::new(), Vec::new(), 4),
+                    u16::try_from(self.w).unwrap_or(u16::MAX),
+                    u16::try_from(self.h).unwrap_or(u16::MAX),
+                )
             }
         }
     }
@@ -588,7 +589,8 @@ impl filmcraft_export::VideoEncoder for ConstantQuantiserExport {
             chroma.push(*v);
         }
         self.encoder.upload(&self.y, &chroma).map_err(filmcraft_export::ExportError::Encode)?;
-        let picture = self.encoder.encode(EncodeRequest::predicted(26).map_err(filmcraft_export::ExportError::Encode)?).map_err(filmcraft_export::ExportError::Encode)?;
+        let picture =
+            self.encoder.encode(EncodeRequest::predicted(26).map_err(filmcraft_export::ExportError::Encode)?).map_err(filmcraft_export::ExportError::Encode)?;
         let data = picture.mp4_sample().map_err(filmcraft_export::ExportError::Encode)?;
         Ok(vec![filmcraft_export::EncodedPacket { data, key: picture.key_frame, duration: self.duration, composition_offset: 0 }])
     }
@@ -663,7 +665,10 @@ fn a_muxed_export_at_the_requested_bitrate_decodes_to_the_pictures_that_went_in(
     // whatever the quantiser the controller chose measures — and still nowhere near a wrong picture. **A
     // different tolerance per mode is not a loosened test**: it is the same comparison with the number
     // that mode measures, and the absolute bound is what would catch a wrong reference (200+, not 30).
-    assert!(deviations.iter().all(|d| *d < 30), "every picture is within the bitrate mode's measured tolerance of the source; deviations {deviations:?} (worst {worst})");
+    assert!(
+        deviations.iter().all(|d| *d < 30),
+        "every picture is within the bitrate mode's measured tolerance of the source; deviations {deviations:?} (worst {worst})"
+    );
     let (lo, hi) = (deviations.iter().copied().min().unwrap_or(0), worst);
     assert!(hi - lo <= 8, "the deviation is flat across the sequence, not drifting: {deviations:?}");
 
@@ -685,7 +690,9 @@ fn a_muxed_export_at_the_requested_bitrate_decodes_to_the_pictures_that_went_in(
          rate controller is not tracking the target"
     );
 
-    eprintln!("muxed {count} pictures at {kbps:.0} kbit/s to {file_size} bytes ({video_bytes} of samples, {achieved_kbps:.0} kbit/s), mean absolute deviation {deviations:?}");
+    eprintln!(
+        "muxed {count} pictures at {kbps:.0} kbit/s to {file_size} bytes ({video_bytes} of samples, {achieved_kbps:.0} kbit/s), mean absolute deviation {deviations:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -887,11 +894,7 @@ fn temporary_measure_the_payload_of_both_modes() {
         for index in 0..24u32 {
             let (luma, chroma) = ramp_shifted(320, 180, 8 * index).expect("the ramp is buildable");
             enc.upload(&luma, &chroma).expect("the ramp uploads");
-            let request = if name == "cqp" {
-                EncodeRequest::predicted(26).expect("qp")
-            } else {
-                EncodeRequest::predicted_at_rate().expect("rate")
-            };
+            let request = if name == "cqp" { EncodeRequest::predicted(26).expect("qp") } else { EncodeRequest::predicted_at_rate().expect("rate") };
             let p = enc.encode(request).expect("encodes");
             let sample = p.mp4_sample().expect("mp4 sample");
             // walk the length-prefixed NALs
