@@ -33,6 +33,7 @@
 //! ## 1. Every VP9 profile the driver advertises, and every entrypoint it offers for it
 //!
 //! ```text
+//! == vaMaxNumProfiles -> 31
 //! == vaQueryConfigProfiles -> VA_STATUS_SUCCESS(0), nprofiles=25
 //!    profile[10] = 19  VAProfileVP9Profile0
 //!    profile[11] = 20  VAProfileVP9Profile1
@@ -46,6 +47,14 @@
 //!    VAProfileVP9Profile3           -> VA_STATUS_SUCCESS(0), n=1: 1(VAEntrypointVLD)
 //! ```
 //!
+//! **Two numbers, and only one of them is the answer: `nprofiles=25`, not 31.** `vaMaxNumProfiles`
+//! (`va.h:1524`) is the *buffer size* an application must allocate — `va.h:1540-1544` says the caller
+//! must provide a list "that can hold at least `vaMaxNumProfile()` entries", and the *actual* count
+//! comes back separately in `num_profile`. On this machine the driver reports a ceiling of 31 and
+//! fills 25. An earlier revision of this note quoted 31 as `nprofiles`, which is the buffer size read
+//! as a count; the correction is here because the two are easy to confuse and the error makes the
+//! driver look like it advertises six profiles it does not. It advertises 25, four of them VP9.
+//!
 //! All four profiles are advertised. **Every one offers `VAEntrypointVLD` (1) and nothing else** —
 //! decode only. `VAEntrypointEncSlice` (6) is absent from all four lists, which is the first and
 //! clearest evidence: the driver does not claim an encoder for VP9.
@@ -58,56 +67,256 @@
 //! constants; and contrast the `VAProfileH265Enc` constant named in a brief on this branch, which
 //! does not exist in libva at all.)
 //!
+//! ### The three entrypoints an encode could use, and which is which
+//!
+//! `va.h` defines **three** encode entrypoints, and they are worth writing down because two of
+//! them are routinely confused (a brief on this branch called `VAEntrypointEncSliceLP` "7"):
+//!
+//! | Entry point | Value | Header |
+//! |---|---|---|
+//! | `VAEntrypointEncSlice` | 6 | `va.h:558`, "slice level encode" |
+//! | `VAEntrypointEncPicture` | 7 | `va.h:559`, "picture encode, JPEG, etc" |
+//! | `VAEntrypointEncSliceLP` | **8** | `va.h:568`, low-power/high-performance slice encode |
+//!
+//! **7 is `VAEntrypointEncPicture`, not `VAEntrypointEncSliceLP`.** The brief's "(7)" was wrong,
+//! so the sweep below asks all three: a claim that "no VP9 encoder" holds only if *every* encode
+//! entrypoint was tried, not just the two a reader thinks of. The pins in this file's tests hold
+//! the values so the next edit cannot repeat the slip.
+//!
 //! ## 2. Asking anyway, and the status the driver returns
 //!
-//! `vaGetConfigAttributes` was called for all four VP9 profiles against both encode entrypoints. For
-//! every one of the 26 attributes asked and all eight (profile, entrypoint) pairs, the answer was:
+//! `vaGetConfigAttributes` was called for all four VP9 profiles against **all three** encode
+//! entrypoints — 12 (profile, entrypoint) pairs — sweeping every attribute id the driver itself
+//! advertises (`vaMaxNumConfigAttributes` returns **59**, so ids 1-58 were each read). For every
+//! pair and every one of the 58 attributes, the answer was the same:
 //!
 //! ```text
-//! -- VP9Profile0/EncSlice  (profile=VAProfileVP9Profile0 ep=VAEntrypointEncSlice)
-//!    VAConfigAttribRateControl              id=  5 status=UNSUPPORTED_ENTRYPOINT(13)     value=3735928559 (0xdeadbeef)
-//!    VAConfigAttribEncVP9(58)               id= 58 status=UNSUPPORTED_ENTRYPOINT(13)     value=3735928559 (0xdeadbeef)
-//!    ... (every attribute, same status)
-//! -- VP9Profile0/EncSliceLP  (profile=VAProfileVP9Profile0 ep=VAEntrypointEncSliceLP)
-//!    VAConfigAttribRateControl              id=  5 status=UNSUPPORTED_ENTRYPOINT(13)     value=3735928559 (0xdeadbeef)
-//! -- VP9Profile1/EncSlice   ... UNSUPPORTED_ENTRYPOINT(13) ... 0xdeadbeef
-//! -- VP9Profile2/EncSlice   ... UNSUPPORTED_ENTRYPOINT(13) ... 0xdeadbeef
-//! -- VP9Profile3/EncSlice   ... UNSUPPORTED_ENTRYPOINT(13) ... 0xdeadbeef
+//! -- VP9Profile0/EncSlice    (profile=19 ep=6  VAEntrypointEncSlice)
+//!    VAConfigAttribRateControl  id=  5 status=UNSUPPORTED_ENTRYPOINT(13)  value=3735928559 (0xdeadbeef)
+//!    VAConfigAttribEncVP9       id= 58 status=UNSUPPORTED_ENTRYPOINT(13)  value=3735928559 (0xdeadbeef)
+//!    ... (all 58 attributes, same status, same untouched poison)
+//! -- VP9Profile0/EncSliceLP  (profile=19 ep=8  VAEntrypointEncSliceLP)   ... all 58 the same
+//! -- VP9Profile0/EncPicture  (profile=19 ep=7  VAEntrypointEncPicture)   ... all 58 the same
+//! -- VP9Profile1/2/3          ... all three entrypoints each, all 58 attributes, the same
 //! ```
 //!
-//! `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` is `13` (`va.h:264+`), and the poison survives
+//! `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` is `13` (`va.h:277`), and the poison survives
 //! untouched, confirming the driver returned early rather than answering.
 //!
-//! ## 3. The control, which is what makes the above mean anything
+//! ### The sweep is exhaustive, and the control is in the same pass
 //!
-//! The same probe, unchanged, on H.264 — a codec this machine's driver is known to encode:
+//! An earlier revision of this note *said* it swept all 58 attributes but had actually sampled a
+//! handful, so "all 58 answer identically" was an inference from a sample. It is now a count, with
+//! the three controls read through the same loop in the same process:
 //!
 //! ```text
-//!    VAProfileH264Main              -> VA_STATUS_SUCCESS(0), n=2: 1(VAEntrypointVLD) 6(VAEntrypointEncSlice)
-//! -- H264High/EncSlice [CONTROL]
-//!    VAConfigAttribRateControl              id=  5 status=VA_STATUS_SUCCESS(0)  value=5334 (0x000014d6)
-//!    VAConfigAttribEncVP9(58)               id= 58 status=VA_STATUS_SUCCESS(0)  value=2147483648 (0x80000000)
-//! -- VP9Profile0/EncSlice
-//!    VAConfigAttribRateControl              id=  5 status=UNSUPPORTED_ENTRYPOINT(13)  value=0xdeadbeef
+//! asked=870  refused(status != 0)=696  answered(status=0, real value)=174  status=0 but POISON INTACT=0
+//!
+//!   870 = 696 VP9 reads (4 profiles x 3 encode entrypoints x 58 attribute ids)
+//!       + 174 control reads (H264High=7, HEVCMain=17, AV1Profile0=32 at EncSlice, 58 ids each)
 //! ```
 //!
-//! The control answers `VA_STATUS_SUCCESS` with real values for the same entrypoint, on the same
-//! display, through the same `dlsym`'ed function pointer. The VP9 reads are therefore measuring the
-//! driver and not the harness. The stronger discrimination, the one this branch used for HEVC:
-//! attribute **58** (`VAConfigAttribEncVP9`) returns `0x80000000` — which is
-//! `VA_ATTRIB_NOT_SUPPORTED` — for the H.264 control, and `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`
-//! with the poison intact for every VP9 encode pair. The driver answers the question; it does not
-//! merely stay silent.
+//! **Not one of the 174 answering reads is a VP9 one**, and the last counter is the one that closes
+//! the "did it just decline to write?" question outright: a `VA_STATUS_SUCCESS` that left the
+//! `0xDEADBEEF` poison in place happened **zero** times in 870 reads. So the driver does not answer
+//! some VP9 attributes and refuse others — for VP9 it returns early on every id it knows, while
+//! the very next read in the same loop, for another codec, returns a populated word.
 //!
-//! ## 4. This is the driver declining a codec libva can express — not an API that lacks it
+//! `174` is also worth reading as what a *working* encoder looks like on this machine: H.264
+//! answered 20 of its 58 ids, HEVC 18, AV1 20. A codec the driver genuinely encodes does not
+//! answer 58 of 58 — it answers the subset that applies to it and `VA_ATTRIB_NOT_SUPPORTED`
+//! (`0x80000000`) for the rest. VP9's answer is not a small subset. It is none of them.
 //!
-//! The header **does** declare VP9 encode: `va_enc_vp9.h` exists and defines
-//! `VAEncSequenceParameterBufferVP9`, `VAEncPictureParameterBufferVP9`, `VAEncSegParamVP9` and
-//! `VACodedBufferVP9Status`, and `va.h:1065` declares
-//! `VAConfigAttribEncVP9 = 58` ("VP9 encoding attribute"). So the API can express a VP9 encoder and
-//! this driver will not provide one. That distinction matters for whoever reads this: the answer is
-//! about **this machine's hardware and driver**, not about VP9, not about libva, and not about
-//! FilmCraft's ability to *decode* VP9 — decode is proven and unaffected.
+//! ## 2a. The call a submission path cannot get past
+//!
+//! The attribute sweep asks a question about a *configuration*. `vaCreateConfig` is the call that
+//! would actually have to succeed, so it is asked too, with the config id poisoned beforehand:
+//!
+//! ```text
+//! == vaCreateConfig (no attribute list; the driver's own defaults)
+//!    VAProfileVP9Profile0/EncSlice    -> UNSUPPORTED_ENTRYPOINT(13)  config=(untouched) 0xdeadbeef
+//!    VAProfileVP9Profile0/EncSliceLP   -> UNSUPPORTED_ENTRYPOINT(13)  config=(untouched) 0xdeadbeef
+//!    VAProfileVP9Profile2/EncSlice    -> UNSUPPORTED_ENTRYPOINT(13)  config=(untouched) 0xdeadbeef
+//!    VAProfileH264High/EncSlice  [CONTROL]  -> VA_STATUS_SUCCESS(0)  config=0x00002b23
+//!    VAProfileAV1Profile0/EncSlice [CONTROL]  -> VA_STATUS_SUCCESS(0)  config=0x00002bd3
+//! ```
+//!
+//! This is the sharpest form of the answer, because it is the first thing a VP9 encode path would
+//! call: **the driver will not create a VP9 encode config at all**, so nothing downstream of it —
+//! context, buffer, picture — is reachable. It is also the answer least able to be a harness
+//! artefact, because the identical call succeeds twice for two other codecs in the same process.
+//!
+//! ## 3. The controls, which are what make the above mean anything
+//!
+//! **Three**, not one, and all in the same process, on the same display, through the same
+//! `dlsym`'ed function pointers, on the same loop that produced every VP9 refusal. The control
+//! profiles are the header's own: **`VAProfileH264High` = 7** (`va.h:507`), **`VAProfileHEVCMain`
+//! = 17** (`va.h:518`) and **`VAProfileAV1Profile0` = 32** (`va.h:531`) — all three are easy to get
+//! wrong, because H.264's *Baseline* is 5 and AV1's is not 256. A probe that guesses them wrong does
+//! not fail loudly: it reads `VA_STATUS_ERROR_UNSUPPORTED_PROFILE` (12) for its supposed controls
+//! and looks exactly like a driver declining every codec. That is the failure mode this section
+//! exists to prevent, and the constants are pinned by the test below.
+//!
+//! ```text
+//! == vaQueryConfigEntrypoints
+//!    VAProfileH264High   -> VA_STATUS_SUCCESS(0) n=2: 1(VAEntrypointVLD) 6(VAEntrypointEncSlice)
+//!    VAProfileAV1Profile0 -> VA_STATUS_SUCCESS(0) n=2: 1(VAEntrypointVLD) 6(VAEntrypointEncSlice)
+//!
+//! == vaGetConfigAttributes, the same attributes, the same poison, the same call
+//! -- H264High/EncSlice   [CONTROL]   attrib  5 status=SUCCESS  value=0x000014d6 (5334)
+//! -- H264High/EncSlice   [CONTROL]   attrib 58 status=SUCCESS  value=0x80000000 <- VA_ATTRIB_NOT_SUPPORTED
+//! -- AV1Profile0/EncSlice [CONTROL]   attrib 52 status=SUCCESS  value=0x05001000
+//! -- AV1Profile0/EncSlice [CONTROL]   attrib 53 status=SUCCESS  value=0x0000241f
+//! -- AV1Profile0/EncSlice [CONTROL]   attrib 54 status=SUCCESS  value=0x0000ffcf
+//! -- HevcMain/EncSlice   [CONTROL]   attrib 50 status=SUCCESS  value=0x01900464
+//! -- HevcMain/EncSlice   [CONTROL]   attrib 51 status=SUCCESS  value=0x000088cf
+//! -- VP9Profile0/EncSlice             attrib  5 status=UNSUPPORTED_ENTRYPOINT(13)  value=0xdeadbeef
+//! ```
+//!
+//! **Why three controls and not one.** A single H.264 control would show the harness can reach a
+//! working encoder. Attributes **50 and 51** (`VAConfigAttribEncHEVCFeatures`,
+//! `VAConfigAttribEncHEVCBlockSizes`, `va.h:1002` and `va.h:1012`) are the sharper pair, because
+//! they discriminate **inside one call**: `0x80000000` — which is `VA_ATTRIB_NOT_SUPPORTED`
+//! (`va.h:1521`) — for H.264 and AV1, populated words `0x01900464` / `0x000088cf` for HEVC, and
+//! `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` with the poison intact for every VP9 pair. Three
+//! different answers from one function tells you the driver is discriminating, not stalling.
+//!
+//! `VA_ATTRIB_NOT_SUPPORTED` matters in its own right: it is the value libva writes when it *is*
+//! answering and the attribute does not apply to that codec. Seeing it for attribute 58 on H.264
+//! (VP9's own attribute, on a non-VP9 codec) is exactly what a live, discriminating driver looks
+//! like — and it is the opposite of the VP9 encode rows, where the status is a refusal and the
+//! poison is untouched.
+//!
+//! The branch's own `vaprobe --caps` reaches the same answer by a different route, listing every
+//! profile the driver advertises with its entrypoints:
+//!
+//! ```text
+//! H264Main VLD: true EncSlice: true      Vp9(0) VLD: true EncSlice: false
+//! H264High VLD: true EncSlice: true      Vp9(1) VLD: true EncSlice: false
+//! HevcMain VLD: true EncSlice: true      Vp9(2) VLD: true EncSlice: false
+//! Av1Main  VLD: true EncSlice: true      Vp9(3) VLD: true EncSlice: false
+//! ```
+//!
+//! VP9 decode present, VP9 encode absent, on every profile, beside three codecs that encode.
+//!
+//! ## 4. Is this the driver, or is VA-API's VP9 encode aspirational?
+//!
+//! **This driver — and libva's VP9 encode is a fully specified, supported part of the API.** That
+//! is the answer, and it was established from the installed headers and the installed library,
+//! never from libva's source (AGENTS.md §2 forbids reading a reference implementation while
+//! establishing an API's semantics). Four independent pieces of evidence:
+//!
+//! 1. **libva lists VP9 as an encoder module.** `va.h:115` reads `- Encoder (H264, HEVC, JPEG,
+//!    MPEG2, VP8, VP9, AV1)` and `va.h:121` is `- \ref api_enc_vp9`. That is the API's own module
+//!    index, and VP9 sits in the encoder list beside H.264 and HEVC — not in a "future work" list,
+//!    and not in the *decoder* list only (`va.h:123`, which also names VP9).
+//! 2. **The record set is complete and shipped.** `/usr/include/va/va_enc_vp9.h` exists and
+//!    defines `VAEncSequenceParameterBufferVP9`, `VAEncPictureParameterBufferVP9`,
+//!    `VAEncSegParamVP9`, `VAEncMiscParameterTypeVP9PerSegmantParam`, `VACodedBufferVP9Status`
+//!    and the `VAConfigAttribValEncVP9` union. An aspirational feature has a stub; this is a
+//!    finished record set.
+//! 3. **`VAConfigAttribEncVP9` (58) has a documented value range**, and the header states it:
+//!    `va.h:1059-1065` defines it "Read-only ... partitioned into fields as defined in the
+//!    `VAConfigAttribValEncVP9` union", and `va_enc_vp9.h:608-631` gives that union's fields —
+//!    `seg_id_block_size: 8`, `segment_feature_support: 4`, `reserved: 20` — with each bit's
+//!    meaning named (`SEG_LVL_ALT_Q` 0x01, `SEG_LVL_ALT_L` 0x02, `SEG_LVL_REF_FRAME` 0x04,
+//!    `SEG_LVL_SKIP` 0x08) against `VA_SEGID_BLOCK_*` (`va.h:1508-1514`). The driver even reports
+//!    `vaMaxNumConfigAttributes` = **59**, so attribute 58 is inside the range it knows about.
+//! 4. **The encode entry points are real symbols in the installed library.** `nm -D` on
+//!    `/usr/lib/libva.so.2` (libva 1.24.0, `libva.so.2.2400.0`) exports the whole encode pipeline,
+//!    and this branch has already called every one of them for H.264 and HEVC:
+//!
+//!    ```text
+//!    $ nm -D --defined-only /usr/lib/libva.so.2 | grep ' T '
+//!    000000000000c340 T vaCreateConfig
+//!    000000000000edc0 T vaCreateBuffer
+//!    000000000000efa0 T vaCreateBuffer2
+//!    000000000000f0a0 T vaBufferSetNumElements
+//!    000000000000f120 T vaUnmapBuffer
+//!    000000000000fc20 T vaMapBuffer
+//!    000000000000fdb0 T vaAcquireBufferHandle
+//!    0000000000010210 T vaBeginPicture
+//!    0000000000010580 T vaRenderPicture
+//!    00000000000111c0 T vaSyncBuffer
+//!    0000000000012a80 T vaEndPicture
+//!    ```
+//!
+//! **A note on that last one, because it looks like it argues the other way.** libva exports **no
+//! per-codec symbols at all** — of the 88 text symbols it exports, **none** mentions VP9, VP8, H.264,
+//! AVC, HEVC, H.265 or AV1 (`nm -D --defined-only … | grep -iE 'vp9|vp8|h264|avc|hevc|h265|av1'`
+//! returns nothing). So "are there VP9 encode symbols in `libva.so.2`?" is the wrong question, and
+//! answering it either way would be a mistake. libva's encode path is codec-agnostic by design: the
+//! codec is carried by the *profile and entrypoint passed to `vaCreateConfig`*, and the
+//! codec-specific part is the record layout in the header. The absence of a `vp9_*` symbol is not
+//! evidence that VP9 encode is missing; it is how every codec in the API is expressed. What the
+//! symbols do show is that the machinery a VP9 encoder would drive is present and exported — and
+//! because `vaCreateConfig` is one codec-agnostic entry point, its presence says **nothing** about
+//! which codecs any given driver implements. Only a driver can answer that, which is what §1–§3
+//! asked.
+//!
+//! ### How far the claim reaches, and where it stops
+//!
+//! | Claim | Status | What it rests on |
+//! |---|---|---|
+//! | This driver advertises no VP9 encoder | **Measured** | 4 profiles, 3 encode entrypoints, 870 poisoned attribute reads, `vaCreateConfig`, three working controls |
+//! | libva fully expresses VP9 encode | **Established** | `va.h:115`/`:121` module index, the shipped `va_enc_vp9.h` record set, `VAConfigAttribEncVP9` = 58 with a stated field layout, `nm -D` on `libva.so.2` |
+//! | Some other VA-API driver accepts VP9 encode | **Unknown — not determinable here** | nothing in the headers or the library records what drivers implement |
+//!
+//! The third row is the one a reader planning a cross-platform feature needs, and it is a genuine
+//! **"cannot determine"**, not a hedge. One machine with one driver cannot answer a question about
+//! other drivers: Intel's Media stack is not the whole of VA-API, and no amount of reading
+//! `/usr/include/va` says which drivers implement what. **"Not available on Linux" would be a
+//! false claim**, because the API it rests on is present and specified — the honest scope is "not
+//! available on *this* driver", which is exactly what the rest of this file says.
+//!
+//! ### So what would a VP9 encode path actually need?
+//!
+//! Not much that is VP9-specific, and most of it is already built and measured. If another
+//! driver advertises `VAProfileVP9Profile0` + `VAEntrypointEncSlice`, the path needs:
+//!
+//! - **Three records** from `va_enc_vp9.h`, none of them large: `VAEncSequenceParameterBufferVP9`
+//!   (frame size, keyframe distances, `bits_per_second`), `VAEncPictureParameterBufferVP9` (the
+//!   eight `reference_frames`, `ref_flags`, `pic_flags`, `refresh_frame_flags`, the per-plane qindex
+//!   deltas, tile counts, and the `bit_offset_*` fields BRC writes through) and
+//!   `VAEncMiscParameterTypeVP9PerSegmantParam` (eight `VAEncSegParamVP9`). Plus
+//!   `VACodedBufferVP9Status` read back off the coded buffer for the driver's chosen qindex and loop
+//!   filter level.
+//! - **The submission machinery, which exists**: `vaCreateConfig` → `vaCreateContext` →
+//!   `vaCreateBuffer` → `vaBeginPicture` → `vaRenderPicture` → `vaSyncBuffer` → `vaEndPicture`.
+//!   FilmCraft has run this end to end for H.264 and for HEVC, including the readback
+//!   (`vaAcquireBufferHandle` → `PRIME_HANDLE_TO_FD` → `mmap`) that §3.0 of the progress doc calls
+//!   the blocker, and which is solved.
+//! - **A `vpcC` sample entry** in the muxer, and the rate-control and GOP plumbing
+//!   `VaEncoder` already has.
+//!
+//! **And how much of the VP9 work is already done?** More than the encode/decode split suggests,
+//! because encode inverts the data flow: the application hands over a *picture* and **the driver
+//! writes the bitstream**. So an encode path does **not** need a VP9 encoder — the thing that would
+//! normally be the hard part is the hardware's job. What it needs from FilmCraft is the frame
+//! header's *meaning*, and that is precisely what the decode path already built and proved:
+//!
+//! | Already in the tree (decode side, bit-exact) | Why an encode path needs it too |
+//! |---|---|
+//! | [`filmcraft_vp9::header::parse_uncompressed`] → [`filmcraft_vp9::header::FrameHeader`] | the fields `VAEncPictureParameterBufferVP9` mirrors — `frame_type`, `show_frame`, `lossless_mode`, `refresh_frame_flags`, tile counts |
+//! | [`filmcraft_vp9::header::HeaderState`] + `ReferenceState` | VP9's reference frames are set/used flags with per-slot sign bias; the encode record wants the same eight slots as surfaces |
+//! | [`crate::vaapi::Vp9State`] — eight reference slots, one per decode | the encoder's DPB is those eight slots; the bookkeeping is written and tested |
+//! | [`crate::vaapi::picture::vp9_picture_record`] / `VaSliceParameterBufferVp9`, 316 bytes pinned on both arms | the same eight segments an encoder must fill in (`VAEncSegParamVP9` is per-segment too) |
+//! | `split_superframe` | VP9's superframe index handling, needed on the mux side as well |
+//! | `SegParam[1..7]` wired and tested on hardware (`vp9_p0_segmented.mp4`, 96/96) | segmentation feature support is exactly what `VAConfigAttribEncVP9`'s `segment_feature_support` reports |
+//!
+//! **What an encode path would still genuinely have to build** is the part decode never touched:
+//! choosing qindices, a segmentation map and loop-filter levels per picture, deciding GOP and
+//! alt-ref structure, honouring the `bit_offset_*` handshake where BRC rewrites the driver's
+//! header, and writing `vpcC`. That is policy and bookkeeping, not codec work — which is the
+//! argument for recording `VAConfigAttribEncVP9` as "known, currently unused" rather than
+//! pre-declaring ~1000 lines of records for a driver that refuses them today.
+//!
+//! So the honest summary for anyone planning this: **the VP9 half of the job is done and the
+//! driver half is the blocker, and the driver half is not ours to fix.**
+//!
+//! The distinction matters for whoever reads this: the answer is about **this machine's hardware
+//! and driver**, not about VP9, not about libva, and not about FilmCraft's ability to *decode*
+//! VP9 — decode is proven and unaffected.
 //!
 //! # What this file deliberately does not contain
 //!
@@ -142,6 +351,44 @@ mod tests {
         assert_eq!(super::super::ffi::VP9_PROFILE_3, 22, "va.h:527 VAProfileVP9Profile3");
     }
 
+    /// **libva has three encode entry points and `VAEntrypointEncSliceLP` is 8, not 7.**
+    ///
+    /// `ffi` declares only `ENC_SLICE`, the one entry point a live path reads, so that is the only
+    /// value this test can compare against something. `VAEntrypointEncPicture = 7` (`va.h:559`) and
+    /// `VAEntrypointEncSliceLP = 8` (`va.h:568`) are recorded here as facts, **not asserted**: with
+    /// no constant to compare them against, `assert_eq!(8, 8)` would compare a literal with itself,
+    /// pass unconditionally and prove nothing while appearing to be a pin. Declaring two dead
+    /// constants in `ffi` purely so a test could read them would be declaring something no live path
+    /// uses, which is the thing this file was written to avoid.
+    ///
+    /// The trap is real and was hit while producing this evidence: a brief on this branch described
+    /// `VAEntrypointEncSliceLP` as 7, which is `VAEntrypointEncPicture`. Probing only 6 and "7" would
+    /// have swept two entry points and reported "no VP9 encoder" while never having asked the
+    /// low-power one, which is precisely the entry point most likely to be added to a driver before
+    /// the slice one. All three are swept (see the module note).
+    #[test]
+    fn the_encode_entrypoint_this_path_uses_is_six() {
+        assert_eq!(super::super::ffi::ENC_SLICE, 6, "va.h:558 VAEntrypointEncSlice");
+    }
+
+    /// **The control profiles, pinned, because guessing them produces a probe that cannot fail
+    /// loudly.**
+    ///
+    /// A probe that reaches for the wrong `VAProfile` gets `VA_STATUS_ERROR_UNSUPPORTED_PROFILE`
+    /// (12) back for its *control*, and a harness that treats any non-zero status as "this driver
+    /// declines everything" reports a machine with no encoders at all instead of reporting the one
+    /// thing it was asked about. That is the same class of error as reading
+    /// `vaMaxNumProfiles` as `nprofiles`, which this file's evidence previously did.
+    #[test]
+    fn the_control_profiles_are_the_ones_va_h_declares() {
+        // H.264 Baseline is 5 and H.264 Main is 6, so "H.264" is not a profile number at all.
+        assert_eq!(super::super::ffi::H264_HIGH, 7, "va.h:507 VAProfileH264High");
+        assert_eq!(super::super::ffi::HEVC_MAIN, 17, "va.h:518 VAProfileHEVCMain");
+        // `VAProfileAV1Profile0 = 32` (`va.h:531`) is recorded in the module note rather than
+        // asserted: `ffi` declares no constant for it, and `assert_eq!(32, 32)` would be a literal
+        // compared with itself.
+    }
+
     /// **No VP9 encode record is declared, and the reason is written down rather than implied.**
     ///
     /// This is not a clever pin. There is nothing to pin, because this driver has no VP9 encoder
@@ -173,6 +420,15 @@ mod tests {
             note.contains("VAConfigAttribEncVP9") && note.contains("va_enc_vp9.h"),
             "the module note must still record that libva CAN express VP9 encode, so this stays a \
              statement about the driver and not about the API"
+        );
+        // **And it must keep the scope explicit**, because "this driver declines VP9 encode" and
+        // "VP9 hardware encode is not available on Linux" are different claims and only the first
+        // is supported. The row that separates them is the third one: no measurement here says
+        // anything about another driver.
+        assert!(
+            note.contains("Unknown") && note.contains("vaMaxNumProfiles") && note.contains("nprofiles=25"),
+            "the module note must keep the measured profile count (25 advertised, not the 31 \
+             `vaMaxNumProfiles` buffer size) and must still record that another driver is unknown"
         );
     }
 }

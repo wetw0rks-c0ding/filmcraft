@@ -267,10 +267,17 @@ config record; size and rate control land near what the settings asked for; and 
   the export surface works or does not.
 - **VP9 encode is not available on this driver**, and that is measured rather than assumed: all four VP9
   profiles are advertised and every one offers `VAEntrypointVLD` and nothing else, and
-  `vaGetConfigAttributes` on every (profile, `EncSlice` / `EncSliceLP`) pair returns
-  `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`. `va_enc_vp9.h` and `VAConfigAttribEncVP9` (58) **do** exist in the
-  headers, so this is the driver declining a codec libva can express — a statement about this machine, not
-  about VP9, libva, or FilmCraft's ability to decode VP9.
+  `vaGetConfigAttributes` on every (profile, encode entrypoint) pair — all **three** of them, `EncSlice` 6,
+  `EncPicture` 7 and `EncSliceLP` **8** — across every attribute id the driver knows
+  (`vaMaxNumConfigAttributes` = 59) returns `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`. The sweep is
+  exhaustive and carries its own control: of 870 poisoned reads, 174 answered and **none** of them is a VP9
+  one, while H.264 High, HEVC Main and AV1 profile 0 answer 20, 18 and 20 of their 58 ids in the same pass.
+  `vaCreateConfig` refuses every VP9 pair and succeeds for all three controls. `va_enc_vp9.h` and
+  `VAConfigAttribEncVP9` (58) **do** exist in the headers, so this is the driver declining a codec libva
+  can express — a statement about **this machine**, not about VP9, libva, or FilmCraft's ability to decode
+  VP9. **Whether some other VA-API driver accepts VP9 encode is not determinable here**: nothing in the
+  headers or the library records what drivers implement, so the claim stops at this driver and does not
+  become "VP9 hardware encode is not available on Linux", which would be false.
 - **AV1 encode records are declared and pinned** (six records, every size, offset and hole measured with a C
   compiler, five holes named as `padding_*` fields) because the driver advertises `EncSlice` for
   `VAProfileAV1Profile0`. **Nothing submits them.** Declaring a record is not the same claim as encoding with

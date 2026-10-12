@@ -162,6 +162,16 @@ of the claim.
 and `EncSlice: true` for **AV1 profile 0**. VP9 reports false, and that is measured rather than inferred
 (§3.6).
 
+**No export of VP9 is declined today, because none can be asked for.** `filmcraft_export::Format` has no
+`Vp9` variant — its variants are H264, Hevc, ProRes, DnxHr, Apv, Mjpeg, the image and audio sequences and
+the two MXF containers — and `vaapi_export::factory` returns `None` for every format that is not H.264 or
+HEVC. So there is no user-reachable path that could decline VP9 silently, and adding a VP9 decline to the
+gate would mean **adding a `Format::Vp9` variant first**: a decline branch for a format the enum cannot
+express is unreachable code, and a `Format::Vp9` with no encoder behind it would fail an export as
+"encoder not available" while the format list claimed it was available. Both are features, not declines, and
+neither is this section's claim. The measured absence above is what such a feature would be built against,
+and on *this* machine it would have nothing to submit to.
+
 ### 3.0 The three spikes that established feasibility, each measured rather than assumed
 
 1. **One I frame.** Encodes and decodes to the right picture (luma ramp, max deviation 3/255, driver average
@@ -291,11 +301,48 @@ open, and the code says which half is which.
 
 **No hardware VP9 encoder on this driver.** All four `VAProfileVP9Profile0..3` are advertised, and **every one
 offers `VAEntrypointVLD` and nothing else**. Asking anyway — `vaGetConfigAttributes` for every (profile,
-`EncSlice` / `EncSliceLP`) pair, across the 26 attributes — returns `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`
-for **all eight pairs**, with the poison left intact. `va_enc_vp9.h` and `VAConfigAttribEncVP9` (**58**)
-**do** exist in the installed headers, so this is **the driver declining a codec libva can express**, not an
-API gap. That distinction is the deliverable: it is a statement about *this machine's driver*, not about VP9,
-not about libva, and not about FilmCraft's ability to *decode* VP9, which is proven and unaffected.
+encode entrypoint) pair, across **every attribute id the driver knows** (`vaMaxNumConfigAttributes` = 59, so
+ids 1–58) — returns `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` for **all 12 pairs** (4 profiles × all **three**
+encode entrypoints: `EncSlice` 6, `EncPicture` 7, `EncSliceLP` **8**), with the poison left intact.
+
+**The sweep is exhaustive and its control is in the same pass: `asked=870 refused=696 answered=174`, and
+none of the 174 is a VP9 one.** A `VA_STATUS_SUCCESS` that left the `0xDEADBEEF` poison in place happened
+**zero** times in 870 reads, so this is not "the driver answered some VP9 attributes and declined others" —
+it declines every id it knows while the next read in the same loop, for another codec, returns a populated
+word. The three controls are H.264 High, HEVC Main and AV1 profile 0, which between them answer 20, 18 and 20
+of their 58 ids: a codec this driver really encodes answers the subset that applies to it and
+`VA_ATTRIB_NOT_SUPPORTED` for the rest, and VP9's answer is none of them. `vaCreateConfig` — the first call a
+submission path would make — likewise refuses every VP9 pair while succeeding for all three controls.
+
+`va_enc_vp9.h` and `VAConfigAttribEncVP9` (**58**) **do** exist in the installed headers, so this is **the
+driver declining a codec libva can express**, not an API gap.
+
+**How far that generalises, which is the part a reader planning this needs:**
+
+| Claim | Status |
+|---|---|
+| This driver advertises no VP9 encoder | **Measured** — 12 pairs, 58 attribute ids, `vaCreateConfig`, three working controls |
+| libva fully expresses VP9 encode | **Established** from the installed headers and `nm -D` on `libva.so.2` |
+| Some other VA-API driver accepts VP9 encode | **Unknown — not determinable here** |
+
+The third row is a real *cannot-determine*, not a hedge: one driver cannot answer a question about other
+drivers, and nothing in `/usr/include/va` records what drivers implement. **"VP9 hardware encode is not
+available on Linux" would be false** — the API it would rest on is present and specified, `va.h:115` lists
+VP9 in the encoder module index and the `va_enc_vp9.h` record set is complete. The honest scope is *this
+driver*. (libva exports no per-codec symbols at all — none of its 88 text symbols mentions any codec — so
+"is there a VP9 encode symbol" is the wrong question; the codec rides on the profile and entrypoint passed
+to `vaCreateConfig`.)
+
+**What a VP9 encode path would still need**, if another driver advertised `EncSlice`: three records
+(`VAEncSequenceParameterBufferVP9`, `VAEncPictureParameterBufferVP9`,
+`VAEncMiscParameterTypeVP9PerSegmantParam`), the `vpcC` sample entry, and the submission machinery — which
+FilmCraft already runs end to end for H.264 and HEVC, readback included. Because encode inverts the data
+flow (the driver writes the bitstream), **no VP9 encoder is needed**; what is needed is the frame header's
+meaning, and the bit-exact VP9 *decode* path already supplies it: `parse_uncompressed` → `FrameHeader`,
+`HeaderState` + `ReferenceState`, `Vp9State`'s eight reference slots, the pinned 316-byte
+`VASliceParameterBufferVP9` with all eight segments wired and tested on hardware, and `split_superframe`.
+What is left is policy — choosing qindices, a segmentation map, loop-filter levels and GOP structure, and
+honouring the `bit_offset_*` handshake where rate control rewrites the driver's header.
 
 The answer lives in `vaapi/vp9_enc.rs` rather than in ~1000 lines of correctly-measured, C-pinned records for
 a codec this machine refuses.
