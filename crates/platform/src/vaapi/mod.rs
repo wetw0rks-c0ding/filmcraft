@@ -52,6 +52,13 @@ mod decoder;
 // driver writes the slice headers), so there is nothing to parse here and this module builds
 // records instead. Safe code, like everything here but `ffi`.
 mod encoder;
+// HEVC encode records, declared and pinned but **not yet submitted** — the sequence, picture and
+// slice records from `va_enc_hevc.h`. Its own file because a second writer on `ffi.rs` (which the
+// H.264 rate-control change is editing) and on this one is what corrupted the tree earlier in this
+// session, and because declaring a record needs no `unsafe` and so does not belong in the FFI
+// module on its merits either. `hevc_abi`'s pins live inside it rather than in the shared
+// `abi_guard.rs`, for the same reason.
+mod hevc_enc;
 
 pub use decoder::{Timings, VaDecoder};
 // VP9: the state one decode carries across its frames, and the record one frame is submitted as.
