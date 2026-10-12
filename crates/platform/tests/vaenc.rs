@@ -261,11 +261,28 @@ fn what_the_export_gate_declines_and_why() {
     assert!(why.contains("4:2:0"), "and it says why: {why}");
 
     // The key-frame ceiling, which needs its own settings because it is a number.
+    //
+    // **Two assertions, because the ceiling moved and a test that only checked one of them would
+    // pass either way.** `MaxFrameNum` is 256 now (`vaapi::MAX_FRAME_NUM`), so:
+    //
+    // - **250 is taken.** This is the value the old ceiling refused — a preset asking for it was
+    //   declined outright — and asserting that it is now accepted is the regression test for the
+    //   width change itself. Before the change this exact `expect_err` is what the suite was
+    //   asserting; an `expect` here fails on the old code.
     let mut s = bitrate_settings(String::new());
     s.keyframe_distance = Some(250);
-    let why = vaapi_config_for(Format::H264, 640, 360, FrameRate::FPS_30, &s).expect_err("250 is past MaxFrameNum");
-    assert!(why.contains("250"), "the message names the interval asked for: {why}");
-    assert!(why.contains("16"), "and the ceiling it hit: {why}");
+    let taken = vaapi_config_for(Format::H264, 640, 360, FrameRate::FPS_30, &s).expect("250 is inside the 256-picture frame_num modulus");
+    assert_eq!(taken.3, 250, "and the caller's interval comes back unchanged rather than being shortened");
+    // - **And the ceiling above it still refuses**, with the number in the message. The refusal is
+    //   not deleted by raising the ceiling it refuses against: a `frame_num` field this wide cannot
+    //   number a longer run, and an export that asked for 300 and got 256 is a file a sixth larger
+    //   than it was promised. 300 is chosen for "past 256" and not for any particular reason; the
+    //   assertions are on the message naming both numbers.
+    let mut s = bitrate_settings(String::new());
+    s.keyframe_distance = Some(300);
+    let why = vaapi_config_for(Format::H264, 640, 360, FrameRate::FPS_30, &s).expect_err("300 is past MaxFrameNum");
+    assert!(why.contains("300"), "the message names the interval asked for: {why}");
+    assert!(why.contains("256"), "and the ceiling it hit: {why}");
 
     // A fractional frame rate is refused rather than rounded: `VAEncMiscParameterFrameRate` here
     // carries whole frames per second, so 30000/1001 is a rate this backend cannot state.
@@ -298,21 +315,45 @@ fn the_factory_is_registered_and_its_declines_are_counted() {
     assert!(filmcraft_export::encoder_registered(vaapi_encoder_factory), "the VA-API encoder factory is registered in front of the software encoders");
 
     // **A decline is still counted**, and it is still counted for a settings combination the gate
-    // refuses for a *documented* reason: FilmCraft's defaults ask for the High profile and a
-    // 60-picture key-frame interval, and this backend states Main and wraps at 16. The point of using
-    // those is that they are the defaults a user gets — the counters a user reads in `perf.stats` have
-    // to move for the declines they will actually hit.
+    // refuses for a *documented* reason: a two-pass H.264 export, which this backend submits one
+    // pass of. The point of using a settings combination is that it is one the counters a user
+    // reads in `perf.stats` have to move for.
+    //
+    // **This used to use FilmCraft's defaults and could not**: they ask for the High profile and a
+    // 60-picture key-frame interval, and at `MaxFrameNum` 16 *and* with `h264_profile` resolving to
+    // Main, both were reasons the gate declined them. The 60-picture interval is no longer a reason
+    // (the modulus is 256), and the profile resolves honestly, so the defaults are now **accepted**
+    // — which is asserted separately below, because that is the change this branch exists to make.
     let before = filmcraft_export::hw_encode_stats();
-    let settings = hw_settings(scratch("declined.mp4").to_string_lossy().to_string());
-    let got = vaapi_encoder_factory(Format::H264, 640, 360, FrameRate::FPS_30, &settings);
+    let mut declined = hw_settings(scratch("declined.mp4").to_string_lossy().to_string());
+    declined.h264_pass = H264Pass::First;
+    let got = vaapi_encoder_factory(Format::H264, 640, 360, FrameRate::FPS_30, &declined);
     let after = filmcraft_export::hw_encode_stats();
-    assert!(
-        got.is_none(),
-        "FilmCraft's default H.264 settings are declined: they ask for the High profile and a 60-picture GOP, and this backend states Main and wraps at 16"
-    );
+    assert!(got.is_none(), "a two-pass H.264 export is declined: this backend submits one pass, and the gate says so");
     assert_eq!(after.declined, before.declined + 1, "and the decline is counted for perf.stats");
     assert_eq!(after.sessions, before.sessions, "with no encoder created");
     assert_eq!(after.frames, before.frames, "and no picture encoded");
+
+    // **And FilmCraft's *default* H.264 settings are no longer a decline at all** — which is the
+    // claim `taken > 0` makes about presets and which this states for the defaults directly. They
+    // ask for the High profile (which resolves to Main, honestly) and a 60-picture key-frame
+    // interval, and 60 is inside the 256-picture modulus this encoder declares.
+    let defaults_before = filmcraft_export::hw_encode_stats();
+    let defaults = hw_settings(scratch("defaults.mp4").to_string_lossy().to_string());
+    match vaapi_encoder_factory(Format::H264, 640, 360, FrameRate::FPS_30, &defaults) {
+        Some(Ok(_)) => {}
+        Some(Err(why)) => panic!("FilmCraft's default H.264 settings are still declined by the factory: {why}"),
+        None => {
+            if open_display().is_err() {
+                eprintln!("SKIPPED: no VA-API display");
+                return;
+            }
+            panic!("the factory declined FilmCraft's own default H.264 settings, which vaapi_config_for now accepts");
+        }
+    }
+    let defaults_after = filmcraft_export::hw_encode_stats();
+    assert_eq!(defaults_after.sessions, defaults_before.sessions + 1, "and count a session rather than a decline");
+    assert_eq!(defaults_after.declined, defaults_before.declined, "with nothing declined");
 
     // **And the settings the gate *accepts* build a real encoder**, which is the whole point of the
     // change this test guards: before it, every settings object the gate accepted was one with no
@@ -331,9 +372,11 @@ fn the_factory_is_registered_and_its_declines_are_counted() {
     }
     // A session was counted for it — **asserted rather than assumed**, because the accept path and
     // the decline path increment different counters and a factory that took neither would still look
-    // right from the outside.
+    // right from the outside. **Measured from `defaults_after`, not from `after`**: the defaults
+    // accepted above already counted a session, so an offset taken before it would be wrong by one.
     let end = filmcraft_export::hw_encode_stats();
-    assert_eq!(end.sessions, after.sessions + 1, "an accepted export counts a hardware session for perf.stats");
+    assert_eq!(end.sessions, defaults_after.sessions + 1, "an accepted export counts a hardware session for perf.stats");
+    assert_eq!(end.declined, defaults_after.declined, "and no decline with it");
 }
 
 // ---------------------------------------------------------------------------

@@ -451,16 +451,21 @@ mod vaapi_export {
         if fps == 0 {
             return Err("a frame rate of 0 fps".into());
         }
-        // The key-frame interval, and **the ceiling the frame loop imposes**. `MaxFrameNum` is 16
-        // here (see `vaapi::MAX_FRAME_NUM`), so the loop inserts a key frame every 16 pictures
+        // The key-frame interval, and **the ceiling the frame loop imposes**. `MaxFrameNum` is 256
+        // here (see `vaapi::MAX_FRAME_NUM`), so the loop inserts a key frame every 256 pictures
         // whatever this is. That is not something to pass through silently: an export that asked
-        // for 250 and gets 16 has a file six times the size it was promised, and the only honest
+        // for 300 and gets 256 has a file a sixth larger than it was promised, and the only honest
         // answers are to tell the caller or to refuse. This refuses, with the number in the
         // message; the loop's own `key_frame_reason` is the safety net for the runs that do pass.
+        //
+        // **The refusal is still a refusal; the ceiling it names is now 256 rather than 16.** Every
+        // preset FilmCraft ships asks for at most 250, so this no longer declines an interval the
+        // settings state outright — what it still catches is an interval past what `frame_num` can
+        // number at all, which is a real limit and not one this gate invented.
         let gop = s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (f64::from(fps) * 2.0).round().max(1.0) as u32);
         if u64::from(gop) > u64::from(VaEncoder::max_frame_num()) {
             return Err(format!(
-                "a key frame every {gop} pictures: this encoder's MaxFrameNum is {} (frame_num is four bits wide), so it cannot \
+                "a key frame every {gop} pictures: this encoder's MaxFrameNum is {} (frame_num is eight bits wide), so it cannot \
                  reach that far without a key frame of its own",
                 VaEncoder::max_frame_num()
             ));

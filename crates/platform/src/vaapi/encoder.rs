@@ -34,22 +34,71 @@
 //!
 //! # The `frame_num` wrap, decided
 //!
-//! `seq_fields` writes `log2_max_frame_num_minus4 = 0`, so `MaxFrameNum` is 16 and `frame_num` is
-//! **four bits** while this module's counter is a `u16`. 7.4.3 then requires that no two pictures in
-//! the DPB share a `frame_num` (because `gaps_in_frame_num_value_allowed_flag` is written clear),
-//! so at picture 16 a wrapped picture collides with picture 0 — unless an IDR separates them.
+//! `seq_fields` writes `log2_max_frame_num_minus4 = 4`, so `MaxFrameNum` is 256 and `frame_num` is
+//! **eight bits** while this module's counter is a `u16`.
 //!
-//! **The decision: the picture that would wrap is an IDR.** Three alternatives were measured on
-//! iHD 26.3.5 rather than argued about, and this is the one that survives at every depth.
+//! **What the specification requires here, read from the clause rather than assumed.** 7.4.3
+//! constrains `frame_num` three ways, and the one that decides a long group of pictures is
+//! Equation 7-22:
+//!
+//! > There shall not be any previous field or frame in decoding order that is currently marked as
+//! > "used for short-term reference" that has a value of `frame_num` equal to any value taken on
+//! > by the variable `UnusedShortTermFrameNum` in the following:
+//! > `UnusedShortTermFrameNum = ( PrevRefFrameNum + 1 ) % MaxFrameNum`
+//! > `while( UnusedShortTermFrameNum != frame_num ) UnusedShortTermFrameNum = ( UnusedShortTermFrameNum + 1 ) % MaxFrameNum`
+//!
+//! **Equation 7-22 forbids a *skipped* frame number still sitting in the DPB — not a wrap.** At the
+//! wrap itself the loop body never runs, because `UnusedShortTermFrameNum` is initialised to
+//! `( PrevRefFrameNum + 1 ) % MaxFrameNum`, which **is** `frame_num`, so the `while` condition is
+//! false immediately and the set of "values taken on" is empty. A bitstream whose `frame_num` runs
+//! `…, 14, 15, 0, 1, …` is therefore conformant on this point, and 8.2.5.3's sliding-window marking
+//! removes the superseded picture without any `memory_management_control_operation` being asked
+//! for.
+//!
+//! Two further clauses point the same way, and together they say the specification does **not**
+//! require either candidate mechanism to make a long group of pictures legal:
+//!
+//! - 7.4.3: "If `gaps_in_frame_num_value_allowed_flag` is equal to 0, the value of `frame_num` for
+//!   the current picture **shall be equal to** `( PrevRefFrameNum + 1 ) % MaxFrameNum`." A wrap *is*
+//!   that value, so with the flag clear the wrap is the only conformant choice — the standard
+//!   mandates it rather than forbidding it.
+//! - 8.2.5.1 step 2: a non-IDR picture runs the **sliding-window** process of 8.2.5.3 (invoked
+//!   because this encoder never sets `adaptive_ref_pic_marking_mode_flag`), and its closing sentence
+//!   is what bounds the buffer: the number of pictures marked "used for reference" "shall not be
+//!   greater than `Max( num_ref_frames, 1 )`". **At `num_ref_frames = 1` — the depth this encoder
+//!   submits and the deepest it accepts — the DPB holds one reference, so no two pictures in it can
+//!   share a `frame_num` whatever the width.** That is why the unaccompanied wrap below measures
+//!   clean, and it is a property of the depth, not of the modulus.
+//!
+//! **So `memory_management_control_operation` is not what a long group of pictures needs, and on
+//! this ABI it cannot be asked for at all.** `VAEncSliceParameterBufferH264`
+//! (`/usr/include/va/va_enc_h264.h`) has **no `dec_ref_pic_marking` field and no
+//! `adaptive_ref_pic_marking_mode_flag`** — the record ends at `disable_deblocking_filter_idc`,
+//! `slice_alpha_c0_offset_div2`, `slice_beta_offset_div2` and `va_reserved`, which the header
+//! declares "Reserved bytes for future use, must be zero". libva's H.264 encoder takes its
+//! reference list from `RefPicList0`/`RefPicList1` and `VAEncPictureParameterBufferH264`'s
+//! `ReferenceFrames`, and marks references itself; there is no entry point by which a caller can
+//! hand it an MMCO to emit. Choosing the second candidate would mean writing into a reserved field
+//! a driver is told must be zero, and hoping — which is the one class of value this module refuses
+//! everywhere else.
+//!
+//! **What is therefore needed is the first candidate: a `log2_max_frame_num` wide enough to carry
+//! the group.** `MaxFrameNum` went 16 → 256 ([`MAX_FRAME_NUM`]), so the wrap this module inserts an
+//! IDR for lands 256 pictures out instead of 16, and every preset's group of pictures is carried by
+//! the counter on its own.
+//!
+//! **The IDR at the wrap is kept**, and it stays a *policy* rather than a codec requirement, now
+//! that the wrap is rare enough to be outside any group of pictures the caller asked for. Three
+//! alternatives were measured on iHD 26.3.5 rather than argued about:
 //!
 //! 1. **Do nothing** — let the wrap happen unaccompanied. Measured at the depth this module
 //!    submits (`refs = 1`): **40 pictures, a flat 9/255 mean absolute deviation on every one, and
-//!    not one ffmpeg diagnostic.** It works *at that depth*, and only because a one-reference DPB
-//!    holds one `frame_num` at a time. That is a property of a depth this module **refuses** for
-//!    producing wrong pictures ([`VaEncoder::new`]), not a property of H.264, so a loop built on it
-//!    would break the moment that refusal is lifted.
-//! 2. **Set `gaps_in_frame_num_value_allowed_flag`** — the syntax element that exists for exactly
-//!    this. Measured: it also produces a clean 40-picture stream. **Declined**, and the reason is
+//!    not one ffmpeg diagnostic.** It is conformant, as 7.4.3's Equation 7-22 shows, but it rests
+//!    on `num_ref_frames == 1`, which is a property of the depth this module **refuses to exceed**
+//!    ([`VaEncoder::new`]) rather than of H.264 — so a loop built on it would break the moment that
+//!    refusal is lifted.
+//! 2. **Set `gaps_in_frame_num_value_allowed_flag`** — the syntax element that exists for a genuine
+//!    *gap*. Measured: it also produces a clean 40-picture stream. **Declined**, and the reason is
 //!    who has to understand it: the flag tells a decoder that `frame_num` may skip, so every
 //!    consumer must treat the numbering as unreliable rather than as a count. A decode-skip
 //!    consumer is exactly what this milestone's verification is, and the cost of the flag is paid
@@ -61,8 +110,10 @@
 //!
 //! The cost is a key frame the caller did not ask for at a position they did not choose, which is
 //! why it is **reported** on [`EncodedPicture::key_frame_reason`] rather than hidden: a caller that
-//! asked for a 24-picture GOP and got a key frame at picture 16 has been given something it did
-//! not ask for and is entitled to know. [`VaEncoder::key_frame_due`] is the single place that
+//! asked for a 300-picture GOP and got a key frame at picture 256 has been given something it did
+//! not ask for and is entitled to know. At the width this module now writes that needs a stream
+//! past 256 pictures to happen at all, which is the second reason the width was measured rather
+//! than picked — see [`MAX_FRAME_NUM`]. [`VaEncoder::key_frame_due`] is the single place that
 //! decides, and a caller-requested key frame and a codec-required one are combined there rather
 //! than in two places that could disagree.
 //!
@@ -430,29 +481,107 @@ impl Current {
 /// that fails at `vaEndPicture` with nothing naming the cause.
 pub const MAX_REFERENCES: u32 = 16;
 
-/// **`MaxFrameNum` for this encoder, which is 16 — four bits of `frame_num`.**
+/// **`MaxFrameNum` for this encoder, which is 256 — eight bits of `frame_num`.**
 ///
-/// [`sequence_record`] writes `log2_max_frame_num_minus4 = 0` and this is the modulus it implies
-/// (7.4.3: `frame_num` is `u(v)` with `v = log2_max_frame_num`, so `MaxFrameNum = 1 << v`). It is a
-/// named constant rather than a number typed where it is used because **the whole frame loop turns on
-/// it**: a picture whose `frame_num` would wrap is a key frame, and a hardcoded `16` in three places
-/// is three chances for the record and the loop to disagree.
+/// [`sequence_record`] writes `log2_max_frame_num_minus4 = 4` and this is the modulus it implies
+/// (7.3.2.1.1: `MaxFrameNum = 2 ^ ( log2_max_frame_num_minus4 + 4 )`, and 7.4.3: `frame_num` is
+/// `u(v)` with `v = log2_max_frame_num`). It is a named constant rather than a number typed where
+/// it is used because **the whole frame loop turns on it**: a picture whose `frame_num` would wrap
+/// is a key frame, and a hardcoded number in three places is three chances for the record and the
+/// loop to disagree.
 ///
-/// **Why it is not simply made bigger, now measured rather than assumed.** `log2_max_frame_num_minus4`
-/// is a `u4`, so a wider modulus is available, and on this driver it works: writing
-/// `log2_max_frame_num_minus4 = 4` (so `MaxFrameNum = 256`) produced a stream in which ffmpeg and
-/// `trace_headers` both read **eight-bit** `frame_num` and `pic_order_cnt_lsb` values, across two
-/// GOPs and 40 pictures. So this is not a driver limitation.
+/// **Why it is 256, which is the same question as what the specification requires** — the module
+/// note, "The `frame_num` wrap, decided", carries the clause text. In short: 7.4.3's Equation 7-22
+/// forbids a *skipped* frame number still marked "used for short-term reference", and at a wrap the
+/// loop that generates that set never runs, so a wrap is conformant and **no
+/// `memory_management_control_operation` is required**. 7.4.3 further says that with
+/// `gaps_in_frame_num_value_allowed_flag` clear `frame_num` **shall be equal to**
+/// `( PrevRefFrameNum + 1 ) % MaxFrameNum` — the wrap is the value the standard *requires*, not one
+/// it forbids. What limits the group of pictures is therefore the **width**, and 8.2.5.1's closing
+/// sentence bounds the DPB at `Max( num_ref_frames, 1 )` pictures, which at the one-reference depth
+/// this module submits is one — so the width, not the reference marking, is what has to grow.
 ///
-/// It is declined for a reason a measurement cannot settle: a wider modulus pushes the wrap further
-/// out but never removes it, because 7.4.3 still forbids two DPB pictures sharing a `frame_num` — at
-/// [`MAX_REFERENCES`] the buffer holds every frame number at once whatever the width. And the width
-/// is not free of a second cost: the forced key frame's position moves from a constant 16 to a
-/// constant 256, so the *policy* this number encodes — "a key frame at least every sixteen pictures"
-/// — is a decision about seeking and file size, not a fact about H.264. Sixteen is kept because the
-/// measurement behind it is a 40-picture run; a wider modulus deserves a run longer than the modulus.
-/// See the module note, "The `frame_num` wrap, decided".
-pub const MAX_FRAME_NUM: u32 = 16;
+/// **256 rather than the 16 this was, and the measurement behind it.** 16 was four bits, which put
+/// the IDR this loop inserts for the wrap at every sixteenth picture — so a preset asking for a
+/// sixty-picture group could not be given one, and the export gate
+/// ([`crate::hardware_encode::vaapi_config_for`]) refused every such preset with the measurement to
+/// hand. `log2_max_frame_num_minus4` is a `u4` (`va_enc_h264.h`, the `seq_fields` bitfield), so
+/// 256 is reachable and **the driver takes it**: on iHD 26.3.5 / libva 1.24, writing
+/// `log2_max_frame_num_minus4 = 4` produced a stream in which ffmpeg and `trace_headers` both read
+/// **eight-bit** `frame_num` values across two group-of-pictures boundaries and 40 pictures, with no
+/// diagnostic. That run predates this change, so it is re-taken at the new width by
+/// `a_run_longer_than_the_modulus_never_wraps` — which is what the old constant's own note said a
+/// wider modulus deserved and did not have.
+///
+/// **Why the ceiling is 256 and not the `u4`'s limit of 2^19.** A wider `frame_num` costs nothing
+/// in the stream, but a wider modulus is a *promise about seeking*: the IDR this loop inserts for
+/// the wrap is the furthest back a decoder can be dropped without re-decoding from the last one, and
+/// a real encoder still asks for its own key frames well inside 256. So this is a policy number —
+/// "no more than 256 pictures between the ones this loop guarantees" — and it is checked against the
+/// settings the caller actually gave rather than inferred from the field's range.
+///
+/// **A caller whose own interval is longer is refused, not silently shortened**:
+/// [`crate::hardware_encode::vaapi_config_for`] declines with this number in the message, because an
+/// export that asked for 300 and got 256 is a file a sixth larger than it was promised.
+///
+/// **This is the one number, and the record's field is computed from it** — see
+/// [`LOG2_MAX_FRAME_NUM_MINUS4`], which is the only place the width is written and which cannot
+/// disagree with this modulus because it is defined in terms of it.
+pub const MAX_FRAME_NUM: u32 = 256;
+
+/// [`MAX_FRAME_NUM`] as the `u4` the sequence record carries it in.
+///
+/// 7.3.2.1.1 defines `MaxFrameNum = 2 ^ ( log2_max_frame_num_minus4 + 4 )`, so the record's four-bit
+/// field holds `log2_max_frame_num - 4` and not the modulus itself.
+///
+/// **Derived from [`MAX_FRAME_NUM`] by leading zeros rather than written as the literal `4`**, and
+/// this is the point of the change rather than tidiness: the width in `seq_fields` and the modulus
+/// [`VaEncoder::key_frame_due`] compares the counter against are two claims about one number, and a
+/// `4` typed next to a `256` is two numbers that can drift with nothing to notice. A one followed by
+/// trailing zeros is a **compile-time** dependency — writing [`MAX_FRAME_NUM`] as `16` again makes
+/// this `0` and the sequence record four bits wide without a single line changing, and
+/// `the_sequence_records_frame_num_width_is_the_one_the_loop_uses` is what would say so.
+///
+/// `u32::BITS - 1 - leading_zeros()` is `log2` of the modulus — 8 for 256 — and the field carries
+/// `log2 - 4`, so the `- 4` below is the subtraction 7.3.2.1.1's `MaxFrameNum = 2 ^ (
+/// log2_max_frame_num_minus4 + 4 )` undoes. **`the_sequence_records_frame_num_width_is_the_one_the_loop_uses`
+/// is what caught the first version of this expression**, which kept the `log2` and wrote 8 into a
+/// four-bit field's place: `MaxFrameNum` came out as 4096 while the loop keyed at 256, the record
+/// still built, and nothing else in the crate objected. That is the whole reason the assertion is a
+/// re-derivation of the modulus rather than a comparison against the constant that produced it.
+const LOG2_MAX_FRAME_NUM_MINUS4: u32 = (u32::BITS - 1 - MAX_FRAME_NUM.leading_zeros()) - 4;
+
+/// **`MaxPicOrderCntLsb` for this encoder, which is 16 — four bits of `pic_order_cnt_lsb`.**
+///
+/// 7.3.2.1.1: `MaxPicOrderCntLsb = 2 ^ ( log2_max_pic_order_cnt_lsb_minus4 + 4 )`, and
+/// `sequence_record` writes `log2_max_pic_order_cnt_lsb_minus4 = 0`.
+///
+/// **It stays at 16 while [`MAX_FRAME_NUM`] went to 256, and that is a decision rather than an
+/// oversight.** `pic_order_cnt_lsb` carries the picture order count, which under
+/// `pic_order_cnt_type == 0` is derived by 8.2.1.1's Equation 8-3 from the previous reference
+/// picture's count and this one — and that equation is *written for* the wrap: it compares the two
+/// least-significant halves against `MaxPicOrderCntLsb / 2` and adds or subtracts a whole
+/// `MaxPicOrderCntLsb` when the difference says the count went backwards or forwards past the
+/// midpoint. A 16-picture order count therefore reconstructs across its own wrap with no help.
+///
+/// The order count is also reset by every IDR (8.2.1.1 infers 0), so it only ever has to span one
+/// key-frame interval — and it is this encoder's key frames, not its `frame_num`, that decide where
+/// a reset lands.
+///
+/// **Widening it anyway would not be wrong, only unmeasured.** It would move the point at which
+/// 8.2.1.1's reconstruction has to do arithmetic rather than copy the count across, so the change
+/// that makes the order count *easier* is the one this module does not need and cannot yet justify.
+/// The two widths being different numbers is asserted in
+/// [`check_output_matches_the_sets`], because a stream in which they had silently drifted back
+/// together would still decode — which is exactly why it needs saying.
+const MAX_PIC_ORDER_CNT_LSB: u32 = 16;
+
+/// [`MAX_PIC_ORDER_CNT_LSB`] as the `u4` the sequence record carries it in: `log2_max_frame_num`
+/// is 8 for a modulus of 256, and the same subtraction gives the order count's field. Written as a
+/// subtraction from the same `log2` [`LOG2_MAX_FRAME_NUM_MINUS4`] uses, so that the two widths in
+/// `seq_fields` are visibly different numbers derived the same way — which is the claim the sequence
+/// record makes and [`check_output_matches_the_sets`] asserts against the parsed sets.
+const LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4: u32 = (u32::BITS - 1 - MAX_PIC_ORDER_CNT_LSB.leading_zeros()) - 4;
 
 /// The value [`VaEncoder::keyframe_interval`] holds before a caller has said what it is.
 ///
@@ -627,14 +756,18 @@ pub enum KeyFrameReason {
     NoReference,
     /// The picture's `frame_num` would have been `MaxFrameNum`, which the field cannot hold.
     ///
-    /// **`frame_num` is four bits wide here**, because `sequence_record` writes
-    /// `log2_max_frame_num_minus4 = 0`, so the wrap comes every 16 pictures — and the IDR lands on the
+    /// **`frame_num` is eight bits wide here**, because `sequence_record` writes
+    /// `log2_max_frame_num_minus4 = 4`, so the wrap comes every 256 pictures — and the IDR lands on the
     /// modulus itself rather than one picture early, so a run carries every number in
-    /// `0..MaxFrameNum` exactly once. The module note, "The `frame_num` wrap, decided", carries the
-    /// three alternatives and the measurements that chose this one: a wider modulus was measured to
-    /// be honoured by the driver but does not remove the collision, and
-    /// `gaps_in_frame_num_value_allowed_flag` was measured to work but pushes the cost onto every
-    /// reader of the file.
+    /// `0..MaxFrameNum` exactly once.
+    ///
+    /// **This is a policy, not a codec requirement, and the module note says so with the clause.**
+    /// 7.4.3's Equation 7-22 forbids a *skipped* frame number still marked "used for short-term
+    /// reference", and at a wrap the set of skipped numbers is empty, so the wrap is conformant
+    /// without an MMCO — which this ABI cannot ask for anyway, since
+    /// `VAEncSliceParameterBufferH264` carries no `dec_ref_pic_marking` field at all. The IDR is kept
+    /// so the wrap is accompanied by construction at any reference depth, and it is **reported**
+    /// rather than hidden precisely because it is not something the caller asked for.
     FrameNumWrap,
 }
 
@@ -663,10 +796,12 @@ pub struct VaEncoder {
     /// the caller never asked for could be written.
     width_mbs: u16,
     height_mbs: u16,
-    /// `MaxFrameNum`, which is `1 << log2_max_frame_num` and is **four bits wide for this
-    /// encoder** — see the module note, "The `frame_num` wrap, decided". Held rather than recomputed
-    /// because it is what [`VaEncoder::key_frame_due`] compares against and the alternative is a
-    /// shift of a field read back out of a byte buffer.
+    /// `MaxFrameNum`, which is `2 ^ log2_max_frame_num` and is **eight bits wide for this
+    /// encoder** — see the module note, "The `frame_num` wrap, decided", for what the
+    /// specification requires and why the width rather than a reference-marking command is the thing
+    /// that carries a long group of pictures. Held rather than recomputed because it is what
+    /// [`VaEncoder::key_frame_due`] compares against and the alternative is a shift of a field read
+    /// back out of a byte buffer.
     max_frame_num: u32,
     /// The frame number of the next picture, which increments per picture and wraps at
     /// `2^log2_max_frame_num`. **A counter, not state**: H.264's frame number is a function of the
@@ -2087,10 +2222,22 @@ fn check_output_matches_the_sets(
         // softening — it is the definition.** `frame_num` is `u(v)` with `v = log2_max_frame_num`
         // (7.4.3) and `pic_order_cnt_lsb` is `u(v)` with `v = log2_max_pic_order_cnt_lsb_minus4
         // + 4` (7.4.3.1), so a driver can only write `frame_num mod MaxFrameNum` and `poc mod
-        // MaxPicOrderCntLsb`. This encoder declares `log2_max_frame_num_minus4 = 0` and
-        // `log2_max_pic_order_cnt_lsb_minus4 = 0`, so **both fields are four bits and both wrap
-        // every 16 pictures**, while `self.frame_num` and `self.poc` are `u16` counters that wrap
-        // at 65536.
+        // MaxPicOrderCntLsb`. **The two widths are deliberately different now**: this encoder
+        // declares `log2_max_frame_num_minus4 = 4` (so `MaxFrameNum` is 256 and `frame_num` is
+        // eight bits) and `log2_max_pic_order_cnt_lsb_minus4 = 0` (so `MaxPicOrderCntLsb` is 16 and
+        // `pic_order_cnt_lsb` is four bits), while `self.frame_num` and `self.poc` are `u16` counters
+        // that wrap at 65536.
+        //
+        // **That difference is the point of the change, and this comparison is what proves the
+        // driver honoured it.** Before, both fields were four bits and both wrapped at the same
+        // picture, so a driver that silently kept the *old* width would have produced a stream this
+        // check still accepted — `frame_num` read as four bits where eight were written gives a
+        // number that is wrong but not wrapped, and the modulo at `MaxFrameNum = 256` would then
+        // compare a small number against a large one and catch it. So the check is what stands
+        // between "the driver took `log2_max_frame_num_minus4 = 4`" and "the record says 4 but the
+        // bitstream does not", and it is why the SPS cross-check in `super::params` compares
+        // `log2_max_frame_num` against the *record* while this compares the *bitstream* against the
+        // *parsed SPS*: two different claims, and only the second says what was encoded.
         //
         // Comparing the two directly — which is what this did until a 20-picture run caught it —
         // refuses picture 16 of every export with "log2_max_frame_num is not what the driver
@@ -2100,20 +2247,68 @@ fn check_output_matches_the_sets(
         // rather than a wrapped one.
         //
         // **The other half of the wrap is not this function's to check, and is stated here so
-        // nobody assumes it is covered.** `gaps_in_frame_num_value_allowed_flag` is written clear,
-        // so 7.4.3 requires that no two pictures in the DPB share a `frame_num` unless an IDR
-        // separates them. That is a property of *which pictures this loop made key frames*, decided
-        // in [`VaEncoder::key_frame_due`] — where the wrap is accompanied by an IDR — and not of
-        // anything the bitstream says back. What the bitstream does say is the width, and that is
-        // what the comparison below uses.
+        // nobody assumes it is covered.** 7.4.3's Equation 7-22 forbids a *skipped* frame number
+        // still marked "used for short-term reference", and 8.2.5.1's closing sentence bounds that
+        // count at `Max( num_ref_frames, 1 )`. Whether a wrap is accompanied by an IDR is a property
+        // of *which pictures this loop made key frames*, decided in [`VaEncoder::key_frame_due`],
+        // and not of anything the bitstream says back. What the bitstream does say is the width, and
+        // that is what the comparison below uses.
         //
-        // It was **measured** that the unaccompanied wrap is harmless at the only depth this module
-        // submits: with the wrap IDR removed, 40 pictures decoded with a flat 9/255 mean absolute
-        // deviation and no ffmpeg diagnostic. The IDR is kept anyway, because that correctness is a
-        // property of a one-reference DPB — a depth this module **refuses** for producing wrong
-        // pictures ([`VaEncoder::new`]) — and not a property of H.264. The module note, "The
-        // `frame_num` wrap, decided", carries the alternatives.
+        // **A reference-marking command is deliberately absent from this list**, and the absence is
+        // a measured ABI fact rather than an oversight: `VAEncSliceParameterBufferH264` has no
+        // `dec_ref_pic_marking` field and no `adaptive_ref_pic_marking_mode_flag` (see the module
+        // note), so there is nothing a caller could ask the driver to emit, and nothing to compare
+        // against. If a future libva grows the field, this is where its `mmcos` would be compared
+        // against what this loop intended — and the check would have to compare it against the
+        // *bitstream*, not against our own record, for the reason the profile check in
+        // `super::params` records.
         let max_frame_num = max_width(sps.log2_max_frame_num, "log2_max_frame_num")?;
+        let max_poc_lsb = max_width(sps.log2_max_poc_lsb, "log2_max_pic_order_cnt_lsb_minus4")?;
+        // **The frame-number width the bitstream declares must be the width this loop's counter is
+        // numbered against, and this is the assertion that says so.**
+        //
+        // The comparisons below take `header.frame_num` against `current.frame_num` **modulo
+        // `max_frame_num`**, and that modulo is correct on its own terms. It is also why it is not
+        // sufficient on its own: if the driver had quietly kept the old four-bit width while our
+        // derived SPS said eight, the parsed slice would be read at eight bits and the comparison
+        // would refuse — but only from picture 16 onwards. A stream that never reached 16 would
+        // pass, and the whole claim "a preset asking for a sixty-picture group now gets one" rests
+        // on exactly the runs that *do* exceed 16.
+        //
+        // **This is the check that closes that**, and it is a check on the *declared* width against
+        // [`MAX_FRAME_NUM`], not a re-parse: `log2_max_frame_num` in an already-parsed parameter set
+        // is a direct statement of how wide the `frame_num` field in every slice of the stream is,
+        // and this module's loop makes a key-frame decision at exactly that modulus. A stream whose
+        // sets say 16 while the loop keys at 256 is a stream whose key frames are not where the gate
+        // promised — so it is refused here, on the first picture, rather than discovered later as a
+        // file nobody can seek into.
+        //
+        // **This runs on either provenance.** A driver-written set disagreeing with the record we
+        // submitted is caught by `super::params::cross_check`; this catches what `cross_check`
+        // cannot see, which is the derived path where the sets are ours and therefore agree with the
+        // record by construction — and where a `LOG2_MAX_FRAME_NUM_MINUS4` that had drifted from
+        // `MAX_FRAME_NUM` would produce a stream that is *internally consistent and still wrong*,
+        // the worst of the three outcomes.
+        if max_frame_num != MAX_FRAME_NUM {
+            return Err(format!(
+                "the parameter sets this encoder hands the muxer declare log2_max_frame_num {}, so frame_num is {} bits wide and wraps every {max_frame_num} pictures, but this encoder's frame loop \
+                 decides its key frames against MaxFrameNum {MAX_FRAME_NUM} — so the key frames in the stream would not be the ones this encoder said they were",
+                sps.log2_max_frame_num, sps.log2_max_frame_num
+            ));
+        }
+        // **And the same for the picture order count**, which is the other width a slice header is
+        // read at. `sequence_record` writes `log2_max_pic_order_cnt_lsb_minus4 = 0`, so
+        // `MaxPicOrderCntLsb` is 16 while `MaxFrameNum` is 256 — the two are *deliberately*
+        // different, and this is where that is asserted rather than left to a comment. If the two
+        // widths drifted together again the stream would still decode, which is why this is a
+        // positive statement about this modulus and not merely "the two agree".
+        if max_poc_lsb != MAX_PIC_ORDER_CNT_LSB {
+            return Err(format!(
+                "the parameter sets this encoder hands the muxer declare log2_max_pic_order_cnt_lsb_minus4 {}, so pic_order_cnt_lsb is {} bits wide and wraps every {max_poc_lsb} pictures, which is not the \
+                 {MAX_PIC_ORDER_CNT_LSB} this encoder writes in its sequence record",
+                sps.log2_max_poc_lsb, sps.log2_max_poc_lsb
+            ));
+        }
         let max_poc_lsb = max_width(sps.log2_max_poc_lsb, "log2_max_pic_order_cnt_lsb_minus4")?;
         if header.frame_num != u32::from(current.frame_num) % max_frame_num {
             return Err(format!(
@@ -2365,11 +2560,17 @@ fn sequence_record(
         //   3   mb_adaptive_frame_field_flag  = 0
         //   4   seq_scaling_matrix_present_flag = 0
         //   5   direct_8x8_inference_flag     = 1
-        //   6-9 log2_max_frame_num_minus4    = 0
+        //   6-9 log2_max_frame_num_minus4    = LOG2_MAX_FRAME_NUM_MINUS4 (so MaxFrameNum 256)
         //   10-11 pic_order_cnt_type         = 0
-        //   12-15 log2_max_pic_order_cnt_lsb_minus4 = 0
+        //   12-15 log2_max_pic_order_cnt_lsb_minus4 = 0 (so MaxPicOrderCntLsb 16)
         //   16  delta_pic_order_always_zero_flag = 1
-        seq_fields: (1 << 0) | (1 << 2) | (1 << 5) | (1 << 16),
+        //
+        // **Bits 6-9 are the one field here that a caller's group-of-pictures length rides on**, and
+        // it is written from the constant rather than as a literal for the reason
+        // [`LOG2_MAX_FRAME_NUM_MINUS4`] gives. What the driver does with it is measured: with 4
+        // here, ffmpeg and `trace_headers` read eight-bit `frame_num` values out of the slices this
+        // module gets back. See the module note, "The `frame_num` wrap, decided".
+        seq_fields: (1 << 0) | (1 << 2) | (1 << 5) | (LOG2_MAX_FRAME_NUM_MINUS4 << 6) | (LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4 << 12) | (1 << 16),
         bit_depth_luma_minus8: 0,
         bit_depth_chroma_minus8: 0,
         num_ref_frames_in_pic_order_cnt_cycle: 0,
@@ -2982,6 +3183,7 @@ pub fn macroblocks_of(coded: (u32, u32)) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vaapi::params;
     use std::mem::{offset_of, size_of};
 
     /// The encode records, as libva 1.24's headers on this machine declare them. A record whose
@@ -3157,6 +3359,56 @@ mod tests {
         // The bitrate is nonzero under RC_CQP: iHD rejects a zero, and a zero would also be the
         // "no bitrate" a reader could mistake for a default target.
         assert_ne!(record.bits_per_second, 0);
+    }
+
+    /// The frame-number width in the sequence record is the one the frame loop keys against, and the
+    /// two order-count widths are deliberately different from it.
+    ///
+    /// This is the record-level half of a check that also runs against the bitstream (see
+    /// [`check_output_matches_the_sets`]): the record says what we asked for, the parsed parameter
+    /// sets say what a decoder will read, and nothing should be able to make those disagree while
+    /// still producing a stream that decodes.
+    #[test]
+    fn the_sequence_records_frame_num_width_is_the_one_the_loop_uses() {
+        let bytes = sequence_record((640, 368), (0, 0, 0, 4), 40, 23, 1, 0).expect("a 640x368 sequence record");
+        let record = read::<ffi::VaEncSequenceParameterBufferH264>(&bytes).expect("the record reads back");
+        // Bits 6-9, read back out of the record rather than off the constant.
+        let minus4 = (record.seq_fields >> 6) & 0xf;
+        assert_eq!(minus4, LOG2_MAX_FRAME_NUM_MINUS4, "log2_max_frame_num_minus4");
+        // 7.3.2.1.1: MaxFrameNum = 2 ^ (log2_max_frame_num_minus4 + 4). **This is the assertion that
+        // would fail if `MAX_FRAME_NUM` were lowered back to 16** — the record would still build,
+        // still be accepted by the driver, and still produce a decodable stream, just one whose key
+        // frames are not where this module says they are.
+        assert_eq!(1u32 << (minus4 + 4), MAX_FRAME_NUM, "the record's width is the modulus the frame loop keys against");
+        // And the picture order count is deliberately **not** the same width.
+        let poc_minus4 = (record.seq_fields >> 12) & 0xf;
+        assert_eq!(1u32 << (poc_minus4 + 4), MAX_PIC_ORDER_CNT_LSB, "MaxPicOrderCntLsb is what this encoder writes");
+        assert_ne!(
+            MAX_PIC_ORDER_CNT_LSB, MAX_FRAME_NUM,
+            "the two widths are deliberately different: the order count wraps on its own modulus, which is 8.2.1.1's Equation 8-3 written for"
+        );
+    }
+
+    /// The derived parameter sets declare the widths this module decided on, read back through the
+    /// parser a decoder would use rather than compared as bytes.
+    ///
+    /// Hardware-independent: it builds the sets and parses them, which is the whole point — the
+    /// widths are what a decoder reads the slice header at, so a width wrong here is a stream whose
+    /// slices are misparsed rather than one that fails to build.
+    #[test]
+    fn the_derived_sets_declare_the_widths_this_encoder_decided_on() {
+        let sequence = read::<ffi::VaEncSequenceParameterBufferH264>(&sequence_record((640, 368), (0, 0, 0, 4), 40, 23, 1, 0).expect("a sequence record"))
+            .expect("the record reads back");
+        let picture = read::<ffi::VaEncPictureParameterBufferH264>(
+            &picture_record(&Current { surface: 1, frame_idx: 0, frame_num: 7, poc: 7, is_reference: true }, 40, 0, 920, &[], 26, false, false, 11)
+                .expect("a P picture record"),
+        )
+        .expect("the record reads back");
+        let sets = params::parameter_sets(&sequence, &picture).expect("the derived parameter sets build and verify");
+        let sps = filmcraft_h264::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(&sets[5..])).expect("the derived SPS parses");
+        assert_eq!(sps.log2_max_frame_num, 8, "and declares the eight-bit frame_num this module keys against");
+        assert_eq!(sps.max_frame_num(), MAX_FRAME_NUM, "which is the modulus the frame loop uses");
+        assert_eq!(sps.log2_max_poc_lsb, 4, "the picture order count keeps its own four-bit width");
     }
 
     /// The same for the picture record: the key-frame bit and the QP, read back out.
@@ -3956,19 +4208,26 @@ fn b_pictures_are_refused_at_construction_with_the_measurement() {
 /// Three claims, and they are different from each other:
 ///
 /// 1. **The wrap is accompanied.** A picture whose `frame_num` would be `MaxFrameNum` — which the
-///    four-bit field cannot hold — is an IDR, so 7.4.3 infers its `frame_num` to 0 and 7.4.3.3 empties
-///    the decoded picture buffer: no two pictures in the buffer share a `frame_num`. This is checked
-///    on the pictures themselves rather than on the decision function alone, because a predicate that
-///    says the right thing while the loop ignores it is the shape of bug this module exists to
-///    prevent.
+///    eight-bit field cannot hold — is an IDR, so 7.4.3 infers its `frame_num` to 0 and 7.4.3.3 empties
+///    the decoded picture buffer. This is checked on the pictures themselves rather than on the
+///    decision function alone, because a predicate that says the right thing while the loop ignores it
+///    is the shape of bug this module exists to prevent.
 /// 2. **The IDR is written with `frame_num` 0**, which is what 7.4.3 infers and what the earlier
 ///    version of this loop did *not* do. Reading it back out of the driver's own bytes is the check;
 ///    see the module note for the ffmpeg diagnostic that a mid-stream IDR carrying the counter's
 ///    value provokes.
-/// 3. **It is reported.** A caller that asked for no key frames and got one at picture 16 of a run
-///    has been given something it did not ask for, and [`EncodedPicture::key_frame_reason`] is how it
-///    finds out. A forced key frame that was invisible would be a default, which is the thing this
-///    module refuses to do everywhere else.
+/// 3. **It is reported.** A caller that asked for no key frames and got one mid-run has been given
+///    something it did not ask for, and [`EncodedPicture::key_frame_reason`] is how it finds out. A
+///    forced key frame that was invisible would be a default, which is the thing this module refuses
+///    to do everywhere else.
+///
+/// **The run is longer than the modulus, and that is the point of it.** At `MaxFrameNum` 16 this
+/// test's 20 pictures carried a wrap and a second one; at 256 a 20-picture run carries none, so the
+/// old run would have passed vacuously — it would have asserted about a wrap that never happened.
+/// [`MAX_FRAME_NUM`]'s own note said a wider modulus "deserves a run longer than the modulus", and
+/// this is that run: 260 pictures at 640x360, which crosses the wrap at 256 and carries on past it.
+/// Whether 256 is the right ceiling is a policy question answered in the export gate; this test
+/// answers only whether the encoder does what the gate promises when the interval reaches it.
 #[test]
 fn the_frame_num_wrap_is_an_idr_and_the_caller_is_told() {
     let Ok(api) = super::open_display() else {
@@ -3980,12 +4239,13 @@ fn the_frame_num_wrap_is_an_idr_and_the_caller_is_told() {
     let mut encoder = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
     encoder.at_rate(30).expect("30 fps is a legal frame rate");
     encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
-    encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
     let mut wraps = 0usize;
     let mut forced_others = Vec::new();
     let mut previous_was_key = false;
-    // Past the wrap, with room for two of them: 20 pictures carry one at 16 and start a second at 17.
-    for index in 0..20u32 {
+    // Past the wrap at `MAX_FRAME_NUM`, with room to see the run continue past it: the modulus is 256,
+    // so this carries 260 pictures and the wrap lands on picture 256.
+    let pictures = MAX_FRAME_NUM + 4;
+    for index in 0..pictures {
         let (luma, chroma) = ramp_shifted(640, 360, 8 * index).expect("the ramp is buildable");
         encoder.upload(&luma, &chroma).expect("the ramp uploads");
         let picture =
@@ -4018,7 +4278,10 @@ fn the_frame_num_wrap_is_an_idr_and_the_caller_is_told() {
         previous_was_key = picture.key_frame;
     }
     assert!(forced_others.is_empty(), "the only key frames beyond the first are the wraps, but {forced_others:?} were key frames for another reason");
-    assert!(wraps >= 1, "a 20-picture run at MaxFrameNum {MAX_FRAME_NUM} must contain at least one wrap, and contained none — so nothing was tested");
+    // **Exactly one wrap in `MAX_FRAME_NUM + 4` pictures**, not merely at least one: a modulus this
+    // wide is only worth having if the wrap lands where the gate says it does, and "at least one"
+    // would be satisfied by a loop that keyed a frame on every picture.
+    assert_eq!(wraps, 1, "a {pictures}-picture run at MaxFrameNum {MAX_FRAME_NUM} must contain exactly one wrap, at picture {MAX_FRAME_NUM}");
 }
 
 /// **A picture order count that never goes backwards, and a key frame that carries 0.**
@@ -4061,27 +4324,39 @@ fn picture_order_counts_advance_by_one_and_reset_only_with_the_key_frame() {
                 // signature of a picture missing from the display order — which is the claim the
                 // B-picture note rests on, so it is checked as arithmetic rather than as a guess.
                 //
-                // `MAX_FRAME_NUM` is the right modulus here because both widths are four bits:
-                // `sequence_record` writes `log2_max_frame_num_minus4` **and**
-                // `log2_max_pic_order_cnt_lsb_minus4` as 0, so `MaxPicOrderCntLsb` is 16 as
-                // `MaxFrameNum` is. **The modulo never fires in this run** — the key frame at
-                // picture 16 resets the count before it could reach 16 — which is the point of the
-                // wrap decision, and it is stated rather than left as arithmetic that might.
+                // **`picture.poc` is the counter, not the field, and it does not wrap.** It is a
+                // `u16` that runs the whole sequence; what wraps is the `u(log2_max_pic_order_cnt_lsb)`
+                // `pic_order_cnt_lsb` the driver writes into the slice header, and that is the value
+                // `check_output_matches_the_sets` compares modulo `MaxPicOrderCntLsb`. **The two
+                // being different is exactly what a `MaxFrameNum` of 256 beside a
+                // `MaxPicOrderCntLsb` of 16 makes visible**, and conflating them is the mistake this
+                // assertion was rewritten to remove — an earlier version compared the counter against
+                // `MAX_FRAME_NUM` and passed only because a key frame at picture 16 reset both at
+                // once, so the modulo never fired and the modulus was never really used.
                 assert_eq!(
                     u32::from(picture.poc),
-                    (u32::from(before) + 1) % MAX_FRAME_NUM,
-                    "picture {index}'s picture order count is one past picture {}'s, modulo MaxPicOrderCntLsb",
+                    u32::from(before) + 1,
+                    "picture {index}'s picture order count is exactly one past picture {}'s, as a counter with no modulus of its own",
                     index - 1
                 );
+                // **And the number that goes into the slice header wraps where the count says it
+                // does.** At picture 16 the counter is 16 and the field is 0: 8.2.1.1's Equation 8-3
+                // reconstructs the full count from that wrap, which is what makes a 16-wide order
+                // count legitimate under a 256-wide `frame_num`.
+                if u32::from(picture.poc) == MAX_PIC_ORDER_CNT_LSB {
+                    assert_eq!(u32::from(picture.poc) % MAX_PIC_ORDER_CNT_LSB, 0, "picture {index} is where pic_order_cnt_lsb wraps to 0 in the bitstream");
+                }
             }
         }
         previous = Some((picture.poc, picture.key_frame));
     }
-    // **A number rather than a feeling.** The run is 20 pictures at `MaxFrameNum` 16: picture 0 is
-    // the IDR at count 0, pictures 1..=15 carry 1..=15, picture 16 is the wrap IDR at 0 again, and
-    // pictures 17, 18, 19 carry 1, 2, 3. Anything else means the count did not reset *with* the
-    // key frame, and this assertion is what says so rather than leaving it to the loop above.
-    assert_eq!(previous.map(|(poc, _)| poc), Some(3), "after a wrap at picture 16 the count restarts and three more pictures land on 3");
+    // **A number rather than a feeling.** The run is 20 pictures: picture 0 is the IDR at count 0,
+    // pictures 1..=15 carry 1..=15, picture 16 carries **16 as a counter and 0 as a field** — the
+    // `MaxPicOrderCntLsb` wrap on a plain P picture, not a key frame, which is the width change at
+    // work: the loop's own key frame for the `frame_num` wrap is 256 pictures out, nowhere near this
+    // run — and pictures 17, 18, 19 carry 17, 18, 19. **No picture in this run is a key frame after
+    // the first**, and the wrap that used to hide the difference is the wrap this change removed.
+    assert_eq!(previous.map(|(poc, _)| poc), Some(19), "the counter runs unbroken to the last picture; only the field wraps, at 16");
 }
 
 /// The record of type `T` in `bytes`, or `None` when it is too short. The safe reader this module's
