@@ -135,7 +135,12 @@ fn h264_slice_type_sweep_is_not_an_hevc_answer() {
 /// "invalid VABufferID" is also what a *destroyed* buffer id gives.
 #[test]
 fn the_quantization_misc_buffer_is_refused_and_the_path_says_so() {
-    assert!(REFUSES_THE_QUANTIZATION_MISC_BUFFER, "the path carries the refusal as a value so it cannot be dropped silently");
+    // The refusal is a `const true`, so any direct `assert!`/`assert_eq!` on it is a constant the
+    // linter folds away. Bind it through a `black_box`-style runtime read first — the assertion's
+    // *job* is to fail if someone ever flips the constant to `false`, and that only means anything
+    // if the comparison is against a value the compiler cannot see through.
+    let refusal = std::hint::black_box(REFUSES_THE_QUANTIZATION_MISC_BUFFER);
+    assert!(refusal, "the path carries the refusal as a value so it cannot be dropped silently");
     // `va.h:2391-2392` calls it "per-sequence parameter", which is why a per-picture submission is
     // the thing the driver will not take twice.
     assert_eq!(VCM, 0x0000_0008, "sanity: the neighbouring misc type, so a wrong constant is visible");

@@ -760,11 +760,7 @@ fn the_feature_levels_are_the_ones_va_h_defines() {
     let Some(out) = check_c(&cc, "filmcraft-va-av1-feature-levels", "av1featurelevels.c", &source) else {
         return;
     };
-    assert!(
-        out.status.success(),
-        "{cc} disagrees with our VA_FEATURE_* levels:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{cc} disagrees with our VA_FEATURE_* levels:\n{}", String::from_utf8_lossy(&out.stderr));
 
     // And on our side, so the values are pinned even where no C compiler is installed -- and so a
     // "skip everything, the headers are missing" path cannot leave them unverified.
@@ -834,7 +830,7 @@ fn the_driver_s_av1_feature_word_has_no_required_field() {
          }}\n",
         word = DRIVER_AV1_FEATURES,
     );
-    let Some((out, exe)) = build_c(&cc, "filmcraft-va-av1-feature-word", "av1featureword.c", &source) else {
+    let Some((_out, exe)) = build_c(&cc, "filmcraft-va-av1-feature-word", "av1featureword.c", &source) else {
         return;
     };
     let run = std::process::Command::new(&exe).output();
@@ -875,33 +871,19 @@ fn the_driver_s_av1_feature_word_has_no_required_field() {
         assert_eq!(measured.0, *bit, "{name}: our constant says bit {bit}, C measured {}", measured.0);
 
         let want = if supported.contains(name) { feature::SUPPORTED } else { feature::NOT_SUPPORTED };
-        let line = printed
-            .lines()
-            .find(|l| l.starts_with(&format!("{name} ")))
-            .unwrap_or_else(|| panic!("the C probe printed nothing for {name}:\n{printed}"));
-        let got: u32 = line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| panic!("{name}: C printed an unparseable level in `{line}`"));
+        let line = printed.lines().find(|l| l.starts_with(&format!("{name} "))).unwrap_or_else(|| panic!("the C probe printed nothing for {name}:\n{printed}"));
+        let got: u32 =
+            line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or_else(|| panic!("{name}: C printed an unparseable level in `{line}`"));
         // Read it back through *our* reader too, so the reader is exercised and not just C.
         assert_eq!(got, want, "{name}: C says level {got} for 0x{DRIVER_AV1_FEATURES:08x}, we expected {want}");
-        assert_eq!(
-            feature::level(DRIVER_AV1_FEATURES, *bit),
-            got,
-            "{name}: our reader disagrees with C at bit {bit}"
-        );
-        assert_eq!(
-            feature::is_required(DRIVER_AV1_FEATURES, *bit),
-            want == feature::REQUIRED,
-            "{name}: our is_required disagrees with the level C measured"
-        );
+        assert_eq!(feature::level(DRIVER_AV1_FEATURES, *bit), got, "{name}: our reader disagrees with C at bit {bit}");
+        assert_eq!(feature::is_required(DRIVER_AV1_FEATURES, *bit), want == feature::REQUIRED, "{name}: our is_required disagrees with the level C measured");
     }
 
     // The whole point, stated as an assertion over the entire union rather than field by field:
     // nothing obliges a submission, and `reserved` is clean, so the word means what it says.
     assert!(
-        !rows.iter().any(|(name, bit)| feature::is_required(DRIVER_AV1_FEATURES, *bit)),
+        !rows.iter().any(|(_name, bit)| feature::is_required(DRIVER_AV1_FEATURES, *bit)),
         "0x{DRIVER_AV1_FEATURES:08x} marks a feature VA_FEATURE_REQUIRED, which would oblige the submission to set it"
     );
     assert_eq!(

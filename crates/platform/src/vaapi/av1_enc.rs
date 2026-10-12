@@ -148,7 +148,7 @@
 //!    2-bit field, so each reads exactly 1.
 //!
 //!    The contrast with HEVC is the evidence that this is a real distinction and not a parsing
-//!!    accident: **the same call, same driver, same day** answers
+//!    accident: **the same call, same driver, same day** answers
 //!    `VAConfigAttribEncHEVCFeatures` (50) = `0x01900464`, where `amp` (bits 4-5) and
 //!    `cu_qp_delta` (bits 22-23) both read **2** — genuinely `VA_FEATURE_REQUIRED`, and
 //!    genuinely binding on a submission. A decoder of these words that cannot tell 2 from 1 will
@@ -811,8 +811,8 @@ pub mod features {
     // The three `VA_FEATURE_*` levels the fields here hold, named once in [`super::feature`] and
     // read once here, so a level is never spelled as a bare number at a use site. `Av1Features` is
     // the word those levels are read out of, and it is a sibling too.
-    use super::feature;
     use super::Av1Features;
+    use super::feature;
 
     /// 2 bits, 0-1.
     pub const SUPPORT_128X128_SUPERBLOCK: u32 = 0;
