@@ -89,7 +89,7 @@
 // every item. Kept here rather than on the `mod hevc_enc;` line so this file is the whole change.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use super::ffi::{VA_PADDING_MEDIUM, VaPictureHevc};
+use super::ffi::{VA_PADDING_LOW, VA_PADDING_MEDIUM, VaPictureHevc};
 
 /// `VABufferID` (`va.h:2042`), written as the `u32` it is.
 ///
@@ -357,6 +357,88 @@ pub struct VaEncSliceParameterBufferHevc {
 /// this backend's encoder has no way to express — its picture stream is one sequence from end to
 /// end — and declaring a constant nothing could set honestly is how a constant gets set anyway.
 pub const LAST_PICTURE_EOSTREAM: u8 = 0x02;
+
+/// `VAQMatrixBufferHEVC` (`va_enc_hevc.h:908`): the scaling lists an HEVC sequence that enables
+/// them must supply. **1016 bytes**, alignof 4, **and no hole anywhere in it** — every gap between
+/// two members and the tail padding after the last were measured at zero by a C compiler.
+///
+/// ```text
+/// $ cc -w -o hevcqmeasure hevcqmeasure.c && ./hevcqmeasure
+/// == VAQMatrixBufferHEVC sizeof=1016 alignof=4
+/// VAQMatrixBufferHEVC              scaling_lists_4x4            offset    0 size   96
+/// VAQMatrixBufferHEVC              scaling_lists_8x8            offset   96 size  384
+/// VAQMatrixBufferHEVC              scaling_lists_16x16          offset  480 size  384
+/// VAQMatrixBufferHEVC              scaling_lists_32x32          offset  864 size  128
+/// VAQMatrixBufferHEVC              scaling_list_dc_16x16        offset  992 size    6
+/// VAQMatrixBufferHEVC              scaling_list_dc_32x32        offset  998 size    2
+/// VAQMatrixBufferHEVC              va_reserved                  offset 1000 size   16
+/// VAQMatrixBufferHEVC              scaling_lists_32x32          gap after scaling_lists_16x16        = 0
+/// VAQMatrixBufferHEVC              scaling_list_dc_32x32        gap after scaling_list_dc_16x16      = 0
+/// VAQMatrixBufferHEVC                                tail padding after va_reserved          = 0
+/// ```
+///
+/// # Why it is declared even though nothing submits it yet
+///
+/// `va_enc_hevc.h:65-68` says a sequence whose `scaling_list_enabled_flag` is 1 **must** be given
+/// the *decoded* form of the lists "to make sure that the driver will generate the correct scaling
+/// lists in the stream", and `va_enc_hevc.h:896-904` repeats it for the picture record. Before this
+/// change the record was not declared, so scaling lists were simply unreachable — which is why
+/// [`features::SCALING_LISTS`] reading `VA_FEATURE_SUPPORTED` on this driver could not be acted on.
+/// Declaring it is what makes the feature answerable rather than a dead end, and
+/// [`scaling_list_enabled`] (the flag that decides whether it is sent) is what keeps "declared"
+/// and "sent" two different claims.
+///
+/// **The driver generates the default lists itself when `scaling_list_data_present_flag` is 0**
+/// (`va_enc_hevc.h:884-889`), which is the state this encoder is in: it declares the lists enabled
+/// (the driver requires it, see the module note on `VA_FEATURE_REQUIRED`) but supplies no custom
+/// data, so the buffer is **not submitted**. That is the header's own instruction and not a shortcut:
+/// supplying one would be supplying a scaling list nobody chose.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaQMatrixBufferHevc {
+    /// `ScalingList[ i ][ MatrixID ][ j ]` for 4x4: `i` (size id) 0-2, matrix id 0-1, `j` 0-15, in
+    /// raster scan order (the header says so, `va_enc_hevc.h:903-907`). **96 bytes at offset 0.**
+    pub scaling_lists_4x4: [[[u8; 16]; 2]; 3],
+    /// The same for 8x8: size id 0-2, matrix id 0-1, `j` 0-63. **384 bytes at offset 96.**
+    pub scaling_lists_8x8: [[[u8; 64]; 2]; 3],
+    /// For 16x16: size id 0-2 (the header writes "i = 2" for this member), matrix id 0-1, `j` 0-63.
+    /// **384 bytes at offset 480.**
+    pub scaling_lists_16x16: [[[u8; 64]; 2]; 3],
+    /// For 32x32: size id 0-1, matrix id 0-1, `j` 0-63. **128 bytes at offset 864** — a fourth
+    /// entry wide, which is why this array is `[2]` and the three above are `[3]`: size id 3 is the
+    /// only one with a single matrix id.
+    pub scaling_lists_32x32: [[u8; 64]; 2],
+    /// `scaling_list_dc_coef_minus8[ sizeID - 2 ][ matrixID ] + 8` for the 16x16 lists: size id 0-2,
+    /// matrix id 0-1. **6 bytes at offset 992.**
+    pub scaling_list_dc_16x16: [[u8; 2]; 3],
+    /// The same for the 32x32 lists: size id 0-1. **2 bytes at offset 998** — which is what makes
+    /// offset 998 unaligned and offset 1000 the next member rather than 1000 and 1002.
+    pub scaling_list_dc_32x32: [u8; 2],
+    /// `va_reserved[VA_PADDING_LOW]` (`va_enc_hevc.h:947-948`) — four words, 16 bytes at offset
+    /// 1000, ending exactly at the record's 1016 with no trailing padding.
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VaQMatrixBufferHevc`'s `Default`, written by hand because the derive does not exist for it.
+///
+/// **`Default` is only legal here because every byte is meant to be zero**, and that is checked
+/// rather than assumed: `a_default_hevc_encode_record_names_no_byte_it_leaves_unset` in
+/// [`hevc_abi`] compares this record's bytes against a C-sized buffer of zeroes, member by member.
+/// The derive cannot be used because `[u8; 64]` is past the length `Default` is implemented for (32),
+/// which is why the other two records here derive it and this one does not.
+impl Default for VaQMatrixBufferHevc {
+    fn default() -> Self {
+        Self {
+            scaling_lists_4x4: [[[0; 16]; 2]; 3],
+            scaling_lists_8x8: std::array::from_fn(|_| [[0; 64]; 2]),
+            scaling_lists_16x16: std::array::from_fn(|_| [[0; 64]; 2]),
+            scaling_lists_32x32: std::array::from_fn(|_| [0; 64]),
+            scaling_list_dc_16x16: [[0; 2]; 3],
+            scaling_list_dc_32x32: [0; 2],
+            va_reserved: [0; VA_PADDING_LOW],
+        }
+    }
+}
 
 /// `VAEncPackedHeaderHEVC_VPS` / `SPS` (`va_enc_hevc.h:277`, `:286`): the packed-header type that
 /// carries the video and sequence parameter sets.

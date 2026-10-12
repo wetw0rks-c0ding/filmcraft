@@ -270,7 +270,7 @@ pub enum RateControl {
 
 impl RateControl {
     /// The `VAConfigAttribRateControl` value this mode submits.
-    fn config_attribute(&self) -> u32 {
+    pub fn config_attribute(&self) -> u32 {
         match self {
             Self::ConstantQuantiser => RC_CQP,
             Self::Cbr(_) => RC_CBR,

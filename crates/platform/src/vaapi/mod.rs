@@ -59,6 +59,24 @@ mod encoder;
 // module on its merits either. `hevc_abi`'s pins live inside it rather than in the shared
 // `abi_guard.rs`, for the same reason.
 mod hevc_enc;
+// AV1 encode records, declared and pinned but **not yet submitted** — the six records of
+// `va_enc_av1.h`, measured against the installed header. Its own file for the same reasons as
+// `hevc_enc`: zero overlap with `ffi.rs` and with the shared `abi_guard.rs`, and declaring a record
+// needs no `unsafe`.
+mod av1_enc;
+// **No VP9 encode records**, because a `dlopen` probe of this driver found no VP9 encoder: all four
+// `VAProfileVP9Profile0`..`3` advertise `VAEntrypointVLD` and nothing else, and every
+// `vaGetConfigAttributes` read against `VAEntrypointEncSlice`/`EncSliceLP` returns
+// `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT`. `va_enc_vp9.h` and `VAConfigAttribEncVP9` (58) *do*
+// exist, so this is the driver declining a codec libva can express. This module holds that answer
+// and its evidence rather than a record nobody could submit.
+mod vp9_enc;
+// The HEVC **submission** path: the frame loop, the records it builds per picture, the readback and
+// the check that what the driver wrote agrees with what it was told. Beside `hevc_enc` for the same
+// reason that one is beside `ffi.rs`: a second writer on one file is how the tree got corrupted
+// earlier in this session, and `hevc_params` is a third file for the same reason.
+mod hevc_params;
+mod hevc_submit;
 
 pub use decoder::{Timings, VaDecoder};
 // VP9: the state one decode carries across its frames, and the record one frame is submitted as.
@@ -67,6 +85,17 @@ pub use decoder::{Timings, VaDecoder};
 // built from and owns the eight reference slots, which `build_frame` cannot be given (see
 // `picture::build_frame`).
 pub use encoder::{Current, EncodeRequest, EncodedPicture, MAX_REFERENCES, Reference, VaEncoder, macroblocks_of, ramp_picture, ramp_shifted};
+// The HEVC submission path. `HevcEncoder` is the entry point — the counterpart of `VaEncoder` — and
+// `HevcEncodeRequest` / `HevcEncodedPicture` are its own types rather than the H.264 ones, because
+// HEVC has no `frame_num` to carry, no crop to report, and a `slice_type` whose encoding is not
+// H.264's. `h264_slice_type_sweep_is_not_an_hevc_answer` in `tests/hevenc.rs` is what keeps them
+// from drifting into each other.
+pub use hevc_submit::{HevcEncodeRequest, HevcEncodedPicture, HevcEncoder, HevcReference, REFUSES_THE_QUANTIZATION_MISC_BUFFER, slice_types};
+// The constants the probe and the oracle test ask the driver about. Re-exported because
+// `hevc_submit` is a private module, and a `pub` item in a private module is dead code the rest of
+// the crate never sees; these four are the numbers a caller needs to check a driver against what
+// this path assumes, and `examples/vahevcprobe.rs` prints all of them.
+pub use hevc_submit::{CONFIG_ATTRIB_INTERLACED, H264_RATE_CONTROL_MASK, HEVC_RATE_CONTROL_MASK, VCM};
 pub use picture::{Vp9Frame, Vp9Reference, Vp9ReferenceSet, Vp9State, vp9_decline, vp9_is_new_frame, vp9_picture_record, vp9_slice_record};
 // AV1, the same three shapes for the same three reasons: `Av1State` is the per-decode reference
 // state (`refresh_frame_flags` has no member in the AV1 *decode* record — see `picture::av1`'s
@@ -83,7 +112,10 @@ pub use av1::{AV1_FILM_GRAIN, AV1_LARGE_SCALE_TILE, Av1Frame, Av1ReferenceSet, A
 // which every frame codec is declined before it can reach, and which is public so that the decline
 // and the builder cannot drift apart (see `picture::build_frame`).
 pub use ffi::Display;
+// `Profile` and `Entrypoint` are what the encoder's capability queries are asked about, and
+// `Entrypoint::EncSlice` in particular is the question the whole encode path gates on.
 pub use ffi::status;
+pub use ffi::{Entrypoint, Profile};
 pub use picture::build_frame;
 pub use stream::Stream;
 pub use stream::stream_info;

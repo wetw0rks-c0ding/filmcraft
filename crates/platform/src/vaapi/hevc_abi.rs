@@ -203,6 +203,22 @@ static ENC_RECORDS: &[EncRecord] = enc_records![
         ("pred_weight_table_bit_length", pred_weight_table_bit_length, size_of::<u32>()),
         ("va_reserved", va_reserved, (VA_PADDING_MEDIUM - 2) * size_of::<u32>()),
     ],
+    // `VAQMatrixBufferHEVC` (va_enc_hevc.h:908). Added with the HEVC submission path rather than
+    // with the three records above, because it is the record `seq_fields.scaling_list_enabled_flag`
+    // makes *mandatory* (va_enc_hevc.h:65-68) and which therefore could not be acted on before.
+    //
+    // **It has no hole, and that is measured here rather than assumed**: a record with no `padding_*`
+    // row at all is the property that failed for `VASegmentParameterVP9`, so the list below carries
+    // one row per member and the gap check asks C for a width of zero between every pair.
+    "VAQMatrixBufferHEVC": size_of::<VaQMatrixBufferHevc>() => [
+        ("scaling_lists_4x4", scaling_lists_4x4, size_of::<[[[u8; 16]; 2]; 3]>()),
+        ("scaling_lists_8x8", scaling_lists_8x8, size_of::<[[[u8; 64]; 2]; 3]>()),
+        ("scaling_lists_16x16", scaling_lists_16x16, size_of::<[[[u8; 64]; 2]; 3]>()),
+        ("scaling_lists_32x32", scaling_lists_32x32, size_of::<[[u8; 64]; 2]>()),
+        ("scaling_list_dc_16x16", scaling_list_dc_16x16, size_of::<[[u8; 2]; 3]>()),
+        ("scaling_list_dc_32x32", scaling_list_dc_32x32, size_of::<[u8; 2]>()),
+        ("va_reserved", va_reserved, size_of::<[u32; VA_PADDING_LOW]>()),
+    ],
 ];
 
 /// **Every byte of every HEVC encode record belongs to a named field, and the fields line up end to
@@ -218,7 +234,7 @@ static ENC_RECORDS: &[EncRecord] = enc_records![
 /// the wrong width, fails here as loudly as one that is too wide.
 #[test]
 fn every_record_the_hevc_encoder_would_submit_tiles_byte_for_byte() {
-    assert_eq!(ENC_RECORDS.len(), 3, "the sequence, picture and slice records, and nothing else");
+    assert_eq!(ENC_RECORDS.len(), 4, "the sequence, picture, slice and scaling-matrix records, and nothing else");
     for record in ENC_RECORDS {
         assert!(!record.fields.is_empty(), "{}: no fields listed, so the loop below proved nothing", record.c_name);
         let mut at = 0usize;
@@ -643,7 +659,9 @@ fn the_hevc_enc_constants_are_what_the_header_declares() {
          _Static_assert(sizeof(VAPictureHEVC) == {picture}, \"VAPictureHEVC\");\n\
          _Static_assert(sizeof(VABufferID) == {bufferid} && sizeof(VASurfaceID) == {surfaceid}, \"VABufferID and VASurfaceID\");\n\
          _Static_assert(sizeof(VAConfigAttribValEncHEVCFeatures) == {featsize}, \"VAConfigAttribValEncHEVCFeatures\");\n\
-         _Static_assert(sizeof(VAConfigAttribValEncHEVCBlockSizes) == {blocksize}, \"VAConfigAttribValEncHEVCBlockSizes\");\n",
+         _Static_assert(sizeof(VAConfigAttribValEncHEVCBlockSizes) == {blocksize}, \"VAConfigAttribValEncHEVCBlockSizes\");\n\
+         _Static_assert(VA_RC_VCM == {vcm}, \"VA_RC_VCM (va.h:1114): in HEVC's rate-control mask, not H.264's\");\n\
+         _Static_assert((VA_RC_CBR | VA_RC_VBR | VA_RC_VCM | VA_RC_CQP | VA_RC_ICQ | VA_RC_MB | VA_RC_QVBR | VA_RC_TCBRC) == {hevc_rc_mask}, \"the mask this driver reports for HEVC\");\n",
         eostream = LAST_PICTURE_EOSTREAM,
         vps = PACKED_HEADER_VPS_OR_SPS,
         pps = PACKED_HEADER_PPS,
@@ -659,6 +677,8 @@ fn the_hevc_enc_constants_are_what_the_header_declares() {
         surfaceid = size_of::<BufferId>(),
         featsize = size_of::<HevcFeatures>(),
         blocksize = size_of::<HevcBlockSizes>(),
+        vcm = super::super::hevc_submit::VCM,
+        hevc_rc_mask = super::super::hevc_submit::HEVC_RATE_CONTROL_MASK,
     );
     let Some(out) = check_c(&cc, "filmcraft-va-hevc-enc-consts", "hevcencconsts.c", &source) else {
         return;
@@ -676,6 +696,17 @@ fn the_hevc_enc_constants_are_what_the_header_declares() {
     assert_eq!(PACKED_HEADER_VPS_OR_SPS, 1);
     assert_eq!(PACKED_HEADER_PPS, 2);
     assert_ne!(PACKED_HEADER_VPS_OR_SPS, PACKED_HEADER_PPS, "a VPS/SPS packed header is not a PPS packed header");
+    // `VA_RC_VCM` is declared **here** rather than in `ffi.rs` because it is a constant only the
+    // HEVC path refuses, and `ffi.rs` is pinned for four codecs' decode. The value is pinned against
+    // `va.h:1114` by the `_Static_assert` above; what is asserted here is the mask it appears in,
+    // which is a **measurement of this driver** and the reason it is a named refusal at all.
+    assert_eq!(super::super::hevc_submit::HEVC_RATE_CONTROL_MASK, 0x14de, "VAConfigAttribRateControl for VAProfileHEVCMain / EncSlice on iHD 26.3.5");
+    assert_eq!(super::super::hevc_submit::HEVC_RATE_CONTROL_MASK & super::super::hevc_submit::VCM, super::super::hevc_submit::VCM, "and VCM is in it");
+    assert_eq!(
+        super::super::hevc_submit::H264_RATE_CONTROL_MASK & super::super::hevc_submit::VCM,
+        0,
+        "which is exactly why H.264's table never needed a name for it and HEVC's does"
+    );
 }
 
 /// **`Default` sets every byte of every HEVC encode record, including the holes.**
@@ -732,6 +763,19 @@ fn a_default_hevc_encode_record_names_no_byte_it_leaves_unset() {
     assert!(sli.chroma_offset_l1.iter().all(|row| row.iter().all(|&w| w == 0)));
     assert!(sli.ref_pic_list0.iter().all(|p| p.picture_id == 0));
     assert!(sli.ref_pic_list1.iter().all(|p| p.picture_id == 0));
+
+    // The scaling-matrix record: no hole to name either, and **a hand-written `Default`**, because
+    // `[u8; 64]` is past the array length `Default` is derived for. That is the one record here
+    // whose `Default` is not a derive, so it is the one where "every byte is zero" has to be proven
+    // rather than inherited — which is what the two long assertions below are.
+    let q = VaQMatrixBufferHevc::default();
+    assert!(q.scaling_lists_4x4.iter().flatten().flatten().all(|&b| b == 0), "the 4x4 lists");
+    assert!(q.scaling_lists_8x8.iter().flatten().flatten().all(|&b| b == 0), "the 8x8 lists");
+    assert!(q.scaling_lists_16x16.iter().flatten().flatten().all(|&b| b == 0), "the 16x16 lists");
+    assert!(q.scaling_lists_32x32.iter().flatten().all(|&b| b == 0), "the 32x32 lists");
+    assert!(q.scaling_list_dc_16x16.iter().flatten().all(|&b| b == 0), "the 16x16 DC coefficients");
+    assert!(q.scaling_list_dc_32x32.iter().all(|&b| b == 0), "the 32x32 DC coefficients");
+    assert!(q.va_reserved.iter().all(|&w| w == 0), "the reserved tail");
 }
 
 /// The three record sizes, stated as numbers and checked against C.
@@ -746,6 +790,7 @@ fn the_hevc_enc_records_are_the_sizes_this_file_documents() {
     assert_eq!(size_of::<VaEncSequenceParameterBufferHevc>(), 116, "VAEncSequenceParameterBufferHEVC");
     assert_eq!(size_of::<VaEncPictureParameterBufferHevc>(), 576, "VAEncPictureParameterBufferHEVC");
     assert_eq!(size_of::<VaEncSliceParameterBufferHevc>(), 1076, "VAEncSliceParameterBufferHEVC");
+    assert_eq!(size_of::<VaQMatrixBufferHevc>(), 1016, "VAQMatrixBufferHEVC");
 }
 
 /// `cc` on this machine, or `None`.
