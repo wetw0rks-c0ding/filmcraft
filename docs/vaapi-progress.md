@@ -384,10 +384,16 @@ breaks were made; eleven were caught on the first attempt, and the escape is wha
 for.
 
 **The submission path now exists, and the driver refuses the picture record.** It reaches `vaRenderPicture`
-and stops: the **sequence record alone renders successfully**, and adding any picture record refuses.
-Measured two ways that agree — FilmCraft's own path (`vaRenderPicture failed for 5 encode buffers: invalid
+and stops. **The localisation is a one-buffer inequality, and it is narrower than "the sequence record
+renders":** `vaRenderPicture` **accepts** the sequence record alone, and `vaEndPicture` then fails with
+`VA_STATUS_ERROR_ENCODING_ERROR` (24) — so that call is `Err`, not `Ok`. Adding any picture record moves the
+failure *earlier*, to `vaRenderPicture` itself, with `VA_STATUS_ERROR_INVALID_BUFFER` (7). **`vaRenderPicture`
+is therefore not the call that refuses the picture record; the picture record is what moves the failure onto
+it.** Measured two ways that agree — FilmCraft's own path (`vaRenderPicture failed for 5 encode buffers: invalid
 VABufferID`) and, independently through the public API, ffmpeg's own `av1_vaapi`, which declines the same
 profile on this machine: *"No usable encoding entrypoint found for profile VAProfileAV1Profile0 (32)"*.
+This is asserted from outside the module by `crates/platform/tests/av1enc.rs`, which mutates in both
+directions to prove it can fail.
 
 The failure was localised by sweeping rate control {NONE,CBR,VBR,CQP,ICQ} × packed headers
 {NONE,SEQ,PIC,SEQ|PIC,0x1b} × surfaces {2,3,4,8} — 80 combinations — plus 16 cumulative picture-record field
@@ -476,9 +482,13 @@ the quantiser it cannot honour), 0 kbps, HDR, non-square pixels, interlaced, fra
 size. `Format::Hevc` reaches the format list through a probe that creates a real session, so a machine without
 the encoder does not advertise it.
 
-**No shipped preset changed status**, because FilmCraft ships no HEVC preset at all — so nothing moved either
-way. `hevc_is_offered_on_this_machine_and_which_presets_it_reaches` reads the real preset list, so a preset
-added later is caught rather than silently missing.
+**A shipped HEVC preset now exists** (`29affc43`), so this subsection's earlier statement that FilmCraft
+shipped none is superseded by **§3.10**, which is the current per-preset table. The preset is conditional on
+`available(Format::Hevc)` and **exports at 30 fps only** — every other rate is refused by name, because the
+encoder writes a fixed 30 into the SPS VUI while the `hvcC` carries the rate the caller stated. That refusal is
+an encoder defect (§3.7 of this file's HEVC notes and `hevc_submit.rs`), not a property of HEVC.
+`hevc_is_offered_on_this_machine_and_which_presets_it_reaches` reads the real preset list, so a preset added
+later is caught rather than silently missing.
 
 **The `hvcC` is cross-checked on every picture**, which is what makes the record trustworthy rather than merely
 written: it re-reads the record's own bytes and refuses an `hvcC` that does not round-trip, lacks one complete

@@ -1674,7 +1674,10 @@ fn sequence_record(size: (u32, u32), width: u16, height: u16, keyframe_interval:
         pcm_sample_bit_depth_chroma_minus1: 0,
         log2_min_pcm_luma_coding_block_size_minus3: 0,
         log2_max_pcm_luma_coding_block_size_minus3: 0,
-        // **The VUI is on**, and the timing in it is the frame rate the caller stated — not a guess.
+        // **The VUI is on**, and the timing in it is the frame rate the caller stated. **Where it is
+        // not** — the constructor path below, before `at_rate` has been called — it is
+        // `DEFAULT_FRAME_RATE_FOR_LEVEL`, which is why `at_rate` rebuilds this record before any picture
+        // is encoded. `check_hvcc_against_the_picture` refuses the mismatch rather than letting it ship.
         // HEVC's sequence record has no separate timing field, so this is the only place the frame
         // rate reaches the bitstream, and a decoder given an `hvcC` whose `avgFrameRate` disagrees
         // with the SPS's VUI is a container describing two different streams.
@@ -1769,12 +1772,15 @@ fn coding_type(is_intra: bool) -> u32 {
     if is_intra { 1 } else { 2 }
 }
 
-/// The frame rate [`level_for`] is asked about when the caller has not stated one yet.
+/// The frame rate used for the VUI and for [`level_for`] **until `at_rate` supplies the caller's own**.
 ///
-/// **It only affects the level, and `at_rate` rebuilds the sequence record with the caller's own
-/// rate before any picture is encoded**, so this number never reaches a stream. `MaxLumaSr` does
-/// not depend on the rate anyway (see [`level_for`]); it is carried so the signature says what it
-/// means.
+/// **This number does reach a stream.** The sequence record's `vui_time_scale` is written as
+/// `2 * DEFAULT_FRAME_RATE_FOR_LEVEL`, so a record built before `at_rate` states a rate carries 30 fps in
+/// its VUI whatever the caller asked for. `at_rate` rebuilds the record with the caller's rate before any
+/// picture is encoded, and `check_hvcc_against_the_picture` refuses a sequence whose `hvcC` rate and SPS VUI
+/// rate disagree — so the defect is caught rather than shipped, but it is a defect, not a neutral default.
+/// Measured: 30 fps exports; 24, 25 and 60 all fail by name. Fixing it means threading the rate through
+/// `sequence_record`, not widening a check.
 const DEFAULT_FRAME_RATE_FOR_LEVEL: u32 = 30;
 
 /// `MaxLumaSr` for each HEVC level, in luma samples (ITU-T H.265 Table A.1, `level_idc = 30 *
