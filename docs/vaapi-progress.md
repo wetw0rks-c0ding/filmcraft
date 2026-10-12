@@ -353,7 +353,20 @@ set** rather than the modes. Of the **eight** modes this driver advertises for H
 in the code as CBR, VBR, VCM, CQP, ICQ, MB, QVBR, TCBRC), **six failed at `vaMapBuffer`** and two
 (`VA_RC_ICQ`, `VA_RC_QVBR`) **at `vaEndPicture`** — and those two failing earlier is the signature of a
 buffer the driver wants and is not getting, not of a mode it dislikes. With the slice header supplied
-**`VA_RC_CQP` — the mode this path names — encodes**, so the other seven are **untested rather than refuted**.
+**`VA_RC_CQP` — the mode this path names — encodes**, and the other modes were **re-swept once pictures came
+back**, because the earlier sweep's precondition no longer held: it was taken before the path packed and
+submitted a slice header, so its result could not be read as either a pass or a refusal.
+
+Each mode was submitted **twice**, with a rate-control record and without, which is what separates a mode
+failure from a record failure — the same distinction the quantisation-buffer bisect turned on. **ICQ and QVBR
+fail with and without a record**, so the failure is the mode and both are **refuted**. TCBRC fails only with
+the record. CBR, VBR and MB encode.
+
+**`VA_RC_VCM` encodes**, at mean 9.1/255 with ffmpeg silent — which **falsifies the reason it was originally
+refused**. It is declined now for a different reason: nothing above the backend can name it, and a mode a
+caller cannot ask for is not a mode the path should accept. That is a statement about the settings surface,
+not about the driver, and the distinction matters: the earlier refusal would have been a claim about every
+driver.
 
 ### 3.9 Reachability from the UI, and what is in progress
 
@@ -365,8 +378,25 @@ stream differs from ours and exports are otherwise byte-identical across machine
 fallback**: a decoder can replay samples through another decoder, an encoder cannot hand a half-written stream
 to one, so a failure during an export stops it with an error.
 
-**HEVC's export reachability is in progress on this branch** and is deliberately not claimed here in either
-direction: the encode path itself is proven (§3.5), what is being wired is the export surface around it.
+**HEVC is reachable too**, through the same factory and the same `Once` (`11b351e`). A `Format::Hevc` export
+reaches the driver on a machine whose driver offers `VA_RC_CBR`/`VBR` and whose picture is a whole multiple of
+8 — 320x240 and 1920x1080 both are. Taken: a bitrate (`Cbr`, `Vbr1Pass`), one pass, progressive, square
+pixels, SDR, MP4/MOV. Declined, each with its reason: MXF (Annex B), two-pass, constant-quality (which names
+the quantiser it cannot honour), 0 kbps, HDR, non-square pixels, interlaced, fractional rate, non-8-multiple
+size. `Format::Hevc` reaches the format list through a probe that creates a real session, so a machine without
+the encoder does not advertise it.
+
+**No shipped preset changed status**, because FilmCraft ships no HEVC preset at all — so nothing moved either
+way. `hevc_is_offered_on_this_machine_and_which_presets_it_reaches` reads the real preset list, so a preset
+added later is caught rather than silently missing.
+
+**The `hvcC` is cross-checked on every picture**, which is what makes the record trustworthy rather than merely
+written: it re-reads the record's own bytes and refuses an `hvcC` that does not round-trip, lacks one complete
+VPS/SPS/PPS, disagrees with its own SPS on profile, level, chroma or geometry, states a frame rate its VUI
+contradicts, or whose picture's `slice_type` contradicts the sample table's sync-sample flag. The check found
+two real defects in itself — it had taken the caller's geometry rather than the sample entry's own dimensions,
+and its key-frame predicate was `written == 2 != key_frame` where the sound form is `key_frame && written != 2`
+(an I slice in a TRAIL picture is legal HEVC; an IDR with non-I slices is an unstartable sync sample).
 
 ### The FFI audit
 
@@ -665,9 +695,13 @@ initialisation and this is the pattern that provokes it.
   nothing on `testsrc2`, which is a property of the source and not of the encoder settings. Large-scale tile
   is a third recorded limit, and it is a limit rather than a gate because there is no flag to read it from;
   §2.
-- **HEVC export reachability** — **in progress on this branch.** The encode path is proven (§3.5) and the
-  gate accepts the format; what is being wired is the export surface around it. Nothing here claims it
-  works and nothing here claims it does not.
+- **HEVC encode, what is still refused** — §3.9. Each refusal carries its measurement: reference depth > 1
+  (measured on HEVC's own numbers, and the same silent-divergence signature H.264 shows), multi-slice
+  pictures, B pictures, `VA_RC_VCM` (**because nothing above the backend can name it**, not because the driver
+  refuses it — which the re-sweep falsified), `VA_RC_ICQ` and `VA_RC_QVBR` (refuted: they fail with and
+  without a record), TCBRC, constant-quality, a non-8-multiple picture size (no crop exists in HEVC's record
+  to ask for one with), a fractional frame rate, HDR, MXF, and non-square pixels. **No HEVC preset ships**, so
+  nothing here is reachable from one until one exists.
 - **H.264 encode, what is still refused** — §3. Each refusal carries its measurement: reference depth > 1
   (measured on both codecs, §3.4), multi-slice pictures (a second coded segment is refused; reachable at 70
   pictures, refused unmeasured), B pictures (the driver reports it *could* — `VAConfigAttribEncMaxRefFrames`

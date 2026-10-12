@@ -325,11 +325,19 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   refused with that measurement in the message. It declines, each by name: MXF, two-pass VBR, HDR, odd sizes,
   non-square pixels, interlaced output, a fractional frame rate, and a named Baseline or High profile, which
   is what `H264Profile::Auto` exists to make unnecessary — it resolves to what the backend will actually write
-  and the export summary prints the profile in the file. **HEVC encode works on the same gate** (one I frame
-  then P frames that predict, decoded clean by ffmpeg at 320×240) and its export reachability is in progress
-  on this branch. **VP9 encode is not available on this driver** — every VP9 profile advertises decode only and
-  every encode entrypoint answers `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` — and **AV1 encode records are
-  pinned but nothing submits them**. `docs/vaapi-progress.md` §3 has each of those with its measurement.
+  and the export summary prints the profile in the file. **HEVC encode works on the same gate** (one I
+  frame then P frames that predict — I 184 B against P 51/45/43/55/48 — decoded clean by ffmpeg at
+  320×240) and a `Format::Hevc` export reaches the driver through it, with an `hvcC` cross-checked on
+  every picture rather than merely written. It is **not** the H.264 path with a different record:
+  HEVC's slice record carries the slice header the driver will not write, so the path packs and submits
+  one itself, which is what two agents spent this milestone failing to find.
+  `platform::vaapi::hevc_export` holds that wiring, beside `hevc_submit` (the encode loop),
+  `hevc_params` (the derived VPS/SPS/PPS) and `hevc_enc`/`hevc_abi` (the records, C-measured and
+  pinned). **No HEVC preset ships**, so nothing here is reachable from a preset yet.
+  **VP9 encode is not available on this driver** — every VP9 profile advertises decode only and every
+  encode entrypoint answers `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` — and **AV1 encode records are
+  pinned but nothing submits them**. `docs/vaapi-progress.md` §3 has each of those with its
+  measurement.
 - **Compositor.** `render` is the reference for monitors, thumbnails and export. `render::plan`
   turns a frame into GPU layers, each with its opacity and blend mode. All 27 blend modes run on the
   GPU (`filmcraft-gpu`): Normal and Dissolve with fixed-function "over" blending, the others by
