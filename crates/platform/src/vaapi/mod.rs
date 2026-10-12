@@ -190,9 +190,25 @@ pub use ffi::{Entrypoint, Profile};
 // to run a path and not enough to tell **which buffer** the driver objected to — and "which buffer"
 // is the whole question the AV1 path is blocked on, because the measurement is that the same
 // session renders the sequence record alone and refuses as soon as the picture record is added.
-// `SliceEncoder` rather than `Encoder` so it cannot be mistaken for `VaEncoder`, which is the
-// H.264 wrapper.
-pub use ffi::{Buffer, Encoder as SliceEncoder, RtFormat};
+// Neither is a `VA*` structure, which is what keeps `mod.rs`'s own rule above ("`mod.rs` never
+// names one") true of this widening too.
+//
+// **It is exported as `SliceEncoder` rather than `Encoder` because `Encoder` next to `VaEncoder`
+// reads as two kinds of the same thing, and they are not.** `SliceEncoder` is the substrate — a
+// config, a surface ring, a context and a coded buffer, with **no codec's records in it** — and the
+// three wrappers above are the things that carry a record. A caller with records to submit wants
+// `VaEncoder`, `HevcEncoder` or `Av1Encoder`; a caller taking a measurement of the driver wants
+// this. Nothing here encodes a picture by itself, and `Av1Encoder::at_constant_quantiser` is what
+// turns this into an AV1 encoder.
+//
+// **`Buffer` is deliberately *not* exported, and this line is where that is decided.**
+// `SliceEncoder::buffer` returns one, so it is reachable; but every caller that needs a buffer wants
+// the id out of it and nothing else — which is what `tests/av1enc.rs` does, through inference, so
+// it never names the type. An item that is reachable but not named by any caller is surface nobody
+// has asked for, the same argument `the_av1_frame_header_parser_is_reachable` below makes about
+// `filmcraft_av1`, and `Buffer` is the widest thing on this list: a `VABufferID` with a `Drop` that
+// calls `vaDestroyBuffer`.
+pub use ffi::{Encoder as SliceEncoder, RtFormat};
 pub use picture::build_frame;
 pub use stream::Stream;
 pub use stream::stream_info;
