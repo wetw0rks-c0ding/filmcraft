@@ -5,8 +5,8 @@ commits. Everything here has been measured on the development machine (Intel Arc
 libva 1.24, iHD 26.3.5); nothing is carried over from another platform unverified.
 
 Two milestones are in flight: **decode**, essentially complete, and **encode**, mid-way through its
-feasibility work. A third, **VP9 decode**, is wired into the decode path *and* measured against
-ffmpeg's own decode — §4.
+feasibility work. Two more are wired into the decode path *and* measured against our own decoder's
+pictures, one for one — **VP9 decode** (§4) and **AV1 decode** (§5).
 
 Every number below is produced by a committed test, and each one names the fixture it came from:
 `cargo test -p filmcraft-platform --test vaapi -- --nocapture` prints one line per fixture with its
@@ -19,7 +19,7 @@ repository**, because a claim a fresh clone cannot regenerate is a claim nobody 
 ## 1. Hardware decode — working
 
 A decode backend in `crates/platform/src/vaapi/`. H.264 and HEVC at 4:2:0, 8- and 10-bit, plus VP9
-profiles 0 and 2 at the same depths (§4).
+profiles 0 and 2 at the same depths (§4) and AV1 Main profile 0 at the same depths (§5).
 
 **Reached through the application, not only a test harness.** `apps/filmcraft/src/main.rs:247` calls
 `filmcraft_platform::register()` at startup; `register()` puts the VA-API factory in front of the software
@@ -82,7 +82,7 @@ reason.
 | declined | why |
 |---|---|
 | H.264 with implicit weighted biprediction | See below. `weighted_bipred_idc == 2` is x264's default for High profile with B frames, so this is **most H.264**. |
-| AV1 | A repo visibility boundary, not a capability one: `filmcraft_av1` does not expose the per-frame header libva wants as a record. See §5. |
+| AV1 outside profile 0, or with applied film grain | Profile 0 at 4:2:0 8/10-bit **decodes** (§5). Profiles 1 and 2 are 4:4:4 / 4:2:2 and `va_dec_av1.h:44` says the API is "8-bit/10bit 420 format only"; 12-bit has no surface. An applied film grain is declined because this backend copies pictures out and never synthesises grain, so a driver rendering grain would disagree with FilmCraft's own decoder on exactly those frames. Large-scale tile is declined too — `filmcraft-av1` parses no LST syntax at all. |
 | VP9 outside profiles 0 / 2 | 4:2:2 / 4:4:0 / 4:4:4 (profiles 1, 3), the reserved profile 4, and 12-bit. Every surface this backend creates is 4:2:0 at 8 or 10 bits, so there is nowhere to put them. |
 | 10-bit H.264 | Matches the Windows backend's own decision (`media_foundation/stream.rs:279`); no fixture would prove a hardware path here. |
 | HEVC with `scaling_list_enabled_flag` | Needs `VAIQMatrixBufferHEVC`, which this backend does not build. `va_dec_hevc.h` sends that buffer only when the flag is 1, so a driver default would decode a picture the stream does not contain. |
@@ -356,7 +356,12 @@ test from three failures to one.
   header directly (`a_vp9_profile_this_backend_does_not_decode_is_an_error_not_a_record` and the
   `vp9_segment_param` tests in `vaapi::picture`). A real-world stream with any of the three would be
   the fixture that closes this; §4.
-- **AV1 hardware decode on Linux** — its own milestone; §5.
+- **AV1, two scope limits that are recorded rather than resolved** — §5. A *full* 64-entry
+  `width_in_sbs_minus_1` (no fixture this suite can generate has 64 tiles in one axis: a 640×500
+  frame has 10 × 8 superblocks, and libaom's `-tile-columns` will not exceed 32 at 8 bits), and
+  whether a **rotated or affine `gm_params`** survives the `wmmat` copy — no fixture carries
+  non-identity global motion, because `-enable-global-motion 1` changes nothing on `testsrc2`, which
+  is a property of the source and not of the encoder settings.
 - **Encode** — `VideoEncoder`/`EncoderFactory` implementation, `sample_entry` from the driver's parameter
   sets, the frame loop driven by settings, and the docs. Also: reference depth > 1, multi-slice pictures
   (a second coded segment is refused), and five syscalls per encoded frame.
