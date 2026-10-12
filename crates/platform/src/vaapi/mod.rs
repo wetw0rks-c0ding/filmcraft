@@ -167,8 +167,9 @@ pub use av1::{AV1_FILM_GRAIN, AV1_LARGE_SCALE_TILE, Av1Frame, Av1ReferenceSet, A
 // `allow(dead_code)`.
 pub use av1_params::{Av1Plan, FrameKind as Av1FrameKind, WMMAT_SCALE_IS_SPECIFIED};
 pub use av1_submit::{
-    AV1_DRIVER_INTERLACED, AV1_DRIVER_PACKED_HEADERS, AV1_DRIVER_RATE_CONTROL_MASK, AV1_MAX_REFERENCES, AV1_PACKED_HEADERS, AV1_RC_CQP, Av1Buffer, Av1EncodeRequest,
-    Av1EncodedPicture, Av1Encoder, Av1Submission, DRIVER_REFUSES_THE_AV1_PICTURE_RECORD, build_submission, driver_outcomes, seq_fields, the_tile_group_buffer,
+    AV1_DRIVER_INTERLACED, AV1_DRIVER_PACKED_HEADERS, AV1_DRIVER_RATE_CONTROL_MASK, AV1_MAX_REFERENCES, AV1_PACKED_HEADERS, AV1_RC_CQP, Av1Buffer,
+    Av1EncodeRequest, Av1EncodedPicture, Av1Encoder, Av1Submission, DRIVER_REFUSES_THE_AV1_PICTURE_RECORD, build_submission, driver_outcomes, seq_fields,
+    the_tile_group_buffer,
 };
 // What a caller outside this module needs to build a decoder: [`Display`] is the initialised libva
 // connection a session is created on; [`stream_info`] reads a sample entry into the codec-agnostic
@@ -182,6 +183,16 @@ pub use ffi::Display;
 // `Entrypoint::EncSlice` in particular is the question the whole encode path gates on.
 pub use ffi::status;
 pub use ffi::{Entrypoint, Profile};
+// **`SliceEncoder` and `RtFormat` are the libva session itself, re-exported under a name that says
+// what it is.** They are what every encode path in this module is a wrapper around: `VaEncoder`,
+// `HevcEncoder` and `Av1Encoder` each hold one, and each adds the records for its own codec. Without
+// them a caller outside this module can only submit a *codec-specific* submission, which is enough
+// to run a path and not enough to tell **which buffer** the driver objected to — and "which buffer"
+// is the whole question the AV1 path is blocked on, because the measurement is that the same
+// session renders the sequence record alone and refuses as soon as the picture record is added.
+// `SliceEncoder` rather than `Encoder` so it cannot be mistaken for `VaEncoder`, which is the
+// H.264 wrapper.
+pub use ffi::{Buffer, Encoder as SliceEncoder, RtFormat};
 pub use picture::build_frame;
 pub use stream::Stream;
 pub use stream::stream_info;
