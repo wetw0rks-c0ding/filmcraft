@@ -7,8 +7,15 @@
 //! is a later one. The H.264 encode records in [`super::ffi`] are the reference for **shape and
 //! conventions**, not for values.
 //!
-//! So what is deliberately absent is the point: there is no `encode()` here, no rate control, no
-//! settings wiring and no `vaCreateSurface`/`vaCreateBuffer` call.
+//! ~~So what is deliberately absent is the point: there is no `encode()` here, no rate control, no
+//! settings wiring and no `vaCreateSurface`/`vaCreateBuffer` call.~~ **That is now superseded.**
+//! [`submit`] is the AV1 submission path: the records below, the packed sequence and frame headers
+//! [`params`] builds from the specification, the buffer list, and the frame loop. **It reaches
+//! `vaRenderPicture` and the driver refuses `VAEncPictureParameterBufferAV1`** — measured over
+//! rate-control modes, packed-header modes, surface counts and field variants, and reproduced by
+//! this crate's own test. See [`submit::driver_outcomes`] for the numbers and
+//! [`submit::DRIVER_REFUSES_THE_AV1_PICTURE_RECORD`] for what the path says about it. There is no
+//! export wiring and no settings surface, and `crates/export/` was not touched.
 //!
 //! # This driver advertises AV1 encode, and that is measured, not assumed
 //!
@@ -103,17 +110,29 @@
 //! Four things a submission will need and the records do not settle, checked and recorded instead
 //! of guessed:
 //!
-//! 1. **The `wmmat` scale is not stated anywhere in the header.** `VAEncWarpedMotionParamsAV1`
+//! 1. ~~**The `wmmat` scale is not stated anywhere in the header.**~~ **Answered, and the answer
+//!    does not need the specification either.** `VAEncWarpedMotionParamsAV1`
 //!    (`va_enc_av1.h:463-468`) says only "`wm.wmmat[]` corresponds to `gm_params[][]` in spec",
 //!    and then points at *the AV1 specification section 5.9.24* and at libaom's source
-//!    (`aomedia.googlesource.com`, `av1/decoder/decodeframe.c`). **Both pointers are outside what
-//!    this tree may read**: §2 forbids reading a third-party decoder's source while implementing a
-//!    format, so the C comment's second half is not a resource here. The AV1 *specification* is a
-//!    permitted source (it is the published spec, like ITU-T for H.264), and section 5.9.24 is
-//!    where the 6-bit-MV-fixed-point scale is defined — but that section is **not vendored into
-//!    this repo**, so the scale is an open question for the submission task, not a fact to assert
-//!    here. No `WMMAT_SCALE_*` constant is declared, because inventing one is the exact failure
-//!    mode this file exists to avoid.
+//!    (`aomedia.googlesource.com`, `av1/decoder/decodeframe.c`). **The first of those two pointers
+//!    is a permitted source and the second is not** — `AGENTS.md` §2 names "the VP9 and AV1
+//!    bitstream specs" as permitted and forbids reading a third-party decoder's source — and this
+//!    revision previously treated the specification as unavailable too. **That was wrong**: it is
+//!    permitted, it is pinned at `5e04f3f`, and `crates/av1` is built from it and ships the tool
+//!    that fetches it.
+//!
+//!    Read from it (`03.symbols.md:124`, and `global_motion_params()`'s initialiser), the identity
+//!    warp's six parameters are **`[0, 0, 1 << 16, 0, 0, 1 << 16]`** — so `WARPEDMODEL_PREC_BITS`
+//!    is 16 and the diagonal is 65536. See [`params::WARPEDMODEL_PREC_BITS`] and
+//!    [`params::IDENTITY_WARP`].
+//!
+//!    **The stronger answer is that this record never needs the scale.** `global_motion_params()`
+//!    reads nothing when `is_global` is 0, and [`transformation::parameters`] says the identity
+//!    transform reads **0** of the eight entries, so a submission whose global motion is identity
+//!    writes `is_global = 0` and no parameters at all — and `wm[].wmmat` is left zero, which is the
+//!    only value correct for a transform that reads no parameters. No `WMMAT_SCALE_*` constant is
+//!    declared here, because none is needed; what is declared is `IDENTITY_WARP`, in
+//!    [`params`], and it is a value rather than an invented scale.
 //! 2. **Per-tile slice records.** AV1's picture record has `tile_cols`, `tile_rows`,
 //!    `num_tile_groups_minus1`, `width_in_sbs_minus_1[63]`, `height_in_sbs_minus_1[63]` and a
 //!    `context_update_tile_id` (0..127), and a *separate* [`VaEncTileGroupBufferAv1`] record with
@@ -942,3 +961,28 @@ pub mod ext2 {
 #[cfg(test)]
 #[path = "av1_abi.rs"]
 mod av1_abi;
+
+/// The AV1 **bitstream** the encode submission path hands the driver: the `sequence_header_obu()`
+/// and `frame_header_obu()` built from the AV1 Bitstream & Decoding Process Specification and
+/// checked by parsing them back with FilmCraft's own parser.
+///
+/// Its own file for the same reason `hevc_params` is beside `hevc_submit`: declaring a record and
+/// *writing the bits the driver will not write for itself* are different jobs, and the second one
+/// is a specification task rather than a libva one. **This is the AV1 analogue of HEVC's packed
+/// slice header** — see `params`'s module note, which opens with `va_enc_av1.h:213-230` on why the
+/// driver cannot supply these.
+///
+/// It also carries the answer to this file's first open question. **The `wmmat` scale is stated by
+/// the specification, and a submission of this shape never needs it**: identity global motion reads
+/// none of the eight entries. See `WMMAT_SCALE_IS_SPECIFIED` and `IDENTITY_WARP`.
+#[path = "av1_params.rs"]
+mod params;
+
+/// The submission path: the records this module declares, assembled per picture and handed to the
+/// driver, together with **what this driver measurably does with them**.
+///
+/// Beside `params` and not inside it because the two can be wrong independently: the bitstream can
+/// be right while the driver refuses the record, and the record can be right while the bitstream is
+/// wrong. `driver_outcomes` records which of the two this machine answered.
+#[path = "av1_submit.rs"]
+mod submit;
