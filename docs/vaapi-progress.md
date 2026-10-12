@@ -239,34 +239,77 @@ files, which is the property that matters for this table.
 
 ---
 
-## 5. Why AV1 is not decoded yet
+## 5. AV1 decode — wired, and measured against hardware
 
-Not a hardware limit — the driver advertises `VLD: true` for AV1 Main here.
+**AV1 Main (profile 0) at 4:2:0 decodes on Linux, at 8 and 10 bits, and `plan_frame` plans it.**
+All five fixtures are `Tier::EveryPicture` and every picture is bit-exact against FilmCraft's own
+decoder through the real media stack: `av1_p0_8bit` 96/96, `av1_p0_10bit` 96/96, `av1_tiled` 48/48,
+`av1_intra_only` 96/96, `av1_loop_restoration` 96/96.
 
-`crates/av1/src/header.rs:478` declares `pub(crate) fn parse` over private types, so the per-frame
-header libva wants as a `VADecPictureParameterBufferAV1` is unreachable. The parser is already written
-and bit-exact with ffmpeg in software; it is simply not exposed — and exposing it is a change in
-`crates/av1` with its own review, which is why it is a separate milestone from VP9's rather than part
-of it. VP9 had the identical wall (`mod header;` in `crates/vp9/src/lib.rs`) and clearing it is what
-this milestone did.
+**What the enabler actually was, correcting the framing this section used to carry.** It said the
+blocker was that `crates/av1/src/header.rs:478` declares `pub(crate) fn parse` over private types —
+a module-visibility wall, the same one VP9 had in `crates/vp9/src/lib.rs`. That was never quite
+true, and `crates/av1` needed no such change:
 
-The architectural asymmetry is worth understanding: the Windows backend decodes VP9 and AV1 today by
-mapping them to fourcc and DXGI profiles (`MFVideoFormat_VP90`, `D3D11_DECODER_PROFILE_AV1_VLD_*`) and
-**never parses the bitstream**. Media Foundation and VideoToolbox delegate header parsing to the OS.
-VA-API requires the application to parse headers and build every picture record, which is why this
-project needs FilmCraft's own parsers for VA-API at all — and why it meets their visibility.
+| what the record builder needs | state before the record existed |
+|---|---|
+| `crates/av1/src/lib.rs:16` | **already `pub mod header;`**, and `:32` already re-exported `FrameHeader` |
+| `HeaderState` (`header.rs:458`) | **already `pub struct`** |
+| `header.rs` | 224 `pub` items against 3 `pub(crate)` — the module was already almost fully public |
+| `BitReader` (`bits.rs:6`) | `pub(crate) struct` — **this**, plus a widened `parse` and a small `pub use` block, is the entire enabler |
+| the spec constants the record names | `pub const` in the **private** `mod spec_tables` — re-exported |
+
+So the wall was a `pub` on one struct and a `pub use` on one list, not a module boundary. The VP9
+precedent does not transfer, and `crates/av1` should not get `pub mod bits;` for it.
+
+**What the record needed that no header documents.** Two of its members are guesses the installed
+headers do not settle, and both were wrong first:
+
+- `lr_unit_shift` inverts to 256 → shift **2**, 64 → shift 0 — *the bigger the unit, the larger the
+  shift*, from `size = 256 >> (2 - shift)` at `header.rs:1154`. Submitted backwards,
+  `av1_loop_restoration.mp4` decoded **18 of 96**.
+- `yframe_restoration_type` carries the **specification's** `FrameRestorationType` (NONE/WIENER/
+  SGRPROJ/SWITCHABLE = 0/1/2/3), not the bitstream's two-bit field. `va_dec_av1.h:606-618` documents
+  none of the five members; `va_enc_av1.h:855-863` documents two of them, and reading its silence on
+  the other three is what points the wrong way. Submitted the wire numbering: **18 of 96** again.
+
+**Both score the same 18, and the 18 are the frames that restore nothing.** The other four fixtures
+have loop restoration off and would have passed under either reading, so without
+`av1_loop_restoration.mp4` the suite could not have chosen. That is the whole lesson, and it is §6's
+fifth entry rather than a new one.
+
+**A fixture that cannot fail is worse than no fixture.** This section's Q1 note claimed a 2×4 tiled
+fixture scored "68 of 96" under the rejected tile-number indexing. It scores **96 of 96** — a grid
+whose columns are all one width makes both readings identical. The real measurement needs an 8×4
+grid of differing columns and rows, where the readings score **48 of 48 against 0 of 48**, which is
+what `av1_tiled.mp4` now encodes and what
+`av1::tests::the_tiled_fixture_is_the_one_that_can_tell` enforces.
+
+**Still open, and recorded as open rather than claimed:** what a *full* 64-entry
+`width_in_sbs_minus_1` does (no fixture this suite can generate has 64 tiles in one axis); and
+whether a rotated or affine `gm_params` survives the `wmmat` copy, since no fixture carries
+non-identity global motion — `-enable-global-motion 1` changes nothing on `testsrc2`, measured.
+
+The architectural asymmetry below still explains *why* any of this was needed.
 
 ---
 
 ## 6. Findings recorded because they were wrong here first
 
-Four conclusions on this branch were wrong and were caught by measurement rather than review. They are listed
+Five conclusions on this branch were wrong and were caught by measurement rather than review. They are listed
 because each was plausible, and each cost real time:
 
 - **A clause that does not exist.** An H.264 "8.2.3.2.1" deriving separable per-position weights was proposed
   and acted on. Zero occurrences of that clause number — or of `lumaWeightL0`, `weightA`, `weightB`,
   `PocDiffB`, `w1`/`w2` — across six ITU editions. A fabricated clause reads exactly like a real one.
   **Specificity is not evidence.**
+- **A fixture that could not fail.** §5's own note claimed a 2×4 tiled AV1 fixture scored "68 of 96"
+  under the rejected tile-number indexing of `width_in_sbs_minus_1`. It scores 96 of 96 — a grid whose
+  columns are all one width makes both readings produce identical arrays, so the number in the note
+  could not have come from that fixture. **A passing fixture proves only what it can distinguish**, and
+  the fix was to encode a grid that separates the hypotheses (48 of 48 against 0 of 48) plus a test
+  that fails if a future ffmpeg makes the grid uniform again. A number no test can reproduce is a
+  number nothing checked.
 - **A grep that missed fields.** `RefPicList0`/`RefPicList1` are CamelCase; searching for `ref_pic_list`
   found nothing and produced a confident, wrong conclusion that the record had no reference lists at all.
 - **A desync bug that was not there.** `luma_offset_lX` was suspected absent from HEVC's `pred_weight_table`.

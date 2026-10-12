@@ -103,12 +103,26 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
     set rather than a per-slice list, so `Vp9State` carries the eight reference slots and one parse
     state across a run, and a frame's `refresh_frame_flags` decides which slots its picture becomes —
     applied only after the driver has rendered it (`vaapi/decoder.rs`, `picture_frame`).
-  - *AV1 is still declined while it is a stream description* (`vaapi/stream.rs`, `plan_frame`):
-    libva wants AV1's per-frame header as a `VADecPictureParameterBufferAV1`, and `filmcraft_av1`
-    does not expose one — `FrameHeader::parse` is `pub(crate)` over private types, so a record could
-    only be filled with invented values, which is the one answer this backend must never give
-    (`vaapi/picture.rs`, `FRAME_HEADER_MISSING`). Exposing that parser is a change in `crates/av1`
-    and needs its own review.
+  - *AV1 Main (profile 0) at 4:2:0, 8 and 10 bits, decodes* (`vaapi/av1.rs`). libva wants AV1's
+    per-frame header as a `VADecPictureParameterBufferAV1` and **one slice record per tile**
+    (`va_dec_av1.h:635`), and both are built from `filmcraft_av1`'s parse of that frame's own
+    uncompressed header. **The slice record is per tile, where VP9's is per frame**: the per-tile byte
+    extents are this backend's job rather than the driver's, and they are walked from the tile-group
+    OBU and then **cross-checked against `filmcraft_av1`'s own split**, because two walks that disagree
+    do not raise an error — they produce plausible-looking wrong tiles.
+    **AV1 has no `refresh_frame_flags` in its decode record** (`grep -in refresh /usr/include/va/
+    va_dec_av1.h` → lines 421 and 436, both inside comments; the field is encode-only, `va_enc_av1.h:607`),
+    so the reference state is entirely this backend's and `Av1State` owns 7.20's eight slots, carrying
+    each slot's `RefInfo` *and* its surface together — AV1's reference state is read by the **next
+    frame's header parse**, not only by the record, which is what VP9's is not.
+    Declined, each with the reason in `av1_decline` and the record: profiles 1 and 2 and 12-bit
+    (`va_dec_av1.h:44` — "This AV1 decoding API supports 8-bit/10bit 420 format only"), monochrome and
+    4:2:2/4:4:4 (no such surface), **applied film grain** (this backend reads pictures back and never
+    synthesises grain), and large-scale tile (`filmcraft-av1` parses no LST syntax at all).
+    Two record fields are settled by hardware measurement rather than by any header, and both are
+    documented at their definitions — `lr_unit_shift` inverts to 256 → **2**, and
+    `yframe_restoration_type` carries the **specification's** `FrameRestorationType`, not the
+    bitstream's two-bit field.
   - *H.264 whose B slices are implicitly weighted is declined* (`weighted_bipred_idc == 2`, which
     is x264's default for High profile with B frames, so most H.264). The backend computes the
     implicit weight of every `(ref0, ref1)` pair the slice's own reference lists could use: if all
