@@ -30,9 +30,12 @@
 //! - **Both take a bitrate.** VideoToolbox through `VTCompressionPropertyKey_AverageBitRate`, and
 //!   VA-API through a `VA_RC_CBR` / `VA_RC_VBR` session with a `VAEncMiscParameterRateControl`. The
 //!   difference is in the modes they can express: VideoToolbox has no constant-quantiser entry point
-//!   here, while VA-API's encoder can also run constant quantiser — which the gate never asks for,
-//!   because FilmCraft's settings state a bitrate and not a quantiser. See [`vaapi_config_for`] for
-//!   what each gate accepts and why.
+//!   here, while VA-API's encoder can also run constant quantiser — which neither gate asks for.
+//!   **The mode that states one is declined by both, with the same words**, because it names no rate
+//!   and every record either backend builds is a rate: mapping a quantiser the settings state onto
+//!   `VTCompressionPropertyKey_Quality` or onto `VAPictureH264::pic_init_qp` is a piece of work in
+//!   its own right, and until it is done the honest answer to a mode this gate cannot express is a
+//!   decline rather than a substitution. See [`vaapi_config_for`] for what each gate accepts and why.
 //! - **VA-API is one slice per picture and one reference deep**, both measured; the VideoToolbox path
 //!   has no such limit. The slice limit is not expressible in the settings and so is not a decline
 //!   here — it is a property of the encoder, stated in [`vaapi::VaEncoder`]'s own documentation.
@@ -64,6 +67,25 @@ pub fn config_for(w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Result
     }
     if s.bitrate_mode == BitrateMode::Vbr2Pass || !matches!(s.h264_pass, H264Pass::Single) {
         return Err("two-pass encoding".into());
+    }
+    // **A constant-quality export is refused rather than given a bitrate**, with the same words and
+    // for the same reason as the VA-API gates. `BitrateMode::ConstantQuality` states a quantiser and
+    // no rate, both [`VtRate`] variants are rates, and the `_ =>` arm below once turned this mode
+    // into a VBR and dropped the quantiser — a file at a rate nobody chose beside a summary reading
+    // `QP n`. This gate covers HEVC as well as H.264 (`hevc` above), so on this side of the refusal
+    // the consequence differs by format and is worth stating: H.264 has the built-in encoder behind
+    // it and the export falls back to it at the quantiser asked for, while **HEVC has no built-in
+    // encoder, so a constant-quality HEVC export becomes "encoder not available" rather than a wrong
+    // file** — the same trade the Linux HEVC gate already made. The refusal is not a claim about the
+    // API: `VTCompressionPropertyKey_Quality` can be set, but nothing here maps FilmCraft's H.264
+    // quantiser onto it, and a mapping this gate invented would be a table sitting next to a rate the
+    // user did state.
+    if s.bitrate_mode == BitrateMode::ConstantQuality {
+        return Err(format!(
+            "a constant-quality export: it states a quantiser ({}) and no bitrate, and this gate submits the bitrate. \
+             FilmCraft's software encoders take that mode; this backend is declined for it rather than encoded at a rate nobody chose",
+            s.constant_qp
+        ));
     }
     if s.signal.is_hdr() {
         return Err("HDR".into());
@@ -306,10 +328,11 @@ mod vaapi_export {
     /// **A settings-set bitrate is honoured.** [`crate::vaapi::RateControl::Cbr`] carries
     /// `s.bitrate_kbps` and [`crate::vaapi::RateControl::Vbr`] carries the `target`/`max_kbps` pair
     /// FilmCraft's own settings already mean, in the fields `VAEncMiscParameterRateControl` has for
-    /// exactly those two numbers. That is the whole of what changed here: before, every mode
-    /// `BitrateMode` can name was refused and the registered factory was a decline rather than an
-    /// encoder; now `Cbr` and `Vbr1Pass` are taken and `Vbr2Pass` — which needs an analysis pass
-    /// over the pictures before the real one — is still refused, with that reason.
+    /// exactly those two numbers. That is the whole of what changed when this gate was opened: before,
+    /// every mode `BitrateMode` can name was refused and the registered factory was a decline rather
+    /// than an encoder; now `Cbr` and `Vbr1Pass` are taken and the other two are refused, each with
+    /// its own reason — `Vbr2Pass` needs an analysis pass over the pictures before the real one, and
+    /// `ConstantQuality` names no rate at all.
     ///
     /// # The two-pass refusal, and why it is not folded into the bitrate one
     ///
@@ -317,12 +340,30 @@ mod vaapi_export {
     /// two-pass export renders the sequence once to measure it and again to encode it, and this
     /// backend is handed pictures one at a time by a pipeline that has no way to encode them twice.
     /// Submitting the second pass's bitrate to a single-pass driver would produce a file at a rate
-    /// nobody chose with nothing wrong anywhere in it, so it is an error naming the pass.
+    /// nobody chose with nothing wrong anywhere in it, so it is an error naming the pass. The
+    /// constant-quality refusal below is refused in the same place for the same structural reason —
+    /// both are read *before* `s.bitrate_kbps`, which is the field whose value they must never reach.
     ///
     /// # What is still declined, and it is a short list
     ///
-    /// Each refusal below names what this backend cannot express rather than what it has not got
-    /// round to, and the two that are *not* about capability are called out as such:
+    /// ## The two refusals that are *not* about capability, named as such
+    ///
+    /// - **A bitrate of zero is refused rather than turned into something.** The settings layer floors
+    ///   a target at 100 kbps before a factory is called, so a zero here is a caller that skipped it —
+    ///   and the only honest answer to "encode at no bits per second" is an error, not a substituted
+    ///   number.
+    /// - **A constant-quality export is refused rather than given a bitrate.**
+    ///   [`BitrateMode::ConstantQuality`] states a quantiser in `ExportSettings::constant_qp` and no
+    ///   rate at all, and every [`ExportBitrate`] variant is a rate — so the `_ =>` arm below, which
+    ///   once turned this mode into a VBR and dropped the quantiser, encoded it at a rate nobody chose
+    ///   while `ExportSettings::summary` printed `QP n` beside it. The decline carries the quantiser,
+    ///   which is what makes it this export's error and not a passing remark: H.264 has a software
+    ///   encoder behind this one, so the file the user gets is the software encoder's, at the
+    ///   quantiser they asked for. [`crate::vaapi::hevc_config_for`] refuses the same mode in the same
+    ///   words, and the refusal is not a claim about the driver: `VA_RC_CQP` exists and is measured
+    ///   (see the check below).
+    ///
+    /// ## The refusals that *are* about what the records can express
     ///
     /// - **Baseline and High profiles**, because the derived parameter sets say Main. The sequence
     ///   record carries no profile field to derive from and an SPS claiming High while the slices are
@@ -375,6 +416,34 @@ mod vaapi_export {
         }
         if s.bitrate_mode == BitrateMode::Vbr2Pass {
             return Err("two-pass encoding".into());
+        }
+        // **A constant-quality export is refused, and it is refused before the bitrate is read** —
+        // for the same reason and in the same words as [`crate::vaapi::hevc_config_for`], which had
+        // to add the same check to its own `_ =>` arm. The mode states a quantiser in
+        // [`ExportSettings::constant_qp`] and no rate at all, so the `bitrate_kbps` below is a
+        // number left over from another mode: the settings layer still carries a target (20 000 kbps
+        // by default) precisely because the field has always been there, and `resolve` still floors
+        // and ceilings it for a mode that names no rate. The `_ =>` arm this replaces turned that
+        // leftover into a `VAEncMiscParameterRateControl` — a 20.00 Mbps VBR under a 1.5x ceiling,
+        // for an export whose summary read `QP 26`. Nothing in the file would have said otherwise:
+        // every `ExportBitrate` variant is a rate, so the quantiser was simply gone.
+        //
+        // **Declining is the honest answer and not a gap.** The record that would carry the
+        // quantiser is `VAPictureH264::pic_init_qp` (`pic_init_qp_minus26 + 26`,
+        // `/usr/include/va/va_enc_h264.h:342`) under `VA_RC_CQP` (`nCQP = 0x00000010`,
+        // `/usr/include/va/va.h`), and this backend has both — `RateControl::ConstantQuantiser` is
+        // measured on this driver and `examples/vaencprobe.rs` exercises it. **Submitting it here is a
+        // separate piece of work, not a branch of this match**: it changes what the gate sends, so
+        // until it is measured end to end the answer to a mode this gate cannot yet express is the
+        // decline the HEVC gate already gives, not a substitution. On this side of the fallback the
+        // decline is also the better export — the software encoder takes `ConstantQuality` as
+        // `RateControl::Qp` and codes the quantiser the user asked for.
+        if s.bitrate_mode == BitrateMode::ConstantQuality {
+            return Err(format!(
+                "a constant-quality export: it states a quantiser ({}) and no bitrate, and this gate submits the bitrate. \
+                 FilmCraft's software encoders take that mode; this backend is declined for it rather than encoded at a rate nobody chose",
+                s.constant_qp
+            ));
         }
         // **The bitrate, as the mode FilmCraft's own settings mean.** `bitrate_kbps` is the target;
         // `max_bitrate_kbps` is the ceiling and, exactly as `ExportSettings::resolve` computes it
@@ -700,3 +769,144 @@ pub use vaapi_export::{
     ExportBitrate, VaEncoderExport, config_for as vaapi_config_for, rate_control_modes as vaapi_rate_control_modes,
     rate_control_modes_named as vaapi_rate_control_modes_named,
 };
+
+// ---------------------------------------------------------------------------
+// The gate against the summary: the two statements a user reads about one file
+// ---------------------------------------------------------------------------
+
+/// The H.264 VA-API gate and the summary line describing the same export.
+///
+/// **`config_for` and `ExportSettings::summary` are in different crates and were written at different
+/// times**, so nothing links them: each can be right on its own while the pair lies. These are the
+/// tests that hold the two together, and they are unit tests in this file rather than in `tests/`
+/// because the thing under test is this file's gate.
+#[cfg(all(test, target_os = "linux"))]
+mod gate_against_summary {
+    use super::vaapi_export::{ExportBitrate, config_for};
+    use filmcraft_export::{BitrateMode, ExportSettings, Format, H264Profile, HardwareEncoding};
+    use filmcraft_time::{FrameRate, Tick};
+
+    const W: u32 = 640;
+    const H: u32 = 360;
+    const FPS: FrameRate = FrameRate::FPS_30;
+    const QP: u8 = 30;
+
+    /// An H.264 export this gate otherwise takes: Main profile, progressive, square pixels, SDR, a
+    /// whole frame rate, one pass, a key-frame interval inside `MaxFrameNum`, and a target rate
+    /// **set to a value no preset uses** — so the numbers below are this test's, not the defaults'.
+    fn settings(mode: BitrateMode) -> ExportSettings {
+        ExportSettings {
+            format: Format::H264,
+            hardware_encoding: HardwareEncoding::Auto,
+            h264_profile: H264Profile::Main,
+            bitrate_mode: mode,
+            bitrate_kbps: 2_000,
+            max_bitrate_kbps: Some(4_000),
+            constant_qp: QP,
+            keyframe_distance: Some(8),
+            ..Default::default()
+        }
+    }
+
+    /// The gate's answer for `mode`, as the record it hands the driver.
+    fn bitrate(mode: BitrateMode) -> Result<ExportBitrate, String> {
+        config_for(Format::H264, W, H, FPS, &settings(mode)).map(|(_, _, _, _, b)| b)
+    }
+
+    /// What the summary tells the user this export's video fidelity is.
+    fn summary_video(mode: BitrateMode) -> String {
+        settings(mode).summary(W, H, FPS, 48_000, Tick::from_units(300, FrameRate::FPS_30.den)).video
+    }
+
+    /// **A constant-quality export is declined, and the decline names the quantiser it stated.**
+    ///
+    /// Before the fix this returned `Ok(Vbr { target: 2_000_000, max: 4_000_000 })`: the mode fell
+    /// into the `_ =>` arm of the bitrate match, so the settings' quantiser was dropped on the floor
+    /// and a rate nobody chose was submitted instead, while the summary beside it said `QP 30`.
+    #[test]
+    fn a_constant_quality_export_is_declined_with_its_quantiser() {
+        let Err(why) = bitrate(BitrateMode::ConstantQuality) else {
+            panic!("a constant-quality export was accepted by a gate that submits a bitrate: it states a quantiser and no rate");
+        };
+        // The number, not just the mode: matching the mode would pass on a fixed string printed
+        // beside any export, and the claim being tested is that the gate *read the settings*.
+        assert!(why.contains(&QP.to_string()), "the decline names the quantiser the settings stated, not just the mode: {why}");
+        // **The same settings with the one word changed produce the record this mode used to get.**
+        // That is the counterpart, and it is why the refusal is the fix rather than the substitution:
+        // the VBR below is the file a user asking for QP 30 would have received and been told was QP 30.
+        assert_eq!(bitrate(BitrateMode::Vbr1Pass), Ok(ExportBitrate::Vbr { target: 2_000_000, max: 4_000_000 }));
+        // **And the number a real export would have carried**, because `ExportSettings::default()`
+        // names no rate at all in constant-quality mode: its 20 000 kbps target (a figure left over
+        // from the rate-based modes) became a 20.00 Mbps VBR under a 1.5x ceiling, beside a summary
+        // reading `QP 26`. Asserted through the gate's own output rather than quoted, so the number
+        // is checked rather than carried along in a comment.
+        let mut defaults = ExportSettings { bitrate_mode: BitrateMode::Vbr1Pass, ..Default::default() };
+        defaults.hardware_encoding = HardwareEncoding::Auto;
+        defaults.h264_profile = H264Profile::Main;
+        assert_eq!(config_for(Format::H264, W, H, FPS, &defaults).map(|(_, _, _, _, b)| b), Ok(ExportBitrate::Vbr { target: 20_000_000, max: 30_000_000 }));
+    }
+
+    /// **The gate's answer for every mode, checked against the mode and against the summary.**
+    ///
+    /// `ExportBitrate` has two variants and every one of them is a rate, so a mode the gate accepts
+    /// is encoded at a rate — and a summary saying `QP n` is a claim about a quantiser this backend
+    /// never submits. The two are contradictions, whichever of them arrives first, so each mode is
+    /// checked both ways: **the mode the gate takes is spelled out**, and **the summary's claim about
+    /// fidelity is derived from the settings rather than quoted**, so a mode added to `BitrateMode`
+    /// later has no arm to fall into and fails here instead of silently inheriting the `_ =>`.
+    ///
+    /// **Written over `BitrateMode::ALL`, so a fifth mode is covered by construction** — which is the
+    /// point: this defect was a `_ =>` arm, and an arm is by definition the one a new variant lands in.
+    #[test]
+    fn the_gate_never_contradicts_what_the_summary_says_the_fidelity_is() {
+        for mode in BitrateMode::ALL {
+            let gate = bitrate(mode);
+            let says = summary_video(mode);
+            let says_qp = says.contains("QP ");
+            assert!(
+                !(gate.is_ok() && says_qp),
+                "{mode:?} is taken by the gate, which submits a bitrate, while the summary quotes a quantiser ({says}): {gate:?}"
+            );
+            if gate.is_ok() {
+                // The converse, from the other side: what the gate takes is a mode the summary
+                // describes with a rate. Asserted against the settings' own predicate rather than a
+                // copy of it, so the two sides of the comparison are computed independently.
+                assert!(mode.names_a_bitrate(), "{mode:?} is taken by the gate, but the summary describes it without a rate");
+                assert!(says.contains("Mbps"), "{mode:?} is taken at a rate, so the summary must quote one: {says}");
+            }
+        }
+        // **The table itself**, so "every mode was considered" is a fact rather than a claim about
+        // the loop above: what this gate submits, or the words it declines with. A mode whose answer
+        // changes has to change this line too, which is the review that should accompany it.
+        assert_eq!(bitrate(BitrateMode::Cbr), Ok(ExportBitrate::Cbr(2_000_000)), "CBR submits the target alone");
+        assert_eq!(bitrate(BitrateMode::Vbr1Pass), Ok(ExportBitrate::Vbr { target: 2_000_000, max: 4_000_000 }), "one-pass VBR submits the pair");
+        assert!(bitrate(BitrateMode::Vbr2Pass).is_err_and(|why| why.contains("two-pass")), "two-pass is declined as two-pass, not as a bitrate");
+        assert!(
+            bitrate(BitrateMode::ConstantQuality).is_err_and(|why| why.contains("constant-quality")),
+            "constant quality is declined by name, not mapped onto a rate"
+        );
+    }
+
+    /// **The summary and the decline both follow the settings, and agree with each other.**
+    ///
+    /// The file either says it was encoded at a quantiser or the export says why it cannot be, and
+    /// the number in both statements has to be the number the user typed: the summary prints
+    /// `self.constant_qp` (not a resolved or clamped value) and the decline prints the same field.
+    /// **Three quantisers rather than one**, including both ends of H.264's range — "Range: 0 to 51,
+    /// inclusive" for the macroblock quantiser parameter, `/usr/include/va/va_enc_h264.h:570` — so a
+    /// fixed 26 or a fixed 30 printed beside any export would fail here rather than pass on the
+    /// default.
+    #[test]
+    fn the_summary_and_the_decline_quote_the_same_quantiser() {
+        for qp in [QP, 0, 51] {
+            let mut s = settings(BitrateMode::ConstantQuality);
+            s.constant_qp = qp;
+            let said = s.summary(W, H, FPS, 48_000, Tick::from_units(300, FrameRate::FPS_30.den)).video;
+            assert!(said.contains(&format!("QP {qp}")), "QP {qp}: the summary quotes the quantiser the settings state, not a fixed one: {said}");
+            let Err(why) = config_for(Format::H264, W, H, FPS, &s).map(|(_, _, _, _, b)| b) else {
+                panic!("a constant-quality export was accepted by a gate that submits a bitrate");
+            };
+            assert!(why.contains(&format!("quantiser ({qp})")), "QP {qp}: the decline quotes the same number the summary did: {why}");
+        }
+    }
+}
