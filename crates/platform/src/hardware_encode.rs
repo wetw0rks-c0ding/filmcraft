@@ -22,6 +22,18 @@
 //! gates — [`vaapi_export::config_for`] for H.264 and [`crate::vaapi::hevc_config_for`] for HEVC —
 //! decline different things, each for a reason its own records can state.
 //!
+//! **AV1 is the third case, and it is the one a format list gets wrong most easily.** A VA-API driver
+//! can advertise `VAEntrypointEncSlice` for `VAProfileAV1Profile0`, accept `vaCreateConfig`,
+//! `vaCreateSurfaces`, `vaCreateContext` and `vaRenderPicture`, and still write no AV1 byte at all —
+//! which is what this machine's does, measured ([`crate::vaapi::driver_outcomes`]). So
+//! "the driver advertises an AV1 encoder" is not a question with an answer, because two different
+//! drivers give the same advertisement and one of them cannot encode. [`vaapi_export::av1_available`]
+//! asks the question that does have an answer — **one key frame, rendered, synced, and mapped back
+//! to a coded buffer with bytes in it** — and it is **not registered**, because
+//! [`filmcraft_export::Format`] has no `Av1` variant to register it against. That is deliberate and
+//! it is the whole of AV1's status in the format list today: nothing, with the probe that would
+//! decide it already written and measured.
+//!
 //! # The two backends do not accept the same exports, and the differences are measured
 //!
 //! [`config_for`] (VideoToolbox) and [`vaapi_config_for`] (VA-API) share most of their decline list
@@ -287,6 +299,7 @@ mod vaapi_export {
     use filmcraft_export::{EncoderFrame, ExportError, ExportSettings, Format, HardwareEncoding, VideoEncoder};
     use filmcraft_isobmff::SampleEntry;
     use filmcraft_time::FrameRate;
+    use std::sync::OnceLock;
 
     /// **The bitrate an export asks of this backend, in bits per second.**
     ///
@@ -759,6 +772,161 @@ mod vaapi_export {
     pub fn rate_control_modes_named() -> String {
         VaEncoder::rate_control_names(rate_control_modes())
     }
+
+    // -----------------------------------------------------------------------
+    // The AV1 availability probe
+    // -----------------------------------------------------------------------
+
+    /// The picture size the AV1 probe encodes: **320x240**, the size the AV1 and HEVC measurements
+    /// were taken at, and a whole number of AV1's 8x8 superblocks in both directions.
+    pub(super) const AV1_PROBE_SIZE: (u32, u32) = (320, 240);
+    /// The rate the probe's [`crate::vaapi::Av1Plan`] states — **30 fps**, whole, which is what
+    /// `VAEncMiscParameterFrameRate` takes.
+    pub(super) const AV1_PROBE_FPS: u32 = 30;
+    /// The quantiser: **100**, the value [`crate::vaapi::Av1Encoder::at_constant_quantiser`] is
+    /// built with and mid-range on `base_q_idx`'s 0..=255.
+    pub(super) const AV1_PROBE_QINDEX: u8 = 100;
+
+    /// **Whether this machine's VA-API driver can produce an AV1 picture FilmCraft can use**, asked
+    /// once, through [`OnceLock`]: the Linux counterpart of [`crate::vaapi::hevc_available`] and
+    /// the same shape as it.
+    ///
+    /// # The criterion, and why it is not the cheap one
+    ///
+    /// **A VA-API AV1 encoder is available if and only if one key frame, submitted through
+    /// [`crate::vaapi::Av1Encoder::encode`], renders, syncs, and maps back to a coded buffer holding
+    /// at least one byte.** That is the whole criterion, and the last clause is it: *the driver
+    /// produced a bitstream*, not *the driver took our records*.
+    ///
+    /// **The cheap question has a measured false positive here, which is the entire reason this
+    /// probe is more expensive than the HEVC one.** [`crate::vaapi::hevc_available`] deliberately
+    /// stops at "a session was created", on the grounds that this is the cheapest honest question. For
+    /// AV1 that question is answered **yes by a driver that writes no AV1 byte at all**, measured on
+    /// this machine's iHD 26.3.5 / libva 1.24 through the shipped submission path
+    /// ([`crate::vaapi::driver_outcomes`]):
+    ///
+    /// ```text
+    /// vaQueryConfigEntrypoints(VAProfileAV1Profile0) -> [1 VLD, 6 EncSlice]    va.h:553, va.h:558
+    /// vaCreateConfig / vaCreateSurfaces / vaCreateContext -> VA_STATUS_SUCCESS
+    /// vaRenderPicture([sequence record])                 -> VA_STATUS_SUCCESS
+    /// vaEndPicture                                       -> VA_STATUS_ERROR_ENCODING_ERROR (24)  va.h:288
+    /// vaRenderPicture([sequence record, picture record]) -> VA_STATUS_ERROR_INVALID_BUFFER (7)    va.h:271
+    /// vaMapBuffer(coded)                                 -> the uninitialised buffer: no AV1 bytes
+    /// ```
+    ///
+    /// So both of the cheap answers — "it advertises `VAEntrypointEncSlice`" and "it created a
+    /// config, a context and a coded buffer" — are true here, and **neither distinguishes this
+    /// driver from one that would encode**. Only asking the question that produces a bitstream
+    /// does. A probe built on the advertisement would answer `true` on a machine where every AV1
+    /// export fails at its first picture, and `register_format_probe` would then put AV1 in the
+    /// format list on that machine — which is a lie told by the list rather than by the export.
+    ///
+    /// # What this deliberately does not claim
+    ///
+    /// - **Not bit-equality with any other encoder.** Encode verification is materially weaker than
+    ///   decode's: a hardware encoder and FilmCraft's software encoder are different algorithms
+    ///   making different decisions, so "matches the software encoder" has no content, and "matches
+    ///   ffmpeg" would be measuring ffmpeg's encoder. **Nothing here says either.**
+    /// - **Not that the bytes are a decodable AV1 bitstream.** "Bytes came back" is a weaker claim
+    ///   than "AV1 came back", and it is the weaker claim deliberately: there is no AV1 bitstream on
+    ///   this machine, so a stronger criterion could not be *evaluated* here, and a criterion that
+    ///   cannot be evaluated is not a criterion. Parsing the first OBU with `filmcraft_av1` is the
+    ///   obvious next strengthening, for the machine that eventually produces one.
+    /// - **Not that an export at the user's picture size will work.** 320x240 is what this asks
+    ///   about, exactly as it is for HEVC.
+    ///
+    /// # `Err` is the answer, not a failure of the probe
+    ///
+    /// Every failure — no display, no `libva`, a driver that refuses the config, and the refusal
+    /// this machine gives at `vaRenderPicture` — is a `false`, with the reason logged. There is no
+    /// error to propagate because nothing here is an export: a caller asking "can this machine
+    /// export AV1" gets yes or no.
+    ///
+    /// # Why it is not registered today
+    ///
+    /// **It cannot be, and that is a fact about [`filmcraft_export::Format`] rather than about this
+    /// probe.** There is no `Format::Av1` variant, so there is nothing to
+    /// `filmcraft_export::register_format_probe` it against. Adding the variant *without* this
+    /// probe would be worse than adding nothing: the format list would claim AV1 is available while
+    /// every AV1 export failed. Adding it *with* this probe would be honest on this machine — the
+    /// probe answers `false` here — but is still the wrong order of work, because a probe that says
+    /// `false` is not a reason to ship a format list entry that never works. **The order is the
+    /// format, the encoder, then the probe.**
+    ///
+    /// # What a `Format::Av1` would need, and none of which is here
+    ///
+    /// - **The variant**, in `filmcraft_export`: `Format::Av1` with its `from_name` / `id` /
+    ///   `extension` (`mp4`) / `label`, a slot in `Format::ALL` (14 → 15),
+    ///   `has_builtin_encoder` answering `false` for it, and `is_h26x` left alone — AV1 is neither
+    ///   H.264 nor H.265.
+    /// - **The registration**, `register_format_probe(Format::Av1, vaapi_av1_available)` beside the
+    ///   HEVC one in `platform::register`. That is the single line this probe is waiting for.
+    /// - **The gate and the adapter**: an `av1_config_for` decline list and an `Av1EncoderExport`
+    ///   implementing `VideoEncoder`, routed from `vaapi_export::factory`, which is an
+    ///   `hevc || h264` match today and would become a three-way one.
+    /// - **A sample entry**: `SampleEntry::av1(Av1Config, w, h)` and an `av01` four-CC. The muxer
+    ///   **already writes `av1C`** (`isobmff/src/codec.rs:1372`) and `Av1Config` already round-trips
+    ///   through its own parser (`:1613`), but `SampleEntry` has only `avc` and `hevc` constructors
+    ///   (`codec.rs:1271`, `:1275`) — so there is no way to hand the muxer an `av01` entry yet, and
+    ///   an export that got one from elsewhere would be a file nobody has tested.
+    /// - **A preset**, gated on `available(Format::Av1)` exactly as the HEVC ones are gated in
+    ///   `export/src/presets.rs`.
+    /// - **A driver that takes the picture record** — which is the part that does not exist on this
+    ///   machine, and the only one no amount of code here can supply.
+    pub fn av1_available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| match av1_probe() {
+            Ok(bytes) => {
+                log::info!("VA-API AV1: the driver produced a {bytes}-byte AV1 key frame, so this machine can export AV1");
+                true
+            }
+            Err(why) => {
+                log::info!("no usable VA-API AV1 encoder: {why}");
+                false
+            }
+        })
+    }
+
+    /// The one question [`av1_available`] asks, as a value: **the number of bytes of AV1 the driver
+    /// wrote for one key frame**, or why there are none.
+    ///
+    /// Every step is one FilmCraft's shipped path already takes, and none of them is the interesting
+    /// one: open the render node (`O_RDWR`, `vaapi/ffi.rs:2903` — with `O_RDONLY`, `vaCreateContext`
+    /// fails `VA_STATUS_ERROR_ALLOCATION_FAILED` for **every** codec and a working machine reads as
+    /// having no VA-API at all), build the encoder, upload a ramp, encode one key frame. **The step
+    /// that decides the answer is the last one**: `Av1Encoder::encode` renders, syncs and reads the
+    /// coded buffer back, and refuses a picture it cannot show bytes for
+    /// ([`crate::vaapi::DRIVER_REFUSES_THE_AV1_PICTURE_RECORD`]).
+    ///
+    /// # What it asks libva, and how each answer is judged
+    ///
+    /// - **No `vaQueryConfigAttributes` anywhere on this path.** That call segfaults inside
+    ///   `iHD_drv_video.so` on libva 1.24, so nothing here may make it — and nothing does, because
+    ///   the probe's only question is whether a picture comes back.
+    /// - **`vaCreateConfig` is judged on its returned `VAStatus` and never on a value libva writes
+    ///   back into the attribute array.** `Encoder::new` sets three attributes (render format, rate
+    ///   control, packed headers) and reads only `st != OK`.
+    /// - **`vaCreateBuffer` and `vaSyncBuffer` carry the arguments libva 1.24 gives them**
+    ///   (`num_elements`, `timeout_ns`), through `Encoder`'s own wrapper, which is where those
+    ///   arguments live — so a probe written here cannot omit them by omission.
+    ///
+    /// **The empty-bytes check below is not a duplicate of that refusal.** `encode` already refuses
+    /// an empty buffer, so on this driver the `?` above returns first and this arm is not reached.
+    /// It is here because it is the criterion: an `encode` that ever returns `Ok` with no picture is
+    /// the one failure this probe exists to catch, and a check that only ever exercises its other
+    /// branch is not a check of the criterion.
+    pub(super) fn av1_probe() -> Result<usize, String> {
+        let display = crate::vaapi::open_display()?;
+        let (luma, chroma) = crate::vaapi::ramp_picture(AV1_PROBE_SIZE.0, AV1_PROBE_SIZE.1)?;
+        let plan = crate::vaapi::Av1Plan::new(AV1_PROBE_SIZE.0, AV1_PROBE_SIZE.1, AV1_PROBE_FPS, AV1_PROBE_QINDEX)?;
+        let mut encoder = crate::vaapi::Av1Encoder::at_constant_quantiser(&display, plan)?;
+        encoder.upload(&luma, &chroma)?;
+        let picture = encoder.encode(crate::vaapi::Av1EncodeRequest::key_frame(0))?;
+        if picture.bytes.is_empty() {
+            return Err("the driver accepted an AV1 picture record and wrote no bytes into the coded buffer, so there is no encoder here".into());
+        }
+        Ok(picture.bytes.len())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -766,7 +934,7 @@ pub use vaapi_export::factory as vaapi_encoder_factory;
 
 #[cfg(target_os = "linux")]
 pub use vaapi_export::{
-    ExportBitrate, VaEncoderExport, config_for as vaapi_config_for, rate_control_modes as vaapi_rate_control_modes,
+    ExportBitrate, VaEncoderExport, av1_available as vaapi_av1_available, config_for as vaapi_config_for, rate_control_modes as vaapi_rate_control_modes,
     rate_control_modes_named as vaapi_rate_control_modes_named,
 };
 
@@ -908,5 +1076,185 @@ mod gate_against_summary {
             };
             assert!(why.contains(&format!("quantiser ({qp})")), "QP {qp}: the decline quotes the same number the summary did: {why}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The AV1 probe: what it answers, and the control that makes the answer evidence
+// ---------------------------------------------------------------------------
+
+/// **The AV1 probe on this machine, and the H.264 control that gives its answer meaning.**
+///
+/// # Why a control is required, and what it must be
+///
+/// **A probe that answers `false` on a machine with no VA-API at all is worth nothing**: a missing
+/// render node, an unresolvable `libva.so.2`, a dead DRM client — every one of those produces the
+/// same `false`, and each is a machine fact rather than an AV1 fact. So the H.264 encoder is run
+/// through **the same four steps in this process**: open the render node, build a slice encoder,
+/// upload a ramp, render one picture and map the coded buffer back. Only the codec differs, so an
+/// H.264 picture coming back is evidence that *this machine, through this code, right now* can do
+/// it — which is what leaves the AV1 answer as a statement about AV1.
+///
+/// **H.264 is the right control for a second, measured reason**: it is the codec this driver
+/// advertises an encoder for *and* actually has one for. `examples/vaprobe.rs --caps` on this
+/// machine answers `H264Main VLD: true EncSlice: true` — the advertisement — and the control below
+/// is what establishes the picture, which the advertisement never does (for AV1, on this very
+/// driver, it demonstrably does not).
+///
+/// **The steps are not the interesting part; the control is.** Every step both probes take is one
+/// FilmCraft's shipped path already takes, and a probe that failed at `open_display` or at
+/// `vaCreateConfig` would be saying something about the machine rather than about AV1. The test
+/// below pins that: the refusal has to name `vaRenderPicture`.
+///
+/// # What none of this is
+///
+/// **Encode verification is materially weaker than decode's and nothing here pretends otherwise.** A
+/// hardware encoder and a software encoder are different algorithms making different decisions, so
+/// there is no bit-equality available at any level, and **"matches ffmpeg" is never a claim about
+/// an encode** — it would be a measurement of ffmpeg's encoder. There is no AV1 bitstream on this
+/// machine at all, so there is nothing to decode and nothing at all to say about fidelity: what is
+/// measured here is **whether a driver produces bytes**, not whether they are good ones.
+#[cfg(all(test, target_os = "linux"))]
+mod av1_probe_evidence {
+    use super::vaapi_export::{AV1_PROBE_FPS, AV1_PROBE_QINDEX, AV1_PROBE_SIZE, av1_available, av1_probe};
+    use crate::vaapi::{Av1Encoder, Av1Plan, DRIVER_REFUSES_THE_AV1_PICTURE_RECORD, EncodeRequest, Entrypoint, Profile, VaEncoder, open_display, ramp_picture};
+
+    /// **The libva session is process-wide on this driver**, so the tests below take turns. The
+    /// mutex is poisoned deliberately: a test that panicked while holding it has not broken the
+    /// session, and `AGENTS.md` §0.6 says lock poisoning is not fatal.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// **The H.264 control: [`av1_probe`]'s four steps, in this process, on the codec this machine
+    /// does encode.** [`VaEncoder`] is the submission path [`super::VaEncoderExport`] wraps, so
+    /// every libva call in here is the same call the H.264 export path makes — the driver, the
+    /// render node, `vaRenderPicture`, `vaSyncBuffer`, `vaMapBuffer`.
+    ///
+    /// **One picture, a key frame**, because a predicted picture would need a reference and the
+    /// point is the session, not the frame loop. The bitrate is a rate nobody is choosing for a
+    /// probe; the ramp compresses to almost nothing at any rate, which is what makes a picture
+    /// coming back unambiguous.
+    fn h264_control() -> Result<usize, String> {
+        let display = open_display()?;
+        let (luma, chroma) = ramp_picture(AV1_PROBE_SIZE.0, AV1_PROBE_SIZE.1)?;
+        let mut encoder = VaEncoder::at_constant_bitrate(&display, AV1_PROBE_SIZE, 1, 500_000)?;
+        // Both stream-shaped settings have to be stated before `encode` will run, and neither is
+        // defaulted: a rate or a GOP invented by a probe is a stream nobody asked for, which is the
+        // whole argument for `hevc_available` not encoding a picture at all.
+        encoder.at_rate(AV1_PROBE_FPS)?.key_frames_every(AV1_PROBE_FPS)?;
+        encoder.upload(&luma, &chroma)?;
+        let picture = encoder.encode(EncodeRequest::key_frame_at_rate()?)?;
+        if picture.bytes.is_empty() {
+            return Err("the H.264 control rendered and synced but wrote no bytes into the coded buffer".into());
+        }
+        Ok(picture.bytes.len())
+    }
+
+    /// **AV1 encode is not available on this machine, and it is not available for the reason the
+    /// criterion names** — the driver refuses the picture record — **which an H.264 picture in this
+    /// same process rules out as a fact about the machine.**
+    ///
+    /// The deliberate breaks, one per assertion: a probe that stopped at `open_display` (its refusal
+    /// would name the display rather than `vaRenderPicture`); a probe that stopped at `vaCreateConfig`
+    /// (the negation below); a probe whose `OnceLock` cached something other than its own result; and
+    /// a driver that began taking the AV1 picture record (the `Ok` arm, which is a red test and not a
+    /// pass, because the recorded measurement would then be stale).
+    #[test]
+    fn the_probe_refuses_at_the_picture_record_while_an_h264_picture_comes_back() {
+        let _guard = lock();
+        // **The control runs first and it gates everything else.** Without a working H.264 encoder in
+        // this process, "AV1 is unavailable" is indistinguishable from "this machine cannot do
+        // anything through VA-API", and a green tick would mean nothing — so the skip is loud and
+        // names what could not be established.
+        let control = match h264_control() {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                eprintln!("SKIPPED: no working H.264 control in this process ({why}), so the AV1 probe's answer is not evidence here");
+                return;
+            }
+        };
+        eprintln!("the H.264 control: {control} bytes of coded picture came back in this process");
+
+        let probed = av1_probe();
+        // **The cached answer is this probe**, so the assertions below are about the function the
+        // format list would call. A probe that cached something else would make them claims about the
+        // wrong function — which is a real possibility and not a hypothetical one, because the cache
+        // is a `OnceLock` written in one place and read in another.
+        assert_eq!(av1_available(), probed.is_ok(), "av1_available() is the probe's own result, memoised: the probe returned {probed:?}");
+        match &probed {
+            // **A red test and not a pass**: a driver that began taking the AV1 picture record makes
+            // `vaapi::driver_outcomes::SUMMARY` stale, and the recorded refusal and this probe's
+            // criterion then have to be revisited together rather than one of them quietly winning.
+            Ok(bytes) => {
+                panic!("FilmCraft's own AV1 submission path produced {bytes} bytes on this driver, which contradicts {DRIVER_REFUSES_THE_AV1_PICTURE_RECORD}")
+            }
+            Err(refusal) => {
+                // **Where it failed is the claim.** "The probe said no" would pass on a machine with
+                // no GPU; "the driver took the records and refused the picture record" cannot.
+                assert!(refusal.contains("vaRenderPicture"), "the probe got as far as rendering and was refused there, which is the measured state: {refusal}");
+                assert!(
+                    !refusal.contains("vaCreateConfig"),
+                    "and it did not fail while creating the session, or this would be a fact about the machine rather than about AV1: {refusal}"
+                );
+                // **The control and the probe in one assertion**, because neither half means anything
+                // alone.
+                assert!(
+                    !av1_available(),
+                    "an H.264 picture came back ({control} bytes) from this driver in this process, so VA-API works here, and AV1 was refused at the picture record: {refusal}"
+                );
+                // **Printed, because the numbers are the evidence** and a reader running this test
+                // should not have to take the two counts above on trust.
+                eprintln!("the AV1 probe's own answer: {refusal}");
+                eprintln!("{DRIVER_REFUSES_THE_AV1_PICTURE_RECORD}");
+            }
+        }
+    }
+
+    /// **The advertisement and the session are both yes while the probe is no** — which is the whole
+    /// reason this probe is not built on either of them.
+    ///
+    /// Every cheap question a capability probe would ask has a `true` here:
+    ///
+    /// - `vaQueryConfigEntrypoints(VAProfileAV1Profile0)` answers `[1 VLD, 6 EncSlice]`, so
+    ///   `EncSlice` is offered (`/usr/include/va/va.h:553`, `:558`);
+    /// - `vaCreateConfig` / `vaCreateSurfaces` / `vaCreateContext` all return `VA_STATUS_SUCCESS`,
+    ///   which [`Av1Encoder::at_constant_quantiser`] would refuse if they did not.
+    ///
+    /// **A probe built on either answer would put AV1 in the format list on a machine where every AV1
+    /// export fails at its first picture.** This test is what holds the difference between
+    /// "advertised" and "produces output", and the two are compared as two separate facts about the
+    /// same display rather than asserted about each other, so it fails if either the driver or the
+    /// criterion moves.
+    #[test]
+    fn the_driver_advertises_an_av1_encoder_and_creates_a_session_and_writes_no_picture() {
+        let _guard = lock();
+        let display = match open_display() {
+            Ok(display) => display,
+            Err(why) => {
+                eprintln!("SKIPPED: no VA-API display: {why}");
+                return;
+            }
+        };
+        let entrypoints = display
+            .entrypoints(Profile::Av1Main)
+            .unwrap_or_else(|why| panic!("vaQueryConfigEntrypoints(VAProfileAV1Profile0), which the rest of this test is about: {why}"));
+        assert!(
+            entrypoints.contains(&Entrypoint::EncSlice),
+            "this driver advertises VAEntrypointEncSlice for VAProfileAV1Profile0, which is what the *cheap* probe would answer and what this one must not"
+        );
+        let plan = Av1Plan::new(AV1_PROBE_SIZE.0, AV1_PROBE_SIZE.1, AV1_PROBE_FPS, AV1_PROBE_QINDEX)
+            .unwrap_or_else(|why| panic!("a {AV1_PROBE_SIZE:?} AV1 plan at {AV1_PROBE_FPS} fps: {why}"));
+        assert!(
+            Av1Encoder::at_constant_quantiser(&display, plan).is_ok(),
+            "vaCreateConfig / vaCreateSurfaces / vaCreateContext succeed for VAProfileAV1Profile0 here, which is the other cheap answer. If this fails, this driver is no longer the one {DRIVER_REFUSES_THE_AV1_PICTURE_RECORD} was measured on, and this test's premise is gone"
+        );
+        // **The contradiction this test exists for**: everything above is true, and the probe is false.
+        assert!(
+            !av1_available(),
+            "the driver advertises VAEntrypointEncSlice for AV1 and creates an AV1 encoder session, and still no AV1 picture comes out of it -- so an availability probe must ask for a picture, not for an advertisement"
+        );
     }
 }
