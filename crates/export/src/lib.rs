@@ -468,7 +468,7 @@ impl Default for ExportSettings {
             scaling: Scaling::default(),
             pixel_aspect: None,
             field_order: FieldOrder::Progressive,
-            h264_profile: H264Profile::High,
+            h264_profile: H264Profile::Auto,
             h264_level: None,
             bitrate_mode: BitrateMode::default(),
             constant_qp: default_constant_qp(),
@@ -1205,10 +1205,14 @@ fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSetti
         H264Pass::First => filmcraft_h264enc::Pass::First,
         H264Pass::Second(st) => filmcraft_h264enc::Pass::Second(st.clone()),
     };
-    cfg.profile = match s.h264_profile {
+    cfg.profile = match s.resolved_h264_profile() {
         H264Profile::Baseline => filmcraft_h264enc::Profile::Baseline,
         H264Profile::Main => filmcraft_h264enc::Profile::Main,
-        H264Profile::High => filmcraft_h264enc::Profile::High,
+        // **`Auto` lands on High here, and that is this encoder's own answer rather than a
+        // catch-all**: the built-in encoder writes all three profiles, so the best profile it can
+        // produce is the strongest one. `resolved_h264_profile` resolves `Auto` before it reaches
+        // here; the arm exists because the match has to be exhaustive over the vocabulary.
+        H264Profile::Auto | H264Profile::High => filmcraft_h264enc::Profile::High,
     };
     cfg.level = s.h264_level;
     if let Some((n, d)) = s.pixel_aspect {

@@ -150,6 +150,30 @@ fn every_builtin_preset_exports_and_ffprobe_confirms() {
             "h264" => {
                 assert!(fmt_name.contains("mp4"), "{name}: {fmt_name}");
                 assert_eq!(v["codec_name"], "h264", "{name}");
+                // **The profile this machine's encoder produced, checked in the finished file by an
+                // external oracle.**
+                //
+                // The built-in presets name no profile: `h264Profile` is `auto`, which is the
+                // delegation ("whatever this machine can actually produce") rather than a promise,
+                // and `filmcraft_export::ExportSettings::resolved_h264_profile` is what turns it
+                // into a profile. The first assertion below is that the delegation is what shipped;
+                // the second is ffprobe's answer to what the file ended up being.
+                //
+                // **The answer is High here, and it is the same on every platform — because these
+                // exports run with hardware encoding off.** `hardware_encoding_is_off_unless_asked_for`
+                // (below) is the test that says so, and the encoder that runs is then FilmCraft's
+                // own, which writes any of the three profiles.
+                //
+                // **It is not the same answer everywhere, and that is the point of the variant.**
+                // With `hardwareEncoding: auto` the OS encoder may take the export, and what it can
+                // produce is platform-dependent: VideoToolbox and NVENC pass the profile through and
+                // write High, while VA-API's derived SPS states Main whatever profile the driver is
+                // offered — an offered High comes back as a byte-identical Main bitstream — so Auto
+                // resolves to Main there and the file says Main. That answer is asserted where the
+                // hardware encoder actually runs, in `crates/platform/tests/vaenc.rs`, against the
+                // same `vaapi_config_for` gate this export path goes through; asserting it from a
+                // software export would be asserting a file nobody produced.
+                assert_eq!(settings["h264Profile"], "auto", "{name}: the preset delegates rather than promising a profile");
                 assert_eq!(v["profile"], "High", "{name}");
                 assert_eq!(a["codec_name"], "aac", "{name}");
                 assert!((num(&a["bit_rate"]) / 1000.0 - 320.0).abs() < 80.0, "{name}: AAC {}", a["bit_rate"]);

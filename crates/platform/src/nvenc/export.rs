@@ -110,10 +110,13 @@ fn config(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -
         max_bitrate_kbps: s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps / 2 * 3),
         cbr: s.bitrate_mode == BitrateMode::Cbr,
         keyint: s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (f64::from(fps.0) / f64::from(fps.1) * 2.0).round().max(1.0) as u32),
-        profile: match s.h264_profile {
-            H264Profile::Baseline => Profile::Baseline,
+        profile: match s.resolved_h264_profile() {
+            // **Resolved, not stored**: `Auto` names no profile, and NVENC is given one it writes
+            // into the stream, so `Auto` is High here — the strongest profile this backend puts in
+            // the file, and what `resolved_h264_profile` resolves it to on Windows too.
+            H264Profile::Auto | H264Profile::High => Profile::High,
             H264Profile::Main => Profile::Main,
-            H264Profile::High => Profile::High,
+            H264Profile::Baseline => Profile::Baseline,
         },
         level: s.h264_level,
         sar: s.pixel_aspect,

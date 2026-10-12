@@ -82,11 +82,15 @@ pub fn config_for(w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Result
         timescale,
         frame_duration,
         keyframe_interval: s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (fps * 2.0).round().max(1.0) as u32),
-        profile: match (hevc, s.h264_profile) {
+        profile: match (hevc, s.resolved_h264_profile()) {
             (true, _) => VtProfile::HevcMain,
             (false, H264Profile::Baseline) => VtProfile::Baseline,
             (false, H264Profile::Main) => VtProfile::Main,
-            (false, H264Profile::High) => VtProfile::High,
+            // **`Auto` is High here, and it is High for a reason rather than by default of the
+            // match**: VideoToolbox takes the profile and writes it into the stream it returns, so
+            // the strongest profile is the one this machine can actually produce — and on macOS
+            // that is what `resolved_h264_profile` resolves `Auto` to as well.
+            (false, H264Profile::Auto) | (false, H264Profile::High) => VtProfile::High,
         },
         rate: match s.bitrate_mode {
             BitrateMode::Cbr => VtRate::Cbr { kbps },
@@ -319,7 +323,9 @@ mod vaapi_export {
     ///
     /// - **Baseline and High profiles**, because the derived parameter sets say Main. The sequence
     ///   record carries no profile field to derive from and an SPS claiming High while the slices are
-    ///   CAVLC at 4x4 would describe a different stream from the one encoded.
+    ///   CAVLC at 4x4 would describe a different stream from the one encoded. **`Auto` is taken**, and
+    ///   resolves to Main: a preset that names no profile is exactly the case this backend can serve
+    ///   honestly (see `ExportSettings::resolved_h264_profile`).
     /// - **Interlaced**, because the sequence record writes `frame_mbs_only_flag = 1` and a field
     ///   sequence cannot be expressed at all.
     /// - **Fractional frame rates**, because `VAEncMiscParameterFrameRate`'s numerator here is whole
@@ -385,7 +391,9 @@ mod vaapi_export {
             // backends cannot pick different ceilings for the same settings.
             _ => {
                 let max_kbps = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps.saturating_mul(3) / 2);
-                let max_bps = max_kbps.checked_mul(1000).ok_or_else(|| format!("a VBR ceiling of {max_kbps} kbps, which does not fit the record's bits-per-second field"))?;
+                let max_bps = max_kbps
+                    .checked_mul(1000)
+                    .ok_or_else(|| format!("a VBR ceiling of {max_kbps} kbps, which does not fit the record's bits-per-second field"))?;
                 ExportBitrate::Vbr { target: bps, max: max_bps }
             }
         };
@@ -411,8 +419,19 @@ mod vaapi_export {
         // to derive it from, and an SPS claiming High while the slice headers are CAVLC and the
         // transform is 4x4 would describe a different stream from the one encoded. A profile this
         // backend cannot state faithfully is a decline, not a nearest match.
-        if s.h264_profile != filmcraft_export::H264Profile::Main {
-            return Err(format!("the {:?} H.264 profile: this backend's derived parameter sets state Main", s.h264_profile));
+        //
+        // **`H264Profile::Auto` is not one of those profiles: it is the delegation this backend
+        // *can* honour.** `ExportSettings::resolved_h264_profile` resolves it to Main on Linux (and
+        // the hardware-encoding check above has already established that the hardware path is the
+        // one in play), so a preset that names no profile passes this gate and comes out a Main
+        // file that says so — which is the whole reason the variant exists. The test is written
+        // against the *resolved* profile rather than against a list that also accepts `Auto`, so
+        // that the two places which know what this encoder writes cannot drift apart.
+        if s.resolved_h264_profile() != filmcraft_export::H264Profile::Main {
+            return Err(format!(
+                "the {} H.264 profile: this backend's derived parameter sets state Main. Choose Auto or Main to export through it",
+                s.h264_profile.label()
+            ));
         }
         // The frame rate, as the whole number of pictures a second the encoder is told.
         //
@@ -621,5 +640,6 @@ pub use vaapi_export::factory as vaapi_encoder_factory;
 
 #[cfg(target_os = "linux")]
 pub use vaapi_export::{
-    ExportBitrate, VaEncoderExport, config_for as vaapi_config_for, rate_control_modes as vaapi_rate_control_modes, rate_control_modes_named as vaapi_rate_control_modes_named,
+    ExportBitrate, VaEncoderExport, config_for as vaapi_config_for, rate_control_modes as vaapi_rate_control_modes,
+    rate_control_modes_named as vaapi_rate_control_modes_named,
 };

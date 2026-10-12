@@ -43,10 +43,14 @@ fn picture(settings: &ExportSettings, w: u32, h: u32) -> PictureDesc {
             }
         }
         Format::H264 => PictureCoding::Avc {
-            profile_idc: match settings.h264_profile {
+            // **Resolved, not stored** (`ExportSettings::resolved_h264_profile`): `Auto` names no
+            // profile, and this record has to name one the samples really carry. `Auto` lands on
+            // High — the strongest profile FilmCraft's own encoder writes, and MXF is never handed
+            // to a hardware encoder — so the file and this record still agree.
+            profile_idc: match settings.resolved_h264_profile() {
                 H264Profile::Baseline => 66,
                 H264Profile::Main => 77,
-                H264Profile::High => 100,
+                H264Profile::Auto | H264Profile::High => 100,
             },
             intra: false,
         },

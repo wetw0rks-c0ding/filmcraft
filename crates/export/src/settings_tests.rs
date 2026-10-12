@@ -290,6 +290,130 @@ fn h264_profile_level_and_keyframes() {
     }
 }
 
+/// **`Auto` is the default, and it resolves to a profile an encoder on this machine can write.**
+///
+/// The rule under test is `ExportSettings::resolved_h264_profile`'s: the *backend* decides, not
+/// the stored value. Two facts make the expectation platform-dependent and both are measured rather
+/// than assumed — VideoToolbox and NVENC pass the profile through and write it into the stream,
+/// while VA-API's derived SPS states Main whatever profile the driver is offered (an offered High
+/// comes back as a byte-identical Main bitstream).
+#[test]
+fn an_auto_h264_profile_resolves_to_what_this_machine_can_produce() {
+    let built_in = ExportSettings::default();
+    assert_eq!(built_in.h264_profile, H264Profile::Auto, "a settings object that names no profile delegates rather than promising");
+    assert_eq!(built_in.hardware_encoding, HardwareEncoding::Off, "and hardware encoding is off unless asked for, so the built-in encoder runs");
+    assert_eq!(built_in.resolved_h264_profile(), H264Profile::High, "the built-in encoder writes all three profiles, so the strongest is what Auto means here");
+
+    let hardware = ExportSettings { hardware_encoding: HardwareEncoding::Auto, ..Default::default() };
+    let want = if cfg!(target_os = "linux") { H264Profile::Main } else { H264Profile::High };
+    assert_eq!(hardware.resolved_h264_profile(), want, "with the OS encoder in play, Auto is the best profile *every* backend here can produce");
+
+    // **MXF is the case the OS encoder cannot take at all** (it carries an Annex B stream, which
+    // this backend's length-prefixed samples are not), so the built-in encoder will run, it writes
+    // every profile, and Auto is High — which is what the `MXF OP1a H.264` preset's own
+    // description says it is. Without this condition the description would be true only with
+    // hardware encoding off.
+    let mxf = ExportSettings { format: Format::MxfOp1a, hardware_encoding: HardwareEncoding::Auto, ..Default::default() };
+    assert_eq!(mxf.resolved_h264_profile(), H264Profile::High, "nothing else can encode MXF H.264 here");
+
+    for named in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
+        let s = ExportSettings { h264_profile: named, hardware_encoding: HardwareEncoding::Auto, ..Default::default() };
+        assert_eq!(
+            s.resolved_h264_profile(),
+            named,
+            "a named profile is a promise and is passed through untouched — Auto delegates, it never rewrites one that was asked for"
+        );
+    }
+
+    // **Every built-in preset inherits the delegation**, which is the only reason this reaches the
+    // hardware export path at all: the presets name no profile, and this is what they resolve to.
+    for p in builtin_presets().iter().filter(|p| p.settings.video_format() == Format::H264) {
+        assert_eq!(p.settings.h264_profile, H264Profile::Auto, "{} names a profile", p.name);
+        assert!(p.settings.resolved_h264_profile() != H264Profile::Auto, "{} leaves the encoder nothing to write", p.name);
+    }
+}
+
+/// **The summary prints the profile the file will have, not the one that was typed.**
+///
+/// This is the mechanism `AudioCodec::Auto` uses for the audio line, applied to the video one: the
+/// panel has to be able to answer "what is this going to be?" before an encoder is chosen, and an
+/// `Auto` that printed "Auto" would answer a different question.
+#[test]
+fn the_summary_names_the_resolved_profile() {
+    let ten = Tick(10 * TICKS_PER_SECOND);
+    let line = |s: &ExportSettings| s.summary(1920, 1080, FrameRate::FPS_30, 48_000, ten).video.clone();
+    let hardware = ExportSettings { format: Format::H264, hardware_encoding: HardwareEncoding::Auto, ..Default::default() };
+
+    // The two platform answers, one line each, asserted on the exact text a user reads. (The level
+    // follows the profile without a comma; that is the panel's existing wording, not this change's.)
+    let want = hardware.resolved_h264_profile().label();
+    assert_eq!(
+        line(&hardware),
+        format!("1920x1080 (1.0), 30 fps, Progressive, {want} auto level, VBR, 1 pass, Target 20.00 Mbps, Max 30.00 Mbps, keyframe every 60 frames"),
+        "the resolved profile, where the stored value is Auto"
+    );
+    let named = ExportSettings { h264_profile: H264Profile::Baseline, ..hardware.clone() };
+    assert!(line(&named).contains(", Baseline auto level,"), "a named profile is printed as named: {}", line(&named));
+    assert!(!line(&hardware).contains("Auto"), "Auto is a delegation, not a description of the file: {}", line(&hardware));
+}
+
+/// **A settings file written before `Auto` existed still loads, and its stored profile is kept.**
+///
+/// This is the data-loss guard for `<data dir>/export-presets.json` and every project that carries
+/// export settings: before this change the field's default was `High` and it was always written out,
+/// so real files on disk carry `"h264Profile":"high"`. If adding the variant had turned that string
+/// into an unknown one, a user's whole preset library would fail to load and every export setting
+/// in every project would be rejected — settings files do not fail loudly and then carry on, they
+/// fall back to defaults or error, and both lose what was stored.
+#[test]
+fn settings_written_before_auto_still_deserialise() {
+    // Exactly the shape of a stored `ExportSettings` from before this change.
+    let stored = serde_json::json!({
+        "format": "h264",
+        "path": "/home/u/Movies/out.mp4",
+        "scale": 1.0,
+        "includeAudio": true,
+        "quality": 90,
+        "bitrateKbps": 20000,
+        "burnCaptions": false,
+        "fieldOrder": "progressive",
+        "h264Profile": "high",
+        "h264Level": 41,
+        "bitrateMode": "vbr1Pass",
+        "constantQp": 26,
+        "hardwareEncoding": "off",
+        "maxBitrateKbps": 30000,
+        "multiplexer": "mp4",
+        "audio": { "codec": "aac", "sampleRate": 48000, "channels": 2, "bitrateKbps": 320, "bits": 16 }
+    });
+    let s: ExportSettings = serde_json::from_value(stored.clone()).unwrap_or_else(|e| panic!("a settings file written before Auto: {e}"));
+    assert_eq!(s.h264_profile, H264Profile::High, "a stored \"high\" is still the High profile, not an unknown variant");
+    assert_eq!(s.resolved_h264_profile(), H264Profile::High, "and it still encodes as High whatever Auto would have said");
+    assert_eq!(
+        (s.h264_level, s.bitrate_mode, s.bitrate_kbps, s.hardware_encoding),
+        (Some(41), BitrateMode::Vbr1Pass, 20_000, HardwareEncoding::Off),
+        "the rest of the file is untouched"
+    );
+    assert_eq!(s.audio.codec, AudioCodec::Aac, "including the audio codec, which has had an Auto since before this change");
+
+    // Every spelling the field has ever had parses, and the new one round-trips.
+    for (name, want) in [("baseline", H264Profile::Baseline), ("main", H264Profile::Main), ("high", H264Profile::High), ("auto", H264Profile::Auto)] {
+        let s: ExportSettings = serde_json::from_value(serde_json::json!({ "h264Profile": name })).unwrap_or_else(|e| panic!("\"{name}\": {e}"));
+        assert_eq!(s.h264_profile, want, "\"{name}\"");
+        let back = serde_json::to_value(&s).unwrap();
+        assert_eq!(back["h264Profile"], name, "\"{name}\" survives a round trip under the same name");
+    }
+
+    // A file that names no profile at all is a file from before the field existed: it gets Auto.
+    let old: ExportSettings = serde_json::from_value(serde_json::json!({ "format": "h264" })).unwrap();
+    assert_eq!(old.h264_profile, H264Profile::Auto, "no profile named means the delegation, not the last default");
+    // …and every built-in preset (and every preset the library could have saved) round-trips whole.
+    for p in builtin_presets() {
+        let back: ExportPreset = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap_or_else(|e| panic!("{}: {e}", p.name));
+        assert_eq!(back.settings.h264_profile, H264Profile::Auto, "{} survives a save and load", p.name);
+    }
+}
+
 #[test]
 fn video_limiter_clamps_luma() {
     let (p, seq, m) = matte([1.0, 1.0, 1.0, 1.0], 64, 36, None);

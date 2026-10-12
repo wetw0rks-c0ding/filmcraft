@@ -41,19 +41,44 @@ impl FieldOrder {
     }
 }
 
-/// H.264 profile.
+/// H.264 profile, or [`H264Profile::Auto`] — "whatever this machine can actually produce".
+///
+/// **`Auto` is a delegation, and it is the default**, which is what makes it the honest value for
+/// a preset to inherit: the built-in presets name no profile at all, and a preset that names
+/// nothing must not leave the file's profile to whatever the backend happens to do.
+///
+/// A named profile is a promise — *this file is a High profile* — and a promise the platform has to
+/// be able to keep. On Linux it cannot always be kept, and that is measured, not suspected:
+/// VA-API's derived parameter sets write `profile_idc = 77` (Main) because the sequence record
+/// carries no profile field to derive from, and a driver offered `VA_PROFILE_H264_HIGH` answers
+/// with a **byte-identical Main bitstream** (`entropy_coding_mode_flag = 0`, no CABAC, no 8x8).
+/// Before [`Auto`] existed, the only ways to export H.264 through that backend were to pick Main by
+/// hand or to be declined — and picking Main silently changed a preset that had asked for nothing,
+/// which is the one outcome this enum exists to rule out.
+///
+/// The rule that replaces that guess is [`ExportSettings::resolved_h264_profile`], and the summary
+/// prints what it resolved to ([`ExportSettings::summary`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum H264Profile {
+    /// **What the encoder that will run on this machine can actually produce** for this export:
+    /// see [`ExportSettings::resolved_h264_profile`]. The default, because a settings file that
+    /// names no profile should not name one by accident.
+    #[default]
+    Auto,
     Baseline,
     Main,
-    #[default]
     High,
 }
 
 impl H264Profile {
+    /// Every profile, in the order a settings panel lists them: the delegation first, then the
+    /// three named profiles from weakest to strongest.
+    pub const ALL: [H264Profile; 4] = [H264Profile::Auto, H264Profile::Baseline, H264Profile::Main, H264Profile::High];
+
     pub fn label(self) -> &'static str {
         match self {
+            H264Profile::Auto => "Auto",
             H264Profile::Baseline => "Baseline",
             H264Profile::Main => "Main",
             H264Profile::High => "High",
@@ -460,6 +485,59 @@ impl ExportSettings {
         }
     }
 
+    /// **The H.264 profile this export is actually encoded at**, which is `self.h264_profile`
+    /// unless that is [`H264Profile::Auto`].
+    ///
+    /// # The rule, and why it lives here rather than in `crates/platform`
+    ///
+    /// **`Auto` asks what the *backend* can produce, not what the user typed**, and the answer
+    /// depends on which encoder the export will actually reach:
+    ///
+    /// - **The built-in encoder will run** — hardware encoding off (the default), or the OS encoder
+    ///   declines this export outright — and it writes any of the three profiles, so `Auto` is
+    ///   [`H264Profile::High`], the strongest. Nothing is lost by asking.
+    /// - **The OS encoder may take it** — hardware encoding on, and a container its samples fit —
+    ///   so `Auto` is the best profile *every* encoder that could run here can produce:
+    ///   - **macOS (VideoToolbox) and Windows (NVENC)** pass the profile through to the driver and
+    ///     write it into the stream, so `Auto` is [`H264Profile::High`] — unchanged from before
+    ///     this variant existed.
+    ///   - **Linux (VA-API)** writes `profile_idc = 77` in its derived SPS whatever profile it is
+    ///     offered, and answers an offered High with a byte-identical Main bitstream, so `Auto` is
+    ///     [`H264Profile::Main`]. That costs quality on a machine that could have had High, and it
+    ///     is paid on purpose: a preset that names nothing must not hand the driver a profile the
+    ///     file will not carry, and must not have to be edited to work on a third platform.
+    ///
+    /// **Every encoder is given *this* value, not the one that was stored** — the built-in encoder
+    /// (`filmcraft_export::h264_factory`), the MXF picture record and the OS backends all resolve
+    /// it. That is what keeps the invariant: *whatever ends up encoding, and whatever the hardware
+    /// path declines to take, the summary names the profile in the file* — the one thing an `Auto`
+    /// has to be if it is to be worth having.
+    ///
+    /// **A user who wants High on Linux says so, and gets it.** A named [`H264Profile::High`] is
+    /// passed through untouched: the VA-API gate declines it by name
+    /// (`hardware_encode::vaapi_config_for`), the export falls back to the built-in encoder, and
+    /// both the summary and the file say High. `Auto` gives that up for a preset that needs no
+    /// editing anywhere; it never substitutes for asking.
+    ///
+    /// **It is here, and not in the platform crate**, because the summary is computed from the
+    /// settings — before an encoder is chosen, and by a crate that cannot depend on
+    /// `crates/platform`. A rule the summary could not call would be a rule no user ever sees.
+    pub fn resolved_h264_profile(&self) -> H264Profile {
+        if self.h264_profile != H264Profile::Auto {
+            return self.h264_profile;
+        }
+        // The three conditions are the VA-API gate's own, one for one: hardware encoding on (it is
+        // the only encoder on this platform that may take the export), a container it can carry
+        // (MXF is an Annex B stream, which this backend's length-prefixed samples are not — so the
+        // gate declines it by name whatever the profile, and the built-in encoder will run), and
+        // the platform whose encoder writes Main.
+        if self.hardware_encoding == HardwareEncoding::Auto && cfg!(target_os = "linux") && !self.format.is_mxf() {
+            H264Profile::Main
+        } else {
+            H264Profile::High
+        }
+    }
+
     /// The audio codec actually used.
     pub fn audio_codec(&self) -> AudioCodec {
         match (self.format, self.audio.codec) {
@@ -561,9 +639,15 @@ impl ExportSettings {
             let mut v = format!("{}x{} ({par}), {} fps, {}", r.width, r.height, r.rate.label(), self.field_order.label());
             match self.video_format() {
                 Format::H264 => {
+                    // **The resolved profile, not the one that was stored**: `H264Profile::Auto`
+                    // means "what this machine can produce", and a summary that printed "Auto"
+                    // would describe the setting rather than the file. The same mechanism
+                    // `audio_codec()` gives `AudioCodec::Auto` a few lines below, and the same
+                    // reason it exists: the user has to be able to read off the panel what the
+                    // export will write.
                     v += &format!(
                         ", {} {}, {}",
-                        self.h264_profile.label(),
+                        self.resolved_h264_profile().label(),
                         self.h264_level.map(|l| format!("L{}.{}", l / 10, l % 10)).unwrap_or_else(|| "auto level".into()),
                         self.bitrate_mode.label()
                     );

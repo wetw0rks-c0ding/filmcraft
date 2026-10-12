@@ -607,7 +607,11 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                 row(ui, t, "Encoder", |ui| ui.label("Hardware (H.265 has no software encoder)"));
             } else {
                 row(ui, t, "Profile", |ui| {
-                    let o = [H264Profile::Baseline, H264Profile::Main, H264Profile::High];
+                    // **`Auto` first, because it is what a fresh export starts on**: the presets
+                    // name no profile and a settings object that names none inherits it, so it is
+                    // the entry a user sees selected until they choose otherwise. The summary line
+                    // below the panel prints what it resolved to for this machine.
+                    let o = H264Profile::ALL;
                     let labels: Vec<(String, bool)> = o.iter().map(|p| (p.label().to_string(), true)).collect();
                     if let Some(i) = combo(ui, reg, "export.video.profile", s.h264_profile.label(), &labels, 120.0) {
                         s.h264_profile = o[i];

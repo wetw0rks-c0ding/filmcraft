@@ -34,6 +34,14 @@ pub fn preset_key(name: &str) -> String {
 /// The default preset (Quick Export, a fresh Export mode).
 pub const DEFAULT_PRESET: &str = "Match Source – Adaptive High Bitrate";
 
+/// The settings every H.264 preset starts from.
+///
+/// **It names no profile, deliberately.** `h264_profile` is left at the default,
+/// [`crate::settings::H264Profile::Auto`], so a preset inherits "whatever this machine can
+/// actually produce" rather than a profile this file would have to keep true on every platform
+/// (see [`crate::ExportSettings::resolved_h264_profile`]). A preset that promised High and got a
+/// Main file would be a shipped description that is false, which is worse than a description that
+/// says nothing about the profile at all.
 fn h264(size: Option<(u32, u32)>, kbps: u32, max_kbps: u32) -> ExportSettings {
     ExportSettings {
         format: Format::H264,
