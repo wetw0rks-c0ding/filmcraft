@@ -488,6 +488,197 @@ two real defects in itself — it had taken the caller's geometry rather than th
 and its key-frame predicate was `written == 2 != key_frame` where the sound form is `key_frame && written != 2`
 (an I slice in a TRAIL picture is legal HEVC; an IDR with non-I slices is an unstartable sync sample).
 
+### 3.10 Every built-in preset, against both hardware gates
+
+The table the previous sessions lost. **One row per preset in `builtin_presets()`, all 31**, and for
+each one which gate is asked, what it says, and whether the refusal is right.
+
+**How each row was obtained.** The gates already ask this question about the real preset list, so this
+table reads their answers rather than re-deriving them: `crates/platform/tests/vaenc.rs`
+(`what_the_export_gate_declines_and_why`) filters `builtin_presets()` by
+`video_format() == Format::H264` and calls the H.264 gate `vaapi_export::config_for` on each, printing
+every refusal with `eprintln!`; `crates/platform/tests/hevenc.rs`
+(`hevc_is_offered_on_this_machine_and_which_presets_it_reaches`) does the same against
+`vaapi::hevc_config_for`. Both were run on this machine:
+
+```
+test what_the_export_gate_declines_and_why ... preset declined by a documented rule: Vimeo 1080p Full HD: two-pass encoding
+preset declined by a documented rule: Vimeo 2160p 4K Ultra HD: two-pass encoding
+preset declined by a documented rule: MXF OP1a H.264: MXF carries an Annex B stream, and this backend's samples are length-prefixed
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+**8 of the 11 H.264 presets export** — 11 reaching the gate (pinned by name, not by count, in
+`presets::reachability_tests`), minus the 3 refusals printed above. **Encode verification stays the
+weaker standard of §3's preamble throughout: no row here claims an encoded stream matches ffmpeg,
+because bit-equality is unavailable between a hardware and a software encoder.**
+
+#### The routing rule, which decides 19 of the 31 rows before either gate runs
+
+`job.rs` calls the registered factory with **`settings.video_format()`** — the *encoder's* format, not
+the container's — and `vaapi_export::factory` answers with:
+
+```rust
+let hevc = format == Format::Hevc;
+if !hevc && (format != Format::H264 || s.hardware_encoding != HardwareEncoding::Auto) {
+    return None;
+}
+```
+
+A `None` here is not a refusal, it is the factory never asking. So for every format with **no VA-API
+encoder in FilmCraft**, neither gate is consulted and **there is no refusal string to quote**. Asked
+anyway, the two gates say only that they are the wrong gate: the H.264 gate answers
+`ProRes is not H.264: the H.264 gate takes H.264, and Format::Hevc goes to the HEVC gate` and the HEVC
+gate answers `ProRes is not HEVC`. Those are routing messages, not capability findings, and the built-in
+encoders behind those formats are exactly what those presets are for. **Nothing here is a gate waiting
+to be weakened.**
+
+One row is not settled by routing: **`MXF OP1a H.264` reaches a gate**, because
+`ExportSettings::video_format()` reports the MXF *video codec* (`MxfVideoCodec::H264 →
+Format::H264`), so the factory is handed `Format::H264` with `format` still `Format::MxfOp1a`, and the
+H.264 gate reads `s.format.is_mxf()` and refuses. That is its real refusal, not the routing line's.
+
+#### The table
+
+"Gate" is `H264` = `vaapi_export::config_for`, `HEVC` = `vaapi::hevc_config_for`. Bitrates are the
+target/ceiling pair the gate is handed in kbps after `ExportSettings::resolve`; the three `Match
+Source` presets name a bits-per-pixel figure instead, so their numbers are what `resolve` computes at
+**1920×1080 / 30 fps** (`w*h*fps*bpp/1000`, floored at 100, ceiling `target*3/2`) — they inherit the
+sequence's size and rate, so those numbers move with the sequence.
+
+| # | Preset | Format asked | Gate | What the gate says | Exports? |
+|---|--------|--------------|------|--------------------|----------|
+| 1 | Match Source – Adaptive High Bitrate | `H264` | H264 | — (taken) | **yes** |
+| 2 | Match Source – Adaptive Medium Bitrate | `H264` | H264 | — (taken) | **yes** |
+| 3 | Match Source – Adaptive Low Bitrate | `H264` | H264 | — (taken) | **yes** |
+| 4 | High Quality 1080p HD | `H264` | H264 | — (taken) | **yes** |
+| 5 | High Quality 2160p 4K | `H264` | H264 | — (taken) | **yes** |
+| 6 | YouTube 1080p Full HD | `H264` | H264 | — (taken) | **yes** |
+| 7 | YouTube 2160p 4K Ultra HD | `H264` | H264 | — (taken) | **yes** |
+| 8 | Vimeo 1080p Full HD | `H264` | H264 | `two-pass encoding` | no |
+| 9 | Vimeo 2160p 4K Ultra HD | `H264` | H264 | `two-pass encoding` | no |
+| 10 | Social Vertical 1080×1920 | `H264` | H264 | — (taken) | **yes** |
+| 11 | MXF OP1a H.264 | `H264` | H264 | `MXF carries an Annex B stream, and this backend's samples are length-prefixed` | no |
+| 12 | HEVC 1080p High Quality | `Hevc` | HEVC | gate takes it; at any rate but 30 fps `check_hvcc_against_the_picture` refuses with `the hvcC states {avg} fps (constantFrameRate {}) and the VUI in the SPS it carries states {30}: a player reads the container and a decoder reads the SPS` | **yes, at 30 fps only** |
+| 13 | Apple ProRes 422 HQ | `ProRes` | none | routing `None`; H264 gate would say `ProRes is not H.264: …` | no (built-in) |
+| 14 | Apple ProRes 422 | `ProRes` | none | routing `None` | no (built-in) |
+| 15 | Apple ProRes 422 LT | `ProRes` | none | routing `None` | no (built-in) |
+| 16 | Apple ProRes 422 Proxy | `ProRes` | none | routing `None` | no (built-in) |
+| 17 | Avid DNxHR HQ | `DnxHr` | none | routing `None` | no (built-in) |
+| 18 | Avid DNxHR SQ | `DnxHr` | none | routing `None` | no (built-in) |
+| 19 | Avid DNxHR LB | `DnxHr` | none | routing `None` | no (built-in) |
+| 20 | APV 422-10 | `Apv` | none | routing `None` | no (built-in) |
+| 21 | APV 422-12 | `Apv` | none | routing `None` | no (built-in) |
+| 22 | MXF OP1a DNxHR HQ | `DnxHr` | none | routing `None` | no (built-in) |
+| 23 | MXF OP1a ProRes 422 HQ | `ProRes` | none | routing `None` | no (built-in) |
+| 24 | MXF OP-Atom DNxHR (Avid) | `DnxHr` | none | routing `None` | no (built-in) |
+| 25 | PNG Sequence | `PngSequence` | none | routing `None` | no (built-in) |
+| 26 | TIFF Sequence | `TiffSequence` | none | routing `None` | no (built-in) |
+| 27 | BMP Sequence | `BmpSequence` | none | routing `None` | no (built-in) |
+| 28 | Animated GIF 640×360 | `Gif` | none | routing `None` | no (built-in) |
+| 29 | Waveform Audio 48 kHz 16-bit | `Wav` | none | routing `None` | no (built-in) |
+| 30 | Waveform Audio 48 kHz 24-bit | `Wav` | none | routing `None` | no (built-in) |
+| 31 | AIFF 48 kHz 16-bit | `Aiff` | none | routing `None` | no (built-in) |
+
+**The numbers behind the "taken" rows.** Every H.264 preset in the list is `Vbr1Pass`, `Auto` profile
+(resolved to Main, which is what the derived SPS writes), progressive, SDR, square pixels, and even
+sided (`resolve` forces `w &= !1; h &= !1`), so the gate's own profile, field-order, pixel-aspect and
+size checks are all passed by construction. The ceiling is taken as stated — 20 000/24 000, 60 000/72 000,
+16 000/20 000, 45 000/54 000, 12 000/16 000 kbps — and the three adaptive presets resolve to
+**12 442/18 663**, **6 221/9 331** and **3 110/4 665** kbps at 1920×1080/30. The key-frame interval is
+`fps*2` (`resolve`), which is **60** at 30 fps against the encoder's `MaxFrameNum` of **256** (§3.2).
+
+**One conditional the table does not show.** Every H.264 row is also conditional on the user's
+`Export ▸ Hardware encoding` opt-in: `HardwareEncoding::default()` is `Off`, and the gate's first check
+after the format is `if s.hardware_encoding != HardwareEncoding::Auto { return Err("hardware encoding is
+off") }`. The preset list does not set it, so "exports" here means *under the opt-in*, which is how
+§3.9 describes it and how both test suites set it (`s.hardware_encoding = HardwareEncoding::Auto`).
+
+#### The verdicts
+
+| # | Preset | Verdict | Why |
+|---|--------|---------|-----|
+| 8, 9 | Vimeo 1080p Full HD, Vimeo 2160p 4K Ultra HD | **Refused for a real reason** | See below. |
+| 11 | MXF OP1a H.264 | **Refused for a real reason** | See below. |
+| 12 | HEVC 1080p High Quality | **Exports at 30 fps. Refused for a fixable reason at every other rate** — and the fix is in the encoder, outside this branch's two files | See below. |
+| 13–31 | all nineteen remaining presets | **Refused for a real reason** (by routing, not by a gate) | No VA-API encoder exists for these formats in FilmCraft. Nothing is declining a capability; there is no encoder to decline with. The built-in encoders are the deliverable. |
+| — | *no preset on this list* | **Ambiguous** | There are none. Every row resolved to one of the two verdicts above. |
+
+**#8/#9, the two-pass refusals — real, and quoted from the gate.** The H.264 gate refuses before it
+reads any bitrate, in `hardware_encode.rs`:
+
+```rust
+if !matches!(s.h264_pass, H264Pass::Single) {
+    return Err("two-pass encoding".into());
+}
+if s.bitrate_mode == BitrateMode::Vbr2Pass {
+    return Err("two-pass encoding".into());
+}
+```
+
+and the HEVC gate spells the same refusal out: `"two-pass encoding: a two-pass export renders the
+sequence once to measure it and again to encode it, and this backend is handed each picture once"`. The
+backend has **no `Pass` concept at all** and is handed each picture once, so there is nothing to submit
+a measured rate control to; taking the second pass's bitrate and encoding in one pass would produce a
+file at a rate nobody chose with nothing wrong anywhere in it. **Left refused.** Both presets already
+carry a comment saying so, and both still export — through FilmCraft's own encoder, which does take the
+two passes.
+
+**#11, the MXF H.264 refusal — real, and a property of the container.** Quoted above. MXF carries the
+H.264 **Annex B** stream with in-band parameter sets (ST 381-3); the VA-API path has no switch to that
+form and hands the muxer four-byte length-prefixed samples, which is the MP4 form. **No choice in
+`presets.rs` can fix this**, because it is the container and not the codec; the only "fix" available
+would be to stop shipping MXF H.264, which is a real broadcast deliverable that works today through
+FilmCraft's own encoder. Left refused, already commented at the preset.
+
+**#12, the HEVC rate constraint — fixable, but not in a file this branch may edit.** The *gate* accepts
+24, 25 and 60 fps; the refusal happens later and is in the encoder:
+
+- `hevc_submit.rs`'s `sequence_record(size, width, height, keyframe_interval)` takes **no frame-rate
+  argument**, and writes `vui_num_units_in_tick: 1` with `vui_time_scale: 2 * DEFAULT_FRAME_RATE_FOR_LEVEL`
+  where `const DEFAULT_FRAME_RATE_FOR_LEVEL: u32 = 30`. So `time_scale / (2 * num_units_in_tick)` is
+  **30 fps in every stream this path writes.**
+- `at_rate(fps)` stores the caller's rate and *rebuilds* the sequence record — but passes no rate to
+  it, so the rebuild keeps the fixed 30.
+- The `hvcC` carries the caller's rate, and `check_hvcc_against_the_picture` compares the two and
+  refuses the mismatch by name.
+
+**The fix is real and is a genuine improvement rather than a weakening**: thread the rate through
+`sequence_record` from `at_rate` into `vui_num_units_in_tick`/`vui_time_scale`, which makes the stream
+state the rate the caller asked for and leaves the cross-check — a good check — exactly as strict. It
+also matches what the code around it already claims: the comment above those two fields reads *"the
+timing in it is the frame rate the caller stated — not a guess"*, and the constant's own doc says
+*"never reaches a stream"* — **both are false today**, which is why the two comments and the code
+disagree. **Not applied here**: the change is in `crates/platform/src/vaapi/hevc_submit.rs`, outside
+this task's two files. So **HEVC presets are a 30 fps export on this branch**, which is a defect in the
+encoder and applies to every route to the format, not a property of the preset or of HEVC.
+
+#### Two things this table could not measure, stated rather than guessed
+
+- **The HEVC row is conditional on the machine, and no test exercises it.** `hevc_presets()` returns
+  empty unless `available(Format::Hevc)`, which is `vaapi::hevc_available` registered by
+  `filmcraft_platform::register()`. `tests/hevenc.rs` does not call `register()`, so on this machine it
+  reports **`HEVC presets exported through the gate: 0 of 0`** and **`note: FilmCraft ships 0 HEVC
+  preset(s)`** — the preset is not in the list it is testing. That is a **coverage hole, not a
+  disagreement**: `vaapi::hevc_available()` returns true here (the same test asserts it directly), and
+  the same settings shape encodes end to end through the registered factory at 30 fps
+  (`a_hevc_export_through_the_gate_decodes_to_the_pictures_that_went_in` — **ok**). But the preset's
+  *own* settings have never been put through `hevc_config_for` by any test. Its row above is read from
+  the gate's checks, every one of which it passes: `Vbr1Pass`, 10 000/15 000 kbps, 1920×1080 (both
+  multiples of 8), progressive, SDR, square pixels, `H264Pass::Single`. **A test that calls `register()`
+  before reading the preset list would close this, and it belongs in `tests/hevenc.rs`.**
+- **§3.9's "No shipped preset changed status" is now stale** for the same reason: it says FilmCraft
+  "ships no HEVC preset at all", and `29affc43` added one. The sentence above is the corrected claim.
+
+#### Where the table is pinned, so it cannot rot
+
+`presets.rs` carries four tests (`presets::reachability_tests`) that assert this partition **by name**,
+because a count survives a rename or a re-routed container and would then be an assertion that cannot
+fail: which 11 presets reach the H.264 gate, which two name a second pass, which one puts H.264 in an
+MXF container, and that no HEVC preset is listed without a probe. They are checked against the real
+`builtin_presets()` output, and were confirmed able to fail (a one-character change to an expected name
+turns the first red with the two lists printed side by side).
+
 ### The FFI audit
 
 A wrong-arity `vaSyncBuffer` (libva's third parameter is `uint64_t timeout_ns`) was found producing correct

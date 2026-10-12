@@ -181,6 +181,36 @@ fn p(name: &str, category: &str, description: &str, settings: ExportSettings) ->
 }
 
 /// Every built-in preset, in browser order.
+///
+/// # Which of these a hardware encoder takes, and which it declines by name
+///
+/// **Measured on this machine, not inferred.** `crates/platform/tests/vaenc.rs` reads this very list
+/// and asks the H.264 gate (`vaapi_export::config_for`) about every preset whose
+/// [`ExportSettings::video_format`] is [`Format::H264`], and `tests/hevenc.rs` asks the HEVC gate
+/// (`vaapi::hevc_config_for`) the same question of every HEVC preset. The full table, with every
+/// refusal quoted, is `docs/vaapi-progress.md` §3.10. The short form:
+///
+/// - **8 of the 11 presets that reach the H.264 gate are taken.** The three that are not are the two
+///   `Vimeo` presets (**`BitrateMode::Vbr2Pass`**, refused with `two-pass encoding`) and
+///   `MXF OP1a H.264` (**`MXF carries an Annex B stream, and this backend's samples are
+///   length-prefixed`**). Each carries its own comment below saying the refusal is deliberate.
+/// - **The HEVC preset is taken at 30 fps only**, for the encoder reason `hevc()` documents, and it is
+///   *conditional on this machine having an HEVC encoder* — see `hevc_presets`.
+/// - **The other nineteen presets are not declined by a gate at all, because no gate is asked.**
+///   ProRes, DNxHR, APV, the MXF containers that carry them, the image sequences, GIF and the audio
+///   formats have no VA-API encoder in FilmCraft. The registered factory returns `None` for them at
+///   its routing line *before* either gate runs — `if !hevc && (format != Format::H264 ||
+///   s.hardware_encoding != HardwareEncoding::Auto) { return None; }` — so there is no refusal to
+///   quote and nothing to weaken. Asking the H.264 gate anyway would answer `ProRes is not H.264: the
+///   H.264 gate takes H.264, and Format::Hevc goes to the HEVC gate`, and the HEVC gate `ProRes is
+///   not HEVC`; those are routing messages, not capability findings, and the built-in encoders behind
+///   those formats are the point.
+///
+/// **`MXF OP1a H.264` is the one non-H.264 *container* that does reach a gate**, because
+/// [`ExportSettings::video_format`] reports the MXF *video codec* rather than the container: the
+/// export code calls the factory with `video_format()` (`job.rs`), so that preset arrives as
+/// `Format::H264` with `format` still `Format::MxfOp1a`, and the H.264 gate reads `s.format.is_mxf()`
+/// and refuses. That is why its refusal below is the gate's and not the routing line's.
 pub fn builtin_presets() -> Vec<ExportPreset> {
     let ms = "Match Source";
     let web = "Web & Social";
@@ -282,4 +312,94 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
 pub fn find_builtin(name: &str) -> Option<ExportPreset> {
     let k = preset_key(name);
     builtin_presets().into_iter().find(|p| preset_key(&p.name) == k)
+}
+
+/// What `docs/vaapi-progress.md` §3.10 asserts, checked against the list that assertion is about.
+///
+/// **The table is a claim about this file, and nothing else in the tree pins it.** The hardware gates
+/// ask their own question in `crates/platform/tests/` (which needs `filmcraft-platform`, a crate
+/// above this one), so a preset added, renamed or re-routed here would change every row of that table
+/// with no test in this crate failing. These four pin the partition it rests on: which presets reach
+/// a gate at all, which name a pass count the gates refuse, which put H.264 in an MXF container, and
+/// that the HEVC preset is absent unless a probe says this machine has an HEVC encoder.
+///
+/// **Pinned by name rather than by count**, because a count survives a rename or a re-routed
+/// container and would then be an assertion that cannot fail.
+#[cfg(test)]
+mod reachability_tests {
+    use super::{BitrateMode, Format, builtin_presets};
+
+    /// Every preset whose [`crate::ExportSettings::video_format`] is H.264, in browser order: **the
+    /// set the H.264 gate is asked about**, and the only presets whose hardware-export status is a
+    /// gate's decision rather than the factory's routing.
+    const AT_THE_H264_GATE: [&str; 11] = [
+        super::DEFAULT_PRESET,
+        "Match Source – Adaptive Medium Bitrate",
+        "Match Source – Adaptive Low Bitrate",
+        "High Quality 1080p HD",
+        "High Quality 2160p 4K",
+        "YouTube 1080p Full HD",
+        "YouTube 2160p 4K Ultra HD",
+        "Vimeo 1080p Full HD",
+        "Vimeo 2160p 4K Ultra HD",
+        "Social Vertical 1080×1920",
+        "MXF OP1a H.264",
+    ];
+
+    fn names_matching(f: impl Fn(&crate::ExportPreset) -> bool) -> Vec<String> {
+        builtin_presets().iter().filter(|p| f(p)).map(|p| p.name.clone()).collect()
+    }
+
+    #[test]
+    fn the_presets_that_reach_the_h264_gate_are_the_ones_the_table_names() {
+        let at_gate = names_matching(|p| p.settings.video_format() == Format::H264);
+        assert_eq!(
+            at_gate,
+            AT_THE_H264_GATE.map(String::from).to_vec(),
+            "a preset added, renamed or moved to another container changes which rows of docs/vaapi-progress.md \
+             §3.10 are true; the HEVC preset is conditional and must not appear in this list"
+        );
+    }
+
+    #[test]
+    fn the_two_presets_that_name_a_second_pass_are_the_two_the_hardware_gates_refuse() {
+        let two_pass = names_matching(|p| p.settings.bitrate_mode == BitrateMode::Vbr2Pass);
+        assert_eq!(
+            two_pass,
+            ["Vimeo 1080p Full HD", "Vimeo 2160p 4K Ultra HD"].map(String::from).to_vec(),
+            "both hardware gates refuse Vbr2Pass as 'two-pass encoding' before any bitrate is read, so a third \
+             preset naming it is a third declined export and the table must say so"
+        );
+    }
+
+    #[test]
+    fn one_preset_puts_h264_in_an_mxf_container_and_the_gate_refuses_it_as_annex_b() {
+        let mxf_h264 = names_matching(|p| p.settings.format.is_mxf() && p.settings.video_format() == Format::H264);
+        assert_eq!(
+            mxf_h264,
+            ["MXF OP1a H.264"].map(String::from).to_vec(),
+            "MXF carries an Annex B stream and the hardware backend's samples are length-prefixed, so this is \
+             the one non-H.264 container that reaches a gate rather than being declined by the routing line"
+        );
+    }
+
+    #[test]
+    fn no_hevc_preset_is_offered_without_a_probe_saying_this_machine_has_an_encoder() {
+        // **`filmcraft-platform` is not a dependency of this crate, so no probe can be registered
+        // here** — which is exactly the state that assertion is about, and the state the platform
+        // tests are in when they report "FilmCraft ships 0 HEVC preset(s)". If a probe ever *is*
+        // registered in this test binary the assertion below fails rather than silently describing a
+        // machine that has one.
+        assert!(
+            !crate::available(Format::Hevc),
+            "a format probe for HEVC is registered in this test binary, so the preset list is conditional on a \
+             machine state this test can no longer state: re-check the HEVC row of docs/vaapi-progress.md §3.10"
+        );
+        let hevc = names_matching(|p| p.settings.video_format() == Format::Hevc);
+        assert!(
+            hevc.is_empty(),
+            "the HEVC preset is gated on crate::available(Format::Hevc), so with no probe it must not be listed, \
+             but these are listed: {hevc:?}"
+        );
+    }
 }
