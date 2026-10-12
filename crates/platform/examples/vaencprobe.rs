@@ -55,10 +55,19 @@
 //! Verify independently with:
 //!
 //! ```text
-//! ffmpeg -v error -f h264 -i /tmp/vaencprobe.h264 -f rawvideo -pix_fmt gray - > frames.gray
+//! ffmpeg -v error -f h264 -i /tmp/vaencprobe.h264 -f rawvideo -pix_fmt yuv420p - > frames.yuv
 //! ```
 //!
-//! which gives `frames * width * height` bytes of luma in display order.
+//! which gives `frames * (width * height + 2 * ceil(width/2) * ceil(height/2))` bytes in display
+//! order — 4:2:0, so **the luma plane is the first `width * height` bytes of each frame**, and that
+//! is the plane the deviation numbers above are computed from.
+//!
+//! **Do not ask for `-pix_fmt gray` to check this file.** `gray` is a *full-range* pixel format, so
+//! `swscale` expands this backend's limited-range luma while converting to it: an uploaded `16` comes
+//! back as `0`, an uploaded `235` as `255`, and an uploaded `117` as `118`. Measured on this machine,
+//! on the probe's own default run, over the ramp's 16..=235 range that expansion is a mean absolute
+//! offset of **9 levels** — which is the whole of the "mean absolute deviation per picture: 9" the
+//! probe used to print, and every bit of it was a colour-range conversion rather than encoder loss.
 #[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -388,7 +397,7 @@ fn run(
     // **The decode check, once, over the whole stream.** ffmpeg is given exactly the bytes the
     // muxer would be given — an elementary stream — and its output is compared with the ramps that
     // went in, one picture at a time.
-    match decode_deviations(&annex_b, &sources) {
+    match decode_deviations(&annex_b, &sources, display) {
         None => println!("decode: ffmpeg is not on this machine, so the decode check did not run (the numbers above are the only evidence)"),
         Some(rows) if rows.is_empty() => println!("decode: ffmpeg decoded no picture at all from this stream"),
         Some(rows) => {
@@ -451,8 +460,22 @@ fn run(
     std::fs::write(out, &annex_b).map_err(|e| format!("writing {out}: {e}"))?;
     println!();
     println!("wrote {out} ({} bytes, {} pictures)", annex_b.len(), frames);
-    println!("decode it with: ffmpeg -v error -f h264 -i {out} -f rawvideo -pix_fmt gray - | wc -c");
-    println!("  (expect {} = {} pictures of {}x{} luma)", frames * display.0 as usize * display.1 as usize, frames, display.0, display.1);
+    // **The instruction names `yuv420p`, and says why `gray` is wrong, because a reader who follows
+    // it with `gray` gets a number nine levels high and believes the encoder lost that much.** The
+    // expected byte count is therefore the *4:2:0* frame, not the luma plane.
+    let (pw, ph) = (display.0 as usize, display.1 as usize);
+    let luma = pw.saturating_mul(ph);
+    let frame_bytes = luma.saturating_add(pw.div_ceil(2).saturating_mul(ph.div_ceil(2)).saturating_mul(2));
+    println!("decode it with: ffmpeg -v error -f h264 -i {out} -f rawvideo -pix_fmt yuv420p - | wc -c");
+    println!(
+        "  (expect {} = {} pictures of {}x{} as 4:2:0; the luma plane is the first {} bytes of each)",
+        frame_bytes.saturating_mul(frames),
+        frames,
+        display.0,
+        display.1,
+        luma
+    );
+    println!("  (do not use -pix_fmt gray to check this file: it is a full-range format and expands the limited-range luma, so it reports ~9 too high)");
     Ok(())
 }
 
@@ -483,11 +506,30 @@ fn format_list(values: &[u8]) -> String {
 /// returned fewer would silently compare the wrong pictures and report a deviation that means
 /// nothing, so the lengths are required to be equal and the caller prints the two counts side by
 /// side.
+///
+/// **The reference is the plane that was uploaded, which here is the source luma itself.** The
+/// probe builds its pictures as planar 4:2:0 luma and hands that same `Vec` to
+/// [`VaEncoder::upload`], so `sources` *is* the encoded plane and no BT.709 conversion is in the
+/// path — unlike the export gate, which starts from RGBA and must run `rgba_to_yuv420_8` to learn
+/// what the encoder was given. Comparing against anything else here (a generated ramp, a scaled
+/// picture) would subtract a colour conversion from the encoder's loss, which is the defect
+/// `-pix_fmt gray` already was on the decode side.
 #[cfg(target_os = "linux")]
-fn decode_deviations(stream: &[u8], sources: &[Vec<u8>]) -> Option<Vec<u8>> {
+fn decode_deviations(stream: &[u8], sources: &[Vec<u8>], display: (u32, u32)) -> Option<Vec<u8>> {
     let ffmpeg = ffmpeg_path()?;
     let mut child = std::process::Command::new(&ffmpeg)
-        .args(["-v", "error", "-f", "h264", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        // **`-pix_fmt yuv420p`, and the luma plane is sliced out of it — not `-pix_fmt gray`.**
+        //
+        // `gray` is a **full-range** pixel format, so `swscale` expands the limited-range luma this
+        // backend codes while converting to it: an uploaded `16` comes back as `0`, an uploaded `235`
+        // as `255`, and an uploaded `117` as `118`. Measured on this machine, on a flat picture
+        // uploaded at 117 and reconstructed exactly: `-pix_fmt gray` reads 118 and `-pix_fmt yuv420p`
+        // reads 117. Over this ramp's own 16..=235 range the expansion is a mean absolute offset of
+        // **9 levels**, and a probe that subtracts a decoded full-range plane from an uploaded
+        // limited-range plane measures **a colour-range conversion, not an encoder** — no tolerance
+        // makes that number honest. `yuv420p` is passed through untouched, and the luma plane is the
+        // plane that was uploaded, so like is compared with like.
+        .args(["-v", "error", "-f", "h264", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -537,19 +579,33 @@ fn decode_deviations(stream: &[u8], sources: &[Vec<u8>]) -> Option<Vec<u8>> {
     if !output.stderr.is_empty() {
         eprintln!("  ffmpeg said: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    let size = sources.first().map(Vec::len).filter(|size| *size > 0)?;
+    // **The luma plane is the first `width * height` bytes of each 4:2:0 frame, and the stride from
+    // one picture to the next is the whole frame** — luma plus both chroma planes. Comparing at the
+    // luma stride over a `yuv420p` buffer would pair every picture with a chroma plane, which is a
+    // comparison that cannot fail to be wrong and is not obviously so.
+    //
+    // `ceil`, not `/ 2`: the encoder refuses an odd size upstream, but the arithmetic is written the
+    // way the picture actually is so it stays correct for any size that reaches it, and every step is
+    // `checked_*` because the geometry arrives from the command line.
+    let (w, h) = (display.0 as usize, display.1 as usize);
+    let size = w.checked_mul(h).filter(|size| *size > 0)?;
+    let chroma = w.div_ceil(2).checked_mul(h.div_ceil(2))?;
+    let frame = size.checked_add(chroma.saturating_mul(2))?;
     // Every source picture is the same size — they are all the same geometry — so `size` is one
-    // picture's length and the picture count is the buffer's.
+    // picture's luma length and the picture count is the buffer's.
     if sources.iter().any(|source| source.len() != size) {
         return Some(Vec::new());
     }
-    if output.stdout.len() != size * sources.len() {
+    if output.stdout.len() != frame.checked_mul(sources.len())? {
         return Some(Vec::new());
     }
     let mut rows = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
-        let Some(at) = index.checked_mul(size) else { return Some(Vec::new()) };
+        let Some(at) = index.checked_mul(frame) else { return Some(Vec::new()) };
         let Some(picture) = output.stdout.get(at..at.saturating_add(size)) else { return Some(Vec::new()) };
+        // Every pixel of the plane, paired with the same raster position in the plane that was
+        // uploaded, and divided by the pixels compared — so the number this returns *is* the mean
+        // absolute deviation, and it reaches 0 on a stream that lost nothing.
         let sum: u64 = picture.iter().zip(source).map(|(a, b)| u64::from(a.abs_diff(*b))).sum();
         rows.push(u8::try_from(sum / size as u64).unwrap_or(u8::MAX));
     }
