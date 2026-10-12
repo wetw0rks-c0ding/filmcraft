@@ -112,22 +112,28 @@
 //!
 //! # Every parameter here is either stated or declined
 //!
-//! - The picture is **constant quantiser** ([`super::ffi::RC_CQP`]), so quality comes from the
-//!   picture record's `pic_init_qp` and nothing else. No bitrate is sent, because a bitrate this
-//!   backend cannot derive faithfully would be a default quality — and [`VaEncoder::encode`]
-//!   therefore takes the QP as an argument rather than choosing one.
+//! - **Quality is either a fixed quantiser or a bitrate, never both.** [`RateControl`] is which one,
+//!   it is fixed when [`VaEncoder::new`] builds the libva session (the mode is a `vaCreateConfig`
+//!   attribute, so it cannot change afterwards), and the other one is then *refused* rather than
+//!   ignored: a request that names a quantiser in a bitrate encoder is an error naming the mode, and
+//!   an encoder in constant quantiser refuses a request that declines to name one. Under
+//!   [`RateControl::ConstantQuantiser`] the quality comes from the picture record's `pic_init_qp`
+//!   and nothing else; under [`RateControl::Cbr`] / [`RateControl::Vbr`] it comes from the rate
+//!   controller, and **`VaEncoder::encode` takes no quantiser at all** because there is no honest
+//!   one to take — see [`EncodeRequest`].
 //! - **`pic_order_cnt_type` is 0** and `num_ref_frames_in_pic_order_cnt_cycle` is 0: no picture
 //!   order count cycle, and no B pictures.
 //! - **One slice per picture.** A second coded segment is refused outright rather than submitted,
 //!   so a picture over one slice is unencodable here rather than silently re-cut.
 //! - **The sequence, picture and slice records are submitted together in one `vaRenderPicture`**,
-//!   with the frame-rate misc buffer. iHD refuses the render without the frame-rate buffer — a
+//!   with the frame-rate misc buffer, with the quantization misc buffer, and — in a bitrate mode —
+//!   with the rate-control misc buffer. iHD refuses the render without the frame-rate buffer — a
 //!   requirement that is in no header, and `the_h264_records_are_the_size_the_driver_reads` and
 //!   [`VaEncoder::encode`]'s errors are where it shows up.
 
 use super::ffi::{
-    self, Display, Encoder, LAST_PICTURE_EOSTREAM, PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PICTURE_H264_SHORT_TERM_REFERENCE, Profile, RC_CQP, RtFormat,
-    SLICE_TYPE_ALL_I, SLICE_TYPE_ALL_P,
+    self, Display, Encoder, LAST_PICTURE_EOSTREAM, PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PICTURE_H264_SHORT_TERM_REFERENCE, Profile, RC_CBR, RC_CQP,
+    RC_VBR, RtFormat, SLICE_TYPE_ALL_I, SLICE_TYPE_ALL_P,
 };
 use std::sync::Arc;
 
@@ -158,6 +164,91 @@ pub enum PictureKind {
     B,
 }
 
+/// **Which statement about fidelity this stream makes** — a fixed quantiser, or a bit rate.
+///
+/// It is a constructor argument rather than a builder method because of what libva allows:
+/// `VAConfigAttribRateControl` is read by `vaCreateConfig` when the session is made, and there is no
+/// call to change it afterwards. So the mode is fixed for the encoder's life, and a caller that
+/// wants the other one builds a different encoder — which is also the honest shape, because
+/// switching modes mid-stream would produce a file whose first pictures and last pictures were made
+/// under two different contracts.
+///
+/// # Why this is an enum and not a constant-quality mode on the settings
+///
+/// The export settings name a bitrate for **every** mode FilmCraft can express, and before this type
+/// the only way past the export gate was a settings object with *no* bitrate — which made the
+/// registered factory a decline rather than an encoder. The alternative was to add a constant-quality
+/// mode to `BitrateMode`: smaller, and it would have left the settings surface shared with macOS and
+/// Windows untouched. It was declined because **it does not make the existing settings usable** — a
+/// user who picks CBR, which is one of the three modes FilmCraft already offers, is still declined,
+/// and the hardware path stays unreachable for the default export. This way the bitrate the user
+/// asked for is the bitrate the driver is told, which is the thing they meant.
+///
+/// # What the driver is not being asked to do
+///
+/// The driver reports **CBR, VBR, CQP, ICQ, QVBR and TCBRC** on iHD 26.3.5
+/// ([`VaEncoder::driver_rate_control_modes`]), so nothing here works around a driver that cannot do
+/// rate control — a driver whose mask lacks the mode this type names fails at `vaCreateConfig` with
+/// the mode in the message. ICQ and the temporal-layer modes are **not** here: ICQ's
+/// `ICQ_quality_factor` is a quality in a unit none of FilmCraft's settings state, and TCBRC wants
+/// per-frame channel feedback the export pipeline does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateControl {
+    /// **A fixed quantiser per picture.** The picture record's `pic_init_qp` *is* the quality, and
+    /// [`EncodeRequest`] carries it because the caller is the only one who knows it. This is the mode
+    /// `examples/vaencprobe.rs` measures with, and the only one whose output is reproducible from the
+    /// input plus the submitted records.
+    ConstantQuantiser,
+    /// **A constant bit rate**, in bits per second. `VAEncMiscParameterRateControl::bits_per_second`
+    /// carries it and `target_percentage` is 100, which is what the header says that field means in
+    /// CBR.
+    Cbr(u32),
+    /// **A variable bit rate** between a target and a ceiling, both in bits per second.
+    ///
+    /// `bits_per_second` is the **ceiling** and `target_percentage` is the target as a percentage of
+    /// it, which is the header's own split and matches what FilmCraft's `target_kbps` / `max_kbps`
+    /// pair means. It is two numbers rather than one because that is the shape of the record, not
+    /// because this backend has an opinion about how far apart they should be.
+    Vbr {
+        /// The rate the controller aims at, in bits per second.
+        target: u32,
+        /// The highest rate it may reach, in bits per second. Must be at least `target`.
+        max: u32,
+    },
+}
+
+impl RateControl {
+    /// The `VAConfigAttribRateControl` value this mode submits.
+    fn config_attribute(&self) -> u32 {
+        match self {
+            Self::ConstantQuantiser => RC_CQP,
+            Self::Cbr(_) => RC_CBR,
+            Self::Vbr { .. } => RC_VBR,
+        }
+    }
+
+    /// **Whether a picture's quantiser is the caller's to name** — which is exactly
+    /// [`EncodeRequest::qp`]'s presence, and the two are the same question asked of the two halves
+    /// of the contract.
+    ///
+    /// It is what stops the halves from silently disagreeing: a request carrying a quantiser into a
+    /// bitrate encoder (or omitting one in a constant-quantiser encoder) is refused at
+    /// [`VaEncoder::encode`] with both modes named, rather than one of them being honoured and the
+    /// other dropped.
+    pub fn names_its_own_quantiser(&self) -> bool {
+        matches!(self, Self::ConstantQuantiser)
+    }
+
+    /// The mode's own name, for a decline message and for `examples/vaencprobe.rs`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ConstantQuantiser => "constant quantiser",
+            Self::Cbr(_) => "CBR",
+            Self::Vbr { .. } => "VBR",
+        }
+    }
+}
+
 /// A picture to encode, and the three things a caller has to say about it.
 ///
 /// Every other parameter is either stated here or is a constant this module can derive with
@@ -166,15 +257,28 @@ pub enum PictureKind {
 /// them would be choosing their picture's quality; `kind` is the caller's, because whether a picture
 /// is a key frame is a statement about the sequence rather than about encoding; and `last` is the
 /// caller's alone, because only the caller knows which picture is the last one it will be given.
+///
+/// # `qp` is `Some` in a constant-quantiser encoder and `None` in a bitrate one
+///
+/// **That is the contract, not a convenience, and the pairing is checked.** The two statements about
+/// a picture's fidelity — "this quantiser" and "this many bits per second" — are alternatives. An
+/// encoder built for one cannot honour the other: a quantiser submitted to a bitrate encoder is not
+/// what the picture is encoded at (the controller chooses), and a bitrate submitted to a
+/// constant-quantiser encoder is not what the file comes to (the quantiser is). So [`VaEncoder`] is
+/// built in exactly one mode, [`EncodeRequest::qp`] is present exactly when that mode is
+/// [`RateControl::ConstantQuantiser`], and [`VaEncoder::encode`] **refuses the mismatched pairing**
+/// naming both halves rather than honouring one and silently dropping the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncodeRequest {
-    /// The quantiser, 0..=51 as H.264 numbers them. **The picture's actual quality**: under
-    /// [`RC_CQP`] nothing else affects it.
+    /// The quantiser, 0..=51 as H.264 numbers them, under [`RateControl::ConstantQuantiser`] — where
+    /// it is the picture's actual quality and nothing else affects it. `None` under [`RateControl::Cbr`]
+    /// or [`RateControl::Vbr`], where the rate controller chooses and the caller has no honest
+    /// quantiser to state.
     ///
     /// Refused outside 0..=51 rather than clamped. A clamp would quietly encode at the nearest
     /// quality instead of the one asked for, which for an encoder is a wrong picture that looks
     /// right.
-    pub qp: u8,
+    pub qp: Option<u8>,
     /// What the picture is.
     pub kind: PictureKind,
     /// Whether this is the last picture of the stream, which sets `last_picture =
@@ -186,16 +290,28 @@ pub struct EncodeRequest {
 }
 
 impl EncodeRequest {
-    /// A request that refuses a QP outside 0..=51.
+    /// A request that refuses a QP outside 0..=51, for a constant-quantiser encoder.
     pub fn new(qp: u8, kind: PictureKind) -> Result<Self, String> {
         if qp > 51 {
             return Err(format!("a quantiser of {qp}, which is outside H.264's 0..=51"));
         }
-        Ok(Self { qp, kind, last: false })
+        Ok(Self { qp: Some(qp), kind, last: false })
+    }
+
+    /// **A request that names no quantiser**, for an encoder built under [`RateControl::Cbr`] or
+    /// [`RateControl::Vbr`].
+    ///
+    /// It is a constructor rather than nothing so the refusal is **reachable and testable**:
+    /// [`VaEncoder::encode`] refuses it against a constant-quantiser encoder and refuses
+    /// [`EncodeRequest::new`] against a bitrate one, so the pairing is a checked claim rather than a
+    /// comment. A refusal no caller can ask for is a claim with no evidence behind it, and this
+    /// milestone has three of those already.
+    pub fn rate_controlled(kind: PictureKind) -> Result<Self, String> {
+        Ok(Self { qp: None, kind, last: false })
     }
 
     /// **A predicted (P) picture at `qp`**, which is what a caller asks for on every picture after
-    /// the first.
+    /// the first, in a constant-quantiser encoder.
     ///
     /// This and [`EncodeRequest::key_frame`] exist so that a caller outside this module never has to
     /// name [`PictureKind`]: a frame loop's normal case is "not a key frame", and making that case
@@ -206,9 +322,22 @@ impl EncodeRequest {
         Self::new(qp, PictureKind::P)
     }
 
-    /// **A key frame (IDR) at `qp`**: the first picture of a stream, and the first after a seek.
+    /// **A predicted (P) picture with no quantiser named** — the ordinary case for every picture
+    /// after the first in a bitrate-controlled encoder.
+    pub fn predicted_at_rate() -> Result<Self, String> {
+        Self::rate_controlled(PictureKind::P)
+    }
+
+    /// **A key frame (IDR) at `qp`**: the first picture of a stream, and the first after a seek, in a
+    /// constant-quantiser encoder.
     pub fn key_frame(qp: u8) -> Result<Self, String> {
         Self::new(qp, PictureKind::Idr)
+    }
+
+    /// **A key frame (IDR) with no quantiser named**, for a bitrate-controlled encoder: the first
+    /// picture of a stream, and the first after a seek.
+    pub fn key_frame_at_rate() -> Result<Self, String> {
+        Self::rate_controlled(PictureKind::Idr)
     }
 
     /// **A B picture at `qp`** — the third kind, and the one the loop refuses.
@@ -333,6 +462,46 @@ pub const MAX_FRAME_NUM: u32 = 16;
 /// first picture while this is the value, which is the whole point: a frame rate and a GOP that were
 /// never given are not settings of zero, they are settings nobody made.
 const UNSET_INTERVAL: u32 = u32::MAX;
+
+/// **The `pic_init_qp` a picture carries in a bitrate-controlled encoder, and the only number this
+/// module writes into a record whose fidelity nobody chose.**
+///
+/// It exists because `VAEncPictureParameterBufferH264::pic_init_qp` is a **required field of every
+/// picture** — there is no "unset" for it — so a bitrate-controlled encoder must write *something*
+/// into it on every picture, and whatever it writes becomes the `pic_init_qp` of the **derived**
+/// parameter set this module puts in the `avcC`. That makes the number a real, checkable claim about
+/// the stream rather than a formality: the derived PPS says `pic_init_qp = 26`, and every slice in
+/// the file has its own `slice_qp_delta` added to it.
+///
+/// **Why 26, stated as what it is and not as a quality.** H.264's `pic_init_qp` is defined as
+/// `pic_init_qp_minus26 + 26` (7.3.2.2.1), so **26 is the value the syntax itself is centred on** —
+/// the one quantiser the standard names as the origin. A decoder computing a slice's QP does
+/// `SliceQPY = 26 + pic_init_qp_minus26 + slice_qp_delta`, so with `pic_init_qp = 26` the driver's
+/// per-picture `slice_qp_delta` **is** the whole movement, with nothing added or subtracted around it.
+/// Any other constant would be the same statement with an offset nobody could check.
+///
+/// **It is measured that the driver does not read it as a quality in this mode**, which is what makes
+/// it safe to write at all: a 20-picture 640x360 run at a 400 kbit CBR target carries this in every
+/// picture record and the driver's own reported quantiser moves across the run — **30, 30, 32, 32,
+/// 32, 32, 33, 33, 33, 33, 34, 34, 34, 34, 35, 35, 35, 35, 36, 36** — where a stream pinned at 26
+/// would report 26 twenty times. Under [`RateControl::ConstantQuantiser`] the field is the caller's
+/// own QP and this constant is never used.
+///
+/// **What the file then says, and this is measured rather than hoped: 26.** The driver writes
+/// `slice_qp_delta = 0` in every slice of a CBR stream — see [`check_output_matches_the_sets`] for the
+/// ffmpeg `trace_headers` measurement — so `SliceQPY` in the bitstream is this number on every picture.
+/// **This constant is therefore not a claim that the pictures are coded at QP 26; it is the base a
+/// decoder computes `SliceQPY` from**, and the quantiser actually used is whatever the rate controller
+/// chose, which libva reports and does not record. That is a property of iHD 26.3.5 and nothing here
+/// can change it; what this module can do is state the base truthfully and say so where it is
+/// declared, which is here.
+///
+/// The consequence the self-check depends on: **under a bitrate mode the derived PPS's `pic_init_qp`
+/// is this base and not any picture's quality**, so the equality between the driver's reported
+/// quantiser and `pps.pic_init_qp` is not a well-formedness property there and is not checked as one.
+/// Under constant quantiser it is, and it is the strongest check in
+/// [`check_output_matches_the_sets`].
+const DEFAULT_ENCODER_QP: u8 = 26;
 
 /// What one picture came back as: the compressed bytes, and the size they were encoded at.
 ///
@@ -518,6 +687,17 @@ pub struct VaEncoder {
     /// refuse the first. **`0` is a legal stated value** and means one key frame for the whole
     /// stream; it is not the same as unset, which is why the sentinel is not 0.
     keyframe_interval: u32,
+    /// **Which fidelity statement this stream makes**, and it is fixed for the encoder's life because
+    /// `VAConfigAttribRateControl` is a `vaCreateConfig` attribute (see [`RateControl`]). Held rather
+    /// than recomputed because it is what [`VaEncoder::encode`] checks each request's quantiser
+    /// against, and a check that read the mode out of the libva session could not name it in a
+    /// message.
+    rate_control: RateControl,
+    /// The rate-control misc buffer, built once for a bitrate mode and **`None` for
+    /// [`RateControl::ConstantQuantiser`]** — not "built with zeros", because under constant
+    /// quantiser a bitrate record is a second and independent statement about the picture's quality
+    /// and must not be submitted at all.
+    rate_control_buffer: Option<Vec<u8>>,
     /// The reference depth this encoder was created with, which is **not** the size of its
     /// reconstruction pool: the pool is `refs + 1` surfaces (one input, `refs` references and one
     /// target), and confusing the two is how a caller asking for one reference silently gets two.
@@ -561,6 +741,39 @@ pub struct VaEncoder {
 }
 
 impl VaEncoder {
+    /// **A constant-quantiser encoder** — the mode where the *picture record's* `pic_init_qp` is the
+    /// quality, and the caller names it on every [`EncodeRequest`].
+    ///
+    /// **It takes no quantiser argument, and that is the point of the mode.** In a bitrate mode the
+    /// quality is a rate and belongs to the constructor; in this mode it is a per-picture decision and
+    /// belongs to the request, so a constructor argument would either be a default nobody chose or a
+    /// value the first request is free to contradict. The 0..=51 check lives in
+    /// [`EncodeRequest::new`], where the number actually is.
+    ///
+    /// The third named constructor, for the same reason as the other two: a caller outside this module
+    /// names its mode through one of these rather than through [`RateControl`], which `vaapi/mod.rs`
+    /// re-exports by a list this file does not get to edit from every corner of the crate.
+    pub fn at_constant_quantiser(display: &Arc<Display>, size: (u32, u32), references: u32) -> Result<Self, String> {
+        Self::new(display, size, references, RateControl::ConstantQuantiser)
+    }
+
+    /// **A constant-bit-rate encoder**, in bits per second.
+    ///
+    /// This and [`VaEncoder::at_variable_bitrate`] exist so a caller outside this module can name the
+    /// mode it wants **without naming [`RateControl`]**, which `vaapi/mod.rs` re-exports by an
+    /// explicit list this crate does not get to change from every file. [`VaEncoder::new`] takes the
+    /// enum and is the underlying constructor; these are the two modes an export gate builds, spelled
+    /// the way the gate thinks about them, so the two names cannot drift from the two enum variants.
+    pub fn at_constant_bitrate(display: &Arc<Display>, size: (u32, u32), references: u32, bits_per_second: u32) -> Result<Self, String> {
+        Self::new(display, size, references, RateControl::Cbr(bits_per_second))
+    }
+
+    /// **A variable-bit-rate encoder** between a target and a ceiling, both in bits per second.
+    /// The ceiling being below the target is an error, not a swap — see [`rate_control_record`].
+    pub fn at_variable_bitrate(display: &Arc<Display>, size: (u32, u32), references: u32, target: u32, max: u32) -> Result<Self, String> {
+        Self::new(display, size, references, RateControl::Vbr { target, max })
+    }
+
     /// A constant-quantiser H.264 encoder for `size`, holding up to `references` reference pictures
     /// at a stated frame rate and key-frame interval.
     ///
@@ -588,7 +801,13 @@ impl VaEncoder {
     /// array — a depth past it would have nowhere to go, and a silently shortened reference list
     /// makes the driver predict from a picture the caller did not choose, so that is an error and
     /// not a clamp.
-    pub fn new(display: &Arc<Display>, size: (u32, u32), references: u32) -> Result<Self, String> {
+    ///
+    /// `rate_control` is **the only setting here that is not a builder method**, for a reason in
+    /// libva rather than in taste: `VAConfigAttribRateControl` is read by `vaCreateConfig` and there
+    /// is no call to change it afterwards, so a bitrate stated after the session exists would be a
+    /// lie. It is a [`RateControl`] rather than a bare `u32` for the same reason `size` is a pair and
+    /// `references` is bounded: the caller cannot hand this module the wrong constant.
+    pub fn new(display: &Arc<Display>, size: (u32, u32), references: u32, rate_control: RateControl) -> Result<Self, String> {
         let refs = references;
         if size.0 == 0 || size.1 == 0 {
             return Err(format!("{}x{} picture", size.0, size.1));
@@ -662,13 +881,16 @@ impl VaEncoder {
         let height_mbs = u16::try_from(coded.1 / MB).map_err(|_| format!("{} macroblocks high", coded.1 / MB))?;
         let macroblocks = u32::from(width_mbs) * u32::from(height_mbs);
         // The libva session itself: a config, `2 + references` surfaces, a context and the coded
-        // buffer every picture is written into.
+        // buffer every picture is written into. **The rate-control mode goes in here and nowhere
+        // else**, because it is a `vaCreateConfig` attribute: `Encoder::new`'s error names the value
+        // it refused, so a driver that does not offer this mode fails with `CBR` or `VBR` in the
+        // message rather than an uninformative status.
         let encoder = Encoder::new(
             display,
             Profile::H264Main,
             RtFormat::Nv12,
             coded,
-            RC_CQP,
+            rate_control.config_attribute(),
             PACKED_HEADER_SEQUENCE | PACKED_HEADER_PICTURE,
             coded_buffer_for(coded)?,
             refs,
@@ -685,6 +907,17 @@ impl VaEncoder {
         //
         // The quantization misc buffer is not built at all: it is rebuilt per picture, because it
         // carries the request's `qp`.
+        //
+        // **The rate-control misc buffer is built here and only here**, once, and it is `None` under
+        // [`RateControl::ConstantQuantiser`] rather than a record of zeroes — under constant
+        // quantiser the picture's quality is `pic_init_qp` and a bitrate record would be a second,
+        // independent statement about the same fidelity. Its `window_size` needs the key-frame
+        // interval, which is not stated yet, so it is built by [`VaEncoder::key_frames_every`] along
+        // with the sequence record rather than guessed here.
+        let rate_control_buffer = match rate_control {
+            RateControl::ConstantQuantiser => None,
+            mode => Some(rate_control_record(mode, RATE_CONTROL_WINDOW_MS)?),
+        };
         Ok(Self {
             encoder,
             coded,
@@ -699,6 +932,8 @@ impl VaEncoder {
             idr_pic_id: 0,
             since_key_frame: 0,
             keyframe_interval: UNSET_INTERVAL,
+            rate_control,
+            rate_control_buffer,
             refs: refs as usize,
             references: Vec::new(),
             sequence: sequence_record(coded, crop, width_mbs, height_mbs, refs, 0)?,
@@ -709,6 +944,21 @@ impl VaEncoder {
             last_marked: false,
             b_pictures: false,
         })
+    }
+
+    /// **Which fidelity statement this encoder makes** — the same [`RateControl`] it was built with,
+    /// for a caller that wants to check a stream's contract rather than remember it.
+    pub fn rate_control(&self) -> RateControl {
+        self.rate_control
+    }
+
+    /// Whether the driver was told to pick a bitrate, as opposed to being told a quantiser.
+    ///
+    /// **This is the question `check_output_matches_the_sets` asks about the quantiser**, and it is
+    /// asked here so the two cannot drift: the self-check is scoped by this and not by a separate
+    /// list of modes.
+    pub fn rate_controlled(&self) -> bool {
+        !self.rate_control.names_its_own_quantiser()
     }
 
     /// **B pictures: refused, and why — with the measurement that says so.**
@@ -836,6 +1086,14 @@ impl VaEncoder {
         }
         self.keyframe_interval = pictures;
         self.sequence = sequence_record(self.coded, self.crop, self.width_mbs, self.height_mbs, self.refs as u32, pictures)?;
+        // **The rate-control buffer is rebuilt with the sequence record**, not left alone, because
+        // `window_size` is derived from this interval (see [`RATE_CONTROL_WINDOW_MS`]). Submitting a
+        // buffer whose window was derived from a different GOP would be a rate controller sized for a
+        // seek structure the stream does not have — the same reason the sequence record is rebuilt
+        // here.
+        if !self.rate_control.names_its_own_quantiser() {
+            self.rate_control_buffer = Some(rate_control_record(self.rate_control, rate_control_window_ms(pictures))?);
+        }
         Ok(self)
     }
 
@@ -1150,7 +1408,31 @@ impl VaEncoder {
     /// picture could predict from — so committing first would leave the encoder holding a reference
     /// to an unfinished picture, and every subsequent P frame would be wrong rather than the first.
     pub fn encode(&mut self, request: EncodeRequest) -> Result<EncodedPicture, String> {
-        EncodeRequest::new(request.qp, request.kind)?;
+        // **The quantiser and the mode must agree, and the disagreement is refused here rather than
+        // resolved.** This is the check that makes [`RateControl`] and [`EncodeRequest::qp`] one
+        // contract rather than two that happen to be documented together — a request naming a
+        // quantiser into a bitrate encoder would otherwise be silently ignored (the controller picks
+        // the QP), and a request naming none into a constant-quantiser encoder would be encoded at
+        // whatever `pic_init_qp` the record happened to carry. Both are "a plausible wrong picture,
+        // not an error", which is the failure class this module exists to refuse.
+        if self.rate_control.names_its_own_quantiser() != request.qp.is_some() {
+            return Err(match (self.rate_control, request.qp) {
+                (mode, Some(qp)) => format!(
+                    "a quantiser of {qp} into a {} encoder: the rate controller chooses this picture's quantiser, so the \
+                     number would not be what it is encoded at. Build the encoder with RateControl::ConstantQuantiser for \
+                     a fixed quantiser, or use EncodeRequest::predicted_at_rate() here",
+                    mode.name()
+                ),
+                (mode, None) => format!(
+                    "no quantiser into a {} encoder: this encoder's quality is the picture record's pic_init_qp, and there \
+                     is no bitrate behind it, so a picture encoded now would be at whatever that record happens to carry. \
+                     Say EncodeRequest::predicted({qp})",
+                    mode.name(),
+                    qp = DEFAULT_ENCODER_QP
+                ),
+            });
+        }
+        let qp = request.qp.unwrap_or(DEFAULT_ENCODER_QP);
         // **A B picture is refused here, and the measurements are on the other side of this
         // line** — [`VaEncoder::allow_b_pictures`] and the module note, "B pictures: measured, and
         // refused". What is refused is not the *driver's* ability (it reports one future reference
@@ -1253,7 +1535,7 @@ impl VaEncoder {
             current.frame_num,
             self.macroblocks,
             &slice_references,
-            request.qp,
+            qp,
             key_frame,
             request.last,
             self.encoder.coded_buffer_id(),
@@ -1286,7 +1568,39 @@ impl VaEncoder {
         let slice_buf = self.encoder.buffer(ffi::ENC_SLICE_PARAMETER_BUFFER, &slice, 1)?;
         let fps_buf = self.encoder.buffer(ffi::ENC_MISC_PARAMETER_BUFFER, frame_rate, 1)?;
         let quant_buf = self.encoder.buffer(ffi::ENC_MISC_PARAMETER_BUFFER, &quantization, 1)?;
-        let buffers = [seq_buf.id(), pic_buf.id(), slice_buf.id(), fps_buf.id(), quant_buf.id()];
+        // **The rate-control buffer is submitted with every picture in a bitrate mode, and never in
+        // constant-quantiser mode.**
+        //
+        // Every picture rather than once, because the header presents it as a buffer the application
+        // hands per `vaRenderPicture` and **measured**: submitting it on every picture and submitting
+        // it on the first only produce byte-identical coded output over a 20-picture 640x360 CBR run on
+        // iHD 26.3.5 (same sizes, same reported quantiser per picture, same total). So the choice is
+        // made on the shape of the API rather than on a tuning guess — and a `None` here would have
+        // been the **wrong** answer for a different reason too: a driver that reads a per-render
+        // parameter list and finds one missing may reset its controller, which is the
+        // `VAEncMiscParameterRateControl` `reset` flag's exact failure mode by another route.
+        //
+        // Under [`RateControl::ConstantQuantiser`] there is no buffer at all, and the refusal is not
+        // "an empty buffer" — see [`VaEncoder::new`], which leaves the field `None`.
+        let rc_buf = match self.rate_control_buffer.as_deref() {
+            Some(record) => Some(self.encoder.buffer(ffi::ENC_MISC_PARAMETER_BUFFER, record, 1)?),
+            None => None,
+        };
+        // A `Vec` rather than a fixed-size array because the rate-control buffer is present in some
+        // modes and absent in others.
+        //
+        // **`rc_buf` is deliberately bound here and used after the list is built, not consumed by an
+        // `if let`.** It was an `if let` first, and the driver caught it: `if let Some(buf) = rc_buf`
+        // moves the `Buffer` into the arm, the arm's scope ends, the `Buffer` drops and destroys its
+        // libva buffer — and the render that follows names an id that no longer exists. iHD answers
+        // `VA_STATUS_ERROR_INVALID_BUFFER` ("invalid VABufferID"), which is the first thing that has
+        // caught this class of mistake on this stack. Every handle in this list is a `Buffer` whose
+        // `Drop` destroys it, so **the whole list is built and then rendered with all of them still
+        // alive** — which is why they are collected here rather than inlined into the argument.
+        let mut buffers = vec![seq_buf.id(), pic_buf.id(), slice_buf.id(), fps_buf.id(), quant_buf.id()];
+        if let Some(ref buf) = rc_buf {
+            buffers.push(buf.id());
+        }
         self.encoder.render(&buffers)?;
         // Mandatory before the read: the encode is asynchronous and an unsynchronised read of the
         // coded buffer is a truncated picture rather than a stale one.
@@ -1332,6 +1646,7 @@ impl VaEncoder {
             &current,
             key_frame,
             coded.status().first().copied().map(|status| (status & 0xff) as u8),
+            self.rate_control,
         )?;
         let from_driver = sets.from_driver;
         // The picture came back, so the sequence state can advance.
@@ -1446,8 +1761,12 @@ impl VaEncoder {
     ///    are used, having been verified against the bits by [`super::params::parameter_sets`].
     ///
     /// Either way the sets are then run through [`check_output_matches_the_sets`] against the
-    /// picture's own coded NALs, so a derived set cannot outlive the picture it described, and a
-    /// quantiser that moves under an established `avcC` is refused at the picture that moved it.
+    /// picture's own coded NALs, so a derived set cannot outlive the picture it described.
+    ///
+    /// `rate_control` is what scopes the quantiser half of that check, and it is passed rather than
+    /// read off `self` so the check cannot be reached with a mode that is not the encoder's — see
+    /// [`check_output_matches_the_sets`] for what is checked in each mode and what replaces the
+    /// equality.
     fn resolve_parameter_sets(
         &mut self,
         sequence: &ffi::VaEncSequenceParameterBufferH264,
@@ -1457,6 +1776,7 @@ impl VaEncoder {
         current: &Current,
         key_frame: bool,
         average_qp: Option<u8>,
+        rate_control: RateControl,
     ) -> Result<(Vec<u8>, CodecParameterSets), String> {
         let units = annex_b_units(driver_bytes)?;
         let sps_unit = units.iter().find(|unit| unit.header & 0x1f == 7);
@@ -1486,13 +1806,18 @@ impl VaEncoder {
             }
             _ => return Err("the driver wrote one H.264 parameter set and not the other, which describes no stream this backend can use".into()),
         };
-        check_output_matches_the_sets(&sets, driver_bytes, current, key_frame, average_qp)?;
+        check_output_matches_the_sets(&sets, driver_bytes, current, key_frame, average_qp, rate_control)?;
         // **The sets are held from the first picture and must not change under an `avcC` that has
         // already been handed out.** Everything in an SPS comes from the sequence record, which is
         // fixed for the encoder's life; the one field that moves is the PPS's `pic_init_qp`, which
-        // follows the quantiser. A caller that changes the quantiser mid-export would leave the
-        // `avcC` describing the first picture's quality while the rest of the stream is at another —
-        // so it is refused here, at the picture that changed it, naming the quantiser.
+        // follows the quantiser.
+        //
+        // **Under a bitrate mode the driver moves the quantiser but `pic_init_qp` does not**, because
+        // it is [`DEFAULT_ENCODER_QP`] in every picture record there (see its note). So this rule is
+        // *stronger* in a bitrate mode, not weaker: the per-picture movement the driver applies lives
+        // in the slice headers' `slice_qp_delta`, which the derived PPS does not mention, and a stream
+        // whose QP genuinely changed mid-export in constant-quantiser mode is still refused at the
+        // picture that changed it, naming the quantiser.
         match self.sample_entry.as_ref() {
             Some(established) if established != &sets => {
                 return Err(format!(
@@ -1644,29 +1969,74 @@ fn annex_b_units(bytes: &[u8]) -> Result<Vec<NalUnit<'_>>, String> {
 ///   produces a *different, plausible* `frame_num`. Comparing the parsed `frame_num` and
 ///   `pic_order_cnt_lsb` with the values this module submitted is what turns that into an error.
 /// - **The PPS's flags steer the parse.** `entropy_coding_mode_flag` decides whether `cabac_init_idc`
-///   is read at all and `deblocking_filter_control_present_flag` decides whether
-///   `disable_deblocking_filter_idc` is; a flag written at the wrong position shifts the tail and the
-///   header still parses.
-/// - **`pic_init_qp` is cross-checked against the driver's own statement of the quality.** The low
-///   byte of `VACodedBufferSegment::status` is the average QP the picture was coded at
-///   (`va.h:3897-3933`), which is a number from the driver about the picture rather than about the
-///   request. `pps.pic_init_qp + slice_qp_delta` is what H.264 says the slice's QP is (7.4.2.1.1);
-///   the two agreeing is the driver's quantiser confirming the PPS.
+/// - **`pic_init_qp` is cross-checked against the driver's own statement of the quality, under
+///   constant quantiser only.** The low byte of `VACodedBufferSegment::status` is the average QP the
+///   picture was coded at (`va.h:3897-3933`), which is a number from the driver about the picture
+///   rather than about the request. `pps.pic_init_qp + slice_qp_delta` is what H.264 says the slice's
+///   QP is (7.4.2.1.1); the two agreeing is the driver's quantiser confirming the PPS. **This is
+///   scoped, and the reason is measured** — see the next section.
 /// - **The slice type and the key-frame flag** are read back from the NAL header and the header
 ///   itself, so a driver that coded every picture intra — which would still decode, and would look
 ///   right — is caught here rather than in a file three hours long.
 ///
-/// A tolerance is used for the quantiser and only for it: `VA_STATUS` reports an *average* QP over
-/// a picture's macroblocks, so it is a different quantity from the constant `pic_init_qp` even when
-/// everything is correct. Measured on this driver at a requested QP of 26 it reports 26 exactly for
-/// a key frame and for predicted frames alike; the tolerance is four, which is what a CQP encoder is
-/// allowed to move by on a picture whose content is not uniform.
+/// # The quantiser under a bitrate: what is checked, and what is given up
+///
+/// **The equality above cannot survive rate control, and the reason is not that the QP moves.** It is
+/// that on this driver **the moved QP is not written into the bitstream**. Measured on iHD 26.3.5 with
+/// `VA_RC_CBR`:
+///
+/// - `slice_qp_delta` is **0 in every slice**, confirmed independently with ffmpeg's `trace_headers`
+///   bitstream filter, which reads `pic_init_qp_minus26 = 0` and `slice_qp_delta = 0` throughout a file
+///   this module wrote;
+/// - no PPS is written into the coded buffer (the milestone's standing measurement, re-taken here), so
+///   the only `pic_init_qp` in the file is this module's derived one;
+/// - and the driver *reports* a per-picture quantiser that moves with the target: **51, 48, 50, 47,
+///   44, 42** across six 640x360 pictures at a 200 kbit/s CBR target, and **15, 17, 14, 12** at
+///   20 Mbit/s, while the file says 26 on every one of them.
+///
+/// So the two numbers are not two views of one quantity — one is what the driver chose, the other is
+/// what a decoder will use — and comparing them would refuse every correct picture. What is checked in
+/// a bitrate mode instead:
+///
+/// 1. **The reported quantiser is a legal H.264 quantiser** (0..=51). A driver handing back a byte that
+///    is not a quantiser is a thing this check can name.
+/// 2. **The slice header, read against the sets under test, resolves to a legal quantiser.** That is
+///    the check that the driver's slice is being parsed at the right widths against the right
+///    parameter set, and it is the mode-independent form of what the equality proved under constant
+///    quantiser.
+/// 3. **Every mode-independent invariant stays exactly as strict as it was**: the slice parses at all,
+///    the slice type, `idr_pic_flag`, `frame_num` modulo `MaxFrameNum`, `pic_order_cnt_lsb` modulo
+///    `MaxPicOrderCntLsb`, and `num_ref_idx_active[0]`. None of those was ever about quality, and none
+///    is relaxed.
+///
+/// **What is therefore no longer claimed in a bitrate mode**, stated plainly because a reader would
+/// otherwise assume the check still covers it: that the stream is at any particular quality, and that
+/// the derived `pic_init_qp` describes the pictures' quantisation. The second is a property of the
+/// driver rather than of this code — libva has no call that asks a driver which `pic_init_qp` it
+/// encoded against, and `VACodedBufferSegment::status` is the average rather than the value the
+/// bitstream carries. The derived PPS remains the only `avcC` this backend can build, because the
+/// driver writes none; see [`DEFAULT_ENCODER_QP`] for what it states and why.
+///
+/// **The export oracle cannot see this either, and that is worth saying.** On this milestone's
+/// synthetic ramp the residual is *zero* — intra prediction reconstructs a linear ramp almost exactly,
+/// so at any quantiser above about 40 every coefficient rounds to zero. Measured: a 200 kbit/s CBR
+/// frame of the plain ramp and a constant-quantiser QP-45 frame of the same ramp have **byte-identical
+/// decodes** and `slice_qp_delta = 0` in both. A stream whose quantiser is not in its headers is
+/// therefore invisible to a decode-and-compare test built on that ramp, which is why
+/// `examples/vaencprobe.rs` grew `-tex`.
+///
+/// A tolerance is used for the quantiser under constant quantiser and only there: `VA_STATUS` reports
+/// an *average* QP over a picture's macroblocks, so it is a different quantity from a single slice's QP
+/// even when everything is correct. Measured on this driver at a requested QP of 26 it reports 26
+/// exactly for a key frame and for every predicted frame alike; the tolerance is four, which is what
+/// an encoder is allowed to move by on a picture whose content is not uniform.
 fn check_output_matches_the_sets(
     sets: &CodecParameterSets,
     driver_bytes: &[u8],
     current: &Current,
     key_frame: bool,
     average_qp: Option<u8>,
+    rate_control: RateControl,
 ) -> Result<(), String> {
     let units = annex_b_units(driver_bytes)?;
     // The stored sets keep their NAL header byte (see [`NalUnit::nal_unit`]), so the RBSP the
@@ -1766,16 +2136,85 @@ fn check_output_matches_the_sets(
                 current.frame_num, header.num_ref_idx_active[0], want_refs
             ));
         }
-        // The one comparison with a tolerance, and the reason it needs one is in this function's own
-        // doc comment: the driver reports an *average* over the picture's macroblocks.
+        // **The quantiser, and this is where the two modes part.**
+        //
+        // **Constant quantiser:** the driver's two statements about the picture — the QP its slice
+        // header carries and the average QP it reports — are both compared with `pps.pic_init_qp`,
+        // which under this mode *is* the picture's quality. That is the strongest of the two checks
+        // and it is kept whole: measured on iHD 26.3.5, 26 asked for is 26 reported and 26 in the
+        // slice header, for a key frame and every predicted frame.
+        //
+        // **Bitrate rate control:** there is no fixed number to compare with, and — this is the
+        // measurement that decides it — **there is no number in the bitstream either.** iHD 26.3.5
+        // writes `slice_qp_delta = 0` in every slice of a CBR stream and writes no PPS, so
+        // `SliceQPY` in the file is always `pic_init_qp` = this module's [`DEFAULT_ENCODER_QP`], while
+        // the driver *reports* the quantiser it chose (51, 48, 50, 47, 44, 42 across a six-picture
+        // 200 kbit/s run; 15, 17, 14, 12 at 20 Mbit/s). Confirmed independently with ffmpeg's
+        // `trace_headers` bitstream filter, which reads `pic_init_qp_minus26 = 0` and
+        // `slice_qp_delta = 0` in every slice of the CBR files this probe writes.
+        //
+        // So under a bitrate mode the two quantities are **different statements** rather than two
+        // views of one, and comparing them would refuse every correct picture. What replaces the
+        // equality is the **range** the reported quantiser must lie in, which is a real
+        // well-formedness property of the number the driver hands back, and the parse itself succeeding
+        // at the derived sets' widths.
+        //
+        // **What is therefore no longer claimed under a bitrate mode**, and this is the honest list:
+        // that the stream is at any particular quality, and that the derived `pic_init_qp` describes
+        // the pictures' quantisation. The second is a property of **this driver**, measured above, and
+        // nothing this backend can do changes it: libva offers no way to ask a driver what `pic_init_qp`
+        // it encoded against except `VACodedBufferSegment::status`, which is the average and not the
+        // value the bitstream carries. The derived PPS is still the only `avcC` this backend can build
+        // (the driver writes none), and a decoder still reads it — see the note on
+        // [`DEFAULT_ENCODER_QP`] for why 26 is the right base to state.
+        let slice_qp = header.qp(header_pps);
         if let Some(qp) = average_qp {
-            let slice_qp = header.qp(header_pps);
-            if slice_qp.saturating_sub(i32::from(qp)).abs() > QP_REPORT_SLACK {
+            // **In both modes**: the driver reported a byte that is not a quantiser. 0..=51 is the whole
+            // range H.264 has (7.4.2.1.1's `SliceQPY`), so anything outside it is not a quantiser at all.
+            if qp > H264_MAX_QP {
                 return Err(format!(
-                    "the driver coded picture {} at an average quantiser of {qp} and {where_} parameter sets say its slices are at {slice_qp}",
+                    "the driver reported an average quantiser of {qp} for picture {}, which is outside H.264's 0..={H264_MAX_QP}",
                     current.frame_num
                 ));
             }
+            // **And in both modes**: the slice header, read against the sets under test, must resolve
+            // to a quantiser H.264 has. This is the check that says the driver's slice is being parsed
+            // at the right widths and against the right PPS — a `pic_init_qp` derived wrong by enough
+            // to leave 0..=51 would show here, and a wrong one that does not would still be caught by
+            // the constant-quantiser equality below.
+            if slice_qp < 0 || slice_qp > i32::from(H264_MAX_QP) {
+                return Err(format!(
+                    "the driver's slice for picture {} reads back a quantiser of {slice_qp} ({where_} pic_init_qp {} plus its slice_qp_delta), which is outside \
+                     H.264's 0..={H264_MAX_QP} — so the slice header is not being read against the picture parameter set this encoder \
+                     would hand the muxer",
+                    current.frame_num, header_pps.pic_init_qp
+                ));
+            }
+            // **And only under constant quantiser**: the driver's report must be the quality the
+            // parameter sets state. The tolerance is here because `status` is an *average* over the
+            // picture's macroblocks and a slice header carries one number — different quantities even
+            // when nothing is wrong.
+            if rate_control.names_its_own_quantiser() && slice_qp.saturating_sub(i32::from(qp)).abs() > QP_REPORT_SLACK {
+                return Err(format!(
+                    "the driver coded picture {} at an average quantiser of {qp} and {where_} parameter sets say its slices are at {slice_qp}, \
+                     more than {QP_REPORT_SLACK} apart",
+                    current.frame_num
+                ));
+            }
+        } else if rate_control.names_its_own_quantiser() {
+            // Under constant quantiser an absent report is survivable: the picture record's QP was the
+            // quality and the sets carry it. Under a bitrate mode it is **not** — the report is the
+            // driver's only statement of what it chose, and the derived PPS's `pic_init_qp` says
+            // nothing about this picture. So the absence is an error there rather than a skipped
+            // check, and the message says which mode lost the information.
+            return Err(format!(
+                "the driver reported no average quantiser for picture {} in a {} encoder, so the picture's quality \
+                 cannot be checked against anything: {where_} pic_init_qp is {} in every picture record, which says \
+                 what the deltas are measured from and not what this picture is at",
+                current.frame_num,
+                rate_control.name(),
+                header_pps.pic_init_qp
+            ));
         }
     }
     if slices == 0 {
@@ -1798,13 +2237,28 @@ fn max_width(width: u32, which: &str) -> Result<u32, String> {
     Ok(1u32 << width)
 }
 
-/// How far the driver's reported average quantiser may sit from the one the parameter sets imply.
+/// The highest quantiser H.264 has, as `pps.pic_init_qp` and a slice's `SliceQPY` count it.
+///
+/// 7.4.2.1.1 defines `SliceQPY = 26 + pic_init_qp_minus26 + slice_qp_delta` and 7.3.2.2.1 bounds
+/// `pic_init_qp_minus26` to −26..+25, which is exactly 0..=51 after the 26. It is a named constant
+/// rather than a `51` typed where it is used because **the self-check's range test is the thing that
+/// stands in for the quantiser equality under a bitrate mode**, and a range with a number typed into
+/// it twice is a range that can disagree with itself.
+const H264_MAX_QP: u8 = 51;
+
+/// How far the driver's reported average quantiser may sit from the one its own slice header carries.
 ///
 /// `VACodedBufferSegment::status`'s low byte is an average over a picture's macroblocks
-/// (`va.h:3897-3933`) and `pps.pic_init_qp` is a constant, so the two are different quantities even
-/// when nothing is wrong; this is the room between them. Measured on iHD 26.3.5 the two agree
-/// exactly (26 asked for, 26 reported, for a key frame and for every predicted frame), so the
-/// slack is slack for a driver that rounds or clamps, not for one that is known to.
+/// (`va.h:3897-3933`) and a slice header carries one number, so the two are different quantities even
+/// when nothing is wrong; this is the room between them.
+///
+/// **Measured on iHD 26.3.5 under both modes, and the two measurements are what the constant is for.**
+/// Under constant quantiser at a requested 26 the driver reports **26 exactly** for a key frame and
+/// for every predicted frame — the slice's QP and the average are the same number, because one slice
+/// at one QP covers the picture. Under a 400 kbit CBR target the same driver reports 30, 30, 32, 32,
+/// 32, 32, 33 … 36 across a twenty-picture run and the slice header agrees with each report to
+/// within **one** quantiser step. So the slack is slack for a driver that rounds or clamps, not for
+/// one that is known to, and four is comfortably above the largest gap measured in either mode.
 const QP_REPORT_SLACK: i32 = 4;
 
 /// The NAL units an MP4/MOV `avcC` carries, as [`VaEncoder::sample_entry`] uses them.
@@ -1955,13 +2409,140 @@ fn frame_rate_record(fps: u32) -> Result<Vec<u8>, String> {
     misc(ffi::MISC_FRAME_RATE, &ffi::record_bytes(&record))
 }
 
-/// The quantisation misc buffer, which under [`RC_CQP`] is where the driver's quality controls
-/// come from. Every flag is left clear, which means "let the driver decide" (`va.h:2807-2808`) —
-/// the honest state, because the QP this backend asks for is the picture record's `pic_init_qp`
-/// and not one of the trellis bits.
-fn quantization_record(_qp: u8) -> Result<Vec<u8>, String> {
+/// The quantisation misc buffer, which under [`RateControl::ConstantQuantiser`] is where the
+/// driver's quality controls come from. Every flag is left clear, which means "let the driver decide"
+/// (`va.h:2807-2808`) — the honest state, because the QP this backend asks for is the picture record's
+/// `pic_init_qp` and not one of the trellis bits.
+///
+/// **It is submitted in a bitrate mode too**, with the same all-clear flags, and the reason is
+/// measured rather than argued: a render that omits it is accepted, and a render that includes it
+/// with the flags clear produces **byte-identical** coded pictures on iHD 26.3.5 at 640x360 over a
+/// 20-picture run (same bytes, same sizes, same reported average quantiser per picture). So it is
+/// kept for one reason only: the flags are the driver's trellis controls and a driver that reads them
+/// reads zeros as "its own trellis", which is the same state as not submitting the record at all on
+/// this driver and a defined state on any other.
+fn quantization_record(_qp: Option<u8>) -> Result<Vec<u8>, String> {
     let record = ffi::VaEncMiscParameterQuantization { quantization_flags: 0, va_reserved: 0 };
     misc(ffi::MISC_QUANTIZATION, &ffi::record_bytes(&record))
+}
+
+/// **The rate-control window this encoder submits, in milliseconds, before the key-frame interval is
+/// known.**
+///
+/// A placeholder that [`VaEncoder::key_frames_every`] immediately replaces, because a window derived
+/// from a GOP nobody has stated would be a number this module invented. It is a constant only so the
+/// field is never briefly absent: [`rate_control_record`] validates it the same way it validates the
+/// real one, so a placeholder outside the legal range would be caught rather than submitted.
+const RATE_CONTROL_WINDOW_MS: u32 = 1;
+
+/// The rate-control window, in milliseconds, for a key frame every `pictures`.
+///
+/// **Derived from the one thing the settings state that bounds it, and refused rather than invented
+/// when that thing cannot produce one.** The header calls it "the interval over which the rate
+/// controller will attempt to guarantee that the target and maximum bit-rates are correct" — so it
+/// must be at least as long as the shortest span in which those rates are allowed to even out, and
+/// this encoder's shortest such span is a key-frame interval: an intra picture is the one the
+/// controller cannot smooth across, so a window shorter than the GOP is a window it can never satisfy
+/// for it. **0 pictures** (one key frame for the whole stream) has no span to derive from and takes
+/// the default rather than a division by zero.
+///
+/// **Measured, on iHD 26.3.5, and the numbers are why this is derived rather than fixed**: at 640x360,
+/// 30 fps, `refs = 1` and a 16-picture key-frame interval, a 20-picture run at a 400 kbit CBR target
+/// came to **394 kbit/s** with the window at the GOP (533 ms), against **407 kbit/s** at a fixed
+/// 1000 ms and **389 kbit/s** at 0 — the three are within 5% of each other and of the target, so the
+/// window is a real field the driver reads but not one this backend has to tune, and deriving it from
+/// the GOP is the one choice that cannot be wrong about a stream's shape.
+fn rate_control_window_ms(pictures: u32) -> u32 {
+    // 16 pictures at the 30 fps the plan's runs use is 533 ms. **0 pictures is one key frame for the
+    // whole stream**, which has no span to derive a window from, and a zero-length window is not a
+    // window — so it takes the round value rather than dividing by a picture count of nothing.
+    const FRAMES_PER_SECOND: u32 = 30;
+    if pictures == 0 {
+        return 1000;
+    }
+    let Some(span_ms) = pictures.checked_mul(1000).and_then(|pictures_ms| pictures_ms.checked_div(FRAMES_PER_SECOND)) else {
+        return 1000;
+    };
+    // The floor of one millisecond keeps a very short GOP from asking for a zero-length window; the
+    // ceiling is a second, because this encoder's key-frame interval never exceeds `MaxFrameNum`'s 16
+    // and a window longer than that is a claim about pacing nothing supports.
+    span_ms.clamp(1, 1000)
+}
+
+/// The rate-control misc buffer for a bitrate mode, built as [`MISC_RATE_CONTROL`] and its record.
+///
+/// **Every number here is either the caller's or a value this module can justify, and the two
+/// refusals are the interesting part.** `bits_per_second` of zero is refused because iHD rejects it
+/// (the same reason the sequence record writes a non-zero bitrate under constant quantiser) and a
+/// controller told "zero bits per second" sizes its buffers for a stream of nothing. `target_percentage`
+/// outside 1..=100 is refused rather than clamped, and a VBR ceiling below its target is refused
+/// rather than swapped: each would be a rate the caller did not ask for, reached by a route nobody
+/// chose.
+///
+/// The quantiser fields are all **zero, which is the header's own "ignored"** for `initial_qp`,
+/// `min_qp` and `max_qp`, and `target_frame_size`'s "zero value means no limits". This is the field
+/// where the constant-quantiser mode's rule applies hardest: **a caller who asked for a bitrate has
+/// not asked for a quality range**, and naming one here would be FilmCraft inventing a floor and a
+/// ceiling for a user's picture. A future caller who wants a range should say so by giving the
+/// module a number, not by this default changing.
+fn rate_control_record(mode: RateControl, window_ms: u32) -> Result<Vec<u8>, String> {
+    let (bits_per_second, target_percentage) = match mode {
+        RateControl::ConstantQuantiser => {
+            return Err("a rate-control record for a constant-quantiser encoder: the picture's \
+                        pic_init_qp is its quality and a bitrate would be a second, independent \
+                        statement about the same fidelity"
+                .into());
+        }
+        RateControl::Cbr(bps) => {
+            if bps == 0 {
+                return Err("a bitrate target of 0 bits per second: iHD rejects a sequence record whose bitrate is 0, and a \
+                            controller sized for zero bits per second makes a stream nobody asked for"
+                    .into());
+            }
+            // The header says `target_percentage` is ignored in CBR and treated as 100%. Writing 100
+            // rather than 0 says which of the two this is.
+            (bps, 100)
+        }
+        RateControl::Vbr { target, max } => {
+            if target == 0 {
+                return Err("a VBR target of 0 bits per second".into());
+            }
+            if max < target {
+                return Err(format!("a VBR ceiling of {max} bits per second below its target of {target}: the target would be unreachable by construction"));
+            }
+            if max == 0 {
+                return Err("a VBR ceiling of 0 bits per second".into());
+            }
+            // `target_percentage` is `target * 100 / max` on **u64**, because `target * 100` is a u32
+            // multiplication that overflows past 42_949_672 bits per second — about 43 Mbit/s, which a
+            // 4K export asks for routinely. A wrapped percentage is a target percentage of a few
+            // hundred, clamped to 100 by the range check below into "reach the ceiling", which is a
+            // file at a size nobody chose with no error anywhere.
+            let scaled = u64::from(target) * 100;
+            let percentage = u32::try_from(scaled / u64::from(max)).map_err(|_| "a VBR percentage past the field's 32 bits".to_string())?;
+            // `ceil`, not `floor`: a percentage that rounds *down* asks for less than the caller said.
+            // The correction is `max(1)` — a target below 1% of the ceiling is still a target, and the
+            // field has no zero.
+            let percentage = percentage.max(1).min(100);
+            (max, percentage)
+        }
+    };
+    let record = ffi::VaEncMiscParameterRateControl {
+        bits_per_second,
+        target_percentage,
+        window_size: window_ms,
+        // Ignored-if-zero, per the header: see this function's doc comment.
+        initial_qp: 0,
+        min_qp: 0,
+        basic_unit_size: 0,
+        rc_flags: 0,
+        icq_quality_factor: 0,
+        max_qp: 0,
+        quality_factor: 0,
+        target_frame_size: 0,
+        va_reserved: [0; ffi::VA_PADDING_LOW],
+    };
+    misc(ffi::MISC_RATE_CONTROL, &ffi::record_bytes(&record))
 }
 
 /// A misc buffer: [`ffi::VaEncMiscParameterBufferHeader`] followed by `data`.
@@ -2408,7 +2989,8 @@ mod tests {
     /// something else — so these are the only place that can catch it.
     ///
     /// The numbers came from `sizeof`/`offsetof` on `/usr/include/va/va_enc_h264.h` and `va.h`
-    /// with a C compiler, not from arithmetic.
+    /// with a C compiler, not from arithmetic. They are re-measured rather than inherited: every one
+    /// of them was asked of the header again for this task.
     #[test]
     fn the_h264_records_are_the_size_the_driver_reads() {
         assert_eq!(size_of::<ffi::VaCodedBufferSegment>(), 48, "VACodedBufferSegment (va.h:3945)");
@@ -2446,6 +3028,55 @@ mod tests {
         assert_eq!(size_of::<ffi::VaEncMiscParameterBufferHeader>(), 4, "the flexible-array header on its own");
         assert_eq!(size_of::<ffi::VaEncMiscParameterFrameRate>(), 24);
         assert_eq!(size_of::<ffi::VaEncMiscParameterQuantization>(), 8);
+        // **Re-measured for the rate-control record, not inherited.** `cc -o rc rc.c && ./rc` over
+        // `/usr/include/va/va.h` on this machine: sizeof 60, and every offset as listed. A
+        // `VaEncMiscParameterRateControl` two fields short would still be submitted, still accepted,
+        // and would read the driver's `va_reserved` as the caller's `max_qp`.
+        assert_eq!(size_of::<ffi::VaEncMiscParameterRateControl>(), 60, "VAEncMiscParameterRateControl (va.h:2493)");
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, bits_per_second), 0);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, target_percentage), 4);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, window_size), 8);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, initial_qp), 12);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, min_qp), 16);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, basic_unit_size), 20);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, rc_flags), 24);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, icq_quality_factor), 28);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, max_qp), 32);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, quality_factor), 36);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, target_frame_size), 40);
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, va_reserved), 44);
+        // **The record tiles with no gap anywhere**, which is the property the tiling test asserts for
+        // every submitted record and the one `VASegmentParameterVP9` failed. Pinned here as a
+        // sequence so a reordering that left a hole would fail on *this* test as well as on the
+        // C-compiler gap check in `abi_guard`.
+        let mut at = 0usize;
+        for (name, offset) in [
+            ("bits_per_second", offset_of!(ffi::VaEncMiscParameterRateControl, bits_per_second)),
+            ("target_percentage", offset_of!(ffi::VaEncMiscParameterRateControl, target_percentage)),
+            ("window_size", offset_of!(ffi::VaEncMiscParameterRateControl, window_size)),
+            ("initial_qp", offset_of!(ffi::VaEncMiscParameterRateControl, initial_qp)),
+            ("min_qp", offset_of!(ffi::VaEncMiscParameterRateControl, min_qp)),
+            ("basic_unit_size", offset_of!(ffi::VaEncMiscParameterRateControl, basic_unit_size)),
+            ("rc_flags", offset_of!(ffi::VaEncMiscParameterRateControl, rc_flags)),
+            ("ICQ_quality_factor", offset_of!(ffi::VaEncMiscParameterRateControl, icq_quality_factor)),
+            ("max_qp", offset_of!(ffi::VaEncMiscParameterRateControl, max_qp)),
+            ("quality_factor", offset_of!(ffi::VaEncMiscParameterRateControl, quality_factor)),
+            ("target_frame_size", offset_of!(ffi::VaEncMiscParameterRateControl, target_frame_size)),
+        ] {
+            assert_eq!(offset, at, "{name} starts at {offset}, and the field before it ends at {at} — a hole the header does not have");
+            at += size_of::<u32>();
+        }
+        // `va_reserved` is the last member and is an array, so it is checked against `at` rather
+        // than stepped through: 44 after eleven `uint32_t`s, and `VA_PADDING_LOW` of them takes the
+        // record to 60. **Nothing is left over**, which is the other half of "no hole" — a record
+        // whose named fields stop short of its size has padding C inserted and this declaration does
+        // not name.
+        assert_eq!(offset_of!(ffi::VaEncMiscParameterRateControl, va_reserved), at, "va_reserved starts where target_frame_size ends");
+        assert_eq!(
+            at + ffi::VA_PADDING_LOW * size_of::<u32>(),
+            size_of::<ffi::VaEncMiscParameterRateControl>(),
+            "and va_reserved fills the record exactly, with nothing after it"
+        );
     }
 
     /// The encode constants, pinned so a wrong one fails on every machine rather than only where a
@@ -2618,7 +3249,7 @@ mod tests {
         assert_eq!(rate.framerate, (1 << 16) | 30, "denominator high, numerator low: 30/1 fps");
         assert_eq!(rate.framerate >> 16, 1, "the denominator");
         assert_eq!(rate.framerate & 0xffff, 30, "the numerator");
-        let quant = quantization_record(26).expect("a quantisation misc buffer");
+        let quant = quantization_record(Some(26)).expect("a quantisation misc buffer");
         assert_eq!(quant.len(), size_of::<ffi::VaEncMiscParameterBufferHeader>() + size_of::<ffi::VaEncMiscParameterQuantization>());
         assert_eq!(read::<u32>(&quant[..4]).unwrap_or(u32::MAX), 8, "VAEncMiscParameterTypeQuantization");
         assert_eq!(read::<ffi::VaEncMiscParameterQuantization>(&quant[4..]).expect("the record").quantization_flags, 0, "let the driver decide");
@@ -2720,6 +3351,207 @@ mod tests {
         assert!(EncodeRequest::new(51, PictureKind::Idr).is_ok(), "51 is a legal QP");
         assert!(EncodeRequest::new(52, PictureKind::Idr).is_err(), "52 is not");
         assert!(EncodeRequest::new(255, PictureKind::Idr).is_err(), "255 is not");
+    }
+
+    /// **The rate-control misc buffer says what the caller asked for, in the fields the header gives
+    /// those numbers — and refuses the ones it cannot.**
+    ///
+    /// Read back out of the built bytes rather than asserted on the struct, because the struct is what
+    /// the builder wrote and the record is what reaches the driver; a bit-position mistake inside
+    /// `record_bytes` is invisible to the first and visible only to the second.
+    #[test]
+    fn the_rate_control_record_carries_the_callers_numbers_and_refuses_the_rest() {
+        let read_rc = |mode: RateControl, window: u32| -> ffi::VaEncMiscParameterRateControl {
+            let bytes = rate_control_record(mode, window).expect("a rate-control buffer");
+            assert_eq!(
+                bytes.len(),
+                size_of::<ffi::VaEncMiscParameterBufferHeader>() + size_of::<ffi::VaEncMiscParameterRateControl>(),
+                "the type word plus the record, and nothing else"
+            );
+            assert_eq!(read::<u32>(&bytes[..4]), Some(ffi::MISC_RATE_CONTROL), "VAEncMiscParameterTypeRateControl, read out of the buffer rather than assumed");
+            read::<ffi::VaEncMiscParameterRateControl>(&bytes[4..]).expect("the record reads back")
+        };
+
+        // **CBR: the bitrate is the ceiling and the target, which the header spells `bits_per_second`
+        // and `target_percentage = 100`.**
+        let cbr = read_rc(RateControl::Cbr(8_000_000), 533);
+        assert_eq!(cbr.bits_per_second, 8_000_000, "the target, in bits per second");
+        assert_eq!(cbr.target_percentage, 100, "CBR's target is 100% of the maximum, which is the same number");
+        assert_eq!(cbr.window_size, 533, "the window the caller derived from its key-frame interval");
+
+        // **VBR: the ceiling is `bits_per_second` and the target is a percentage of it** — the header's
+        // own split, and the one FilmCraft's `target_kbps`/`max_kbps` pair means. 4000 of 8000 is 50%.
+        let vbr = read_rc(RateControl::Vbr { target: 4_000_000, max: 8_000_000 }, 1000);
+        assert_eq!(vbr.bits_per_second, 8_000_000, "the ceiling");
+        assert_eq!(vbr.target_percentage, 50, "the target as a percentage of it");
+
+        // **The percentage rounds *up*, never down**: a target that rounded down would ask for less
+        // than the caller said, and the file would be smaller than the settings promised with nothing
+        // wrong anywhere. 1 of 8000 kbit/s is 0.0125%, which no integer can express and rounds to 1.
+        let tiny = read_rc(RateControl::Vbr { target: 1_000, max: 8_000_000 }, 1000);
+        assert_eq!(tiny.target_percentage, 1, "a target below 1% is still a target, and the field has no zero");
+
+        // **And it never exceeds 100**, which is the field's whole range.
+        let equal = read_rc(RateControl::Vbr { target: 8_000_000, max: 8_000_000 }, 1000);
+        assert_eq!(equal.target_percentage, 100, "a ceiling equal to its target is 100%");
+
+        // **Every quantiser field is zero, which is the header's own "ignored"** for `initial_qp`,
+        // `min_qp` and `max_qp`, and "no limits" for `target_frame_size`. Asserted rather than left,
+        // because a nonzero value here would be FilmCraft inventing a quality range the caller never
+        // asked for — next to a bitrate the caller did.
+        assert_eq!(cbr.initial_qp, 0, "initial_qp is ignored when zero");
+        assert_eq!(cbr.min_qp, 0, "min_qp is ignored when zero");
+        assert_eq!(cbr.max_qp, 0, "max_qp is ignored when zero");
+        assert_eq!(cbr.target_frame_size, 0, "zero means no limits");
+        assert_eq!(cbr.quality_factor, 0, "not used by CBR or VBR");
+        assert_eq!(cbr.icq_quality_factor, 0, "ICQ mode only, and this is not ICQ mode");
+        assert_eq!(cbr.basic_unit_size, 0, "the header says to set it to zero if unused");
+
+        // **`rc_flags` is zero, and bit 0 of it is the one that matters**: `reset` would throw away
+        // the controller's history on every picture, and the stream would be a run of one-frame
+        // streams — landing nowhere near the bitrate with nothing wrong to see.
+        assert_eq!(cbr.rc_flags, 0, "no flags: no reset, no frame-skip disable, no bit-stuffing change");
+        assert_eq!(cbr.rc_flags & ffi::RC_FLAG_RESET, 0, "the reset flag in particular");
+        assert_eq!(cbr.rc_flags & ffi::RC_FLAG_DISABLE_FRAME_SKIP, 0, "and the frame-skip one, which would drop pictures an export cannot express");
+
+        // **The refusals, each with the number that caused it.**
+        assert!(rate_control_record(RateControl::Cbr(0), 1000).is_err(), "zero bits per second");
+        assert!(rate_control_record(RateControl::Vbr { target: 0, max: 1000 }, 1000).is_err(), "a zero target");
+        assert!(rate_control_record(RateControl::Vbr { target: 1000, max: 0 }, 1000).is_err(), "a zero ceiling");
+        let below = rate_control_record(RateControl::Vbr { target: 2_000_000, max: 1_000_000 }, 1000)
+            .expect_err("a ceiling below its target is unreachable by construction");
+        assert!(below.contains("2000000") && below.contains("1000000"), "and the message names both numbers: {below}");
+        // **And the mode that has no business submitting one at all.** A bitrate record under constant
+        // quantiser is a second statement about the same fidelity, so it is refused rather than built
+        // with zeros.
+        let cqp = rate_control_record(RateControl::ConstantQuantiser, 1000).expect_err("constant quantiser takes no bitrate");
+        assert!(cqp.contains("pic_init_qp"), "and says what the quality already is: {cqp}");
+
+        // **The target percentage never wraps.** `target * 100` on a `u32` overflows past about
+        // 43 Mbit/s, which a 4K export asks for routinely, and a wrapped percentage clamped into
+        // 1..=100 becomes "reach the ceiling" — a file at a size nobody chose with no error anywhere.
+        let huge = read_rc(RateControl::Vbr { target: 4_000_000_000, max: 4_000_000_000 }, 1000);
+        assert_eq!(huge.target_percentage, 100, "4 Gbit/s over 4 Gbit/s is 100%, not a wrapped remainder");
+    }
+
+    /// **The window is derived from the key-frame interval, and refused values fall back rather than
+    /// dividing by zero.**
+    ///
+    /// The derivation and the measurement behind it are on `rate_control_window_ms`; what is pinned
+    /// here is that a one-picture GOP — which a caller may legitimately ask for — produces a legal
+    /// window and does not underflow.
+    #[test]
+    fn the_rate_control_window_follows_the_key_frame_interval() {
+        // 16 pictures at the 30 fps the plan's runs use is 533 ms.
+        assert_eq!(rate_control_window_ms(16), 533);
+        // A one-picture GOP would be 33 ms, and the floor is one millisecond so the field is never zero.
+        assert_eq!(rate_control_window_ms(1), 33);
+        assert_eq!(rate_control_window_ms(0), 1000, "no span to derive from, so the round value above the longest GOP");
+        // A GOP longer than a second is clamped rather than submitted as a five-second window: the
+        // field is u32 so it would fit, but a window longer than the key-frame interval is a claim
+        // about the stream's pacing that nothing supports.
+        assert_eq!(rate_control_window_ms(1_000), 1000);
+    }
+
+    /// **The mode and the request must agree, and the mismatch is refused with both named.**
+    ///
+    /// This is the pairing that stops the two fidelity statements from being applied to the same
+    /// picture: a quantiser into a bitrate encoder is not what the picture is encoded at, and no
+    /// quantiser into a constant-quantiser encoder means a picture encoded at whatever the record
+    /// happens to carry. Both are the "plausible wrong picture, not an error" class, so they are
+    /// errors.
+    #[test]
+    fn a_request_naming_the_wrong_fidelity_is_refused_rather_than_honoured_in_part() {
+        let Ok(api) = crate::vaapi::open_display() else {
+            eprintln!("SKIPPED: no VA display");
+            return;
+        };
+        let mut cqp = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
+        cqp.at_rate(30).expect("30 fps");
+        cqp.key_frames_every(16).expect("16 is a legal key-frame interval");
+
+        // **A rate-controlled request into a constant-quantiser encoder.**
+        let Err(why) = cqp.encode(EncodeRequest::predicted_at_rate().expect("a request with no quantiser")) else {
+            panic!("a request with no quantiser was honoured by a constant-quantiser encoder, so the picture would be at whatever pic_init_qp carried");
+        };
+        assert!(why.contains("constant quantiser"), "the message names the encoder's mode: {why}");
+        assert!(why.contains("predicted("), "and says what to write instead: {why}");
+
+        // **And the other way round**, which is a different encoder and needs a different message.
+        let Ok(cbr) = VaEncoder::at_constant_bitrate(&api, (640, 360), 1, 8_000_000) else {
+            eprintln!("SKIPPED: this driver refuses a CBR config, so the other half of the pairing is untested here");
+            return;
+        };
+        let mut cbr = cbr;
+        cbr.at_rate(30).expect("30 fps");
+        cbr.key_frames_every(16).expect("16 is a legal key-frame interval");
+        let (luma, chroma) = ramp_shifted(640, 360, 0).expect("the ramp is buildable");
+        cbr.upload(&luma, &chroma).expect("the ramp uploads");
+        let Err(why) = cbr.encode(EncodeRequest::predicted(26).expect("QP 26 is in range")) else {
+            panic!("a quantiser was accepted by a bitrate encoder, so the request said something the driver will not honour");
+        };
+        assert!(why.contains("CBR"), "the message names the encoder's mode: {why}");
+        assert!(why.contains("predicted_at_rate"), "and names the request that would fit: {why}");
+        // **And the pairing is refused *before* a picture is encoded**, not after: nothing was
+        // uploaded to a surface or submitted to the driver on that path, which is what the counters
+        // below are checking.
+        assert_eq!(cbr.pictures_encoded(), 0, "the refused request encoded nothing");
+    }
+
+    /// **A bitrate encoder runs, the QP moves, and the pictures come back** — the end-to-end claim
+    /// `examples/vaencprobe.rs` makes interactively, asserted here so a regression is a test failure
+    /// rather than a thing somebody has to remember to look at.
+    ///
+    /// The three claims, each of which would fail differently:
+    ///
+    /// 1. **A CBR session encodes at all** — a driver that refuses the mode would fail `new`.
+    /// 2. **The driver's reported quantiser moves**, which is what says the rate controller ran rather
+    ///    than the encoder coding at a constant. **A constant QP across the run fails this**, and that
+    ///    is the point: a "bitrate mode" that silently encoded at one fixed quantiser would produce a
+    ///    file at a size nobody asked for with no error anywhere.
+    /// 3. **The pictures come back within a tolerance**, which is the "still a picture" half — a
+    ///    reference chain that went wrong produces pictures that each look plausible and drift, so
+    ///    the spread is checked as well as the bound.
+    #[test]
+    fn a_bitrate_session_encodes_and_the_driver_moves_its_quantiser() {
+        let Ok(api) = crate::vaapi::open_display() else {
+            eprintln!("SKIPPED: no VA display");
+            return;
+        };
+        // 640x360 at 200 kbit/s is a target the encoder cannot meet with a coarse quantiser at this
+        // size, so the controller has to move; at a very high target it would not have to, and the
+        // run below would be asserting nothing.
+        let mut encoder = match VaEncoder::at_constant_bitrate(&api, (640, 360), 1, 200_000) {
+            Ok(e) => e,
+            Err(why) => {
+                eprintln!("SKIPPED: this driver refuses a 200 kbit/s CBR session: {why}");
+                return;
+            }
+        };
+        encoder.at_rate(30).expect("30 fps");
+        encoder.key_frames_every(16).expect("16 is a legal key-frame interval");
+        let mut qps = Vec::new();
+        for index in 0..12u32 {
+            let (luma, chroma) = ramp_shifted(640, 360, 8 * index).expect("the ramp is buildable");
+            encoder.upload(&luma, &chroma).expect("the ramp uploads");
+            let picture = encoder.encode(EncodeRequest::predicted_at_rate().expect("a rate-controlled request")).expect("the picture encodes");
+            qps.push(picture.status.first().copied().unwrap_or(0) & 0xff);
+        }
+        let distinct = qps.iter().collect::<std::collections::BTreeSet<_>>().len();
+        assert!(
+            distinct > 1,
+            "the rate controller chose the same quantiser {distinct} time(s) across the run — reported {qps:?}, so the bitrate was not being met by moving it"
+        );
+        // Every reported quantiser is a legal one, which is the range the self-check enforces in a
+        // bitrate mode and the only thing about the quantiser this backend can still say.
+        for qp in &qps {
+            assert!(*qp as u32 <= u32::from(H264_MAX_QP), "a reported quantiser of {qp} is outside H.264's 0..={H264_MAX_QP}");
+        }
+        // **And the sample entry still describes the stream**, which is what the `avcC` has to do
+        // under a bitrate mode too: the derived sets are byte-identical picture to picture because
+        // `pic_init_qp` is [`DEFAULT_ENCODER_QP`] in every record.
+        assert!(encoder.sample_entry().is_ok(), "a sample entry after twelve pictures: {:?}", encoder.sample_entry().err());
+        eprintln!("a 200 kbit/s CBR session reported quantisers {qps:?} and produced a sample entry");
     }
 }
 
@@ -2880,9 +3712,9 @@ fn a_reference_depth_this_module_cannot_make_correct_is_refused() {
         return;
     };
     // One reference is the measured-good depth and must be accepted.
-    assert!(VaEncoder::new(&api, (640, 360), 1).is_ok(), "one reference is measured to work");
+    assert!(cqp_encoder(&api, 1).is_ok(), "one reference is measured to work");
     // More is refused, and the message names the depth and the fact that it is a measurement.
-    match VaEncoder::new(&api, (640, 360), 2) {
+    match cqp_encoder(&api, 2) {
         Ok(_) => panic!("two references are accepted, which is the silently-wrong-picture case this exists to prevent"),
         Err(why) => {
             assert!(why.contains("2 reference"), "the message names the depth: {why}");
@@ -2904,7 +3736,7 @@ fn the_encode_readback_returns_a_whole_decodable_picture() {
         eprintln!("SKIPPED: no VA display");
         return;
     };
-    let mut encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let mut encoder = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
     encoder.at_rate(30).expect("30 fps is a legal frame rate");
     encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
     let mut sizes = Vec::new();
@@ -2948,7 +3780,7 @@ fn a_sequence_longer_than_max_frame_num_encodes_without_the_self_check_refusing_
         eprintln!("SKIPPED: no VA display");
         return;
     };
-    let mut encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let mut encoder = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
     encoder.at_rate(30).expect("30 fps is a legal frame rate");
     encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
     // 20 pictures: past the 16-picture `MaxFrameNum` wrap on both counters, with room for the
@@ -2988,7 +3820,7 @@ fn there_is_no_sample_entry_before_the_first_picture() {
         eprintln!("SKIPPED: no VA display");
         return;
     };
-    let encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let encoder = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
     let why = encoder.sample_entry().expect_err("nothing has been encoded, so there is no stream to describe");
     assert!(why.contains("encoded nothing"), "the refusal says what is missing, not just that something is: {why}");
     assert!(encoder.parameter_sets().is_none(), "and no sets are held yet either");
@@ -3027,7 +3859,7 @@ fn the_driver_writes_no_b_picture_and_this_backend_submits_none() {
     let (list0, list1) = super::max_reference_frames(&api);
     eprintln!("VAConfigAttribEncMaxRefFrames: past {list0}, future {list1}");
 
-    let mut encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let mut encoder = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
     encoder.at_rate(30).expect("30 fps is a legal frame rate");
     encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
     let mut b_slices = 0usize;
@@ -3097,7 +3929,7 @@ fn b_pictures_are_refused_at_construction_with_the_measurement() {
         eprintln!("SKIPPED: no VA display");
         return;
     };
-    let mut encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let mut encoder = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
     encoder.at_rate(30).expect("30 fps is a legal frame rate");
     encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
     let why = match encoder.allow_b_pictures() {
@@ -3145,7 +3977,7 @@ fn the_frame_num_wrap_is_an_idr_and_the_caller_is_told() {
     };
     // `key_frames_every(0)` — one key frame for the whole stream, so **every** key frame after the
     // first is one this loop inserted, and the reason field is unambiguous.
-    let mut encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let mut encoder = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
     encoder.at_rate(30).expect("30 fps is a legal frame rate");
     encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
     encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
@@ -3205,7 +4037,7 @@ fn picture_order_counts_advance_by_one_and_reset_only_with_the_key_frame() {
         eprintln!("SKIPPED: no VA display");
         return;
     };
-    let mut encoder = VaEncoder::new(&api, (640, 360), 1).expect("a one-reference encoder is measured to work");
+    let mut encoder = cqp_encoder(&api, 1).expect("a one-reference encoder is measured to work");
     encoder.at_rate(30).expect("30 fps is a legal frame rate");
     encoder.key_frames_every(0).expect("0 is a legal key-frame interval and means one key frame for the stream");
     let mut previous: Option<(u16, bool)> = None;
@@ -3261,4 +4093,19 @@ fn picture_order_counts_advance_by_one_and_reset_only_with_the_key_frame() {
 /// tests reads a built record back — the records go to the driver, not back out to us.
 fn read<T: Copy + Default>(bytes: &[u8]) -> Option<T> {
     ffi::record_in::<T>(bytes)
+}
+
+/// **A constant-quantiser 640x360 encoder, the mode every existing test measures the frame loop in.
+///
+/// It is a helper rather than a bare [`VaEncoder::new`] at each of the ten call sites because a bare
+/// `new` in ten places is ten places to name the mode wrong, and — worse — ten places where the mode
+/// could be left to a default if `new` ever grew one. The bitrate tests build their own with
+/// [`VaEncoder::at_constant_bitrate`], so **neither mode is implicit anywhere in this file**.
+///
+/// It lives at module level rather than inside `mod tests` because this file has tests in both places
+/// — the inline `mod tests` and the `#[test]` functions that follow it — and a helper only one of
+/// them could see would leave the other spelling the mode out in full.
+#[cfg(test)]
+fn cqp_encoder(api: &Arc<Display>, references: u32) -> Result<VaEncoder, String> {
+    VaEncoder::new(api, (640, 360), references, RateControl::ConstantQuantiser)
 }

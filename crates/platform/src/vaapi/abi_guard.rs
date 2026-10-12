@@ -969,6 +969,36 @@ static SUBMITTED_RECORDS: &[SubmittedRecord] = submitted_records![
         ("quantization_flags", quantization_flags, size_of::<u32>()),
         ("va_reserved", va_reserved, size_of::<u32>()),
     ],
+    // The rate-control record, and the row that is here for a reason beyond the usual: **it has no
+    // hole at all**, so it is the one submitted record where the tiling test proves nothing on its
+    // own and the C gap check has to carry it. Every member is a `uint32_t` or a union of them, from
+    // offset 0 to 44, and `va_reserved[VA_PADDING_LOW]` takes it to 60 — twelve members in a row with
+    // no padding between any two of them and none after the last.
+    //
+    // **There is no `padding_*` row here, and that is the assertion.** A record added to this list
+    // is supposed to name every byte it contains; a member with no C name can only appear as one of
+    // those, and one appearing where the header has none would mean this declaration grew a hole the
+    // header does not have — the `VASegmentParameterVP9` failure, which agreed with C on every size
+    // and offset and handed the driver two indeterminate bytes per record. The gap check asks the
+    // compiler for `offsetof(b) - offsetof(a) - sizeof(a)` between each pair of members and asserts
+    // it equals **zero** here rather than leaving a hole-free record unchecked, so "no hole" is a
+    // measurement rather than an absence of one.
+    "VAEncMiscParameterRateControl": size_of::<VaEncMiscParameterRateControl>() => [
+        ("bits_per_second", bits_per_second, size_of::<u32>()),
+        ("target_percentage", target_percentage, size_of::<u32>()),
+        ("window_size", window_size, size_of::<u32>()),
+        ("initial_qp", initial_qp, size_of::<u32>()),
+        ("min_qp", min_qp, size_of::<u32>()),
+        ("basic_unit_size", basic_unit_size, size_of::<u32>()),
+        // The union's `value` member. C sizes it as the union, which is `sizeof(uint32_t)` — 4 — and
+        // that is what the `sizeof` static assertion below asks the compiler.
+        ("rc_flags", rc_flags, size_of::<u32>()),
+        ("ICQ_quality_factor", icq_quality_factor, size_of::<u32>()),
+        ("max_qp", max_qp, size_of::<u32>()),
+        ("quality_factor", quality_factor, size_of::<u32>()),
+        ("target_frame_size", target_frame_size, size_of::<u32>()),
+        ("va_reserved", va_reserved, VA_PADDING_LOW * size_of::<u32>()),
+    ],
     // **The one record here that is not a libva record**, and the one whose verification read as
     // rigorous and was wrong: `struct drm_prime_handle` is handed to the kernel by
     // `DRM_IOCTL_PRIME_HANDLE_TO_FD`, it was declared eight bytes short, and the request number that
@@ -1167,6 +1197,7 @@ fn every_declaration_matches_what_a_c_compiler_measures() {
         ("VAEncSliceParameterBufferH264", size_of::<VaEncSliceParameterBufferH264>()),
         ("VAEncMiscParameterFrameRate", size_of::<VaEncMiscParameterFrameRate>()),
         ("VAEncMiscParameterQuantization", size_of::<VaEncMiscParameterQuantization>()),
+        ("VAEncMiscParameterRateControl", size_of::<VaEncMiscParameterRateControl>()),
         ("struct drm_prime_handle", size_of::<drm::DrmPrimeHandle>()),
     ];
     let mut source = String::from(

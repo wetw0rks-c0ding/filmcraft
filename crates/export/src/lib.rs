@@ -214,6 +214,14 @@ pub enum H264Pass {
     Second(filmcraft_h264enc::PassStats),
 }
 
+/// [`ExportSettings::constant_qp`]'s value in a settings file written before the field existed — the
+/// same 26 [`ExportSettings::default`] uses, and for the same reason (H.264 7.3.2.2.1 centres
+/// `pic_init_qp` on it). A named function rather than `Default::default()` because the two must not
+/// be able to drift apart silently.
+fn default_constant_qp() -> u8 {
+    26
+}
+
 /// Every Export-mode setting. Serialized in camelCase; every field is optional on input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -267,6 +275,16 @@ pub struct ExportSettings {
     /// stream needs is raised.
     pub h264_level: Option<u8>,
     pub bitrate_mode: BitrateMode,
+    /// H.264 quantiser for [`BitrateMode::ConstantQuality`] (0 = best, 51 = worst), and read by no
+    /// other mode. Out-of-range values are refused by [`ExportSettings::validate`] and by every
+    /// encoder that takes the mode, never clamped.
+    ///
+    /// The default is **26**, the value H.264's own syntax centres on: `pic_init_qp` is defined as
+    /// `pic_init_qp_minus26 + 26` (7.3.2.2.1), so 26 is the one quantiser a decoder's arithmetic is
+    /// anchored to rather than a taste. Any other default would be the same statement with an offset
+    /// nobody could check.
+    #[serde(default = "default_constant_qp")]
+    pub constant_qp: u8,
     /// May H.264 be encoded by the system's hardware encoder (VideoToolbox on macOS, NVENC on
     /// Windows)? Off unless asked for: hardware output depends on the machine, so it is not
     /// byte-reproducible like the built-in encoder's (`determinism_tests`).
@@ -453,6 +471,7 @@ impl Default for ExportSettings {
             h264_profile: H264Profile::High,
             h264_level: None,
             bitrate_mode: BitrateMode::default(),
+            constant_qp: default_constant_qp(),
             hardware_encoding: HardwareEncoding::default(),
             max_bitrate_kbps: None,
             adaptive_bitrate: None,
@@ -482,6 +501,13 @@ impl ExportSettings {
         }
         if self.format == Format::Hevc && self.bitrate_mode == BitrateMode::Vbr2Pass {
             return Err(ExportError::Unsupported("H.265 export has no two-pass mode: choose CBR or VBR, 1 pass".into()));
+        }
+        // **A constant-quality export's quantiser is checked here, once, for every backend.** It is
+        // the one fidelity number the settings state outright, so it is the one a hand-edited
+        // project file can put outside the standard's range — and the encoders refuse rather than
+        // clamp, so this is where a user is told instead of getting the nearest quality silently.
+        if self.bitrate_mode == BitrateMode::ConstantQuality && self.video_format().is_h26x() {
+            self.constant_quantiser()?;
         }
         Ok(())
     }
@@ -1159,6 +1185,19 @@ fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSetti
     let max = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps * 3 / 2);
     cfg.rate = match s.bitrate_mode {
         BitrateMode::Cbr => filmcraft_h264enc::RateControl::Cbr { kbps },
+        // **Constant quality is the one mode the software encoder and the hardware encoders can all
+        // state the same way**, because H.264's quantiser is in the bitstream: the built-in encoder
+        // has `RateControl::Qp` for it and the settings' number goes straight through. `kbps` and
+        // `max` above are computed and unused here — the mode names no rate, so there is nothing
+        // for them to be a ceiling of.
+        //
+        // The `Err` arm is a whole `Some(Err(..))` rather than a `?` because a quantiser outside
+        // 0..=51 is **this export's error, not a decline**: sending it to another encoder would
+        // produce a file at a quality nobody asked for, which is what the check exists to prevent.
+        BitrateMode::ConstantQuality => match s.constant_quantiser() {
+            Ok(qp) => filmcraft_h264enc::RateControl::Qp(qp),
+            Err(e) => return Some(Err(e)),
+        },
         _ => filmcraft_h264enc::RateControl::Vbr { target_kbps: kbps, max_kbps: max },
     };
     cfg.pass = match &s.h264_pass {

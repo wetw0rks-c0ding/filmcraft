@@ -75,7 +75,17 @@ pub enum HardwareEncoding {
     Auto,
 }
 
-/// Bitrate encoding of bitrate-driven codecs (H.264).
+/// **How the video encoder is asked to spend its bits** — a rate, or a fixed quantiser.
+///
+/// The name is historical: `Cbr` / `Vbr1Pass` / `Vbr2Pass` are all rates, and the mode that names no
+/// rate at all arrived later. `ConstantQuality` is in this enum rather than beside it because it is
+/// the same choice the other three make — *what the export promises about fidelity* — and a settings
+/// file that carries both a rate and a quality has two answers to one question.
+///
+/// **It is not a Linux-only mode.** [`ExportSettings`] is one structure read by every backend, so a
+/// mode added here is offered on macOS and Windows too, and each backend either takes it or declines
+/// it by name. That is why [`Self::ALL`] exists: a backend's list of modes is a list of *its* modes,
+/// and the settings surface lists all four.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BitrateMode {
@@ -86,15 +96,44 @@ pub enum BitrateMode {
     Vbr1Pass,
     /// Variable bitrate, two passes (the picture is rendered and analysed first).
     Vbr2Pass,
+    /// **Constant quality**: every picture is coded at the quantiser in
+    /// [`ExportSettings::constant_qp`] and the file comes out at whatever size that takes. It states
+    /// no rate at all, so `bitrate_kbps` and `max_bitrate_kbps` are not read and the size estimate
+    /// has nothing to compute from — which is a fact about the mode, reported as one, rather than a
+    /// number carried over from the last rate the user typed.
+    ///
+    /// [`ExportSettings::constant_quantiser`] is the checked way to read the quantiser, and every
+    /// encoder that takes this mode refuses a value outside H.264's 0..=51 rather than clamping it.
+    ConstantQuality,
 }
 
 impl BitrateMode {
+    /// Every mode, in the order a settings panel lists them.
+    pub const ALL: [BitrateMode; 4] = [BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass, BitrateMode::ConstantQuality];
+
     pub fn label(self) -> &'static str {
         match self {
             BitrateMode::Cbr => "CBR",
             BitrateMode::Vbr1Pass => "VBR, 1 pass",
             BitrateMode::Vbr2Pass => "VBR, 2 pass",
+            BitrateMode::ConstantQuality => "Constant quality",
         }
+    }
+
+    /// **Whether this mode names a rate**, which is what `bitrate_kbps` and `max_bitrate_kbps` are
+    /// for. `false` for [`BitrateMode::ConstantQuality`] alone.
+    ///
+    /// It exists so that the two statements about a file's size — the estimated bytes and the
+    /// settings the estimate came from — are made by the same branch. A summary that printed
+    /// "Target 20.00 Mbps" beside a constant-quality export would be quoting a number the export
+    /// does not use.
+    pub fn names_a_bitrate(self) -> bool {
+        !matches!(self, BitrateMode::ConstantQuality)
+    }
+
+    /// Whether the mode needs the sequence rendered twice before it is encoded.
+    pub fn is_two_pass(self) -> bool {
+        matches!(self, BitrateMode::Vbr2Pass)
     }
 }
 
@@ -358,6 +397,25 @@ impl ExportSettings {
         if self.format.is_mxf() { self.mxf_video_codec.encoder_format() } else { self.format }
     }
 
+    /// **The H.264 quantiser a [`BitrateMode::ConstantQuality`] export is encoded at**, or why the
+    /// settings cannot state one.
+    ///
+    /// **Refused outside 0..=51, never clamped.** `constant_qp` arrives from a project file and a UI
+    /// field, both untrusted, and a clamp would encode at the nearest quality instead of the one
+    /// asked for — a wrong picture that looks right, which is the defect class this whole file exists
+    /// to refuse (see [`crate::VideoEncoder`]'s contract).
+    ///
+    /// It is checked here rather than at each encoder because every backend that takes this mode
+    /// wants the same number in the same units, and one checked accessor is the only way the
+    /// software encoder, VideoToolbox, NVENC and VA-API cannot disagree about what "QP 40" means.
+    pub fn constant_quantiser(&self) -> crate::Result<u8> {
+        let qp = self.constant_qp;
+        if qp > 51 {
+            return Err(crate::ExportError::Unsupported(format!("a quantiser of {qp}: H.264 numbers them 0 (best) to 51 (worst)")));
+        }
+        Ok(qp)
+    }
+
     /// Whether the output is a numbered image sequence.
     pub fn is_image_sequence(&self) -> bool {
         matches!(self.format, Format::PngSequence | Format::TiffSequence | Format::BmpSequence)
@@ -429,12 +487,19 @@ impl ExportSettings {
     }
 
     /// Estimated output size in bytes for `duration` of a sequence (`seq_w`×`seq_h` at `seq_rate`).
+    ///
+    /// **Zero for a constant-quality H.264 or HEVC export, and that is an answer rather than a
+    /// gap.** The size of a constant-quantiser file is whatever the pictures quantise to, which is
+    /// the one number in this function that cannot be computed before the pictures are encoded —
+    /// carrying the last typed bitrate over would print a figure for a rate the export never uses.
+    /// [`Summary::estimated_size`] says so in words where a number would otherwise be.
     pub fn estimate_bytes(&self, seq_w: u32, seq_h: u32, seq_rate: FrameRate, seq_sr: u32, duration: Tick) -> u64 {
         let r = self.resolve(seq_w, seq_h, seq_rate, seq_sr);
         let secs = duration.seconds().max(0.0);
         let fps = r.rate.num as f64 / r.rate.den as f64;
         let px = r.width as f64 * r.height as f64;
         let video_bps = match self.video_format() {
+            Format::H264 | Format::Hevc if !self.bitrate_mode.names_a_bitrate() => 0.0,
             Format::H264 | Format::Hevc => r.target_kbps as f64 * 1000.0,
             Format::ProRes => crate::prores_profile(&self.prores_profile).nominal_mbps_1080p30() * 1e6 * px / (1920.0 * 1080.0) * fps / 29.97,
             Format::DnxHr => {
@@ -502,18 +567,27 @@ impl ExportSettings {
                         self.h264_level.map(|l| format!("L{}.{}", l / 10, l % 10)).unwrap_or_else(|| "auto level".into()),
                         self.bitrate_mode.label()
                     );
-                    v += &match self.bitrate_mode {
-                        BitrateMode::Cbr => format!(", {}", mbps(r.target_kbps)),
-                        _ => format!(", Target {}, Max {}", mbps(r.target_kbps), mbps(r.max_kbps)),
-                    };
+                    if self.bitrate_mode.names_a_bitrate() {
+                        v += &match self.bitrate_mode {
+                            BitrateMode::Cbr => format!(", {}", mbps(r.target_kbps)),
+                            _ => format!(", Target {}, Max {}", mbps(r.target_kbps), mbps(r.max_kbps)),
+                        };
+                    } else {
+                        // The quantiser, and the fact that it is what makes the size unknowable here.
+                        v += &format!(", QP {}", self.constant_qp);
+                    }
                     v += &format!(", keyframe every {} frames", r.keyint);
                 }
                 Format::Hevc => {
                     v += &format!(", HEVC Main (hardware encoder), {}", self.bitrate_mode.label());
-                    v += &match self.bitrate_mode {
-                        BitrateMode::Cbr => format!(", {}", mbps(r.target_kbps)),
-                        _ => format!(", Target {}, Max {}", mbps(r.target_kbps), mbps(r.max_kbps)),
-                    };
+                    if self.bitrate_mode.names_a_bitrate() {
+                        v += &match self.bitrate_mode {
+                            BitrateMode::Cbr => format!(", {}", mbps(r.target_kbps)),
+                            _ => format!(", Target {}, Max {}", mbps(r.target_kbps), mbps(r.max_kbps)),
+                        };
+                    } else {
+                        v += &format!(", QP {}", self.constant_qp);
+                    }
                     v += &format!(", keyframe every {} frames", r.keyint);
                 }
                 Format::ProRes => {
@@ -555,7 +629,15 @@ impl ExportSettings {
         };
         let format = if container.is_empty() { self.format.label().to_string() } else { format!("{} ({container})", self.format.label()) };
         let estimated_bytes = self.estimate_bytes(seq_w, seq_h, seq_rate, seq_sr, duration);
-        Summary { format, video, audio, estimated_bytes, estimated_size: format_bytes(estimated_bytes) }
+        // **A constant-quality H.264 / HEVC export has no size estimate, and says so in words.**
+        // `estimated_bytes` is zero there, which `format_bytes` would happily round up to "1 KB" —
+        // a number for a file whose size is the one thing the settings did not state.
+        let estimated_size = if estimated_bytes == 0 && !self.bitrate_mode.names_a_bitrate() && matches!(self.video_format(), Format::H264 | Format::Hevc) {
+            "not known in constant quality".to_string()
+        } else {
+            format_bytes(estimated_bytes)
+        };
+        Summary { format, video, audio, estimated_bytes, estimated_size }
     }
 }
 

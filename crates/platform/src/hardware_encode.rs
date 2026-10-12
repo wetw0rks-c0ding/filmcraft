@@ -24,9 +24,12 @@
 //! [`config_for`] (VideoToolbox) and [`vaapi_config_for`] (VA-API) share most of their decline list
 //! and differ in two places, each for a reason the backend can state rather than a preference:
 //!
-//! - **VideoToolbox takes a bitrate**; VA-API's H.264 slice encoder here is **constant quantiser**,
-//!   so a settings-set bitrate cannot be honoured and an export that names one is declined. See
-//!   [`vaapi_config_for`] for the measurement and the reasoning.
+//! - **Both take a bitrate.** VideoToolbox through `VTCompressionPropertyKey_AverageBitRate`, and
+//!   VA-API through a `VA_RC_CBR` / `VA_RC_VBR` session with a `VAEncMiscParameterRateControl`. The
+//!   difference is in the modes they can express: VideoToolbox has no constant-quantiser entry point
+//!   here, while VA-API's encoder can also run constant quantiser — which the gate never asks for,
+//!   because FilmCraft's settings state a bitrate and not a quantiser. See [`vaapi_config_for`] for
+//!   what each gate accepts and why.
 //! - **VA-API is one slice per picture and one reference deep**, both measured; the VideoToolbox path
 //!   has no such limit. The slice limit is not expressible in the settings and so is not a decline
 //!   here — it is a property of the encoder, stated in [`vaapi::VaEncoder`]'s own documentation.
@@ -256,34 +259,80 @@ mod vaapi_export {
     use filmcraft_isobmff::SampleEntry;
     use filmcraft_time::FrameRate;
 
+    /// **The bitrate an export asks of this backend, in bits per second.**
+    ///
+    /// This is [`crate::vaapi::RateControl`] spelled in the terms [`ExportSettings`] uses, and the
+    /// reason it is a separate type rather than the `vaapi` one is reachability rather than taste:
+    /// `vaapi/mod.rs` re-exports an explicit list of names, and a type only the export gate and the
+    /// gate's tests need does not belong in a list the encode milestone maintains. [`build`] is the
+    /// one place the two are translated, so the translation is one function rather than a rule spread
+    /// over every caller.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ExportBitrate {
+        /// A constant bit rate: the same number every second, and what `BitrateMode::Cbr` means.
+        Cbr(u32),
+        /// A variable bit rate between a target and a ceiling, both in bits per second — which is
+        /// what FilmCraft's `target_kbps` and `max_kbps` mean together.
+        Vbr {
+            /// The rate the driver is asked to aim at.
+            target: u32,
+            /// The highest rate it may reach.
+            max: u32,
+        },
+    }
+
+    impl ExportBitrate {
+        /// What [`crate::vaapi::VaEncoder`] is built with, or why it cannot be built.
+        fn build(&self, display: &std::sync::Arc<crate::vaapi::Display>, size: (u32, u32), references: u32) -> Result<VaEncoder, String> {
+            match *self {
+                Self::Cbr(bps) => VaEncoder::at_constant_bitrate(display, size, references, bps),
+                Self::Vbr { target, max } => VaEncoder::at_variable_bitrate(display, size, references, target, max),
+            }
+        }
+    }
+
     /// What [`crate::vaapi::VaEncoder`] needs that [`ExportSettings`] states, or why this
     /// export is not one it can do.
     ///
-    /// # The decline that decides this backend's usefulness: the bitrate
+    /// # The bitrate: submitted, not declined
     ///
-    /// **A settings-set bitrate cannot be honoured, so an export that names one is declined.**
-    /// `VaEncoder` submits [`crate::vaapi::RC_CQP`] and nothing else, and the module's own note
-    /// says why: a bitrate it cannot derive faithfully would be a *default quality*, which for an
-    /// encoder means a file at a size nobody asked for.
+    /// **A settings-set bitrate is honoured.** [`crate::vaapi::RateControl::Cbr`] carries
+    /// `s.bitrate_kbps` and [`crate::vaapi::RateControl::Vbr`] carries the `target`/`max_kbps` pair
+    /// FilmCraft's own settings already mean, in the fields `VAEncMiscParameterRateControl` has for
+    /// exactly those two numbers. That is the whole of what changed here: before, every mode
+    /// `BitrateMode` can name was refused and the registered factory was a decline rather than an
+    /// encoder; now `Cbr` and `Vbr1Pass` are taken and `Vbr2Pass` — which needs an analysis pass
+    /// over the pictures before the real one — is still refused, with that reason.
     ///
-    /// That makes this gate stricter than the VideoToolbox and NVENC ones, and it is worth being
-    /// blunt about the consequence rather than letting a reader find it out from an export: **every
-    /// `BitrateMode` FilmCraft's settings can express names a bitrate target** — `Cbr`, `Vbr1Pass`
-    /// and `Vbr2Pass` all do — so **this backend declines every H.264 export the current settings
-    /// can produce**, and the registered factory is a decline rather than an encoder.
+    /// # The two-pass refusal, and why it is not folded into the bitrate one
     ///
-    /// What is *not* the reason, because it would be convenient to say so and it is not measured:
-    /// the driver is not the limit. `VAConfigAttribRateControl` is queried here and its answer is
-    /// in the decline message, so a machine whose driver cannot do CBR or VBR at all produces a
-    /// different message from one whose driver can — and neither says "VA-API cannot do bitrate
-    /// control", which would be a claim about every driver rather than this one.
+    /// `Vbr2Pass` is refused **before** any bitrate is read, because it is a different refusal: a
+    /// two-pass export renders the sequence once to measure it and again to encode it, and this
+    /// backend is handed pictures one at a time by a pipeline that has no way to encode them twice.
+    /// Submitting the second pass's bitrate to a single-pass driver would produce a file at a rate
+    /// nobody chose with nothing wrong anywhere in it, so it is an error naming the pass.
     ///
-    /// The ways out, neither of which this task makes, and both of which are stated so a reader
-    /// does not have to guess: submit a rate-control mode with a bitrate (which needs the rate
-    /// control misc buffer this backend does not build, and whose QP then moves per picture, which
-    /// the parameter-set self-check in `VaEncoder` deliberately refuses), or give the settings a
-    /// constant-quality mode that maps to a QP rather than a bitrate.
-    pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Result<(u32, u32, u32, u32), String> {
+    /// # What is still declined, and it is a short list
+    ///
+    /// Each refusal below names what this backend cannot express rather than what it has not got
+    /// round to, and the two that are *not* about capability are called out as such:
+    ///
+    /// - **Baseline and High profiles**, because the derived parameter sets say Main. The sequence
+    ///   record carries no profile field to derive from and an SPS claiming High while the slices are
+    ///   CAVLC at 4x4 would describe a different stream from the one encoded.
+    /// - **Interlaced**, because the sequence record writes `frame_mbs_only_flag = 1` and a field
+    ///   sequence cannot be expressed at all.
+    /// - **Fractional frame rates**, because `VAEncMiscParameterFrameRate`'s numerator here is whole
+    ///   frames per second and rounding 23.976 to 24 is a stream at a rate nobody chose.
+    ///
+    /// # The driver's own answer, kept in the message
+    ///
+    /// The bitrate refusal this replaced named `VAConfigAttribRateControl`'s answer so a reader could
+    /// tell "this driver cannot" from "this backend did not". That distinction still matters — the
+    /// modes *not* taken (ICQ, the temporal-layer ones) are declined for reasons of their own — so
+    /// [`rate_control_modes_named`] is still what a diagnostic prints, and the driver is still asked
+    /// before a config is made.
+    pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Result<(u32, u32, u32, u32, ExportBitrate), String> {
         if format != Format::H264 {
             // **No HEVC encoder here**, and the reason is the module's: `VaEncoder` declares the
             // H.264 encode records and nothing else. Naming it here matters, because the software
@@ -297,22 +346,49 @@ mod vaapi_export {
         if s.format.is_mxf() {
             return Err("MXF carries an Annex B stream, and this backend's samples are length-prefixed".into());
         }
+        // **Two-pass is refused before the bitrate is read**, and for its own reason: a two-pass
+        // export renders the sequence twice and this backend is handed each picture once. The bitrate
+        // gate below would otherwise accept it and the file would come out at a rate nobody chose.
         if !matches!(s.h264_pass, H264Pass::Single) {
             return Err("two-pass encoding".into());
         }
-        if s.bitrate_mode != BitrateMode::Vbr1Pass || s.bitrate_kbps != 0 {
+        if s.bitrate_mode == BitrateMode::Vbr2Pass {
+            return Err("two-pass encoding".into());
+        }
+        // **The bitrate, as the mode FilmCraft's own settings mean.** `bitrate_kbps` is the target;
+        // `max_bitrate_kbps` is the ceiling and, exactly as `ExportSettings::resolve` computes it
+        // (and as the software H.264 encoder's own factory does at `lib.rs:1159`), a ceiling below
+        // the target is not a VBR range and becomes 1.5x.
+        //
+        // **A bitrate of zero is refused rather than turned into something.** The settings layer
+        // floors `target_kbps` at 100 kbps before an encoder factory is called (`resolve`), so a
+        // zero here means the caller bypassed that — and the only honest answer to "encode at no
+        // bits per second" is an error, not a substituted number.
+        let kbps = s.bitrate_kbps;
+        if kbps == 0 {
             return Err(format!(
-                "a bitrate target ({} kbps, {}): this backend is constant quantiser, so it cannot honour one. \
-                 The driver reports {} for rate control",
-                s.bitrate_kbps,
-                match s.bitrate_mode {
-                    BitrateMode::Cbr => "CBR",
-                    BitrateMode::Vbr1Pass => "VBR 1-pass",
-                    BitrateMode::Vbr2Pass => "VBR 2-pass",
-                },
+                "a bitrate target of 0 kbps: this backend submits the bitrate it is given rather than choosing one, and there is \
+                 nothing here to convert. The settings layer floors a target at 100 kbps (ExportSettings::resolve), so a zero here \
+                 is a caller that skipped it. The driver reports {} for rate control",
                 super::vaapi_export::rate_control_modes_named()
             ));
         }
+        // **kbit/s → bit/s, checked.** `saturating_mul` would turn an overflow into a bitrate three
+        // orders of magnitude too small — a file at 0.1% of the requested size with no error anywhere,
+        // which is the whole class of defect this gate exists to refuse. `u32::MAX / 1000` is about
+        // 4.29 Gbit/s, past any H.264 export.
+        let bps = kbps.checked_mul(1000).ok_or_else(|| format!("a bitrate target of {kbps} kbps, which does not fit the record's bits-per-second field"))?;
+        let bitrate = match s.bitrate_mode {
+            BitrateMode::Cbr => ExportBitrate::Cbr(bps),
+            // The ceiling, in the same checked units. `max` at 1.5x is `ExportSettings::resolve`'s own
+            // rule, applied to a number it has already floored — the same expression, so the two
+            // backends cannot pick different ceilings for the same settings.
+            _ => {
+                let max_kbps = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps.saturating_mul(3) / 2);
+                let max_bps = max_kbps.checked_mul(1000).ok_or_else(|| format!("a VBR ceiling of {max_kbps} kbps, which does not fit the record's bits-per-second field"))?;
+                ExportBitrate::Vbr { target: bps, max: max_bps }
+            }
+        };
         if s.signal.is_hdr() {
             return Err("HDR: this backend encodes 4:2:0 8-bit and writes no VUI or `colr`".into());
         }
@@ -370,7 +446,7 @@ mod vaapi_export {
                 VaEncoder::max_frame_num()
             ));
         }
-        Ok((w, h, fps, gop))
+        Ok((w, h, fps, gop, bitrate))
     }
 
     /// What the encoder needs from the settings, resolved to numbers.
@@ -457,11 +533,18 @@ mod vaapi_export {
             self.encoder
                 .upload(&self.y, &chroma)
                 .map_err(|e| ExportError::Encode(format!("VA-API: {e} (turn Export ▸ Hardware encoding off to use the software encoder)")))?;
-            // **The quantiser is the one setting this backend takes as a number, and it is the
-            // caller's.** `s.quality` (0-100) is not used: the software H.264 encoder ignores it in
-            // favour of the bitrate too, and mapping a percentage onto a QP would be a table this
-            // backend would be inventing.
-            let request = EncodeRequest::predicted(26).map_err(ExportError::Encode)?;
+            // **No quantiser is named, and that is the whole point.** The export gate built this
+            // encoder under a [`RateControl`] derived from `s.bitrate_mode` and `s.bitrate_kbps`, so
+            // the picture's fidelity is that bitrate and there is no honest QP for this function to
+            // pass — `EncodeRequest::rate_controlled` is the constructor that says so, and
+            // `VaEncoder::encode` refuses the other pairing rather than quietly honouring one half.
+            //
+            // **`s.quality` (0-100) is still not used**, and now for a stronger reason than before: it
+            // was ignored because the backend was constant quantiser and the software encoder ignores
+            // it too; it is ignored now because a percentage mapped onto a QP would be a table this
+            // backend would be inventing, sitting next to a bitrate the user did state. Two
+            // statements about the same fidelity, one of them invented.
+            let request = EncodeRequest::predicted_at_rate().map_err(ExportError::Encode)?;
             let picture = self
                 .encoder
                 .encode(request)
@@ -498,7 +581,7 @@ mod vaapi_export {
             filmcraft_export::note_hw_encode_declined();
             None
         };
-        let (ew, eh, fps, gop) = match config_for(format, w, h, rate, s) {
+        let (ew, eh, fps, gop, bitrate) = match config_for(format, w, h, rate, s) {
             Ok(c) => c,
             Err(why) => return declined(&why),
         };
@@ -508,7 +591,7 @@ mod vaapi_export {
         };
         // One reference: the only depth measured to produce correct pictures, and the ceiling this
         // backend accepts (`VaEncoder::new` refuses deeper with the measurement in the message).
-        let mut encoder = match VaEncoder::new(&display, (ew, eh), 1) {
+        let mut encoder = match bitrate.build(&display, (ew, eh), 1) {
             Ok(e) => e,
             Err(why) => return declined(&why),
         };
@@ -538,5 +621,5 @@ pub use vaapi_export::factory as vaapi_encoder_factory;
 
 #[cfg(target_os = "linux")]
 pub use vaapi_export::{
-    VaEncoderExport, config_for as vaapi_config_for, rate_control_modes as vaapi_rate_control_modes, rate_control_modes_named as vaapi_rate_control_modes_named,
+    ExportBitrate, VaEncoderExport, config_for as vaapi_config_for, rate_control_modes as vaapi_rate_control_modes, rate_control_modes_named as vaapi_rate_control_modes_named,
 };

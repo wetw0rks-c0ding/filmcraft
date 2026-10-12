@@ -337,20 +337,29 @@ pub const CONFIG_ATTRIB_ENC_SLICE_STRUCTURE: VaBufferType = 15;
 // never needed.
 
 /// `VA_RC_CQP` (`va.h:1116`): constant quantiser. The QP comes from the picture record's
-/// `pic_init_qp` and each slice's `slice_qp_delta`, so nothing here is derived from a bitrate —
-/// which is what makes it the honest first choice for a spike: a rate control mode would put the
-/// picture's fidelity at the mercy of a number this backend does not have yet.
+/// `pic_init_qp` and each slice's `slice_qp_delta`, so nothing here is derived from a bitrate.
+///
+/// **It was the only mode this backend submitted until the rate-control work, and it is still one of
+/// two.** The driver is not the limit either way: [`Encoder::driver_rate_control_modes`] answers
+/// **CBR, VBR, CQP, ICQ, QVBR and TCBRC** on iHD 26.3.5, and what a caller chooses is a *fidelity*
+/// decision (a fixed quantiser or a target rate), so [`crate::vaapi::VaEncoder`] is built in exactly
+/// one of the two and never both.
 pub const RC_CQP: u32 = 0x0000_0010;
-// The rate control modes and the encode buffer kinds that this spike does not submit are declared
+// The rate control modes and the encode buffer kinds that this backend does not submit are declared
 // anyway and pinned by `the_encode_constants_are_the_ones_libva_uses`, for the same reason the
 // decode side names the profiles it does not decode: a reader asking "is there a VA_RC_VCM?" needs
 // the answer to be "not declared, therefore not used" rather than a guess. `cfg_attr` rather than a
 // blanket `allow`, so a constant nothing references at all still warns.
 #[cfg_attr(not(test), allow(dead_code))]
-/// `VA_RC_CBR` (`va.h:1110`).
+/// `VA_RC_CBR` (`va.h:1110`): **constant bit rate.** Submitted with a
+/// [`VaEncMiscParameterRateControl`] whose `bits_per_second` is the bitrate asked for and whose
+/// `target_percentage` is 100 (the header says that field is ignored in CBR and treated as 100%).
 pub const RC_CBR: u32 = 0x0000_0002;
 #[cfg_attr(not(test), allow(dead_code))]
-/// `VA_RC_VBR` (`va.h:1112`).
+/// `VA_RC_VBR` (`va.h:1112`): **variable bit rate.** Submitted with a
+/// [`VaEncMiscParameterRateControl`] whose `bits_per_second` is the *maximum* and whose
+/// `target_percentage` is the target as a percentage of it, which is what FilmCraft's
+/// `target_kbps`/`max_kbps` pair means.
 pub const RC_VBR: u32 = 0x0000_0004;
 #[cfg_attr(not(test), allow(dead_code))]
 /// `VA_RC_ICQ` (`va.h:1121`): constant quality.
@@ -368,7 +377,10 @@ pub const RC_QVBR: u32 = 0x0000_0400;
 /// `VA_RC_AVBR` (`va.h:1164`).
 pub const RC_AVBR: u32 = 0x0000_0800;
 #[cfg_attr(not(test), allow(dead_code))]
-/// `VA_RC_TCBRC` (`va.h:1176`), the temporal-layer rate control iHD's driver exposes.
+/// `VA_RC_TCBRC` (`va.h:1176`), the temporal-layer rate control iHD's driver exposes. **Not
+/// submitted**: its `target_frame_size` wants application feedback per frame ("channel capacity
+/// divided by fps"), which FilmCraft's export pipeline does not have — it renders a picture and
+/// hands it over, and nothing measures the channel afterwards.
 pub const RC_TCBRC: u32 = 0x0000_1000;
 
 /// `VA_ENC_PACKED_HEADER_SEQUENCE` (`va.h:1206`): the driver writes the SPS.
@@ -1882,12 +1894,112 @@ pub struct VaEncMiscParameterQuantization {
     pub va_reserved: u32,
 }
 
-// `VAEncMiscParameterRateControl` (`va.h:2493`) — the record a `VA_RC_CBR` / `VA_RC_VBR` / `VA_RC_ICQ`
-// config needs, 60 bytes — is deliberately **not** declared here. This backend runs under
-// `VA_RC_CQP`, where the quantiser is the picture's `pic_init_qp` and a bitrate record would be a
-// second, independent statement about the picture's fidelity. It is Task 3's record, and it will be
-// declared from the header with the rest then, next to the misc buffer that carries it. Declaring it
-// now, unused, is how a reader ends up thinking a bitrate is a thing this backend sends.
+/// `VAEncMiscParameterRateControl` (`va.h:2493`): what the rate controller is told to aim at. **60
+/// bytes**, measured with a C compiler against `/usr/include/va/va.h` rather than derived —
+///
+/// ```text
+/// $ cc -o rc rc.c && ./rc
+/// sizeof VAEncMiscParameterRateControl = 60
+/// alignof = 4
+/// bits_per_second        off=  0
+/// target_percentage      off=  4
+/// window_size            off=  8
+/// initial_qp             off= 12
+/// min_qp                 off= 16
+/// basic_unit_size        off= 20
+/// rc_flags               off= 24
+/// ICQ_quality_factor     off= 28
+/// max_qp                 off= 32
+/// quality_factor         off= 36
+/// target_frame_size      off= 40
+/// va_reserved            off= 44
+/// ```
+///
+/// **The layout has no holes, and that is a measurement rather than an assumption.** Every member is
+/// a `uint32_t` or a `uint32_t`-sized union of them, so the twelve members tile the record
+/// contiguously from 0 to 44 and `va_reserved[VA_PADDING_LOW]` takes it to 60 with nothing left
+/// over. This is exactly the property `record_bytes`'s safety argument rests on and the one
+/// `VASegmentParameterVP9` got wrong, so it is **asked of the C compiler as a gap per member** by
+/// [`super::abi_guard::no_submitted_record_has_a_byte_the_header_does_not_account_for`] — which
+/// asserts a gap of **zero** between every pair of neighbours and after the last one, rather than
+/// skipping a record that happens to have no hole. A `padding_*` field here would be the tell that
+/// one had been added by mistake, because there is nowhere in the header for one.
+///
+/// **The record is submitted under a bitrate mode and not under [`RC_CQP`]**, which is what the note
+/// this replaces used to say. Under constant quantiser the picture's `pic_init_qp` *is* its quality,
+/// so a bitrate would be a second and independent statement about the same fidelity — the reason it
+/// was left undeclared. The two are alternatives, not additions: [`crate::vaapi::VaEncoder`] is built
+/// in exactly one of the two modes, and a request that names a quantiser in a bitrate encoder (or
+/// refuses to name one in a constant-quantiser encoder) is an error rather than a silent preference.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaEncMiscParameterRateControl {
+    /// **The maximum bit rate, in bits per second.** The header is explicit that this is the *maximum*
+    /// the controller may generate and that `target_percentage` is the target expressed as a
+    /// percentage of it — so FilmCraft's `target_kbps` goes here for CBR and its `max_kbps` here for
+    /// VBR, and the two are not the same field. A value of 0 is not a "no limit": iHD rejects a
+    /// sequence record whose `bits_per_second` is 0 under every mode, which is why this backend writes
+    /// a level-5.1 bitrate there even under [`RC_CQP`] where nothing reads it.
+    pub bits_per_second: u32,
+    /// The target as a percentage of `bits_per_second`, 1..=100. **Ignored in CBR**, where the header
+    /// says it is treated as 100% — so this backend writes 100 there and the target *is*
+    /// `bits_per_second`. The range is checked where the record is built rather than clamped: a
+    /// percentage outside it names a target the controller cannot aim at, and clamping it is a file at
+    /// a rate nobody asked for.
+    pub target_percentage: u32,
+    /// **The rate-control window, in milliseconds** — the interval over which the controller tries to
+    /// make the target and maximum bit rates correct. Zero is **not** documented as "the driver's
+    /// choice" here, unlike `initial_qp` / `min_qp` / `max_qp` below, so it is written from the one
+    /// thing FilmCraft's settings do state that bounds it: the key-frame interval this encoder is
+    /// built with, which is the shortest span in which the sizes are allowed to even out. See
+    /// `crate::vaapi::VaEncoder::at_bitrate` for the measurement behind the value.
+    pub window_size: u32,
+    /// The quantiser the controller starts from. **Ignored if zero**, per the header, so zero is the
+    /// honest "no opinion" and not a default of 26: under a bitrate mode the quality is the bitrate
+    /// and naming a starting quantiser here would be a second statement about it.
+    pub initial_qp: u32,
+    /// The lowest quantiser the controller may use. **Ignored if zero.** Zero is again the header's
+    /// own "no limit", which is what a caller who expressed a bitrate and not a quality range wants.
+    pub min_qp: u32,
+    /// **Only used by some drivers, and the header says to set it to zero if unused.** FilmCraft has
+    /// no statement about it, so it is zero.
+    pub basic_unit_size: u32,
+    /// `rc_flags`, the union's `value` member. **Every bit clear**, and one of them matters enough to
+    /// name: bit 0 is `reset`, "the next frame will be treated as the start of a new stream, with all
+    /// rate controller state reset to its initial values". A record with it set would throw away the
+    /// controller's history on every picture, and the stream would then be encoded as a stream of
+    /// one-frame streams — which lands nowhere near the requested bitrate and looks fine on screen.
+    /// The rest (frame skip, bit stuffing, MB-level rate control, temporal id, `cfs_Iframes`, parallel
+    /// BRC, dynamic scaling, frame tolerance mode) are all FilmCraft has no opinion about, and every
+    /// one of them defaults to the driver's behaviour when clear.
+    pub rc_flags: u32,
+    /// **ICQ mode only** — the header says this must be 1..=51 there. Under CBR or VBR it is not read,
+    /// so it is 0, which is not a legal ICQ value and is deliberately not made into one.
+    pub icq_quality_factor: u32,
+    /// The highest quantiser the controller may use. **Ignored if zero.** Like `min_qp`, zero is the
+    /// header's own "no limit".
+    pub max_qp: u32,
+    /// Not used by CBR or VBR; 0.
+    pub quality_factor: u32,
+    /// Desired frame size in bytes, for the modes where the application supplies feedback (TCBRC).
+    /// **"Zero value means no limits"** per the header, which is the honest value for a mode that
+    /// does not take one.
+    pub target_frame_size: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// Bit 0 of [`VaEncMiscParameterRateControl::rc_flags`]: force a rate-controller reset on the next
+/// picture. Named because it is the one flag that is silent, wrong and expensive all at once — see
+/// the field's own note.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RC_FLAG_RESET: u32 = 1 << 0;
+/// Bit 1 of [`VaEncMiscParameterRateControl::rc_flags`]: disable frame skip in rate-control mode.
+/// **Left clear deliberately** — a hardware encoder that drops frames to meet a bit rate produces a
+/// stream whose picture order no longer matches the timeline it was given, and an export cannot
+/// express that (see `VaEncoderExport::encode`, which checks every picture arrives). See the field's
+/// own note for the rest.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const RC_FLAG_DISABLE_FRAME_SKIP: u32 = 1 << 1;
 
 // ---------------------------------------------------------------------------------------------
 // Reading the records back out of the opaque bytes `Picture` carries. The tests of

@@ -3,10 +3,23 @@
 //!
 //! ```text
 //! vaencprobe [-qp N] [-w W] [-h H] [-f FRAMES] [-refs N] [-fps N] [-gop N] [-o FILE] [-allidr]
+//!            [-br KBPS] [-maxbr KBPS] [-vbr] [-tex AMPLITUDE]
 //! ```
 //!
 //! Default: **one I frame followed by five P frames** of a 640x360 luma ramp that **moves 8 columns
 //! left per picture**, at QP 26 and 30 fps, written to `/tmp/vaencprobe.h264`.
+//!
+//! # The two fidelity modes, and what each one shows
+//!
+//! `-br KBPS` builds a **CBR** session at that many kilobits per second instead of a constant-quantiser
+//! one; `-vbr` with `-br` builds a **VBR** session with `-maxbr` (or 1.5x the target) as its ceiling.
+//! With neither, the session is constant quantiser at `-qp`.
+//!
+//! **The table's QP column is the evidence for the difference.** Under constant quantiser it reads
+//! `-qp` on every picture — the driver's own statement of what it coded, agreeing with the request. Under
+//! a bitrate it moves, because the rate controller is choosing per picture, and the sizes move with it;
+//! that is the mode an export actually runs in, since FilmCraft's settings state a bitrate and not a
+//! quantiser.
 //!
 //! # Why the content moves, which a still picture cannot show
 //!
@@ -57,6 +70,10 @@ fn main() {
     let mut gop = 0u32;
     let mut out = "/tmp/vaencprobe.h264".to_string();
     let mut all_idr = false;
+    let mut kbps = 0u32;
+    let mut max_kbps = 0u32;
+    let mut vbr = false;
+    let mut tex = 0u8;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -69,39 +86,188 @@ fn main() {
             "-gop" => gop = it.next().and_then(|v| v.parse().ok()).unwrap_or(gop),
             "-o" => out = it.next().cloned().unwrap_or(out),
             "-allidr" => all_idr = true,
+            "-br" => kbps = it.next().and_then(|v| v.parse().ok()).unwrap_or(kbps),
+            "-maxbr" => max_kbps = it.next().and_then(|v| v.parse().ok()).unwrap_or(max_kbps),
+            "-vbr" => vbr = true,
+            "-tex" => tex = it.next().and_then(|v| v.parse().ok()).unwrap_or(tex),
             other => {
                 eprintln!("vaencprobe: unknown argument {other}");
                 std::process::exit(2);
             }
         }
     }
-    if let Err(why) = run(width, height, qp, frames, refs, fps, gop, all_idr, &out) {
+    if let Err(why) = run(width, height, qp, frames, refs, fps, gop, all_idr, &out, kbps, max_kbps, vbr, tex) {
         eprintln!("vaencprobe: {why}");
         std::process::exit(1);
     }
 }
 
+/// The picture a run encodes: the moving ramp, or the ramp with detail added when `-tex` asks for it.
+#[cfg(target_os = "linux")]
+fn source(display: &(u32, u32), shift: u32, tex: u8) -> Result<(Vec<u8>, Vec<u8>), String> {
+    match tex {
+        0 => filmcraft_platform::vaapi::ramp_shifted(display.0, display.1, shift),
+        amplitude => textured_ramp(display.0, display.1, shift, amplitude),
+    }
+}
+
+/// **A ramp with a deterministic high-frequency pattern added, and the reason this function exists.**
+///
+/// A pure ramp has a **near-zero residual**: intra prediction reconstructs it almost exactly, so at any
+/// quantiser above about 40 every coefficient rounds to zero and the encoded picture is *just the
+/// prediction*. Measured on this driver: a 200 kbit/s CBR frame and a constant-quantiser QP-45 frame
+/// of the same ramp have **byte-identical decodes** and `slice_qp_delta = 0` in both, because neither
+/// has a coefficient to quantise.
+///
+/// **That makes the ramp blind to exactly the question a rate-control run has to answer** — whether the
+/// quantiser the driver used is the one the bitstream says. A picture with detail has a residual at
+/// every quantiser, so the decode it produces depends on the QP, and a stream whose headers disagree
+/// with what was encoded shows up as a picture that is wrong rather than one that is indistinguishable.
+///
+/// The pattern is a **fixed integer hash of the coordinates**, not a generator: the same flag on the
+/// same machine produces the same picture, so two runs are comparable, and no LCG state has to be
+/// carried between pictures for the sequence to stay a function of the picture index alone. The shift
+/// still applies, so the reference chain is as testable here as on the plain ramp.
+///
+/// It wraps into 16..=235 so a sample can never leave H.264's legal luma range and have its deviation
+/// blamed on the encoder clipping input rather than on the quantiser.
+#[cfg(target_os = "linux")]
+fn textured_ramp(width: u32, height: u32, shift: u32, amplitude: u8) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (mut luma, chroma) = filmcraft_platform::vaapi::ramp_shifted(width, height, shift)?;
+    let columns = width.max(1) as usize;
+    for (at, sample) in luma.iter_mut().enumerate() {
+        let x = (at % columns) as u32;
+        let y = (at / columns) as u32;
+        // A 3-term integer hash of the coordinates: cheap, deterministic, and spread enough that a
+        // 4x4 intra block's four coefficients differ, which is what makes the residual non-zero.
+        let hash = x.wrapping_mul(2_654_435_761).wrapping_add(y.wrapping_mul(40_503)).wrapping_add(shift.wrapping_mul(12_345));
+        // Fold the hash's high byte into -amplitude..=amplitude around the ramp's own value.
+        let stepped = ((i32::from(((hash >> 16) & 0xff) as u8)) - 128) * i32::from(amplitude) / 128;
+        let wanted = i32::from(*sample) + stepped;
+        *sample = u8::try_from(wanted).unwrap_or(*sample).clamp(16, 235);
+    }
+    Ok((luma, chroma))
+}
+
+/// Which fidelity statement this run makes, resolved from the flags.
+///
+/// **The `-qp` value is deliberately dropped in a bitrate mode rather than ignored silently.** Under
+/// CBR/VBR the quantiser is the rate controller's, and submitting `-qp` would be a second statement
+/// about a picture's fidelity that the driver does not honour — which is exactly what
+/// `VaEncoder::encode` refuses, so the probe refuses it here and says why rather than passing a
+/// request the encoder would reject several lines later.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum Mode {
+    /// Constant quantiser at `qp`.
+    ConstantQuantiser(u8),
+    /// Constant bit rate, in bits per second.
+    Cbr(u32),
+    /// Variable bit rate between a target and a ceiling, in bits per second.
+    Vbr {
+        /// The rate the controller is asked to aim at.
+        target: u32,
+        /// The highest rate it may reach.
+        max: u32,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl Mode {
+    fn name(&self) -> String {
+        match self {
+            Self::ConstantQuantiser(qp) => format!("constant quantiser at QP {qp}"),
+            Self::Cbr(bps) => format!("CBR at {} kbit/s", bps / 1000),
+            Self::Vbr { target, max } => format!("VBR at {} kbit/s, ceiling {} kbit/s", target / 1000, max / 1000),
+        }
+    }
+}
+
+/// The mode the flags describe, or why they cannot describe one.
+#[cfg(target_os = "linux")]
+fn resolve_mode(qp: u8, kbps: u32, max_kbps: u32, vbr: bool) -> Result<Mode, String> {
+    if kbps == 0 {
+        if vbr || max_kbps != 0 {
+            return Err("-vbr and -maxbr need a -br to aim at".into());
+        }
+        return Ok(Mode::ConstantQuantiser(qp));
+    }
+    let Some(bps) = kbps.checked_mul(1000) else {
+        return Err(format!("{kbps} kbit/s does not fit the record's 32-bit bits-per-second field"));
+    };
+    if !vbr {
+        if max_kbps != 0 {
+            return Err("-maxbr only means something with -vbr; CBR's target is its ceiling".into());
+        }
+        return Ok(Mode::Cbr(bps));
+    }
+    // The same 1.5x ceiling `ExportSettings::resolve` and this crate's export gate use, so a probe
+    // run and an export of the same settings ask the driver for the same thing.
+    let max_kbps = if max_kbps >= kbps { max_kbps } else { kbps.saturating_mul(3) / 2 };
+    let max = max_kbps.checked_mul(1000).ok_or_else(|| format!("a ceiling of {max_kbps} kbit/s does not fit the record's 32-bit bits-per-second field"))?;
+    Ok(Mode::Vbr { target: bps, max })
+}
+
+/// The encoder this run drives, in the mode the flags describe.
+///
+/// **The mode is a constructor argument rather than a call after construction**, and the reason is
+/// libva's: `VAConfigAttribRateControl` is read by `vaCreateConfig` and nothing changes it
+/// afterwards. The two bitrate modes go through `VaEncoder`'s named constructors rather than a
+/// `RateControl` value, so this file does not have to name a type it only passes along.
+#[cfg(target_os = "linux")]
+fn build(api: &std::sync::Arc<filmcraft_platform::vaapi::Display>, size: (u32, u32), refs: u32, mode: Mode) -> Result<filmcraft_platform::vaapi::VaEncoder, String> {
+    use filmcraft_platform::vaapi::VaEncoder;
+    match mode {
+        Mode::ConstantQuantiser(_) => VaEncoder::at_constant_quantiser(api, size, refs),
+        Mode::Cbr(bps) => VaEncoder::at_constant_bitrate(api, size, refs, bps),
+        Mode::Vbr { target, max } => VaEncoder::at_variable_bitrate(api, size, refs, target, max),
+    }
+}
+
 /// Encode a run of pictures and report what is needed to tell prediction from intra coding.
 #[cfg(target_os = "linux")]
-fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, fps: u32, gop: u32, all_idr: bool, out: &str) -> Result<(), String> {
-    use filmcraft_platform::vaapi::{EncodeRequest, VaEncoder, ramp_shifted};
+fn run(
+    width: u32,
+    height: u32,
+    qp: u8,
+    frames: usize,
+    refs: u32,
+    fps: u32,
+    gop: u32,
+    all_idr: bool,
+    out: &str,
+    kbps: u32,
+    max_kbps: u32,
+    vbr: bool,
+    tex: u8,
+) -> Result<(), String> {
+    use filmcraft_platform::vaapi::{EncodeRequest, VaEncoder};
     let api = filmcraft_platform::vaapi::open_display().map_err(|why| format!("no VA-API display: {why}"))?;
     println!("driver: {} (libva {}.{})", api.vendor().unwrap_or("(none)"), api.va_version().0, api.va_version().1);
 
     // What the driver says it can hold references for, asked before any config exists.
     let (l0, l1) = filmcraft_platform::vaapi::max_reference_frames(&api);
     println!("VAConfigAttribEncMaxRefFrames: reference list 0 = {l0}, list 1 = {l1} (asked with {refs})");
-    // **What the driver reports for rate control**, which is what decides whether the settings
-    // gate could ever accept a bitrate. Printed here because the decline says "the driver reports
-    // <names>" and a probe that did not show it would leave the claim unchecked.
+    // **What the driver reports for rate control.** It was printed because the settings gate's
+    // bitrate *decline* said "the driver reports <names>"; it is printed now for the opposite
+    // reason — the gate *submits* a mode, and this is the answer to "could it have submitted
+    // anything else", which a reader of the probe is entitled to.
     println!("VAConfigAttribRateControl: {}", filmcraft_platform::hardware_encode::vaapi_rate_control_modes_named());
 
-    let mut encoder = VaEncoder::new(&api, (width, height), refs)?;
+    let mode = resolve_mode(qp, kbps, max_kbps, vbr)?;
+    let mut encoder = build(&api, (width, height), refs, mode)?;
     encoder.at_rate(fps)?;
     encoder.key_frames_every(gop)?;
     let (coded, display) = encoder.sizes();
     let (l, r, t, b) = encoder.crop();
-    println!("picture: {display:?} displayed, {coded:?} coded, crop left {l} right {r} top {t} bottom {b}, QP {qp}");
+    println!("picture: {display:?} displayed, {coded:?} coded, crop left {l} right {r} top {t} bottom {b}");
+    // **Which fidelity statement this run makes, printed before anything is encoded** — and in a
+    // bitrate mode `-qp` is named as *not applied*, because a quantiser sitting in the command line
+    // next to a bitrate and having no effect is the kind of thing a probe report should say out loud.
+    match mode {
+        Mode::ConstantQuantiser(_) => println!("fidelity: {}", mode.name()),
+        other => println!("fidelity: {} (the -qp value {qp} does not apply in this mode)", other.name()),
+    }
     println!("stream: {fps} fps, key frame every {gop} pictures (0 = one for the whole stream)");
     println!("references held: {} of {} capacity", encoder.reference_count(), encoder.reference_capacity());
 
@@ -122,14 +288,21 @@ fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, fps: u32, gop:
     for index in 0..frames {
         // **Every picture is a different picture.** This is the whole test: a still sequence would
         // decode correctly whether or not the references were used.
-        let (luma, chroma) = ramp_shifted(display.0, display.1, shift * index as u32)?;
+        let (luma, chroma) = source(&display, shift * index as u32, tex)?;
         encoder.upload(&luma, &chroma)?;
         sources.push(luma);
         // The picture *kind* is the loop's decision, not this call's: a caller asks for a P picture
         // and the loop makes it an IDR when the reference state or the `frame_num` wrap demands it.
         // The reason comes back on the picture, so it is printed rather than assumed away.
         let last = index + 1 == frames;
-        let mut request = EncodeRequest::predicted(qp)?;
+        // **The request names a quantiser only in constant-quantiser mode.** In a bitrate mode the
+        // rate controller chooses and the request says so with `None`, which is the pairing
+        // `VaEncoder::encode` checks; passing `-qp` through regardless would be refused there with a
+        // message about modes rather than about pictures, which is a worse place to learn it.
+        let mut request = match mode {
+            Mode::ConstantQuantiser(qp) => EncodeRequest::predicted(qp)?,
+            _ => EncodeRequest::predicted_at_rate()?,
+        };
         if last {
             request = request.last();
         }
@@ -180,6 +353,27 @@ fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, fps: u32, gop:
         "sizes: I frame {first} bytes, P frames mean {mean_rest} bytes — a ratio of {:.2}",
         if mean_rest == 0 { f64::NAN } else { first as f64 / mean_rest as f64 }
     );
+    // **The achieved bit rate, in a bitrate mode — the number that says the rate control is running.**
+    //
+    // It is the coded bytes over the pictures' duration at the rate the encoder was told, which is the
+    // definition of a bitrate and nothing else. **A short run under-reports** (the controller has not
+    // converged and the first key frame dominates), so the line says how many pictures it is over
+    // rather than presenting the number bare; the export-level oracle in `tests/vaenc.rs` is where a
+    // size claim is actually asserted.
+    if fps > 0 && frames > 1 {
+        let total: usize = sizes.iter().sum();
+        let seconds = frames as f64 / f64::from(fps);
+        let achieved = total as f64 * 8.0 / seconds / 1000.0;
+        match mode {
+            Mode::ConstantQuantiser(_) => println!("bit rate: {achieved:.0} kbit/s over {frames} pictures — no target; this mode states a quantiser, not a rate"),
+            Mode::Cbr(bps) => println!("bit rate: {achieved:.0} kbit/s against a {target:.0} kbit/s CBR target ({ratio:.0}% of it)", target = bps as f64 / 1000.0, ratio = achieved / (bps as f64 / 1000.0) * 100.0),
+            Mode::Vbr { target, max } => println!(
+                "bit rate: {achieved:.0} kbit/s against a {target_k:.0} kbit/s VBR target and a {max_k:.0} kbit/s ceiling",
+                target_k = target as f64 / 1000.0,
+                max_k = max as f64 / 1000.0
+            ),
+        }
+    }
     // **The decode check, once, over the whole stream.** ffmpeg is given exactly the bytes the
     // muxer would be given — an elementary stream — and its output is compared with the ramps that
     // went in, one picture at a time.
@@ -212,15 +406,24 @@ fn run(width: u32, height: u32, qp: u8, frames: usize, refs: u32, fps: u32, gop:
         // The size control: the same moving content, every picture coded intra. **This is what makes
         // the size drop evidence rather than an observation** — without it, a P frame that was small
         // for some other reason (a quiet picture, a driver quirk) would look like prediction. With
-        // it, the comparison is same content, same quantiser, same everything but the picture type.
+        // it, the comparison is same content, same everything but the picture type.
+        //
+        // **The control is always constant quantiser**, whatever mode the run itself used, because the
+        // comparison it exists for is "predicted against intra at the same quality" and a bitrate mode
+        // has no single quality to hold still. A run in a bitrate mode therefore compares a predicted
+        // stream at a moving quantiser against an intra stream at `-qp`, which is a weaker statement —
+        // and it says so, rather than printing a ratio that reads as if it were the same comparison.
         println!();
-        println!("control: the same pictures, every one coded as an IDR:");
-        let mut control = VaEncoder::new(&api, (width, height), 1).map_err(|e| format!("control encoder: {e}"))?;
+        println!("control: the same pictures, every one coded as an IDR at QP {qp}{}", match mode {
+            Mode::ConstantQuantiser(_) => "",
+            _ => " (the run above is at a bit rate, so this compares across qualities — the decode check above is the stronger evidence)",
+        });
+        let mut control = VaEncoder::at_constant_quantiser(&api, (width, height), 1).map_err(|e| format!("control encoder: {e}"))?;
         control.at_rate(fps)?;
         control.key_frames_every(1)?;
         let mut control_sizes = Vec::new();
         for index in 0..frames {
-            let (luma, chroma) = ramp_shifted(display.0, display.1, shift * index as u32)?;
+            let (luma, chroma) = source(&display, shift * index as u32, tex)?;
             control.upload(&luma, &chroma)?;
             let c = control.encode(EncodeRequest::predicted(qp)?)?;
             control_sizes.push(c.driver_bytes);
@@ -276,14 +479,44 @@ fn decode_deviations(stream: &[u8], sources: &[Vec<u8>]) -> Option<Vec<u8>> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
+    // **The output is drained on its own thread while the input is being written, and that is not an
+    // optimisation — it is the difference between working and hanging forever.**
+    //
+    // Both ends are pipes, and each has about 64 KiB of buffer. Writing the stream first and reading
+    // the decode afterwards deadlocks the moment the decoded luma passes the buffer: ffmpeg blocks
+    // writing pictures nobody is reading, stops reading the elementary stream, and this process blocks
+    // writing a stream nobody is reading. **Measured on this machine at 320x180:** 60 pictures (3.4 MB
+    // of gray) complete, 72 pictures (4.1 MB) hang until killed — `vaencprobe` parked in
+    // `anon_pipe_write` with ffmpeg parked writing its own stdout. The hang is a function of decoded
+    // size, not of the encoder, which had finished and printed its sizes and bit rate long before.
+    //
+    // So the reader starts first and takes the stdout and stderr handles; `wait_with_output` below no
+    // longer has pipes to drain, which is exactly what makes this correct rather than merely lucky.
+    use std::io::Read as _;
+    let mut stdout = child.stdout.take()?;
+    let mut stderr = child.stderr.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        // Both are read to completion: a decode that writes more than the pipe holds only makes
+        // progress while something is draining it, and a half-read pipe is what turns a hang into a
+        // short answer. `read_to_end` returns the bytes it got, and a read error ends the drain with
+        // what arrived — ffmpeg dying mid-stream is reported by the length check below, not by a panic.
+        let _ = stdout.read_to_end(&mut out);
+        let _ = stderr.read_to_end(&mut err);
+        (out, err)
+    });
+
     // The child's stdin is a pipe this function owns; writing to it and dropping the handle closes it,
     // which is what tells ffmpeg the elementary stream has ended. A closed pipe mid-write means ffmpeg
-    // stopped reading, and `wait_with_output` then reports whatever it managed to decode.
+    // stopped reading, and the join below then reports whatever it managed to decode.
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin.write_all(stream);
     }
-    let output = child.wait_with_output().ok()?;
+    let status = child.wait().ok()?;
+    let (stdout, stderr) = reader.join().ok()?;
+    let output = std::process::Output { status, stdout, stderr };
     // **ffmpeg's own diagnostics are not ignored.** A stream it decodes *with* a warning has been
     // accepted and is not necessarily right, and a probe that printed a deviation over it would
     // report a number computed from a stream nobody would trust.
