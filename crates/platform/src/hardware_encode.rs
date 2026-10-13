@@ -5,10 +5,10 @@
 //! H.264 hardware encoding is opt-in per export (`ExportSettings::hardware_encoding`, `Auto`): its output
 //! depends on the machine, while the built-in encoder's is byte-identical everywhere. The factory
 //! declines, so the built-in encoder is used, for everything the hardware path does not take: other
-//! formats, MXF (Annex B), two-pass VBR, HDR, odd picture sizes, non-square pixels, and any
-//! configuration the hardware encoder cannot create a session for. A hardware encoder that fails in
-//! the middle of an export reports an error (the export stops); it cannot hand the stream over to
-//! another encoder.
+//! formats, MXF (Annex B), two-pass VBR, the constant-quality and video-conference rate modes, HDR,
+//! odd picture sizes, non-square pixels, and any configuration the hardware encoder cannot create a
+//! session for. A hardware encoder that fails in the middle of an export reports an error (the export
+//! stops); it cannot hand the stream over to another encoder.
 //!
 //! HEVC (`Format::Hevc`) has no built-in encoder, so choosing the format is the opt-in, the same
 //! configurations are declined, and a declined export fails with "encoder not available" instead of
@@ -37,7 +37,8 @@
 //! # The two backends do not accept the same exports, and the differences are measured
 //!
 //! [`config_for`] (VideoToolbox) and [`vaapi_config_for`] (VA-API) share most of their decline list
-//! and differ in two places, each for a reason the backend can state rather than a preference:
+//! and differ in three places, each for a reason the backend can state rather than a preference.
+//! [`vaapi_config_for`] is the reference for what each gate accepts and why.
 //!
 //! - **Both take a bitrate.** VideoToolbox through `VTCompressionPropertyKey_AverageBitRate`, and
 //!   VA-API through a `VA_RC_CBR` / `VA_RC_VBR` session with a `VAEncMiscParameterRateControl`. The
@@ -47,7 +48,18 @@
 //!   and every record either backend builds is a rate: mapping a quantiser the settings state onto
 //!   `VTCompressionPropertyKey_Quality` or onto `VAPictureH264::pic_init_qp` is a piece of work in
 //!   its own right, and until it is done the honest answer to a mode this gate cannot express is a
-//!   decline rather than a substitution. See [`vaapi_config_for`] for what each gate accepts and why.
+//!   decline rather than a substitution.
+//! - **Both refuse `BitrateMode::VideoConference`, and each says which of the two kinds of reason it
+//!   is.** The mode states a rate *and* a cap on any one picture
+//!   (`VAEncMiscParameterBufferMaxFrameSize`, in bits), so submitting a VBR for it produces a
+//!   plausible file with the cap silently gone, beside a summary reading `Video conference (VCM)`.
+//!   **VideoToolbox's reason is a claim about the gate**: there is no field for a per-picture ceiling
+//!   in `VtConfig`, and `<VideoToolbox/VTCompressionProperties.h>` declares no property for one
+//!   either, so the ceiling has nowhere to go at any depth. **VA-API's H.264 reason is a claim about
+//!   the driver**: `VAConfigAttribRateControl` is `0x14d6` there against `0x14de` for H.265, one bit
+//!   apart, and `vaCreateConfig` was measured refusing the bit. "This driver does not support
+//!   VA_RC_VCM" on the macOS side would name a capability VideoToolbox never advertised. See
+//!   [`vt_refuses`] for both wordings, and for the two header neighbours that are not the answer.
 //! - **VA-API is one slice per picture and one reference deep**, both measured; the VideoToolbox path
 //!   has no such limit. The slice limit is not expressible in the settings and so is not a decline
 //!   here — it is a property of the encoder, stated in [`vaapi::VaEncoder`]'s own documentation.
@@ -55,10 +67,16 @@
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
+// **Not behind a `cfg`.** [`vt_refuses`] is the VideoToolbox gate's decision function and names no OS
+// API, so it is compiled on every platform and unit-tested on the machines CI runs — which is the
+// only reason the refusal wordings below are exercised by anything at all. Only what it feeds, the
+// `VtConfig`, is macOS-only.
+use filmcraft_export::{BitrateMode, ExportSettings};
+
 #[cfg(target_os = "macos")]
-use filmcraft_export::{BitrateMode, H264Pass, H264Profile};
+use filmcraft_export::{EncodedPacket, EncoderFrame, ExportError, Format, HardwareEncoding, VideoEncoder};
 #[cfg(target_os = "macos")]
-use filmcraft_export::{EncodedPacket, EncoderFrame, ExportError, ExportSettings, Format, HardwareEncoding, VideoEncoder};
+use filmcraft_export::{H264Pass, H264Profile};
 #[cfg(target_os = "macos")]
 use filmcraft_isobmff::{AvcConfig, HevcConfig, SampleEntry};
 #[cfg(target_os = "macos")]
@@ -66,6 +84,136 @@ use filmcraft_time::FrameRate;
 
 #[cfg(target_os = "macos")]
 use crate::videotoolbox_encode::{ParamSets, VtCodec, VtConfig, VtEncoder, VtPacket, VtProfile, VtRate};
+
+/// **Why the VideoToolbox gate cannot express `s.bitrate_mode`, or `None` for the two it takes.**
+///
+/// # One function, so the refusal a caller reads is the one the code decided on
+///
+/// The same argument, and deliberately the same shape, as `vaapi_export::refuses` on the Linux
+/// side. It is asked twice: once before `s.bitrate_kbps` is read, and once from the arm of the rate
+/// `match` that the three modes below cannot reach. **The second call is a bug-catcher** — reaching
+/// it means the first was removed or reordered, and the arm says so rather than encoding at a rate
+/// nobody chose.
+///
+/// It takes the whole settings rather than the mode, because a refusal that names a number has to
+/// read that number from the settings rather than quote a constant the user never typed.
+///
+/// **It is compiled on every platform, and it names no OS API.** That is not tidiness: `config_for`
+/// needs VideoToolbox to run at all, so a refusal that only existed inside it could never be
+/// exercised by anything. Compiling it here means the wordings below are checked by ordinary
+/// `cargo test` on the machine CI runs on, and only the `VtConfig` it feeds stays macOS-only. **What
+/// that does *not* buy is any statement about VideoToolbox's behaviour** — see the closing note.
+///
+/// # The three refusals, each named as one kind of reason or the other
+///
+/// A refusal is either **a claim about this gate** — it submits a bitrate, and the mode states
+/// something a bitrate cannot carry — or **a claim about the driver**, which needs a measurement to
+/// stand on. The distinction is not decoration: `ConstantQuality` was once refused here on the first
+/// kind of reason while worded as though it were the second, and the Linux gate corrected that
+/// wording after finding the driver ran the mode all along. Which kind each refusal is, is stated.
+///
+/// - **`Vbr2Pass` — a claim about this gate**, and the plainest one. A two-pass export renders the
+///   sequence once to measure it and again to encode it; this backend is handed one picture at a
+///   time by a pipeline with no way to encode it twice. Submitting the second pass's rate to a
+///   single-pass encoder gives a file at a rate nobody chose with nothing wrong anywhere in it.
+/// - **`ConstantQuality` — a claim about this gate.** The mode states a quantiser in
+///   `ExportSettings::constant_qp` and no rate, and both [`VtRate`] variants are rates. `VTCompressionPropertyKey_Quality`
+///   *can* be set, so this is not a claim about the API: nothing here maps FilmCraft's H.264
+///   quantiser onto it, and a mapping this gate invented would be a table sitting next to a rate the
+///   user did state.
+/// - **`VideoConference` — a claim about this gate too, and the header is what settles it.** The
+///   next section is the long argument; the short form is that the mode states two numbers and
+///   VideoToolbox has no field for the second.
+///
+/// # `VideoConference`: what the mode states, and where the second number would go
+///
+/// **`VA_RC_VCM` is two numbers.** `va.h:1113-1114` puts *"\brief Video conference mode."*
+/// (`0x00000008`) beside *"\brief Variable bitrate."* (`VA_RC_VBR`, `0x00000004`), so it is a
+/// variable bit rate **and** a ceiling on any one picture; the ceiling travels in
+/// `VAEncMiscParameterBufferMaxFrameSize` (`va.h:2753-2762`, in **bits** — the header's other
+/// frame-size record is in bytes), and `va.h:3894` marks `VA_CODED_BUF_STATUS_BITRATE_HIGH`
+/// *"(VCM only)"* for a frame closing on it.
+///
+/// **VideoToolbox has nowhere to put the ceiling.** `<VideoToolbox/VTCompressionProperties.h>`
+/// declares **no VCM mode at all and no maximum-picture-size property**. Its rate control is four
+/// keys and all four are rates or windows: `kVTCompressionPropertyKey_AverageBitRate` (*"The
+/// long-term desired average bit rate in bits per second"*), `kVTCompressionPropertyKey_ConstantBitRate`
+/// (*"Requires that the encoder use a Constant Bit Rate algorithm"*), `kVTCompressionPropertyKey_VariableBitRate`
+/// (*"Requires that the encoder use a variable bitrate (VBR) rate control algorithm…"*) and
+/// `kVTCompressionPropertyKey_DataRateLimits` (*"Zero, one or two hard limits on data rate"*) — whose
+/// two numbers are a limit and a **time window**, which is exactly what this gate already submits for
+/// `VtRate::Vbr`, a one-second ceiling at `max_kbps / 8` (`videotoolbox_encode.rs:546`). **The only
+/// size ceiling in that header is `kVTCompressionPropertyKey_MaxH264SliceBytes`** (*"Specifies the
+/// maximum slice size for H.264 encoding"*), which caps a **slice**, is H.264-only, and is not the
+/// mode's cap on a **picture**. `VtConfig` carries one `rate` field
+/// (`videotoolbox_encode.rs:104`) and both its variants are rates, so the second number has no field
+/// in the gate either — the refusal is about a missing field, and the missing field is not this
+/// crate's doing.
+///
+/// # Why this is deliberately *not* the Linux wording
+///
+/// `vaapi_export::refuses` says *"this driver does not offer VA_RC_VCM for H.264"*, and that is right
+/// **there**, because that refusal rests on a measurement: `VAConfigAttribRateControl` is `0x14d6` for
+/// `VAProfileH264Main` on this machine against `0x14de` for H.265, one bit apart, and the rate-control
+/// sweep saw `vaCreateConfig` refuse the bit with `VA_STATUS_ERROR_INVALID_PARAMETER`. **There is no
+/// such measurement to point at here.** VideoToolbox's rate control is not a mode a driver advertises
+/// from a bitmask, so "this driver does not support VA_RC_VCM" would name a capability VideoToolbox
+/// never had and would read as a fact about a machine rather than about a missing field — the same
+/// error the constant-quality wording made, in the opposite direction. So the message names the gate.
+///
+/// # The two nearest things in that header, and why neither is the answer
+///
+/// Both were checked, because both are the obvious objection to a refusal that quotes an API.
+///
+/// - **`kVTCompressionPropertyKey_RealTime`** — *"Hints the video encoder that compression is, or is
+///   not, being performed in real time"*. A hint about how the session is being fed; this gate sets
+///   it `false` for offline encoding (`videotoolbox_encode.rs:512`). **It states no rate and no cap**,
+///   so turning it on would be VBR under a different name — the substitution, not the fix.
+/// - **`kVTCompressionPreset_VideoConferencing`** — *"A preset to achieve low-latency encoding for
+///   real-time communication applications"*. The nearest name to this mode in the header, and **not
+///   a rate-control mode**: it is one of the preset *dictionaries* returned by
+///   `kVTCompressionPropertyKey_SupportedPresetDictionaries`, its contents are encoder-specific and
+///   undocumented, and applying it would overwrite the properties this gate sets deliberately —
+///   real-time off, frame reordering off, the bitrate, the GOP and the colour matrix. **A user who
+///   asked for VCM and got it from a preset would get a different file whose size nobody chose, under
+///   a promise of the mode they asked for**, which is precisely the defect this refusal removes.
+///
+/// So VideoToolbox cannot express `VA_RC_VCM`, and the mode is declined by name. **Declining is also
+/// the cheap correct answer for this export's consequence**: H.264 has the built-in encoder behind it,
+/// which still encodes the export at the rate the settings state; HEVC has no built-in encoder, so a
+/// video-conference HEVC export becomes "encoder not available" rather than a wrong file.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn vt_refuses(s: &ExportSettings) -> Option<String> {
+    match s.bitrate_mode {
+        BitrateMode::Vbr2Pass => Some("two-pass encoding".to_string()),
+        // **The quantiser is the settings', not a constant**, which is what makes this *this* export's
+        // error rather than a passing remark beside it.
+        BitrateMode::ConstantQuality => Some(format!(
+            "a constant-quality export: it states a quantiser ({}) and no bitrate, and this gate submits the bitrate. \
+             FilmCraft's software encoders take that mode; this backend is declined for it rather than encoded at a rate nobody chose",
+            s.constant_qp
+        )),
+        // **Named, quoting what the mode states, and naming the gate as the reason.** The three
+        // clauses are the three claims the test checks: what the mode is, what it states (a rate and
+        // a per-picture ceiling, in bits), and that the reason is a missing field here rather than a
+        // driver that was asked and said no. "FilmCraft's own H.264 encoder still encodes this
+        // export, at the rate the settings state" is deliberately a claim about *fallback*, not about
+        // VCM being honoured: the built-in encoder takes this mode as a VBR of the stated target and
+        // ceiling (`export/src/lib.rs:1201`), so the file it writes is the one this gate would have
+        // written anyway — which is exactly why the refusal is worth making by name.
+        BitrateMode::VideoConference => Some(
+            "a video-conference (VA_RC_VCM) export: the mode states a variable bit rate AND a maximum size for any one frame \
+             (VAEncMiscParameterBufferMaxFrameSize, va.h:2753-2762, in bits), and this gate submits a bitrate — it has no field \
+             for that per-picture ceiling, and neither does VideoToolbox: VTCompressionProperties.h declares no VCM mode and no \
+             maximum-picture-size property, only kVTCompressionPropertyKey_AverageBitRate / _ConstantBitRate / _VariableBitRate and \
+             _DataRateLimits, whose two numbers are a limit over a time window rather than a limit on one picture. FilmCraft's \
+             own H.264 encoder still encodes this export, at the rate the settings state; this backend is declined for it rather \
+             than encoded as a VBR with the ceiling silently dropped"
+                .to_string(),
+        ),
+        BitrateMode::Cbr | BitrateMode::Vbr1Pass => None,
+    }
+}
 
 /// The hardware encoder's configuration for an export, or why it is not used for it.
 #[cfg(target_os = "macos")]
@@ -77,27 +225,25 @@ pub fn config_for(w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Result
     if s.format.is_mxf() {
         return Err("MXF carries an Annex B stream".into());
     }
-    if s.bitrate_mode == BitrateMode::Vbr2Pass || !matches!(s.h264_pass, H264Pass::Single) {
+    // **Two-pass, for either knob.** `h264_pass` is checked *first*, which is the order the single
+    // fused condition used to have, so no export's refusal changes: a `Vbr2Pass` mode and a
+    // two-pass pass both say "two-pass encoding", and a settings object that sets both still says it
+    // first.
+    if !matches!(s.h264_pass, H264Pass::Single) {
         return Err("two-pass encoding".into());
     }
-    // **A constant-quality export is refused rather than given a bitrate**, with the same words and
-    // for the same reason as the VA-API gates. `BitrateMode::ConstantQuality` states a quantiser and
-    // no rate, both [`VtRate`] variants are rates, and the `_ =>` arm below once turned this mode
-    // into a VBR and dropped the quantiser — a file at a rate nobody chose beside a summary reading
-    // `QP n`. This gate covers HEVC as well as H.264 (`hevc` above), so on this side of the refusal
-    // the consequence differs by format and is worth stating: H.264 has the built-in encoder behind
-    // it and the export falls back to it at the quantiser asked for, while **HEVC has no built-in
-    // encoder, so a constant-quality HEVC export becomes "encoder not available" rather than a wrong
-    // file** — the same trade the Linux HEVC gate already made. The refusal is not a claim about the
-    // API: `VTCompressionPropertyKey_Quality` can be set, but nothing here maps FilmCraft's H.264
-    // quantiser onto it, and a mapping this gate invented would be a table sitting next to a rate the
-    // user did state.
-    if s.bitrate_mode == BitrateMode::ConstantQuality {
-        return Err(format!(
-            "a constant-quality export: it states a quantiser ({}) and no bitrate, and this gate submits the bitrate. \
-             FilmCraft's software encoders take that mode; this backend is declined for it rather than encoded at a rate nobody chose",
-            s.constant_qp
-        ));
+    // **Every mode this gate cannot express is refused here, by name, before the bitrate is read** —
+    // two-pass, constant quality and video conference together, from [`vt_refuses`] so the two places
+    // that ask cannot disagree. The reason is structural and not about any one mode: `bitrate_kbps`
+    // below is a number left over from a *different* mode for the first, and for VCM it is one of
+    // the two numbers the mode consists of rather than the whole of it.
+    //
+    // **`VideoConference` is the newest of the three and the one whose wrongness is invisible.** It
+    // *does* state a rate, so submitting VBR for it produces a perfectly plausible file at a size
+    // nothing is wrong with — while the ceiling that distinguishes it (`va.h:2753-2762`) is silently
+    // gone, and the summary promises a per-picture bound the file does not have.
+    if let Some(why) = vt_refuses(s) {
+        return Err(why);
     }
     if s.signal.is_hdr() {
         return Err("HDR".into());
@@ -129,9 +275,39 @@ pub fn config_for(w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Result
             // that is what `resolved_h264_profile` resolves `Auto` to as well.
             (false, H264Profile::Auto) | (false, H264Profile::High) => VtProfile::High,
         },
+        // **Exhaustive over `BitrateMode`, with no `_ =>` arm, and that is the whole point of this
+        // being rewritten rather than given one more variant.** The `_ =>` arm that stood here
+        // returned `VtRate::Vbr` for everything that was not `Cbr`, so it silently swallowed three
+        // modes: `Vbr2Pass`, `ConstantQuality` (already refused further up, so its arm was
+        // unreachable — but only because a check *elsewhere* happened to run first) and
+        // `VideoConference`, which nothing refused and which therefore became a VBR beside a summary
+        // reading `Video conference (VCM)`. **A catch-all is by definition the one a new variant
+        // lands in**, and there is no compiler error and no test failure on the day that happens.
+        // Written with the five variants named, a sixth `BitrateMode` does not compile until someone
+        // has decided what it states — the same rule `BitrateMode::names_a_bitrate` follows, and for
+        // the same reason.
         rate: match s.bitrate_mode {
             BitrateMode::Cbr => VtRate::Cbr { kbps },
-            _ => VtRate::Vbr { target_kbps: kbps, max_kbps },
+            // **A target and a one-second ceiling, which is what `s.max_bitrate_kbps` means** when it
+            // is above the target and `resolve`'s own 1.5x when it is not — the same expression the
+            // VA-API gate and the built-in encoder use, so the three cannot pick different ceilings
+            // for the same settings.
+            BitrateMode::Vbr1Pass => VtRate::Vbr { target_kbps: kbps, max_kbps },
+            // **The three modes [`vt_refuses`] declined above, reaching an arm they cannot.** There is
+            // no catch-all here either, so this arm is a decision rather than a default: it returns
+            // the refusal, and if `vt_refuses` no longer has one for this mode then the refusal above
+            // was removed or reordered, which is a bug in the gate rather than an export it cannot
+            // do. **`VideoConference` is listed by name in the pattern rather than swept up**, so
+            // removing it from here is a compile error instead of a silent fall-through into VBR.
+            BitrateMode::Vbr2Pass | BitrateMode::ConstantQuality | BitrateMode::VideoConference => {
+                return Err(vt_refuses(s).unwrap_or_else(|| {
+                    format!(
+                        "{:?} reached the rate submission after this gate's own refusal for it: the check above is the refusal, \
+                         so getting here means it was removed or reordered, which is a bug in the gate",
+                        s.bitrate_mode
+                    )
+                }));
+            }
         },
     })
 }
@@ -1273,6 +1449,230 @@ mod gate_against_summary {
             };
             assert!(why.contains(&format!("quantiser ({qp})")), "QP {qp}: the decline quotes the same number the summary did: {why}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The VideoToolbox gate's refusals, on a machine that cannot run VideoToolbox
+// ---------------------------------------------------------------------------
+
+/// **What these tests can and cannot establish, said first because it is the part that is easy to
+/// overstate afterwards.**
+///
+/// [`super::vt_refuses`] is the function `config_for` asks before it reads the bitrate, it takes the
+/// settings, and it names no OS API — so it is compiled and run on Linux by ordinary `cargo test`,
+/// and everything asserted below is really executed. **What is not tested here, and cannot be from
+/// this machine, is VideoToolbox.** Concretely:
+///
+/// - **Not that `config_for` calls it.** `config_for` is `#[cfg(target_os = "macos")]`, so this file's
+///   macOS half does not compile on Linux at all. That the gate calls [`super::vt_refuses`] before the
+///   bitrate is read is a claim about code, not a claim about a run; only a macOS build checks it.
+/// - **Not that the rate `match` in `config_for` is exhaustive.** Nor is it checked here that the
+///   three modes the match refuses are the three [`super::vt_refuses`] refuses. They are named side by
+///   side in the source for exactly that reason, and the table below checks the second of the two.
+/// - **Not anything about the encoded file.** Encode verification is materially weaker than decode's:
+///   a hardware encoder and FilmCraft's software encoder are different algorithms making different
+///   decisions, so there is no bit-equality at any level and "matches ffmpeg" is never a claim about
+///   an encode. **Nothing in this module says any encoder's bytes are right.** What it checks is that
+///   the gate and the summary cannot describe one file two different ways.
+///
+/// **What it does establish** is the part that was broken: for every mode `BitrateMode` can name, the
+/// gate either takes it or refuses it by name, and the refusal says what the mode states and which
+/// kind of reason it is.
+#[cfg(all(test, target_os = "linux"))]
+mod vt_gate_against_summary {
+    use super::vt_refuses;
+    use filmcraft_export::{BitrateMode, ExportSettings, Format, H264Profile, HardwareEncoding};
+    use filmcraft_time::{FrameRate, Tick};
+
+    const W: u32 = 640;
+    const H: u32 = 360;
+    const FPS: FrameRate = FrameRate::FPS_30;
+    const QP: u8 = 30;
+
+    /// An export this gate would otherwise take, carrying the two numbers a VBR would have been
+    /// built from: a **2 Mbit/s target and a 4 Mbit/s ceiling**, neither a preset's default. They
+    /// matter because the defect is that a video-conference export was given exactly the record a
+    /// `Vbr1Pass` export gets — so the numbers below are the ones the substitution would have used.
+    fn settings(mode: BitrateMode) -> ExportSettings {
+        ExportSettings {
+            format: Format::H264,
+            hardware_encoding: HardwareEncoding::Auto,
+            h264_profile: H264Profile::Main,
+            bitrate_mode: mode,
+            bitrate_kbps: 2_000,
+            max_bitrate_kbps: Some(4_000),
+            constant_qp: QP,
+            keyframe_distance: Some(8),
+            ..Default::default()
+        }
+    }
+
+    /// What the summary tells the user this export's video fidelity is — **derived from the settings,
+    /// never quoted**, so a mode whose summary wording changes is caught here rather than assumed.
+    fn summary_video(mode: BitrateMode) -> String {
+        settings(mode).summary(W, H, FPS, 48_000, Tick::from_units(300, FPS.den)).video
+    }
+
+    /// **Every mode, its verdict, and the word its refusal has to contain** — the table the test
+    /// below reads, so "every mode was considered" is a fact about the source rather than a claim
+    /// about a loop. The third column is what makes each row fail for its own reason: two refusals
+    /// that printed the same sentence would pass a loop that only counted them.
+    const TABLE: [(BitrateMode, bool, &str); 5] = [
+        (BitrateMode::Cbr, false, ""),
+        (BitrateMode::Vbr1Pass, false, ""),
+        (BitrateMode::Vbr2Pass, true, "two-pass"),
+        (BitrateMode::ConstantQuality, true, "constant-quality"),
+        (BitrateMode::VideoConference, true, "VA_RC_VCM"),
+    ];
+
+    /// **The gate takes two modes and refuses three, each by its own words.**
+    ///
+    /// Written over [`BitrateMode::ALL`] against [`TABLE`], so the sixth mode fails here with "no row
+    /// in this table" rather than landing in a catch-all: this defect *was* a catch-all, and the
+    /// table is what a new variant has to be added to.
+    #[test]
+    fn every_mode_is_either_taken_or_refused_by_its_own_name() {
+        for mode in BitrateMode::ALL {
+            let Some(&(_, refused, word)) = TABLE.iter().find(|(m, _, _)| *m == mode) else {
+                panic!("{mode:?} is in BitrateMode::ALL but in no row of TABLE, so nothing in this test decides what the gate does with it");
+            };
+            match vt_refuses(&settings(mode)) {
+                // **A mode the gate takes has no refusal at all**, which is the other half of "the
+                // gate and the summary cannot disagree": a mode with a rate in it and a refusal
+                // would be a mode FilmCraft offers that the hardware path silently cannot do.
+                None => assert!(!refused, "{mode:?} is taken by this gate, so it must not be in the refusal list"),
+                Some(why) => {
+                    assert!(refused, "{mode:?} is refused, so TABLE says it is taken: {why}");
+                    assert!(why.contains(word), "{mode:?} is declined by its own name, not by another mode's words ({word}): {why}");
+                }
+            }
+        }
+        // **And the table is the whole of `BitrateMode`, so nothing was skipped**: a mode removed
+        // from the enum leaves a stale row here rather than silently passing.
+        assert_eq!(TABLE.len(), BitrateMode::ALL.len(), "every mode in BitrateMode::ALL has a row in TABLE");
+    }
+
+    /// **A constant-quality export is declined with the quantiser the settings stated**, over three
+    /// values including both ends of H.264's range. The claim being tested is that the gate *read the
+    /// settings*: matching the mode alone would pass on a sentence printed beside any export.
+    #[test]
+    fn the_constant_quality_refusal_quotes_the_quantiser_the_settings_state() {
+        for qp in [QP, 0, 51] {
+            let mut s = settings(BitrateMode::ConstantQuality);
+            s.constant_qp = qp;
+            let why = vt_refuses(&s)
+                .unwrap_or_else(|| panic!("a constant-quality export was accepted by a gate that submits a bitrate: it states a quantiser and no rate"));
+            assert!(why.contains(&format!("quantiser ({qp})")), "QP {qp}: the refusal names the quantiser this settings object states, not a constant: {why}");
+            // **And the summary quotes the same number**, so the two statements about one file carry
+            // one value. `ConstantQuality` is the mode where this matters most: it is the one whose
+            // summary says `QP n` rather than a rate, so a refusal that printed a different `n` would
+            // contradict it.
+            // The summary is taken from **this settings object**, not a fresh one built from the
+            // mode: `summary_video(mode)` cannot see `constant_qp`, so it would print the default
+            // quantiser and this comparison would pass on the wrong number.
+            let said = s.summary(W, H, FPS, 48_000, Tick::from_units(300, FPS.den)).video;
+            assert!(said.contains(&format!("QP {qp}")), "QP {qp}: the summary states the same quantiser the refusal does: {said}");
+        }
+    }
+
+    /// **A video-conference export is declined by name, and the refusal says which of the two kinds
+    /// of reason it is: the gate.**
+    ///
+    /// The distinction is the whole content of the message, and it is the one thing here a reviewer
+    /// cannot check by eye. *"This driver does not offer VA_RC_VCM"* is what `vaapi_export::refuses`
+    /// says and it is right **there**, because that refusal rests on a measurement —
+    /// `VAConfigAttribRateControl` is `0x14d6` for H.264 on the machine that ran it, one bit short of
+    /// H.265's `0x14de`, and `vaCreateConfig` was seen refusing the bit. **VideoToolbox's rate control
+    /// is not a mask a driver advertises from**, so that sentence would name a capability
+    /// VideoToolbox never had and would read as a fact about a machine rather than about a missing
+    /// field — which is the error `ConstantQuality` made on this gate once already, in the opposite
+    /// direction.
+    ///
+    /// **So the test checks the reason, not the outcome.** It asserts what the mode states, verbatim
+    /// from the header, rather than that the string "VA_RC_VCM" appears — which a fixed prefix would
+    /// satisfy; it asserts the header names the refusal leans on; and it asserts the message does
+    /// **not** attribute the refusal to a driver.
+    ///
+    /// **The deliberate breaks:** rewording the refusal as a driver claim fails the last assertion;
+    /// naming the mode without saying what it states fails the second; and accepting the mode fails
+    /// the first, which is what a `_ =>` arm does.
+    #[test]
+    fn a_video_conference_export_is_refused_by_name_and_for_the_gates_reason() {
+        let vcm = settings(BitrateMode::VideoConference);
+        let Some(why) = vt_refuses(&vcm) else {
+            panic!(
+                "a video-conference export was accepted by the VideoToolbox gate: the mode states a per-picture ceiling this gate has \
+                 no field for, so a VBR here is a file whose ceiling was never applied, beside a summary reading {:?}",
+                BitrateMode::VideoConference.label()
+            )
+        };
+        // **What the mode states, in the header's own words and units.** The cap is a maximum size for
+        // *one picture* in **bits** (`va.h:2753-2762`), which is why the refusal cannot simply say
+        // "VCM is a bitrate mode": the bitrate is the half this gate *can* express.
+        assert!(why.contains("VA_RC_VCM"), "the refusal names the mode: {why}");
+        assert!(why.contains("maximum size for any one frame"), "the refusal quotes what the mode states rather than paraphrasing it: {why}");
+        assert!(why.contains("VAEncMiscParameterBufferMaxFrameSize"), "the refusal names the record the ceiling would travel in: {why}");
+        assert!(why.contains("in bits"), "the refusal states the unit the ceiling is in: {why}");
+        // **The header it leans on, by name.** These are the keys VideoToolbox *does* have, so their
+        // presence is the evidence for "there is no field for the ceiling" rather than an assertion
+        // about it. A refusal that dropped them would be asking the reader to take the claim on trust.
+        assert!(why.contains("VTCompressionProperties.h"), "the refusal says which header settles it: {why}");
+        assert!(why.contains("_DataRateLimits"), "the refusal names the nearest key VideoToolbox has, and says why it is not one: {why}");
+        assert!(why.contains("_AverageBitRate"), "and the key this gate actually submits: {why}");
+        // **The reason is the gate, and the message must say so.** Three separate ways the message
+        // could read as a driver claim, all of them false here and all of them what the constant-quality
+        // wording used to sound like.
+        assert!(why.contains("this gate submits a bitrate"), "the refusal names itself as the subject, which is the reason: {why}");
+        assert!(
+            !why.contains("driver"),
+            "VideoToolbox's rate control is not a mask a driver advertises from, so there is no measurement to quote and no driver to blame: {why}"
+        );
+        // **Not a claim about the API being unable either.** `kVTCompressionPropertyKey_RealTime` can
+        // be set and `kVTCompressionPreset_VideoConferencing` exists, and the message must not imply
+        // otherwise — a refusal that read "VideoToolbox cannot do this" would be the same error with
+        // the subject swapped.
+        assert!(
+            why.contains("neither does VideoToolbox"),
+            "the refusal says the missing field is not merely this gate's, so nobody re-adds it expecting a different answer: {why}"
+        );
+
+        // **The one-word difference that was the whole defect.** These two settings differ only in
+        // `bitrate_mode`, and the second is taken: before the fix the first was given the second's
+        // record. If a future change makes VCM taken, this fails — which is intended, and is a red
+        // test rather than a pass.
+        assert!(
+            vt_refuses(&settings(BitrateMode::Vbr1Pass)).is_none(),
+            "one-pass VBR is the mode this gate submits a rate for, so the two settings above differ by one word and must not get the same answer"
+        );
+        // **And what the summary promised for the mode the gate now declines.** This half needs no
+        // VideoToolbox: it is the user-facing string, and it is the other end of the contradiction —
+        // the summary names VCM and quotes a rate, which is why the gate had better say no than
+        // quietly hand back a VBR.
+        let said = summary_video(BitrateMode::VideoConference);
+        assert!(
+            said.contains(BitrateMode::VideoConference.label()),
+            "the summary still promises the mode, which is exactly why the gate declines by name rather than substituting: {said}"
+        );
+        assert!(said.contains("Mbps"), "and it quotes a rate, so a decline is the only honest answer this gate has: {said}");
+        assert!(BitrateMode::VideoConference.names_a_bitrate(), "and the mode states a rate, so it is not the constant-quality case of a mode naming none");
+    }
+
+    /// **Nothing here claims a file was written, and this is the sentence that has to stay true.**
+    ///
+    /// A green run of this module means: *the gate's decision function says what it means for every
+    /// mode FilmCraft can name, and the summary cannot promise something the gate does not do.* It
+    /// does not mean a video-conference export encodes, does not mean the refusal is the right place
+    /// to put VCM on VideoToolbox, and does not mean the encoded bytes are anything in particular.
+    /// **The first two are engineering decisions and the third is not measurable at all** — different
+    /// algorithms, no bit-equality at any level, and "matches ffmpeg" would be a measurement of
+    /// ffmpeg's encoder.
+    #[test]
+    fn the_claims_this_module_makes_are_about_the_gate_and_not_about_a_bitstream() {
+        // Checked rather than asserted in prose: the module's own imports are the claim. If a test
+        // here ever needed `videotoolbox_encode`, `VtEncoder` or `vt`, this would not compile on
+        // Linux at all — so the bound is structural, and this is the reminder of it.
+        assert!(vt_refuses(&settings(BitrateMode::Cbr)).is_none(), "the gate submits a rate for CBR, which is the claim this module makes about the gate");
     }
 }
 
