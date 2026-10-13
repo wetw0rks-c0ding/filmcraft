@@ -1275,6 +1275,40 @@ impl SampleEntry {
     pub fn hevc(cfg: HevcConfig, width: u16, height: u16) -> Self {
         Self::video(FourCc(*b"hvc1"), CodecConfig::Hevc(cfg), width, height)
     }
+    /// AV1 entry (`av01`, the whole configuration in `av1C`).
+    ///
+    /// The AV1 counterpart of [`Self::avc`], and **the half of AV1 the muxer was missing**.
+    /// [`Av1Config`] has parsed out of `av1C` (`parse_sample_entry`, `b"av1C" if f == b"av01"`) and
+    /// been written back by [`SampleEntry::write`] for as long as it has existed, but nothing could
+    /// *build* one — so no `av01` track could be produced here at all, and an AV1 encoder would
+    /// have had no way to hand its samples to this crate. `crates/codecs`' Matroska reader ran into
+    /// the same wall and wrote the call out longhand
+    /// (`SampleEntry::video(FourCc(*b"av01"), …)`); this is that line, named.
+    ///
+    /// **`av1C` and no per-sample parameter sets**, which is what the AV1 codec binding specifies
+    /// for a self-contained track: the configuration record states the profile, the level and the
+    /// chroma format, and every picture is the OBU stream itself.
+    pub fn av1(cfg: Av1Config, width: u16, height: u16) -> Self {
+        Self::video(FourCc(*b"av01"), CodecConfig::Av1(cfg), width, height)
+    }
+    /// VP9 entry (`vp09`, the whole configuration in `vpcC`).
+    ///
+    /// **Named for the codec, like [`Self::avc`] and [`Self::hevc`]**, even though the record it
+    /// writes is `vpcC` and that record is shared with VP8. A function cannot be called `vpcC` —
+    /// `clippy::non_snake_case` refuses it, and the gate that runs on every commit is
+    /// `cargo clippy --workspace --all-targets -- -D warnings` — so the record's name is carried
+    /// in this comment and in the doc above instead. `parse_sample_entry` reads a `vpcC` back only
+    /// under `vp09` (`b"vpcC" if f == b"vp09"`), so **a future VP8 entry is this constructor with a
+    /// different four-CC**, not a near-identical twin with a misleading name.
+    ///
+    /// **`codec_init` is the caller's, and FilmCraft's own VP9 records leave it empty**: the VP
+    /// codec ISOBMFF binding carries profile, level, bit depth, chroma sampling and the whole
+    /// colour description in the record's fixed fields and reserves `codecInitializationData` for
+    /// VP8. The field is still carried and still round-trips, so a record read from a file that
+    /// fills it is written back unchanged.
+    pub fn vp9(cfg: VpcConfig, width: u16, height: u16) -> Self {
+        Self::video(FourCc(*b"vp09"), CodecConfig::Vp9(cfg), width, height)
+    }
     /// ProRes entry; `fourcc` one of `apch`/`apcn`/`apcs`/`apco`/`ap4h`/`ap4x`.
     pub fn prores(fourcc: FourCc, width: u16, height: u16) -> Self {
         let mut e = Self::video(fourcc, CodecConfig::ProRes { fourcc }, width, height);
@@ -1626,6 +1660,110 @@ mod tests {
         assert_eq!(VpcConfig::parse(&v.to_bytes()).unwrap(), v);
         let o = OpusConfig { output_channels: 2, pre_skip: 312, input_sample_rate: 48000, output_gain: 0, channel_mapping_family: 0, channel_mapping: vec![] };
         assert_eq!(OpusConfig::parse(&o.to_bytes()).unwrap(), o);
+    }
+
+    /// `SampleEntry::av1` writes an entry this module reads back — **which is the whole point of
+    /// the constructor**, so it is proved on the sample entry and not only on `av1C`.
+    ///
+    /// The configuration is filled in field by field rather than defaulted, because a
+    /// write-then-parse round trip of two all-default records can pass while every field is being
+    /// dropped: `Default` gives `seq_profile` 0, `seq_level_idx_0` 0, every flag false and
+    /// `initial_presentation_delay_minus_one` `None`, and a writer that emitted nothing at all
+    /// would still parse back to exactly that. Two extra assertions pin the bytes themselves, so
+    /// the record's bit layout is checked against the specification and not merely against the
+    /// parser that reads it:
+    ///
+    /// - **byte 0 is the marker byte** `0x81` — `marker = 1`, `version = 1`, the first byte of an
+    ///   `AV1CodecConfigurationRecord` as the AV1 codec ISO Media File Format Binding defines it,
+    ///   and the same byte `Av1Config::parse` refuses when `marker` is clear (`codec.rs:445`).
+    /// - **byte 2 carries seven separate fields** in three bits and four bits and a two-bit field.
+    ///   The values below put tier and high bit depth in the top two bits and chroma subsampling
+    ///   and sample position in the bottom five, so the expected byte `0xCE` only comes out if
+    ///   every one of those seven is written where the reader looks for it.
+    #[test]
+    fn av1_sample_entry_roundtrips() {
+        let cfg = Av1Config {
+            seq_profile: 0,
+            // Level 13 is above 7, which is the condition under which `seq_tier` is read at all,
+            // so a record carrying `seq_tier_0` is not a value the binding would reject.
+            seq_level_idx_0: 13,
+            seq_tier_0: true,
+            high_bitdepth: true,
+            twelve_bit: false,
+            monochrome: false,
+            chroma_subsampling_x: true,
+            chroma_subsampling_y: true,
+            chroma_sample_position: 2,
+            initial_presentation_delay_minus_one: Some(9),
+            config_obus: vec![0x0A, 0x0B, 0x00, 0x00],
+        };
+        let bytes = cfg.to_bytes();
+        assert_eq!(bytes[0], 0x81, "marker bit set and version 1: {:?}", bytes);
+        // tier 0x80 | high 0x40 | twelve 0x20 | mono 0x10 | subsampling_x 0x08 | _y 0x04 | position 0b10
+        assert_eq!(bytes[2], 0xCE, "the seven flag/field bits of the third byte: {:?}", bytes);
+        assert_eq!(Av1Config::parse(&bytes).unwrap(), cfg);
+
+        let e = SampleEntry::av1(cfg.clone(), 1920, 1080);
+        assert_eq!(e.format.0, *b"av01", "the AV1 sample entry is av01, and the parser only reads av1C under av01");
+        // **MP4 and QuickTime**, because the muxer is asked for both and the video part of a
+        // sample entry is not allowed to differ between them.
+        for qt in [false, true] {
+            let back = roundtrip(&e, qt, b"vide");
+            assert_eq!(back.codec, CodecConfig::Av1(cfg.clone()), "the av1C that came back is not the one written (qt={qt})");
+            let v = back.video.as_ref().expect("a video sample entry parses back as one");
+            assert_eq!((v.width, v.height), (1920, 1080), "the picture size must survive the trip (qt={qt})");
+            assert_eq!(back, e, "the whole sample entry, every field (qt={qt})");
+        }
+    }
+
+    /// `SampleEntry::vp9` writes an entry this module reads back, **and the record it writes is
+    /// version 1**, which is the branch `VpcConfig::parse` reads the full layout from — a version
+    /// byte of 0 would parse (through the draft layout) into a record with no colour description
+    /// at all, so that byte is asserted as well as the round trip.
+    ///
+    /// The packed byte is asserted for the same reason as AV1's: bit depth is four bits, chroma
+    /// subsampling three and full range one, and the value below exercises all three at once
+    /// (`10 << 4 | 1 << 1 | 1` = `0xA3`), so it cannot come out right unless each is written where
+    /// the reader expects it.
+    ///
+    /// **`codec_init` is filled in here even though FilmCraft's own VP9 records leave it empty**,
+    /// because it is the one variable-length part of the record: a `u16` length followed by that
+    /// many bytes, read through the checked `Cur::bytes` accessor. An empty tail is checked
+    /// separately for the same reason.
+    #[test]
+    fn vp9_sample_entry_roundtrips() {
+        let cfg = VpcConfig {
+            profile: 0,
+            level: 31,
+            bit_depth: 10,
+            chroma_subsampling: 1,
+            full_range: true,
+            colour_primaries: 9,
+            transfer_characteristics: 16,
+            matrix_coefficients: 9,
+            codec_init: vec![0xAA, 0xBB, 0xCC],
+        };
+        let bytes = cfg.to_bytes();
+        assert_eq!(bytes[0], 0x01, "vpcC version 1, the layout the full parse reads: {:?}", bytes);
+        assert_eq!(bytes[6], 0xA3, "bit depth 10, chroma subsampling 1, full range: {:?}", bytes);
+        assert_eq!(VpcConfig::parse(&bytes).unwrap(), cfg);
+
+        let e = SampleEntry::vp9(cfg.clone(), 1280, 720);
+        assert_eq!(e.format.0, *b"vp09", "the VP9 sample entry is vp09, and the parser only reads vpcC under vp09");
+        for qt in [false, true] {
+            let back = roundtrip(&e, qt, b"vide");
+            assert_eq!(back.codec, CodecConfig::Vp9(cfg.clone()), "the vpcC that came back is not the one written (qt={qt})");
+            let v = back.video.as_ref().expect("a video sample entry parses back as one");
+            assert_eq!((v.width, v.height), (1280, 720), "the picture size must survive the trip (qt={qt})");
+            assert_eq!(back, e, "the whole sample entry, every field (qt={qt})");
+        }
+        // **And the record FilmCraft itself writes**, whose `codecInitializationData` is empty
+        // because VP9's configuration is entirely in the fixed fields. A default record is all
+        // zeroes, so it is checked through the entry rather than by comparing it to itself.
+        let bare = SampleEntry::vp9(VpcConfig { profile: 2, level: 31, ..Default::default() }, 320, 240);
+        let back = roundtrip(&bare, false, b"vide");
+        assert!(matches!(&back.codec, CodecConfig::Vp9(v) if v.codec_init.is_empty()), "an empty codecInitializationData stays empty: {:?}", back.codec);
+        assert_eq!(back.codec, bare.codec);
     }
 
     #[test]

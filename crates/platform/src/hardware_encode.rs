@@ -844,35 +844,80 @@ mod vaapi_export {
     ///
     /// # Why it is not registered today
     ///
-    /// **It cannot be, and that is a fact about [`filmcraft_export::Format`] rather than about this
-    /// probe.** There is no `Format::Av1` variant, so there is nothing to
-    /// `filmcraft_export::register_format_probe` it against. Adding the variant *without* this
-    /// probe would be worse than adding nothing: the format list would claim AV1 is available while
-    /// every AV1 export failed. Adding it *with* this probe would be honest on this machine — the
-    /// probe answers `false` here — but is still the wrong order of work, because a probe that says
-    /// `false` is not a reason to ship a format list entry that never works. **The order is the
-    /// format, the encoder, then the probe.**
+    /// **It cannot be, and the blocker is no longer the variant — it is that there is nothing to
+    /// route an AV1 export to.** `filmcraft_export::register_format_probe` ignores a format
+    /// `Format::ALL` does not carry (`export/src/lib.rs:702`), so registering this needs the
+    /// variant, the variant needs an encoder to be worth offering, and **the encoder is the piece
+    /// that does not exist** (see the list below). Adding the variant alone would be the VP9 trap
+    /// this tree has already reasoned about: a format in the list with no encoder behind it.
     ///
-    /// # What a `Format::Av1` would need, and none of which is here
+    /// # What a `Format::Av1` would need, and what is still missing
     ///
+    /// **Done — the muxer half.** `SampleEntry::av1(Av1Config, w, h)` exists
+    /// (`isobmff/src/codec.rs`, beside `avc` / `hevc`) and writes the `av01` four-CC with its
+    /// `av1C`, and `SampleEntry::vp9(VpcConfig, w, h)` does the same for `vp09` / `vpcC`. **Both
+    /// are proved to round-trip**: each test writes a sample entry, reads it back through
+    /// `parse_sample_entry` and asserts the configuration *and* the picture size that came back,
+    /// plus the record's own marker/version byte and its packed flag byte, so a writer that dropped
+    /// a field fails rather than quietly producing a default. So the container layer can carry an
+    /// `av01` or a `vp09` track — **which was the blocker named before this one.**
+    ///
+    /// Still missing, in the order it has to be built:
+    ///
+    /// - **An adapter.** `VideoEncoder` is implemented in `crates/platform/src` exactly three
+    ///   times — `HardwareEncoder` (VideoToolbox), `VaEncoderExport` (H.264, `hardware_encode.rs:606`)
+    ///   and `HevcEncoderExport` (`vaapi/hevc_export.rs:303`) — and **none of them is AV1**. A
+    ///   `Format::Av1` arm in [`vaapi_export::factory`] has nothing to return. This is the piece the
+    ///   whole milestone is waiting on, and it is a day's work that nothing in the tree can check.
+    /// - **A rate the settings can ask for.** [`crate::vaapi::Av1Encoder`] has exactly one
+    ///   constructor, `at_constant_quantiser` (`vaapi/av1_submit.rs:379`), against `HevcEncoder`'s
+    ///   `at_constant_bitrate` / `at_variable_bitrate` / `new(RateControl)` / `at_rate` /
+    ///   `at_rate_exact` / `key_frames_every` / `sample_entry`. So **every mode in
+    ///   [`filmcraft_export::BitrateMode::ALL`] that states a rate — `Cbr`, `Vbr1Pass`, `Vbr2Pass`,
+    ///   `VideoConference` — has no AV1 submission at all** (named rather than counted, because a
+    ///   mode added to that list must be counted again), and the one that does not,
+    ///   `ConstantQuality`, asks for a quantiser the settings number as H.264's 0..=51 while AV1
+    ///   codes at `base_q_idx` 0..=255. A gate that took it would be inventing a conversion; one
+    ///   that refused it would refuse every export the settings can name. **That is why the format
+    ///   is not here and a half-gate is not either** — see `docs/vaapi-progress.md` §3.7 for the
+    ///   record shapes and §3.6 for VP9.
+    /// - **A container that says MP4.** `Exporter::new` picks the brand with
+    ///   `settings.format.is_h26x() && multiplexer == Mp4` (`export/src/job.rs:131`), and AV1 is
+    ///   deliberately not an H.26x profile, so an AV1 export would be muxed into a QuickTime (`qt  `)
+    ///   file while `Format::Av1::extension()` is `mp4`. One line, in a file this milestone does not
+    ///   touch, and it has to land with the variant.
     /// - **The variant**, in `filmcraft_export`: `Format::Av1` with its `from_name` / `id` /
     ///   `extension` (`mp4`) / `label`, a slot in `Format::ALL` (14 → 15),
     ///   `has_builtin_encoder` answering `false` for it, and `is_h26x` left alone — AV1 is neither
-    ///   H.264 nor H.265.
+    ///   H.264 nor H.265. **`estimate_bytes` and `ExportSettings::summary`'s constant-quality arm
+    ///   are `settings.rs` matches the new variant forces**, which is where the compiler will point.
     /// - **The registration**, `register_format_probe(Format::Av1, vaapi_av1_available)` beside the
-    ///   HEVC one in `platform::register`. That is the single line this probe is waiting for.
-    /// - **The gate and the adapter**: an `av1_config_for` decline list and an `Av1EncoderExport`
-    ///   implementing `VideoEncoder`, routed from `vaapi_export::factory`, which is an
-    ///   `hevc || h264` match today and would become a three-way one.
-    /// - **A sample entry**: `SampleEntry::av1(Av1Config, w, h)` and an `av01` four-CC. The muxer
-    ///   **already writes `av1C`** (`isobmff/src/codec.rs:1372`) and `Av1Config` already round-trips
-    ///   through its own parser (`:1613`), but `SampleEntry` has only `avc` and `hevc` constructors
-    ///   (`codec.rs:1271`, `:1275`) — so there is no way to hand the muxer an `av01` entry yet, and
-    ///   an export that got one from elsewhere would be a file nobody has tested.
+    ///   HEVC one in `platform::register` (`platform/src/lib.rs:101`). That is the single line this
+    ///   probe is waiting for, and it is the **last** line, not the first.
     /// - **A preset**, gated on `available(Format::Av1)` exactly as the HEVC ones are gated in
     ///   `export/src/presets.rs`.
     /// - **A driver that takes the picture record** — which is the part that does not exist on this
     ///   machine, and the only one no amount of code here can supply.
+    ///
+    /// # What a VP9 path needs, and why it is not a copy of this one
+    ///
+    /// **No VP9 *encoder* is needed, and that is the whole difference.** Encode inverts the data
+    /// flow: what an encoder must supply is the *meaning* of the frame header, and the bit-exact
+    /// VP9 decode path in this tree already supplies it — `parse_uncompressed` → `FrameHeader`,
+    /// `HeaderState` + `ReferenceState`, the eight reference slots, the pinned 316-byte
+    /// `VASliceParameterBufferVP9` and `split_superframe`. A VP9 encoder is that read backwards,
+    /// and `crates/platform/src/vaapi/vp9_enc.rs` has measured this machine and found **no VP9
+    /// encoder entry point at all**: all four `VAProfileVP9Profile0..3` offer `VLD` and nothing
+    /// else, asked across every attribute id the driver knows and all three encode entrypoints,
+    /// with H.264 / HEVC / AV1 answering in the same pass as controls.
+    ///
+    /// So the VP9 path needs: a `Format::Vp9` variant; a probe in the shape of this one; an
+    /// adapter implementing `VideoEncoder`; the `VAEncSequenceParameterBufferVP9`,
+    /// `VAEncPictureParameterBufferVP9` and `VAEncMiscParameterTypeVP9PerSegmantParam` records; the
+    /// submission machinery FilmCraft already runs for H.264, HEVC and AV1; and a preset. **The
+    /// capability check is already written**: `vaapi::stream::supports` is parameterised by profile
+    /// *and* entrypoint, so a driver that grows a VP9 encoder is picked up with no new code. The
+    /// muxer half — `SampleEntry::vp9` — is done, and is the one part that is hardware-independent.
     pub fn av1_available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| match av1_probe() {
