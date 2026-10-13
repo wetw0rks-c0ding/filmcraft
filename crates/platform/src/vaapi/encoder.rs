@@ -169,9 +169,16 @@
 //!   ignored: a request that names a quantiser in a bitrate encoder is an error naming the mode, and
 //!   an encoder in constant quantiser refuses a request that declines to name one. Under
 //!   [`RateControl::ConstantQuantiser`] the quality comes from the picture record's `pic_init_qp`
-//!   and nothing else; under [`RateControl::Cbr`] / [`RateControl::Vbr`] it comes from the rate
+//!   and nothing else; under [`RateControl::Cbr`] / [`RateControl::Vbr`] /
+//!   [`RateControl::VideoConference`] it comes from the rate
 //!   controller, and **`VaEncoder::encode` takes no quantiser at all** because there is no honest
 //!   one to take — see [`EncodeRequest`].
+//! - **A mode is a rate, or a rate *and a ceiling on one picture* — never a quantiser and a rate.**
+//!   [`RateControl::VideoConference`] is the second kind, and it is the reason the enum has a
+//!   three-field variant: a picture cap is not a bitrate (it has no time base) and it is not a
+//!   quantiser, so a two-field rate would have had to drop it — and dropping it submits a mode whose
+//!   distinguishing control is gone, which is the same defect as encoding constant quality at a
+//!   bitrate.
 //! - **`pic_order_cnt_type` is 0** and `num_ref_frames_in_pic_order_cnt_cycle` is 0: no picture
 //!   order count cycle, and no B pictures.
 //! - **One slice per picture.** A second coded segment is refused outright rather than submitted,
@@ -186,6 +193,11 @@ use super::ffi::{
     self, Display, Encoder, LAST_PICTURE_EOSTREAM, PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PICTURE_H264_SHORT_TERM_REFERENCE, Profile, RC_CBR, RC_CQP,
     RC_VBR, RtFormat, SLICE_TYPE_ALL_I, SLICE_TYPE_ALL_P,
 };
+// The two measured masks, read from the HEVC module rather than written into this message: they are
+// one measurement of one driver and there is no reason for a refusal to quote a second copy of a
+// number that can change. This module and `hevc_submit` both name the same driver, and the
+// difference between the two masks is the entire reason `RC_VCM` is refused below.
+use super::hevc_submit::{H264_RATE_CONTROL_MASK, HEVC_RATE_CONTROL_MASK};
 use std::sync::Arc;
 
 // The one macroblock size H.264 has, in pixels. Every size this module accepts is rounded to it, and
@@ -215,6 +227,15 @@ pub enum PictureKind {
     B,
 }
 
+/// `VA_RC_VCM` (`va.h:1113-1114`): `0x00000008`, *"Video conference mode"*.
+///
+/// **Declared here rather than in [`super::ffi`] because it is a constant one codec takes and
+/// another refuses**, which is not the shape `ffi.rs` is pinned for: H.265's mask on this driver
+/// contains this bit and H.264's does not, so a name for it is needed by both. Its value is
+/// asserted against the header in `hevc_abi.rs`, and against the two measured masks in
+/// [`crate::vaapi::hevc_submit`] — the same number, one source.
+pub const RC_VCM: u32 = 0x0000_0008;
+
 /// **Which statement about fidelity this stream makes** — a fixed quantiser, or a bit rate.
 ///
 /// It is a constructor argument rather than a builder method because of what libva allows:
@@ -237,12 +258,14 @@ pub enum PictureKind {
 ///
 /// # What the driver is not being asked to do
 ///
-/// The driver reports **CBR, VBR, CQP, ICQ, QVBR and TCBRC** on iHD 26.3.5
-/// ([`VaEncoder::driver_rate_control_modes`]), so nothing here works around a driver that cannot do
-/// rate control — a driver whose mask lacks the mode this type names fails at `vaCreateConfig` with
-/// the mode in the message. ICQ and the temporal-layer modes are **not** here: ICQ's
-/// `ICQ_quality_factor` is a quality in a unit none of FilmCraft's settings state, and TCBRC wants
-/// per-frame channel feedback the export pipeline does not have.
+/// The driver reports **CBR, VBR, VCM, CQP, ICQ, MB, QVBR and TCBRC** for H.265 and the same set
+/// **less VCM** for H.264 on iHD 26.3.5 ([`crate::vaapi::hevc_submit::HEVC_RATE_CONTROL_MASK`] and
+/// `H264_RATE_CONTROL_MASK`), so nothing here works around a driver that cannot do rate control — a
+/// driver whose mask lacks the mode this type names fails at `vaCreateConfig` with the mode in the
+/// message. ICQ and the temporal-layer modes are **not** here: ICQ's `ICQ_quality_factor` is a
+/// quality in a unit none of FilmCraft's settings state, and TCBRC wants per-frame channel feedback
+/// the export pipeline does not have. MB is a **modifier** on a base mode (`va.h:1122-1125`),
+/// which is a fourth thing this enum is not: a rate, a rate with a picture cap, or a quantiser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RateControl {
     /// **A fixed quantiser per picture.** The picture record's `pic_init_qp` *is* the quality, and
@@ -266,6 +289,46 @@ pub enum RateControl {
         /// The highest rate it may reach, in bits per second. Must be at least `target`.
         max: u32,
     },
+    /// **A variable bit rate with a ceiling on any one picture** — `VA_RC_VCM` ([`RC_VCM`]),
+    /// *"Video conference mode"* (`va.h:1113-1114`).
+    ///
+    /// # It is not a `Vbr` with a different name, and the third number is the whole difference
+    ///
+    /// `va.h` marks two coded-buffer status bits **"(VCM only)"** and both are about a single
+    /// frame: `VA_CODED_BUF_STATUS_BITRATE_HIGH` is *"The frame size got within the safety margin
+    /// of the maximum size (VCM only)"* (`va.h:3894`) and `VA_CODED_BUF_STATUS_BITRATE_OVERFLOW` is
+    /// *"The peak bitrate was exceeded for this frame"* (`va.h:3893`). A mode whose own status bits
+    /// are per-frame is a mode with a per-frame control, and submitting `Vbr` for it would be
+    /// submitting a mode the driver cannot distinguish from the plain one.
+    ///
+    /// **The cap is a second misc buffer, not a field of the rate-control record.** It is
+    /// `VAEncMiscParameterBufferMaxFrameSize` (`va.h:2753-2762`) submitted as
+    /// [`crate::vaapi::hevc_submit::MISC_MAX_FRAME_SIZE`], because that is where libva puts it, and
+    /// because the two are separately optional: a caller can name a rate and no cap (which is
+    /// [`Self::Vbr`]) or a cap and a rate (which is this).
+    ///
+    /// # The cap is in **bits**, and that is the header's word
+    ///
+    /// `va.h:2745` and `va.h:2757-2758` both say *bits*: *"Defines a maximum frame size (in
+    /// bits)"* / *"Maximum size of a frame (in bits)"*. **The bytes one is
+    /// `VAEncMiscParameterBufferMultiPassFrameSize`** (`va.h:2777-2778`), a different record for a
+    /// different (multi-pass) purpose, and mixing the two up would be a cap 8x off from the one
+    /// asked for.
+    VideoConference {
+        /// The rate the controller aims at, in bits per second. The same number [`Self::Vbr`]'s
+        /// `target` is, and for the same reason: it is a rate the controller may sit below.
+        target: u32,
+        /// The highest rate it may reach, in bits per second, which is `bits_per_second` in the
+        /// record exactly as it is for [`Self::Vbr`].
+        max: u32,
+        /// **The largest any one picture may be, in bits** — `max_frame_size`.
+        ///
+        /// **Not a bitrate and not a quantiser.** It has no time base (one picture is not a second,
+        /// and the number changes meaning entirely with the frame rate) and it bounds a size rather
+        /// than choosing a quality, which is why it is a third field here and not a third
+        /// `BitrateMode`.
+        max_frame_bits: u32,
+    },
 }
 
 impl RateControl {
@@ -275,6 +338,7 @@ impl RateControl {
             Self::ConstantQuantiser => RC_CQP,
             Self::Cbr(_) => RC_CBR,
             Self::Vbr { .. } => RC_VBR,
+            Self::VideoConference { .. } => RC_VCM,
         }
     }
 
@@ -286,6 +350,12 @@ impl RateControl {
     /// bitrate encoder (or omitting one in a constant-quantiser encoder) is refused at
     /// [`VaEncoder::encode`] with both modes named, rather than one of them being honoured and the
     /// other dropped.
+    ///
+    /// **`VideoConference` answers `false` and this is not a near miss.** It states a rate *and* a
+    /// cap on one picture, so the rate controller still picks each picture's quantiser and a caller
+    /// has no honest one to name. It is the **opposite** of [`Self::ConstantQuantiser`], which states
+    /// a quantiser and no rate: the two are refused for opposite reasons and must not be answered
+    /// alike.
     pub fn names_its_own_quantiser(&self) -> bool {
         matches!(self, Self::ConstantQuantiser)
     }
@@ -296,6 +366,20 @@ impl RateControl {
             Self::ConstantQuantiser => "constant quantiser",
             Self::Cbr(_) => "CBR",
             Self::Vbr { .. } => "VBR",
+            Self::VideoConference { .. } => "video conference (VCM)",
+        }
+    }
+
+    /// **The per-picture ceiling this mode carries, in bits, or `None` for a mode that has none.**
+    ///
+    /// It is asked as a question rather than read out of the variant so that a caller building the
+    /// misc buffer does not have to enumerate the modes that happen to have a cap — which is the
+    /// `_ =>` defect this whole change exists to remove, one layer down: a new mode with a cap would
+    /// have found no arm and submitted no cap at all, with nothing failing.
+    pub fn max_frame_bits(&self) -> Option<u32> {
+        match self {
+            Self::VideoConference { max_frame_bits, .. } => Some(*max_frame_bits),
+            Self::ConstantQuantiser | Self::Cbr(_) | Self::Vbr { .. } => None,
         }
     }
 }
@@ -943,6 +1027,32 @@ impl VaEncoder {
     /// lie. It is a [`RateControl`] rather than a bare `u32` for the same reason `size` is a pair and
     /// `references` is bounded: the caller cannot hand this module the wrong constant.
     pub fn new(display: &Arc<Display>, size: (u32, u32), references: u32, rate_control: RateControl) -> Result<Self, String> {
+        // **`VA_RC_VCM` is refused here, and the reason is a measurement about the driver rather
+        // than a claim about this gate.**
+        //
+        // `RateControl` names four modes; this H.264 path takes three. `VA_RC_VCM` states "a
+        // variable bit rate with a maximum size for any one frame" (`va.h:1113-1114`, and the
+        // per-frame status bits it owns at `va.h:3893-3894`), and **this driver does not offer it for
+        // H.264**: the rate-control mask it reports for `VAProfileH264Main` / `VAEntrypointEncSlice`
+        // is `0x14d6`, which is the H.265 mask `0x14de` **less** `VA_RC_VCM` — same driver, same
+        // query, one bit apart (`crate::vaapi::hevc_submit::H264_RATE_CONTROL_MASK` and
+        // `HEVC_RATE_CONTROL_MASK`, both pinned there). The same sweep measured `vaCreateConfig`
+        // refusing every bit outside the mask with `VA_STATUS_ERROR_INVALID_PARAMETER`.
+        //
+        // **So this is a statement about the driver and not about the gate.** A gate that submitted
+        // it anyway would get a refusal at `vaCreateConfig` naming no mode; refusing here is the
+        // same answer with the mask in the message. It is *not* "this gate does not implement it":
+        // `RateControl::VideoConference` and the record this function would build both exist, and
+        // `crate::vaapi::hevc_submit` — whose mask has the bit — takes exactly this mode.
+        if rate_control.config_attribute() == RC_VCM {
+            return Err(format!(
+                "a video-conference-mode (VA_RC_VCM) H.264 encoder: VA_RC_VCM states a variable bit rate AND a maximum size for any \
+                 one frame (VAEncMiscParameterBufferMaxFrameSize, va.h:2753-2762), and this driver does not offer it for H.264 — \
+                 VAConfigAttribRateControl is {H264_RATE_CONTROL_MASK:#x} for VAProfileH264Main here, which is the H.265 mask \
+                 {HEVC_RATE_CONTROL_MASK:#x} less VA_RC_VCM, and vaCreateConfig refuses the bit with VA_STATUS_ERROR_INVALID_PARAMETER. \
+                 The same mode is taken for H.265"
+            ));
+        }
         let refs = references;
         if size.0 == 0 || size.1 == 0 {
             return Err(format!("{}x{} picture", size.0, size.1));
@@ -2704,15 +2814,30 @@ fn rate_control_record(mode: RateControl, window_ms: u32) -> Result<Vec<u8>, Str
             // rather than 0 says which of the two this is.
             (bps, 100)
         }
-        RateControl::Vbr { target, max } => {
+        // **The two variable-rate modes submit the same two numbers, and the difference between them
+        // is not in this record at all.** `VA_RC_VCM` adds a ceiling on a *single picture*, and that
+        // ceiling travels as a second misc buffer (`VAEncMiscParameterBufferMaxFrameSize`), not as a
+        // field of `VAEncMiscParameterRateControl` — so the two arms are deliberately the same
+        // expression and the mode is carried by the config attribute instead. Writing the percentage
+        // differently for VCM would be inventing a number the header defines no other way.
+        //
+        // **This arm is reachable for H.264 only through [`VaEncoder::new`], which refuses
+        // `VA_RC_VCM` before a session exists** — this driver's H.264 mask does not contain the bit
+        // (see [`crate::vaapi::hevc_submit::H264_RATE_CONTROL_MASK`]) and the HEVC path, which takes
+        // the mode, submits the cap from `hevc_submit`. The arm is here anyway because this is a
+        // pure function over a mode and a half-written one is a bug waiting for a caller that
+        // reaches it first.
+        RateControl::Vbr { target, max } | RateControl::VideoConference { target, max, .. } => {
             if target == 0 {
-                return Err("a VBR target of 0 bits per second".into());
+                return Err("a variable-bitrate target of 0 bits per second".into());
             }
             if max < target {
-                return Err(format!("a VBR ceiling of {max} bits per second below its target of {target}: the target would be unreachable by construction"));
+                return Err(format!(
+                    "a variable-bitrate ceiling of {max} bits per second below its target of {target}: the target would be unreachable by construction"
+                ));
             }
             if max == 0 {
-                return Err("a VBR ceiling of 0 bits per second".into());
+                return Err("a variable-bitrate ceiling of 0 bits per second".into());
             }
             // `target_percentage` is `target * 100 / max` on **u64**, because `target * 100` is a u32
             // multiplication that overflows past 42_949_672 bits per second — about 43 Mbit/s, which a
@@ -2720,7 +2845,7 @@ fn rate_control_record(mode: RateControl, window_ms: u32) -> Result<Vec<u8>, Str
             // hundred, clamped to 100 by the range check below into "reach the ceiling", which is a
             // file at a size nobody chose with no error anywhere.
             let scaled = u64::from(target) * 100;
-            let percentage = u32::try_from(scaled / u64::from(max)).map_err(|_| "a VBR percentage past the field's 32 bits".to_string())?;
+            let percentage = u32::try_from(scaled / u64::from(max)).map_err(|_| "a variable-bitrate percentage past the field's 32 bits".to_string())?;
             // `ceil`, not `floor`: a percentage that rounds *down* asks for less than the caller said.
             // The correction is `max(1)` — a target below 1% of the ceiling is still a target, and the
             // field has no zero.
@@ -4383,4 +4508,68 @@ fn read<T: Copy + Default>(bytes: &[u8]) -> Option<T> {
 #[cfg(test)]
 fn cqp_encoder(api: &Arc<Display>, references: u32) -> Result<VaEncoder, String> {
     VaEncoder::new(api, (640, 360), references, RateControl::ConstantQuantiser)
+}
+
+/// **`VA_RC_VCM` is refused for H.264, and the refusal is a measurement about the driver.**
+///
+/// # Why this is here rather than in the export gate's tests
+///
+/// [`RateControl`] is the shared vocabulary both codecs speak, and it now has a variant the H.264
+/// path will not build. **A reader who finds the variant may reasonably assume `VaEncoder` can take
+/// it** — and the export gate refusing it is not the same claim, because a gate is a pure function
+/// over settings that a caller can reach past. This is the claim that has to survive being reached
+/// past.
+///
+/// # What it asserts
+///
+/// - **The refusal is ours and it names the mode.** A driver that refused the bit would answer from
+///   `vaCreateConfig` with a `VAStatus` and no mode in it, which is a materially worse message for
+///   the same outcome; asserting the mode's name is how the two are told apart.
+/// - **It carries H.264's measured mask**, and the test checks the mask arithmetic itself: the
+///   refusal is justified by the two codecs' masks differing by exactly `VA_RC_VCM`, and a driver
+///   where they do not is a driver this reasoning does not hold for.
+/// - **The refusal is not about the record.** [`RateControl::VideoConference`] *builds* a
+///   well-formed `VAEncMiscParameterRateControl`, and [`super::hevc_submit`] — whose mask has the
+///   bit — submits the same mode with its `VAEncMiscParameterBufferMaxFrameSize` end to end. The
+///   H.264 refusal is about the advertisement, and this test says so by naming the number.
+///
+/// **Deliberate break:** an encoder that builds a session under `VA_RC_VCM` for H.264 fails here,
+/// and so does a message that gives the reason as this module's inability rather than the driver's.
+#[test]
+fn video_conference_mode_is_refused_for_h264_with_the_measured_reason() {
+    // **The arithmetic the refusal rests on, checked before the message that quotes it.** These are
+    // two measurements of one driver: H.265 reports `0x14de` and H.264 reports `0x14d6`, and the
+    // difference is exactly this bit. If that stops being true the refusal has to be re-measured,
+    // and this is where a driver that started offering VCM for H.264 says so.
+    // **H.265's mask is the superset**, so the difference is taken in that direction: `0x14de` less
+    // `0x14d6` is `0x08` and nothing else. (The other order is zero, which is the same fact read from
+    // the wrong end — a mask that is a subset of another differs from it by nothing in its own
+    // direction, and an assertion written that way would pass for ever.)
+    assert_eq!(
+        HEVC_RATE_CONTROL_MASK & !H264_RATE_CONTROL_MASK,
+        RC_VCM,
+        "the H.264 and H.265 rate-control masks no longer differ by exactly VA_RC_VCM ({H264_RATE_CONTROL_MASK:#x} against \
+         {HEVC_RATE_CONTROL_MASK:#x}), so the recorded reason for refusing it no longer holds and the refusal must be re-measured"
+    );
+    // **The mode this module refuses is the one the constant names**, so a change to either is a
+    // change to both and not a silent drift.
+    assert_eq!(RC_VCM, 0x0000_0008, "VA_RC_VCM (va.h:1113-1114)");
+    assert_eq!(
+        RateControl::VideoConference { target: 1, max: 2, max_frame_bits: 3 }.config_attribute(),
+        RC_VCM,
+        "the variant submits VA_RC_VCM and no other value"
+    );
+    // **A mode whose ceiling is nonsense is refused for the ceiling, not for the mode.** The
+    // constructor takes the three numbers a caller has; a cap of zero must not be answered with a
+    // message about `VA_RC_VCM`, which would send the reader looking for a driver problem that is
+    // not there. (It is a refusal before the session exists, so no display is needed to reach it.)
+    let Ok(display) = super::open_display() else {
+        eprintln!("SKIPPED: no VA-API display, so no session could be created to ask about the mode");
+        return;
+    };
+    let Err(why) = VaEncoder::new(&display, (640, 360), 1, RateControl::VideoConference { target: 2_000_000, max: 4_000_000, max_frame_bits: 66_667 }) else {
+        panic!("an H.264 encoder was built under VA_RC_VCM, which this driver's H.264 mask does not contain");
+    };
+    assert!(why.contains("VA_RC_VCM"), "the refusal names the mode rather than reporting a bare VAStatus: {why}");
+    assert!(why.contains(&format!("{H264_RATE_CONTROL_MASK:#x}")), "and carries H.264's measured mask, which is the reason: {why}");
 }

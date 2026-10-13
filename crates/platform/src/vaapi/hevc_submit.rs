@@ -384,43 +384,101 @@ pub mod slice_types {
          what this driver ACCEPTS is not measured, because our own submissions do not yet produce a picture";
 }
 
-/// `VA_RC_VCM` (`va.h:1114`): `0x00000008`.
+/// `VA_RC_VCM` (`va.h:1113-1114`): `0x00000008`.
 ///
-/// **It is in HEVC's rate-control mask and not H.264's, and the export gate does not offer it — but
-/// the reason has moved, because the first sweep's reason was falsified.**
+/// **It is in HEVC's rate-control mask and not H.264's, and both facts are load-bearing for
+/// exactly one decision: which gate takes the mode.**
 ///
 /// `VaEncoder::rate_control_names` lists H.264's eight modes and VCM is not among them, because VCM
 /// is not in the mask libva reports for `VAProfileH264Main` on this driver. For `VAProfileHEVCMain`
 /// the same query answers with `0x14de`, which **contains** `VA_RC_VCM` and therefore names it (the
-/// full expansion is on [`HEVC_RATE_CONTROL_MASK`]).
+/// full expansion is on [`HEVC_RATE_CONTROL_MASK`]). H.264's is `0x14d6` — the same eight less this
+/// bit — so the H.264 path refuses the mode with the two numbers in the message and the HEVC path
+/// takes it. **That is a statement about the driver, not about either gate**: the same
+/// [`super::encoder::RateControl::VideoConference`] is submitted by this path and refused by that
+/// one, and the only thing that differs is the mask.
 ///
 /// **What the first sweep concluded, and why it was wrong.** It read VCM's failure as the mode being
 /// unrunnable and recorded it as a refusal. **The re-taken sweep measures VCM *encoding*** — mean
-/// 9.1/255 from the source, ffmpeg silent, both with a rate-control record and with none. **So the
-/// driver runs it and the old reason is false.**
+/// 9.1/255 from the source, ffmpeg silent, both with a rate-control record and with none — and
+/// [`the_vcm_picture_cap_reaches_the_driver`] measures the *cap* on top of that. **So the driver
+/// runs it, and the old reason is false twice over**: first because the mode encodes, and then
+/// because the reason that was substituted for it ("nothing above this backend can name it") was
+/// itself removed by [`super::hevc_export`], which names it.
 ///
-/// **What the gate declines now, and why that is still the right answer.** The decline is **not**
-/// "this driver cannot do VCM" — it can. It is that **nothing above this backend can ask for it**:
-/// [`super::encoder::RateControl`] has no variant for it, FilmCraft's `BitrateMode` has no mode that
-/// means "a variable bit rate with a per-picture cap", and `ExportSettings` has no field for the cap.
-/// **Both of those files belong to the settings layer and neither is this backend's to grow**, which
-/// is why the measurement changed nothing here: wiring `VA_RC_VCM` needs a user-facing fidelity that
-/// does not exist yet, not a libva call. A mode that appears in one codec's mask and not the other's,
-/// and that no setting above it can name, is exactly the kind of thing that gets accepted silently
-/// the moment a mask bit is forwarded into a config attribute — so it stays a **named refusal with a
-/// stated reason**, and the reason is now the absence of a way to ask for it rather than the driver's
-/// inability to answer.
+/// **What it states, which is why it is not `Vbr`.** A rate *and* a ceiling on any one picture —
+/// `VAEncMiscParameterBufferMaxFrameSize`, submitted as [`MISC_MAX_FRAME_SIZE`]. The header owns
+/// two per-frame status bits and marks one of them **"(VCM only)"**
+/// (`VA_CODED_BUF_STATUS_BITRATE_HIGH`, `va.h:3894`). See
+/// [`super::encoder::RateControl::VideoConference`], which is where the numbers live.
+pub const VCM: u32 = super::encoder::RC_VCM;
+
+/// `VAEncMiscParameterTypeMaxFrameSize` (`va.h:2384-2385`): `4`, the type word of the
+/// `VAEncMiscParameterBufferMaxFrameSize` record this path submits alongside the rate-control record
+/// under [`VCM`].
 ///
-/// **`VA_RC_CQP` is the counter-example, and it is why this is a rule and not a shrug.** CQP was in
-/// the same position — unreachable through `RateControl`, and declined by the export gate on the
-/// reason that "this gate submits the bitrate" — and it was then **wired**, because its absence was a
-/// missing wire rather than a missing capability. **`VA_RC_VCM` is not the same case**, and the
-/// difference is the thing that would tell them apart: `BitrateMode` *has* a
-/// [`BitrateMode::ConstantQuality`](filmcraft_export::BitrateMode::ConstantQuality) that means
-/// exactly "a quantiser, no rate", so wiring CQP needed no new user-facing concept at all. **No
-/// `BitrateMode` means VCM**, so wiring it would mean inventing one — a product decision, stated as
-/// such rather than smuggled in with a libva change.
-pub const VCM: u32 = 0x0000_0008;
+/// **Declared here rather than in `ffi.rs` for the same reason [`VCM`] is**: it is a constant only
+/// the HEVC path submits, and `ffi.rs` is pinned for four codecs' decode. Its value is a plain
+/// enumerator and is asserted against the header in this module's tests.
+pub const MISC_MAX_FRAME_SIZE: u32 = 4;
+
+/// `VAEncMiscParameterBufferMaxFrameSize` (`va.h:2753-2762`): the **per-picture ceiling** VCM adds
+/// to a bit rate.
+///
+/// # The layout is pinned against the header, and the numbers are pasted rather than derived
+///
+/// `gcc` against `/usr/include/va/va.h` on this machine: `sizeof` **24**, `type` at **0**,
+/// `max_frame_size` at **4**, `va_reserved` at **8** with four `uint32_t`. The assertions in this
+/// module's tests re-state all four, so a field added or moved is a compile/test failure rather than
+/// a buffer the driver reads a neighbour's bytes from.
+///
+/// **It is in BITS.** `va.h:2745` — *"Defines a maximum frame size (in bits)"* — and `va.h:2757-2758`
+/// — *"Maximum size of a frame (in bits)"*. **The bytes one is
+/// `VAEncMiscParameterBufferMultiPassFrameSize`** (`va.h:2777-2778`, a different record for
+/// multi-pass), and a submission that used the two interchangeably would be a cap eight times the one
+/// asked for — which is not a subtle wrongness, it is a cap the user cannot see at all.
+///
+/// **`type` is `va_deprecated`** (`va.h:2755-2756`, *"duplicated with VAEncMiscParameterBuffer,
+/// should be deprecated"*) and the field is still written, because the record is laid out as
+/// `{ type, max_frame_size, va_reserved[4] }` and a record without the leading word is a different
+/// length. It carries [`MISC_MAX_FRAME_SIZE`], which is the same word the misc buffer's own header
+/// carries, so the two cannot disagree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct MaxFrameSize {
+    /// Shall be [`MISC_MAX_FRAME_SIZE`] (`va.h:2754`).
+    pub type_: u32,
+    /// The maximum size of a frame, in bits.
+    pub max_frame_size: u32,
+    /// Reserved, must be zero (`va.h:2760-2761`).
+    pub va_reserved: [u32; ffi::VA_PADDING_LOW],
+}
+
+impl MaxFrameSize {
+    /// The misc buffer this record travels in: [`ffi::VaEncMiscParameterBufferHeader`] then the
+    /// record, which is the same framing every other misc buffer on this path uses.
+    ///
+    /// **Written here rather than reused from `hevc_params` so that the two constants stay
+    /// together**: the type word, the struct and the field's units are one piece of the header, and
+    /// a reader checking any of them has all three in one place.
+    ///
+    /// **A cap of zero is refused rather than submitted.** The header gives this field no
+    /// "zero means no limit" reading — that clause belongs to `target_frame_size` in
+    /// `VAEncMiscParameterRateControl` (`va.h`), a different field in a different record — and a cap
+    /// of zero submitted to a driver that happens to read it as "unlimited" would be a ceiling of
+    /// nothing, which is the same defect as a rate of zero: a limit nobody chose, applied silently.
+    pub fn misc_buffer(max_frame_bits: u32) -> Result<Vec<u8>, String> {
+        if max_frame_bits == 0 {
+            return Err("a maximum frame size of 0 bits: VAEncMiscParameterBufferMaxFrameSize states a maximum and the header gives \
+                        this field no zero-means-unlimited reading, so a cap of nothing is a ceiling nobody asked for"
+                .into());
+        }
+        let record = MaxFrameSize { type_: MISC_MAX_FRAME_SIZE, max_frame_size: max_frame_bits, va_reserved: [0; ffi::VA_PADDING_LOW] };
+        let mut out = ffi::record_bytes(&ffi::VaEncMiscParameterBufferHeader { type_: MISC_MAX_FRAME_SIZE });
+        out.extend_from_slice(&ffi::record_bytes(&record));
+        Ok(out)
+    }
+}
 
 /// **`VA_RC_MB` (`va.h:1125`): **`0x00000080`**, and it is measured to encode — with a caveat that
 /// makes it a different kind of "works" from the other working rows.
@@ -514,11 +572,15 @@ pub const MB: u32 = 0x0000_0080;
 /// - **`VA_RC_TCBRC` fails on the *record*, not on the mode** — it encodes with no record at all and
 ///   fails at `vaRenderPicture` with CBR's, which is the signature of a record this backend cannot
 ///   build rather than a mode it cannot run.
-/// - **`VA_RC_VCM` encodes.** The old note called it a refusal because `RateControl` has no variant
-///   for it; **that reason is falsified** — the driver runs it. What is still true is that
-///   FilmCraft's settings and [`RateControl`] have no way to *name* it, so the export gate declines it
-///   as **unreachable rather than broken**. [`VCM`] keeps the constant and the mask measurement;
-///   **the refusal reason has moved.**
+/// - **`VA_RC_VCM` encodes, and is now wired end to end.** The old note called it a refusal because
+///   `RateControl` has no variant for it; **that reason is falsified** — the driver runs it. The
+///   reason that replaced it ("FilmCraft's settings have no way to *name* it, so the gate declines it
+///   as unreachable") is **falsified too**: [`super::encoder::RateControl::VideoConference`] and
+///   [`filmcraft_export::BitrateMode::VideoConference`] now name it, and the per-picture cap it
+///   states travels as [`MaxFrameSize`]. What this row is now evidence for is the *first* half —
+///   the mode runs — and the cap's own measurement is separate and named: the cap reaching the
+///   driver is `the_vcm_picture_cap_reaches_the_driver` in `tests/hevenc.rs`, because a mode that
+///   encodes is not a mode that honours its distinguishing control.
 /// - **`VA_RC_MB` encodes, and its sizes are `VA_RC_CQP`'s byte for byte.** That is a finding rather
 ///   than a duplicate row, and it is stated here so the table is not read as nine ways of saying the
 ///   same thing. `va.h:1122-1125` is explicit that `VA_RC_MB` *"may be combined with other RC modes,
@@ -802,6 +864,14 @@ pub struct HevcEncoder {
     /// that names the mode for a swept one.
     rate_control_attribute: u32,
     rate_control_buffer: Option<Vec<u8>>,
+    /// **The `VAEncMiscParameterBufferMaxFrameSize` buffer, `None` unless this stream is VCM.**
+    ///
+    /// **It does not depend on the key-frame interval, so [`HevcEncoder::key_frames_every`] does not
+    /// rebuild it** — the rate-control buffer is rebuilt there because its `window_size` is the
+    /// interval, and a buffer that were rebuilt for no reason would be one whose two copies could
+    /// differ. A cap is a property of the mode, not of the schedule, and it is built once next to
+    /// the config that fixes the mode.
+    max_frame_size: Option<Vec<u8>>,
     /// The reference depth the caller asked for.
     refs: usize,
     /// The pictures this encoder holds, oldest first. **The whole of the frame loop's state.**
@@ -857,6 +927,20 @@ impl HevcEncoder {
     /// an error, not a swap.
     pub fn at_variable_bitrate(display: &Arc<Display>, size: (u32, u32), references: u32, target: u32, max: u32) -> Result<Self, String> {
         Self::new(display, size, references, RateControl::Vbr { target, max })
+    }
+
+    /// **A video-conference-mode encoder**: a variable bit rate between a target and a ceiling, plus
+    /// a ceiling on any one picture in bits.
+    ///
+    /// **The third number is the whole difference from [`Self::at_variable_bitrate`], and it is not
+    /// optional.** `VA_RC_VCM` owns two coded-buffer status bits the header marks *"(VCM only)"*
+    /// (`va.h:3893-3894`), which is a per-frame statement, and the control that produces it is a
+    /// second misc buffer rather than a field of the rate-control record. A zero cap is refused by
+    /// [`MaxFrameSize::misc_buffer`] rather than submitted: `va.h:2758`'s field has no documented
+    /// zero, and a cap of zero submitted as "no cap" would be a claim the driver would have to
+    /// interpret.
+    pub fn at_video_conference(display: &Arc<Display>, size: (u32, u32), references: u32, target: u32, max: u32, max_frame_bits: u32) -> Result<Self, String> {
+        Self::new(display, size, references, RateControl::VideoConference { target, max, max_frame_bits })
     }
 
     /// A constant-quantiser HEVC Main encoder for `size`, holding up to `references` reference
@@ -1046,6 +1130,14 @@ impl HevcEncoder {
             None | Some(RateControl::ConstantQuantiser) => None,
             Some(mode) => Some(super::hevc_params::rate_control_record(mode, RATE_CONTROL_WINDOW_MS)?),
         };
+        // **The per-picture ceiling, built only for the mode that states one.** This is the
+        // difference between `VA_RC_VCM` and `VA_RC_VBR` in everything but the config attribute, and
+        // it is asked as a question — [`RateControl::max_frame_bits`] — rather than matched on the
+        // variant, so a mode that grows a cap later submits one without a new arm here.
+        let max_frame_size = match rate_control.as_ref().and_then(RateControl::max_frame_bits) {
+            Some(bits) => Some(MaxFrameSize::misc_buffer(bits)?),
+            None => None,
+        };
         Ok(Self {
             encoder,
             coded: size,
@@ -1056,6 +1148,7 @@ impl HevcEncoder {
             rate_control,
             rate_control_attribute: attribute,
             rate_control_buffer,
+            max_frame_size,
             refs: refs as usize,
             references: Vec::new(),
             sequence: sequence_record(size, width, height, 0, None)?,
@@ -1106,28 +1199,44 @@ impl HevcEncoder {
             .and_then(|values| values.first().copied())
     }
 
-    /// **Which rate-control modes this backend will submit for HEVC, as a mask.**
-    ///
-    /// It is H.264's set with `VA_RC_VCM` taken out, and it is written out rather than computed
+    /// **It is H.264's set with `VA_RC_VCM` taken out, and it is written out rather than computed
     /// from [`VCM`] alone so that a driver offering a mode nobody has a record for cannot be
-    /// accepted by a caller reading the mask.
-    /// **The rate-control modes in `mask` this backend refuses, by name** — which is `VA_RC_VCM` and
-    /// nothing else, today.
+    /// accepted by a caller reading the mask.**
+    ///
+    /// **That sentence describes what this backend *had* accepted, and it is now false of the
+    /// mask's own contents**: `HevcEncoder::refused_rate_control` is empty because every mode in
+    /// this mask that FilmCraft has a concept for is now submitted. `super::encoder` is the other
+    /// half of the change: the H.264 path refuses [`VCM`] with this number in its message, because
+    /// `0x14d6` does not contain the bit.
+    ///
+    /// **The rate-control modes in `mask` this backend refuses, by name — which is now none of
+    /// them, because the last one was wired.**
     ///
     /// A refusal list rather than an acceptance list, because a caller who passes this module's mask
     /// straight into a config attribute is asking a question the driver answers with "yes" for a mode
     /// this backend has no record to honour. Returning the difference names it.
     ///
-    /// **This is a refusal of `VA_RC_VCM` alone and is not a statement that the rest work** — it is
-    /// a refusal of *naming*, and [`hevc_rate_control_outcomes`] measures the modes themselves: the
-    /// re-taken sweep has **CBR, VBR, MB and VCM all encoding**, so VCM is here because nothing above
-    /// this backend can ask for it rather than because the driver will not run it.
+    /// **It used to be `VA_RC_VCM` alone, and it is empty now.** The reason it was refused was
+    /// **"nothing above this backend can name it"** — `RateControl` had no variant, `BitrateMode` had
+    /// no mode, and there was no field for the cap. All three now exist
+    /// ([`super::encoder::RateControl::VideoConference`],
+    /// [`filmcraft_export::BitrateMode::VideoConference`] and
+    /// [`MaxFrameSize`]), and the mode is submitted end to end. **This is a list that got shorter
+    /// by being measured, not by being deleted**: the cap reaching the driver is
+    /// `the_vcm_picture_cap_reaches_the_driver` in `tests/hevenc.rs`, and the two codecs' masks
+    /// still differ by exactly [`VCM`], so the H.264 path still refuses the same mode with the two
+    /// numbers in its message.
+    ///
+    /// **A reader who wants the modes still unnamed should ask the sweep, not this list.**
+    /// `ICQ`, `QVBR`, `TCBRC` and `MB` are in the driver's mask and have no `RateControl` variant:
+    /// ICQ and QVBR are **refuted by measurement** (`vaEndPicture` fails both with and without a
+    /// record), TCBRC wants per-frame channel feedback the export pipeline does not have, and MB is
+    /// a modifier on a base mode rather than a mode. None of those is a *naming* gap this function
+    /// describes, and listing them here would be claiming a measurement this function does not
+    /// make. See [`hevc_rate_control_outcomes`].
     pub fn refused_rate_control(mask: u32) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        if mask & VCM != 0 {
-            out.push("VA_RC_VCM (variable bitrate with a per-picture cap)");
-        }
-        out
+        let _ = mask;
+        Vec::new()
     }
 
     /// The record this encoder submits, `None` when it submits none.
@@ -1137,6 +1246,18 @@ impl HevcEncoder {
     /// driver was asked for reads [`HevcEncoder::config_attribute`] instead.
     pub fn rate_control(&self) -> Option<RateControl> {
         self.rate_control
+    }
+
+    /// **The per-picture ceiling this encoder submits, in bits**, or `None` when it is not a
+    /// video-conference-mode encoder.
+    ///
+    /// **Read back off the record that was built, not off the mode** — the two are the same number
+    /// only while [`MaxFrameSize::misc_buffer`] does what it says, and a caller that wants to know
+    /// what the *driver* was told reads this. The test that changes the cap and watches the pictures
+    /// change reads it here first, so a submission that ignored the cap fails there rather than
+    /// showing up as a test that passed for the wrong reason.
+    pub fn max_frame_bits(&self) -> Option<u32> {
+        self.rate_control.as_ref().and_then(RateControl::max_frame_bits)
     }
 
     /// **The `VAConfigAttribRateControl` value this encoder was created with**, which is what the
@@ -1561,6 +1682,18 @@ impl HevcEncoder {
         let ph_slice_param = self.encoder.buffer(PACKED_HEADER_PARAMETER_BUFFER_TYPE as _, &packed_header_parameter(PACKED_HEADER_SLICE, &header), 1)?;
         let rc_buf = self.rate_control_buffer.as_ref().map(|record| self.encoder.buffer(ffi::ENC_MISC_PARAMETER_BUFFER, record, 1));
         let rc_buf = rc_buf.transpose()?;
+        // **The per-picture ceiling, submitted next to the rate-control record that states the rate
+        // it caps.** Both are `VAEncMiscParameterBuffer` type buffers, so they differ only in the
+        // record behind the header; the driver reads each on its own type word.
+        //
+        // **It is pushed after the rate-control record, and the order is stated rather than assumed
+        // because the header does not state one.** The order below is the one this driver accepts,
+        // measured with the cap changing the output (see `the_vcm_picture_cap_reaches_the_driver` in
+        // `tests/hevenc.rs`), so this is a measurement like the rest of this list rather than a
+        // preference. A driver that needed the reverse would fail at `vaRenderPicture` naming no
+        // buffer, which is why it is worth having measured.
+        let mfs_buf = self.max_frame_size.as_ref().map(|record| self.encoder.buffer(ffi::ENC_MISC_PARAMETER_BUFFER, record, 1));
+        let mfs_buf = mfs_buf.transpose()?;
         // **Every handle is alive across the render.** `Buffer::drop` destroys its libva buffer, and
         // an `if let` that moved one into an arm dropped it before the render named its id — which is
         // exactly what iHD answers with `VA_STATUS_ERROR_INVALID_BUFFER`. See the H.264 note at the
@@ -1590,6 +1723,9 @@ impl HevcEncoder {
         buffers.push(ph_slice_data.id());
         buffers.push(slice_buf.id());
         if let Some(ref buf) = rc_buf {
+            buffers.push(buf.id());
+        }
+        if let Some(ref buf) = mfs_buf {
             buffers.push(buf.id());
         }
         if submits_the_quantization_misc_buffer() {
@@ -2715,4 +2851,88 @@ fn unescape_rbsp(escaped: &[u8]) -> Vec<u8> {
 /// here would be an `unsafe` block outside them. That is a rule, not a style preference.
 fn read<T: Copy + Default>(bytes: &[u8]) -> Option<T> {
     ffi::record_in::<T>(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    /// **The `VAEncMiscParameterBufferMaxFrameSize` record is the size and shape a C compiler
+    /// measures from `va.h`, and every number here is that one rather than arithmetic.**
+    ///
+    /// **Why this is a test at all.** libva has no `sizeof` / `offsetof` to ask at runtime, so a record
+    /// declared one field out of place does not fail a call — **the driver reads a neighbour's value
+    /// and encodes something else**, which is the worst class of failure this crate has. The cap is
+    /// the one record on this path whose only field is a 32-bit number sitting between a type word
+    /// and a reserved tail, so a field that moved would read the reserved bytes as the ceiling.
+    ///
+    /// The numbers came from a C program compiled against `/usr/include/va/va.h` on this machine
+    /// (`sizeof` 24; `type` 0; `max_frame_size` 4; `va_reserved` 8 with four `uint32_t`), and the
+    /// type word from `va.h:2384-2385` (`VAEncMiscParameterTypeMaxFrameSize = 4`).
+    #[test]
+    fn the_max_frame_size_record_is_the_layout_va_h_declares() {
+        assert_eq!(size_of::<MaxFrameSize>(), 24, "VAEncMiscParameterBufferMaxFrameSize (va.h:2753-2762): a u32 type, a u32 cap and VA_PADDING_LOW");
+        assert_eq!(offset_of!(MaxFrameSize, type_), 0, "the deprecated type word is the first field and is still written");
+        assert_eq!(offset_of!(MaxFrameSize, max_frame_size), 4, "the cap follows the type word, not a reserved hole");
+        assert_eq!(offset_of!(MaxFrameSize, va_reserved), 8, "and the four reserved words follow it (va.h:2760-2761)");
+        assert_eq!(MISC_MAX_FRAME_SIZE, 4, "VAEncMiscParameterTypeMaxFrameSize (va.h:2384-2385)");
+        // **The two words are the same one, and the record cannot be built with a different pair.**
+        // `va.h:2754` says the field "shall be set to #VAEncMiscParameterTypeMaxFrameSize", and the
+        // misc buffer's own header carries the type a driver dispatches on. A record whose two words
+        // disagreed would be a buffer of a type whose payload is not that record.
+        let buffer = MaxFrameSize::misc_buffer(1_234).expect("a cap of 1234 bits is a cap");
+        // The misc buffer is `VaEncMiscParameterBufferHeader` (one u32, `va.h:1973`) then the record.
+        let header = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+        assert_eq!(header, MISC_MAX_FRAME_SIZE, "the buffer's own header carries the type word");
+        assert_eq!(
+            u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
+            MISC_MAX_FRAME_SIZE,
+            "and the record's deprecated type field carries it too"
+        );
+        // **The cap is where the record says it is, and the reserved words are zero** — the header
+        // requires them to be zero (`va.h:2760-2761`), and a non-zero one is a driver reading data
+        // the header says is not there.
+        assert_eq!(u32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]), 1_234, "the cap is at offset 4 of the record, which is 8 of the buffer");
+        assert!(buffer[12..].iter().all(|byte| *byte == 0), "the reserved tail is zero, as va.h:2760-2761 requires");
+        assert_eq!(buffer.len(), 4 + 24, "a misc buffer is its four-byte header plus the record (va.h:1973)");
+    }
+
+    /// **A cap of zero is refused, and the refusal says what a zero would be.** It is not a number
+    /// this record can carry as "no limit": `va.h` gives that clause to `target_frame_size` in
+    /// `VAEncMiscParameterRateControl`, which is a different field in a different record, and the
+    /// header says of this one only that it is *"Maximum size of a frame (in bits)"*. A zero
+    /// submitted as a ceiling the driver reads as unlimited is a limit nobody chose, applied silently.
+    #[test]
+    fn a_cap_of_zero_is_refused_rather_than_submitted_as_no_limit() {
+        let Err(why) = MaxFrameSize::misc_buffer(0) else {
+            panic!(
+                "a per-picture cap of 0 bits was submitted: the header gives this field no zero-means-unlimited reading, and the clause that has one \
+                    belongs to target_frame_size in a different record"
+            );
+        };
+        assert!(why.contains("0 bits"), "the refusal names the number: {why}");
+        // **And the smallest cap that is accepted is a cap**, so this is a refusal of the value and
+        // not of the record: one bit is one bit.
+        assert!(MaxFrameSize::misc_buffer(1).is_ok(), "a one-bit cap is a cap, and the record builds it");
+    }
+
+    /// **The cap is read back off the submission, and it is the number the caller gave.**
+    ///
+    /// `HevcEncoder::max_frame_bits` answers from the `RateControl` the encoder was built with, and
+    /// this is the check that it and the record agree for the modes that have a cap — a gate that
+    /// read a different field, or a mode that grew a cap and found no arm, would show up here rather
+    /// than in a picture that is the wrong size.
+    #[test]
+    fn the_cap_is_reported_by_the_modes_that_state_one_and_by_no_other() {
+        let vcm = RateControl::VideoConference { target: 2_000_000, max: 4_000_000, max_frame_bits: 66_667 };
+        assert_eq!(vcm.max_frame_bits(), Some(66_667), "a video-conference mode states its cap, in bits");
+        assert_eq!(vcm.config_attribute(), VCM, "and submits VA_RC_VCM");
+        assert!(!vcm.names_its_own_quantiser(), "a rate and a cap is not a quantiser: the rate controller still picks each picture's");
+        // **The three modes with no cap answer `None`, and each is a real answer rather than a
+        // default** — an exhaustive match, so a mode that grew a cap has to say so here.
+        assert_eq!(RateControl::Cbr(1_000).max_frame_bits(), None, "CBR states no per-picture ceiling");
+        assert_eq!(RateControl::Vbr { target: 1_000, max: 2_000 }.max_frame_bits(), None, "VBR states no per-picture ceiling");
+        assert_eq!(RateControl::ConstantQuantiser.max_frame_bits(), None, "a constant quantiser states no per-picture ceiling");
+    }
 }

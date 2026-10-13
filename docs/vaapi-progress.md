@@ -469,7 +469,7 @@ record failure. On iHD 26.3.5 / libva 1.24, six 320x240 pictures each, changing 
 |---|---|---|---|---|---|
 | `VA_RC_CBR` (0x02) | encodes, mean 9.1/255 | encodes, mean 9.2/255 | yes | silent, 6/6 | works — the gate submits it |
 | `VA_RC_VBR` (0x04) | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | silent, 6/6 | works — the gate submits it |
-| `VA_RC_VCM` (0x08) | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | silent, 6/6 | **the driver runs it** |
+| `VA_RC_VCM` (0x08) | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | silent, 6/6 | **the driver runs it — and the gate now submits it**, see below |
 | **`VA_RC_CQP` (0x10) — THE CONTROL** | **encodes, mean 9.1/255**, sizes `[184, 51, 45, 43, 55, 48]` | **encodes, mean 9.1/255**, same sizes | yes | **silent, 6/6** | **works — and is what the gate now submits for a constant-quality export** |
 | `VA_RC_ICQ` (0x40) | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` | the same | no | — | **refuted — the mode, not the record** |
 | `VA_RC_MB` (0x80) | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | silent, 6/6 | accepted, but see below |
@@ -485,14 +485,17 @@ refutation now carries weight it did not have before, because the same `vaEndPic
 other modes seconds earlier. TCBRC fails only with the record.
 
 **`VA_RC_VCM` encodes**, at mean 9.1/255 with ffmpeg silent — which **falsifies the reason it was originally
-refused**. It is declined now for a different reason: nothing above the backend can name it, and a mode a
-caller cannot ask for is not a mode the path should accept. That is a statement about the settings surface,
-not about the driver, and the distinction matters: the earlier refusal would have been a claim about every
-driver. **`VA_RC_CQP` is the counter-example that keeps this a rule and not a shrug** — it was in exactly the same
-position (unreachable through `RateControl`, and declined by the gate on the reason that "this gate submits the
-bitrate") and was then **wired**, because `BitrateMode::ConstantQuality` already meant "a quantiser, no rate", so
-wiring it needed no new user-facing concept. **No `BitrateMode` means VCM**, so wiring it would mean inventing
-one — a product decision, stated as such rather than smuggled in with a libva change.
+refused**. It is **wired now**, and the second reason it carried in between is false as well: `9c75de0e` added
+`BitrateMode::VideoConference`, so the settings surface *can* name it, and the per-picture cap it states is derived
+rather than absent. §3.10 has the wiring and the measurement of the cap reaching the driver.
+
+**The reason that was substituted for the original one was the useful part.** "The driver runs it but nothing above
+the backend can name it" is a statement about *this tree's* plumbing, dressed in the clothes of a statement about the
+driver — the same mistake `VA_RC_CQP` was refused for ("this gate submits the bitrate", true of the gate and
+silent about the driver) and the same mistake the H.264 gate now makes correctly **about** the driver when it
+declines VCM by name. **The distinction is between the two and it is checkable**: one is a number in a mask
+(`0x14d6` for H.264 against `0x14de` for H.265, the same driver and the same query), the other is a missing
+variant. A refusal must say which.
 
 **`VA_RC_MB` encodes, and its sizes are `VA_RC_CQP`'s byte for byte** (`[184, 51, 45, 43, 55, 48]` under both a
 record and none). That is a finding rather than a duplicate row: `va.h:1122-1125` says `VA_RC_MB` *"may be
@@ -555,6 +558,75 @@ contradicts, or whose picture's `slice_type` contradicts the sample table's sync
 two real defects in itself — it had taken the caller's geometry rather than the sample entry's own dimensions,
 and its key-frame predicate was `written == 2 != key_frame` where the sound form is `key_frame && written != 2`
 (an I slice in a TRAIL picture is legal HEVC; an IDR with non-I slices is an unstartable sync sample).
+
+#### 3.9a `VA_RC_VCM` is wired for HEVC, and refused for H.264 **as a fact about the driver**
+
+`BitrateMode::VideoConference` was named by `9c75de0e` and both gates let it fall through their `_ =>` arm to a
+plain variable bit rate — so the summary printed *"Video conference (VCM), Target 20.00 Mbps, Max 30.00 Mbps"*
+beside a file with **none of the guarantee the name promises**. That is the same defect class as the
+`ConstantQuality` substitution fixed earlier, and it is invisible for VCM in a way it is not for a quantiser:
+**VCM *does* state a rate, so the substituted file is perfectly plausible.** The cap is a ceiling on *one
+picture* (`VAEncMiscParameterBufferMaxFrameSize`, `va.h:2753-2762`, in **bits**) and it is a **second misc
+buffer**, not a field of `VAEncMiscParameterRateControl` — which is why a mode can be wired and still be wired
+with its distinguishing control missing.
+
+**The two gates differ, and the reason is a number rather than a preference.** This driver reports
+`VAConfigAttribRateControl = 0x14de` for `VAProfileHEVCMain` and `0x14d6` for `VAProfileH264Main` — the same
+driver, the same query, one bit apart, and that bit is `VA_RC_VCM`. So:
+
+- **HEVC takes it.** `RateControl::VideoConference { target, max, max_frame_bits }` submits `0x08` plus the
+  `max_frame_size` record, and `HevcBitrate::VideoConference` carries the same three numbers out of
+  `hevc_config_for`. **`HevcBitrate::build` handing the ceiling to `HevcEncoder` has its own test**, because
+  that is the one place the gate's fidelity and the encoder meet, and the export path cannot observe it
+  (the registered factory returns a `Box<dyn VideoEncoder>`).
+- **H.264 refuses it by name, and says it is the driver.** The message quotes what the mode states, both mask
+  numbers, and where the mode *is* available. **This is the distinction the module history keeps getting wrong**:
+  `VA_RC_CQP` was refused here on the reason that "this gate submits the bitrate" — true of the gate, silent
+  about the driver — and `VA_RC_VCM` was for a while refused on "nothing above the backend can name it", which
+  is a claim about this tree. A refusal must say which of the two it is, and `VaEncoder::new` refuses the
+  mode for H.264 on the same measured fact, so a caller reaching past the gate is told the same thing.
+
+**Where the cap lives, and why it is derived.** `ExportSettings` has no field for it. The ceiling is
+*the target rate's share of one picture* — `target_bps * rate.den / rate.num` bits, rounded up — computed in
+`hevc_export::per_picture_ceiling`. Three reasons, and the third is the one that would change the decision:
+
+1. **Every input is already on the summary line.** The mode names a bitrate, so the summary prints the target,
+   the ceiling and the frame rate, and all three are terms of the derived number. A cap the user cannot see is
+   a cap the user cannot reason about.
+2. **A field with no control behind it is the defect the mode was created to fix.** `VA_RC_VCM` sat unwired
+   because a capability no setting could name never reaches a driver; a field reachable only from a
+   hand-edited project file and a test reproduces that one layer up.
+   `every_input_the_derived_per_picture_ceiling_needs_is_on_the_summary_line` asserts the *absence* of such a
+   field from the serialized settings, so adding one becomes a deliberate act.
+3. **Making it a real control is a `crates/ui-egui` change**, and a real one. Until that exists the derived
+   number is the one FilmCraft can justify from what it was given. The cost is stated rather than hidden: a
+   user cannot choose a ceiling other than the rate's own share.
+
+**The cap reaching the driver is measured, and the measurement is red-able.**
+`the_vcm_picture_cap_reaches_the_driver` holds the rate, the ceiling, the frame rate, the key-frame interval and
+the six pictures fixed and changes one number. The first version compared total coded size, and **the measurement
+refused that assertion**: at 320×240 the ramp is small enough that a cap changes the controller's *path* and not
+only its ceiling, and the totals run 443 bytes at a 200-bit cap, 528 at 2000 and 472 at 20000 — a *tighter* cap
+produced a larger stream in the middle of the range. So the assertion is on **the driver's own average
+quantiser**, the low byte of each segment's status word (`VA_CODED_BUF_STATUS_PICTURE_AVE_QP_MASK`, `va.h:3897`),
+which has a reason behind it that a size does not: **meeting a small ceiling needs a coarser quantiser**. Six
+320×240 pictures, 2 Mbit/s target, 30 fps:
+
+| cap (bits) | average QP per picture | coded sizes |
+|---|---|---|
+| 200 | 50, 51, 50, 44, 41, 42 | 148, 68, 74, 88, 28, 37 |
+| 800 | 50, 44, 49, 41, 40, 36 | 148, 89, 50, 84, 37, 77 |
+| 66 667 (the derived value) | 11, 12, 10, 10, 10, 10 | 264, 38, 39, 42, 43, 46 |
+| 2 000 000 | 11, 12, 10, 10, 10, 10 | 264, 38, 39, 42, 43, 46 |
+| 100 000 000 | 11, 12, 10, 10, 10, 10 | 264, 38, 39, 42, 43, 46 |
+
+**The control is a plain-VBR run in the same process, asserted first**, and the three loose caps agreeing byte for
+byte is what makes the tight row evidence rather than noise: the driver is deterministic for a given submission,
+and a cap that does not bind does not move a byte. Removing the submission from `HevcEncoder::encode` fails the
+quantiser comparison; sending the cap in the *bytes* of `VAEncMiscParameterBufferMultiPassFrameSize` instead of
+the bits of this one fails the submission check. **This is not "matches ffmpeg"** and it is not a comparison with
+any other encode — it is a direction the driver's own output must take, checked against the same encoder's run
+with a cap it does not have to obey.
 
 ### 3.10 Every built-in preset, against both hardware gates
 
@@ -1072,15 +1144,14 @@ initialisation and this is the pattern that provokes it.
   §2.
 - **HEVC encode, what is still refused** — §3.9. Each refusal carries its measurement: reference depth > 1
   (measured on HEVC's own numbers, and the same silent-divergence signature H.264 shows), multi-slice
-  pictures, B pictures, `VA_RC_VCM` (**because nothing above the backend can name it** — `BitrateMode` has
-  no variant meaning "a variable bit rate with a per-picture cap", so wiring it is a settings-layer decision;
-  the driver itself runs it, which the third sweep measured), `VA_RC_ICQ` and `VA_RC_QVBR` (**refuted**:
-  both fail at `vaEndPicture` with and without a rate-control record, while five other modes succeeded
-  through the same call in the same process), TCBRC (fails on the record, not the mode), a non-8-multiple
-  picture size (no crop exists in HEVC's record to ask for one with), HDR, MXF, and non-square pixels.
-  **Constant-quality is no longer in this list**: `VA_RC_CQP` is measured working and is wired, with the
-  export test asserting the quantiser reaches the pictures. **No HEVC preset ships**, so nothing here is
-  reachable from one until one exists.
+  pictures, B pictures, `VA_RC_ICQ` and `VA_RC_QVBR` (**refuted**: both fail at `vaEndPicture` with and
+  without a rate-control record, while five other modes succeeded through the same call in the same
+  process), TCBRC (fails on the record, not the mode), a non-8-multiple picture size (no crop exists in
+  HEVC's record to ask for one with), HDR, MXF, and non-square pixels. **`VA_RC_VCM` is no longer in
+  this list**: it is wired, and §3.10 records the cap reaching the driver. **Constant-quality is no
+  longer in it either**: `VA_RC_CQP` is measured working and is wired, with the export test asserting
+  the quantiser reaches the pictures. **No HEVC preset ships**, so nothing here is reachable from one
+  until one exists.
 - **`VA_RC_MB` combined with a base mode** — `va.h:1122-1125` calls `VA_RC_MB` a modifier that "may be
   combined with other RC modes, except CQP", and the sweep submitted it alone. A bare `0x80` produces output
   **byte-identical to `VA_RC_CQP`'s**, which is what a modifier with nothing to modify looks like. The

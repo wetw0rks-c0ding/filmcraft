@@ -1437,8 +1437,72 @@ fn the_export_gate_takes_what_it_can_express_and_declines_the_rest_with_its_reas
     };
     assert!(why_qp.contains("51"), "the refusal names the range it enforces: {why_qp}");
 
-    // **A fractional frame rate is taken, not rounded**, because the VUI states an exact rational:
-    // `rate` carries 24000/1001 and `fps` is the whole number the *driver's* misc buffer carries,
+    // **`BitrateMode::VideoConference` is taken, and what it submits is a rate *and* a per-picture
+    // ceiling.** The mode is `VA_RC_VCM`, which the sweep measures encoding on this driver, and the
+    // ceiling is the number that makes it VCM rather than VBR
+    // (`VAEncMiscParameterBufferMaxFrameSize`, `va.h:2753-2762`).
+    //
+    // **The rate is VBR's rate, byte for byte** — asserted against the VBR row the test already
+    // computed, because a gate that gave VCM a ceiling of its own would produce a different file
+    // from a mode whose rate half is identical.
+    let mut vcm = hevc_settings(String::new());
+    vcm.bitrate_mode = BitrateMode::VideoConference;
+    let taken_vcm = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::FPS_30, &vcm)
+        .expect("VA_RC_VCM is measured working on this driver and this gate submits it, so a video-conference HEVC export is one it can encode");
+    let HevcBitrate::VideoConference { target, max, max_frame_bits } = taken_vcm.bitrate else {
+        panic!("a video-conference export was not submitted as a rate with a per-picture ceiling: {:?}", taken_vcm.bitrate);
+    };
+    assert_eq!((target, max), (2_000_000, 4_000_000), "VCM's rate is the same target and ceiling VBR submits — the cap is the only difference");
+    // **And the gate is rate-controlled, not quantiser-controlled.** `HevcEncoderExport::build`
+    // refuses an encoder whose two halves disagree, and under this mode every request must therefore
+    // name no quantiser. A gate that answered `true` here would be refused at the first picture.
+    assert!(!taken_vcm.bitrate.names_its_own_quantiser(), "VCM states a rate, so the requests must name no quantiser");
+    assert_eq!(taken_vcm.bitrate.quantiser(), None, "and there is no quantiser for a request to carry under VCM");
+
+    // **The ceiling is the target rate's share of one picture, in bits.**
+    //
+    // **2 Mbit/s over 30 pictures a second is 66 666.67 bits each**, rounded up to 66 667. The
+    // number is written out rather than re-derived with the gate's own expression, because a test
+    // that computed the expected value the way the code does cannot catch the code being wrong in
+    // the way the code is.
+    assert_eq!(max_frame_bits, 66_667, "the per-picture ceiling the gate derived is not 2 Mbit/s over 30 frames (66 666.67 bits, rounded up)");
+    // **The three properties that make it a ceiling and not a second bitrate.** All three are stated
+    // as relations rather than as literals, so they hold for any settings this test might be given
+    // next: it is **below the rate** (a picture may not weigh a whole second), it is **a whole
+    // number of bits in a 32-bit field**, and it **moves with the frame rate** — which is the one
+    // that separates it from every other number on `ExportSettings`, since the same number means
+    // something different at 15 fps.
+    assert!(u64::from(max_frame_bits) < u64::from(target), "a per-picture ceiling of {max_frame_bits} bits is not below the {target} bit/s rate it caps");
+    assert!(
+        u64::from(max_frame_bits).checked_mul(30).is_some(),
+        "a per-picture ceiling must be multiplied by the frame rate without overflowing, so the arithmetic that produced it is checkable"
+    );
+    // **The frame rate is what moves it, and that is the assertion a hard-coded cap fails.** At 15 fps
+    // the same 2 Mbit/s gives each picture twice as long, so the ceiling must double — to
+    // 133 334 bits, 2 000 000 over 15 being 133 333.33.
+    let half_rate = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::new(15, 1), &vcm).expect("15 fps is a rate this gate takes");
+    assert_eq!(
+        half_rate.bitrate.max_frame_bits(),
+        Some(133_334),
+        "at 15 fps the same 2 Mbit/s leaves each picture twice as long, so the ceiling must rise to 133 334 bits"
+    );
+    // **And a rate it cannot divide by is refused by number rather than yielding a cap of nothing.**
+    // `rate.num` and `rate.den` are `i64` and arrive from a project file.
+    for bad in [FrameRate::new(0, 1), FrameRate::new(-30, 1), FrameRate::new(30, 0), FrameRate::new(30, -1)] {
+        let Err(why_bad) = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, bad, &vcm) else {
+            panic!("a video-conference export at a frame rate of {bad:?} was accepted, and its per-picture ceiling is that rate's share of one picture");
+        };
+        assert!(why_bad.contains("per-picture") || why_bad.contains("frame rate"), "the refusal names the arithmetic that could not be done: {why_bad}");
+    }
+    // **A frame rate so slow the ceiling would not fit the record's 32-bit field is refused too**,
+    // which is a `checked_mul` the gate does not get to skip: 4 000 000 bit/s at 1/1000 of a frame a
+    // second is 4e9 bits, and `va.h:2757-2758`'s field is 32 bits wide.
+    let Err(too_slow) = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::new(1, 1000), &vcm) else {
+        panic!("a per-picture ceiling past the record's 32-bit field was accepted");
+    };
+    assert!(too_slow.contains("32-bit") || too_slow.contains("1/1000"), "the refusal names the field the number would not fit: {too_slow}");
+
+    // **A fractional frame rate is taken, not rounded**, because the VUI states an exact rational:    // `rate` carries 24000/1001 and `fps` is the whole number the *driver's* misc buffer carries,
     // which is 24. Both numbers are asserted, because the test that only checked `fps` could not see
     // a gate that threw the caller's rate away and re-rounded.
     //
@@ -2417,5 +2481,452 @@ fn every_rate_the_gate_takes_states_that_rate_in_the_bitstream_and_in_the_contai
             format!("{}/{}", rate.num, rate.den),
             "{name} fps: ffmpeg read the elementary stream as {said_rate}, which is the rate a decoder gets from this bitstream alone"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The per-picture ceiling: `VAEncMiscParameterBufferMaxFrameSize`, and whether it reaches the driver
+// ---------------------------------------------------------------------------------------------
+
+/// What one capped encode produced, and what an independent decode of it says.
+#[derive(Debug)]
+struct Capped {
+    /// Coded bytes per picture, in order.
+    sizes: Vec<usize>,
+    /// The driver's own average quantiser per picture — the low byte of each segment's status word,
+    /// which is `VA_CODED_BUF_STATUS_PICTURE_AVE_QP_MASK` (`va.h:3897`).
+    average_qp: Vec<u8>,
+    /// What the encoder reports it was built with, read back off the submission rather than off the
+    /// caller's own argument.
+    submitted_cap: Option<u32>,
+    /// Whatever ffmpeg said, trimmed; empty is the claim this file makes.
+    diagnostic: String,
+    /// Pictures ffmpeg returned.
+    decoded: usize,
+    /// Mean absolute deviation of the decode from the **source**, over every luma sample returned.
+    mean: f64,
+    /// The worst single sample.
+    worst: u8,
+}
+
+/// **Six pictures, one rate, one number changed: a video-conference-mode encode whose per-picture
+/// ceiling is `cap`, or a plain variable-bitrate encode when `cap` is `None`.**
+///
+/// **Every input is identical between runs** — the same ramps, the same 30 fps, the same target and
+/// ceiling in bits per second, the same key-frame interval, the same six pictures in the same order —
+/// so any difference in what comes out is the cap and nothing else. That is the whole design, and it
+/// is why `cap` is the only argument.
+fn encode_capped(cap: Option<u32>, pictures: usize) -> Result<Capped, String> {
+    let display = crate_display()?;
+    const TARGET: u32 = 2_000_000;
+    const CEILING: u32 = 4_000_000;
+    let mut encoder = match cap {
+        Some(bits) => HevcEncoder::at_video_conference(&display, (WIDTH, HEIGHT), 1, TARGET, CEILING, bits)?,
+        None => HevcEncoder::at_variable_bitrate(&display, (WIDTH, HEIGHT), 1, TARGET, CEILING)?,
+    };
+    encoder.at_rate(30)?;
+    encoder.key_frames_every(0)?;
+    // **The request shape is read off the encoder**, so the control row goes through exactly the
+    // submission an export gives it and nothing is accommodated for it here.
+    let names_its_own_quantiser = !encoder.rate_controlled();
+    let mut sizes = Vec::new();
+    let mut average_qp = Vec::new();
+    let mut stream = Vec::new();
+    for frame in 0..pictures as u32 {
+        let (luma, chroma) = ramp_shifted(WIDTH, HEIGHT, frame * SHIFT)?;
+        encoder.upload(&luma, &chroma)?;
+        let request = if names_its_own_quantiser {
+            if frame == 0 { HevcEncodeRequest::key_frame(QP)? } else { HevcEncodeRequest::predicted(QP)? }
+        } else if frame == 0 {
+            HevcEncodeRequest::key_frame_at_rate()
+        } else {
+            HevcEncodeRequest::predicted_at_rate()
+        };
+        let request = if frame + 1 == pictures as u32 { request.last() } else { request };
+        let picture = encoder.encode(request)?;
+        sizes.push(picture.bytes.len());
+        // `status` is one word per segment; the average quantiser is its low byte and everything
+        // else in it is a flag this test has no claim about.
+        average_qp.extend(picture.status.iter().map(|w| (*w & 0xff) as u8));
+        stream.extend_from_slice(&picture.bytes);
+    }
+    let submitted_cap = encoder.max_frame_bits();
+    let _ = encoder.flush();
+    let path = scratch(&format!("vcm-cap-{}.h265", cap.map(|c| c.to_string()).unwrap_or_else(|| "none".to_string())));
+    std::fs::write(&path, &stream).map_err(|e| format!("writing the elementary stream: {e}"))?;
+    let decoded = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "hevc", "-i", path.to_str().unwrap_or_default(), "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .output()
+        .map_err(|e| format!("ffmpeg could not be run: {e}"))?;
+    let diagnostic = String::from_utf8_lossy(&decoded.stderr).trim().to_string();
+    let frame_bytes = (WIDTH * HEIGHT) as usize;
+    let mut sum = 0u64;
+    let mut worst = 0u8;
+    let mut counted = 0u64;
+    let mut count = 0usize;
+    for frame in 0..pictures {
+        let Some(got) = decoded.stdout.get(frame * frame_bytes..(frame + 1) * frame_bytes) else { break };
+        count += 1;
+        let (want, _) = ramp_shifted(WIDTH, HEIGHT, frame as u32 * SHIFT).unwrap_or_default();
+        for (a, b) in got.iter().zip(want.iter()) {
+            sum += u64::from(a.abs_diff(*b));
+            worst = worst.max(a.abs_diff(*b));
+            counted += 1;
+        }
+    }
+    Ok(Capped { sizes, average_qp, submitted_cap, diagnostic, decoded: count, mean: sum as f64 / counted.max(1) as f64, worst })
+}
+
+/// The display, or a refusal naming why — a skip is not a pass, so the reason is the error.
+fn crate_display() -> Result<std::sync::Arc<Display>, String> {
+    display().ok_or_else(|| "no VA-API display on this machine".to_string())
+}
+
+/// The mean of the driver's own per-picture average quantisers.
+fn mean_qp(run: &Capped) -> f64 {
+    if run.average_qp.is_empty() {
+        return f64::NAN;
+    }
+    run.average_qp.iter().map(|q| f64::from(*q)).sum::<f64>() / run.average_qp.len() as f64
+}
+
+/// **The per-picture ceiling reaches the driver — and the test is built so that removing the
+/// submission makes it fail.**
+///
+/// # What is being claimed
+///
+/// `VA_RC_VCM` states a rate *and* a maximum size for any one picture. The rate is a field of
+/// `VAEncMiscParameterRateControl`, which this path has submitted since before VCM was named. **The
+/// ceiling is not a field of that record**: it is a second misc buffer,
+/// `VAEncMiscParameterBufferMaxFrameSize` (`va.h:2753-2762`, in **bits**), with its own type word.
+/// So a mode that is wired can still be wired with the distinguishing control missing, and the only
+/// way to know is to change the number and watch the output.
+///
+/// # Why "different bytes" is not the assertion
+///
+/// The first version of this compared total coded size, and **the measurement refused it**: at
+/// 320x240 the ramp is small enough that a cap changes the rate controller's *path*, not only its
+/// ceiling, and the totals run 443 bytes at a 200-bit cap, 528 at 2000 and 472 at 20000 — a tighter
+/// cap produced a **larger** stream in the middle of the range. An assertion of the form "a tighter
+/// ceiling is a smaller stream" is therefore false on this driver, and a test that asserted it would
+/// be asserting something about a lossy encoder that is not true.
+///
+/// **What is asserted instead is the driver's own average quantiser per picture**, the low byte of
+/// each segment's status word (`VA_CODED_BUF_STATUS_PICTURE_AVE_QP_MASK`, `va.h:3897`). It has a
+/// reason behind it that a size does not: **meeting a small ceiling requires coarser quantisation**,
+/// so a cap the driver must obey must raise it. Measured on iHD 26.3.5 / libva 1.24 at 2 Mbit/s
+/// target, 30 fps, 320x240:
+///
+/// | cap (bits) | average QP per picture | coded sizes |
+/// |---|---|---|
+/// | 200 | 50, 51, 50, 44, 41, 42 | 148, 68, 74, 88, 28, 37 |
+/// | 800 | 50, 44, 49, 41, 40, 36 | 148, 89, 50, 84, 37, 77 |
+/// | 2 000 000 | 11, 12, 10, 10, 10, 10 | 264, 38, 39, 42, 43, 46 |
+/// | 100 000 000 | 11, 12, 10, 10, 10, 10 | 264, 38, 39, 42, 43, 46 |
+///
+/// **This is not "matches ffmpeg" and is not a comparison with any other encode.** It is a
+/// direction the driver's own output must take if it read the cap, and it is checked against nothing
+/// but the same encoder's run with a cap it does not have to obey.
+///
+/// # The control, and it runs in this process, first
+///
+/// **A plain variable-bitrate encode at the same target and ceiling, with no cap at all.** It is the
+/// path the gate has submitted since the H.264 milestone, so it is a known-good row, and it is
+/// asserted **before** the cap rows are read: a run in which a small cap produced coarser pictures
+/// is not evidence if nothing else in the process encoded. **The control and the cap rows are the
+/// same six pictures at the same rate**, so the control is a measurement of this encoder on this
+/// machine minutes earlier rather than of a table.
+///
+/// The second half of the control is the **loose cap**: 66 666 bits — the number the gate derives for
+/// 2 Mbit/s at 30 fps — is far above what a 320x240 ramp weighs, so it must leave the output
+/// **byte-identical** to a cap of 2 000 000 and of 100 000 000. That equality is what makes the first
+/// comparison evidence rather than noise: the driver is deterministic for a given submission, and a
+/// cap that does not bind does not move a byte.
+///
+/// # Deliberate breaks
+///
+/// - **Not submitting the cap at all** — a submission that built the buffer and then dropped it, or
+///   one that sent a fixed number: the tight and loose runs come out identical and the quantiser
+///   comparison fails.
+/// - **Sending the cap in bytes rather than bits** (`va.h:2777-2778` is the *other* record, the
+///   multi-pass one): every cap in this test is under 2^16 bits, so a bytes value eight times larger
+///   would still be small enough for a 320x240 ramp to fit inside, and the tight row would then
+///   produce the loose row's quantiser and fail here.
+/// - **A cap that the driver ignores**: the tight run's quantiser would be the loose run's, which is
+///   the same failure, seen from the driver rather than from this path.
+///
+/// **The tight row's fidelity is held to the same tolerance as the others, and the note on that is
+/// a measurement rather than a prediction.** A 200-bit ceiling is 25 bytes for a whole 320x240
+/// picture and the driver is reported at QP 50 for it, so *a content that could not survive that*
+/// would be a legitimate output — and it is the test's own smooth ramp, which does, at **9.1/255
+/// mean and 32 worst**, the same figures every other row in this file measures. So the row is
+/// asserted at the usual bounds rather than excused from them, and what it is evidence for is the
+/// **quantiser and the bytes**, not the fidelity: a cap that reached the driver *and* visibly cost
+/// the picture something would be a different claim, and one this content cannot make either way.
+#[test]
+fn the_vcm_picture_cap_reaches_the_driver() {
+    let _guard = lock();
+    if filmcraft_testkit::ffmpeg_or_skip("the VCM per-picture cap").is_none() {
+        return;
+    }
+    const PICTURES: usize = 6;
+    /// The ceiling the gate derives for 2 Mbit/s at 30 fps: `2_000_000 * 1 / 30` is 66 666.67 bits,
+    /// rounded **up** to 66 667 — and the arithmetic is spelled out here because a test that
+    /// re-derived it with the same expression would pass whatever the gate computed.
+    const DERIVED: u32 = 66_667;
+    /// Far below what a 320x240 ramp weighs, so the driver has to coarsen to meet it.
+    const TIGHT: u32 = 200;
+    /// A cap this size and a cap four orders of magnitude larger must not differ: neither binds.
+    const LOOSE: u32 = 2_000_000;
+    /// A cap no picture here could reach, for the same reason and with the same claim to make.
+    const LOOSEST: u32 = 100_000_000;
+
+    // **(0) THE CONTROL, first.** The known-good path, in this process, with no accommodation.
+    let control = encode_capped(None, PICTURES).expect("a plain variable-bitrate encode of six pictures: the path this gate has submitted all along");
+    assert_eq!(
+        control.submitted_cap, None,
+        "the control run is a variable-bitrate encoder and states no per-picture ceiling, so this is the row everything else is read against"
+    );
+    assert!(control.diagnostic.is_empty(), "the control run — plain VBR, no cap — decoded with a diagnostic: {}", control.diagnostic);
+    assert_eq!(control.decoded, PICTURES, "the control run: ffmpeg decoded {} of {PICTURES} pictures", control.decoded);
+    assert!(control.mean <= 16.0, "the control run decoded {:.1}/255 from the source, over this encoder's measured 16", control.mean);
+    eprintln!(
+        "VCM per-picture cap, CONTROL (plain VBR, no cap): QP {:?}, sizes {:?}, {:.1}/255 from the source",
+        control.average_qp, control.sizes, control.mean
+    );
+
+    let run = |cap: u32| -> Capped {
+        encode_capped(Some(cap), PICTURES).unwrap_or_else(|why| panic!("a video-conference encode with a cap of {cap} bits was refused: {why}"))
+    };
+
+    let tight = run(TIGHT);
+    let loose = run(LOOSE);
+    let loosest = run(LOOSEST);
+    let derived = run(DERIVED);
+    for (label, got) in [("tight", &tight), ("loose", &loose), ("loosest", &loosest), ("derived", &derived)] {
+        eprintln!(
+            "VCM cap {label:>8}: QP {:?} (mean {:.1}), sizes {:?}, {}/{} pictures decoded, {:.1}/255 from the source, ffmpeg {}",
+            got.average_qp,
+            mean_qp(got),
+            got.sizes,
+            got.decoded,
+            PICTURES,
+            got.mean,
+            if got.diagnostic.is_empty() { "silent" } else { &got.diagnostic }
+        );
+    }
+
+    // **(1) The submission carries the number the caller asked for.** Read back off the encoder
+    // rather than off the argument, so a path that accepted a cap and did not submit it fails here
+    // rather than in the comparison below.
+    for (label, got, want) in [("tight", &tight, TIGHT), ("loose", &loose, LOOSE), ("loosest", &loosest, LOOSEST), ("derived", &derived, DERIVED)] {
+        assert_eq!(got.submitted_cap, Some(want), "the {label} encoder was built with a cap of {want} bits and reports carrying a different one");
+        assert_eq!(got.average_qp.len(), PICTURES, "the {label} run reported {} status words for {PICTURES} pictures", got.average_qp.len());
+    }
+
+    // **(2) A cap the driver does not have to obey changes nothing, byte for byte.** This is what
+    // makes the comparison below evidence about the cap rather than about the driver being
+    // nondeterministic: a submission that ignored the cap, or that sent a fixed number, would also
+    // make these three agree — and would then fail (3), which is the point.
+    assert_eq!(
+        (derived.sizes.as_slice(), derived.average_qp.as_slice()),
+        (loose.sizes.as_slice(), loose.average_qp.as_slice()),
+        "a cap of {DERIVED} bits and a cap of {LOOSE} bits produced different output, though neither can bind a 320x240 ramp: the driver is not \
+         deterministic for a given submission, so the comparison against a tight cap below would be measuring noise"
+    );
+    assert_eq!(
+        (derived.sizes.as_slice(), derived.average_qp.as_slice()),
+        (loosest.sizes.as_slice(), loosest.average_qp.as_slice()),
+        "a cap of {LOOSEST} bits differs from one of {DERIVED}, and no picture here weighs anything like either"
+    );
+
+    // **(3) THE CLAIM: a ceiling the driver must meet coarsens the pictures.** The direction is the
+    // reason — meeting a small maximum needs a coarser quantiser — and the threshold is set from the
+    // loose row's own measurement rather than chosen to make a test pass: the loose row is at ~10.8
+    // and the tight row is at ~46, so a bound anywhere between the two separates them and a bound
+    // near the loose row's own value would still catch a cap that was submitted but ignored.
+    let tight_qp = mean_qp(&tight);
+    let loose_qp = mean_qp(&loose);
+    eprintln!("mean driver average-QP: tight cap {tight_qp:.1}, loose cap {loose_qp:.1}");
+    assert!(
+        tight_qp > loose_qp + 10.0,
+        "a per-picture cap of {TIGHT} bits gave a mean average quantiser of {tight_qp:.1} and a cap of {LOOSE} bits gave {loose_qp:.1}: \
+         meeting a small maximum needs a coarser quantiser, so the ceiling is not reaching the driver"
+    );
+    // And the picture is not merely re-quantised — the coded bytes differ too, which rules out a
+    // submission that reached the driver and was then ignored by the rate controller.
+    assert_ne!(
+        tight.sizes, loose.sizes,
+        "a cap of {TIGHT} bits and a cap of {LOOSE} bits produced the same coded sizes {:?}, so nothing but the quantiser moved",
+        loose.sizes
+    );
+
+    // **(4) Every one of the four is a stream a decoder can read, and is the pictures that went in.**
+    for (label, got) in [("tight", &tight), ("loose", &loose), ("loosest", &loosest), ("derived", &derived)] {
+        assert!(got.diagnostic.is_empty(), "the {label} cap produced a stream ffmpeg complained about: {}", got.diagnostic);
+        assert_eq!(got.decoded, PICTURES, "the {label} cap: ffmpeg decoded {} of {PICTURES} pictures", got.decoded);
+        assert!(got.mean <= 16.0, "the {label} cap decoded {:.1}/255 from the source, over this encoder's measured 16", got.mean);
+        assert!(got.worst <= 48, "the {label} cap has a sample {}/255 from the source, over this file's measured 48", got.worst);
+    }
+
+    // **(5) The control is not decoration: the loose cap is VBR's own output to within a quantiser
+    // step.** A cap that does not bind must not make the encoder into a *different* encoder, and the
+    // two runs are the same submission with one buffer added. Their mean quantisers are within
+    // three, which is the run-to-run difference between two submissions of the same records.
+    assert!(
+        (loose_qp - mean_qp(&control)).abs() < 3.0,
+        "a cap of {LOOSE} bits gave a mean average quantiser of {loose_qp:.1} against the control's {:.1}, so a cap that does not bind is changing the \
+         encoder rather than only bounding it",
+        mean_qp(&control)
+    );
+}
+
+/// **A video-conference HEVC export goes out of the registered factory as a file ffmpeg decodes to
+/// the pictures that went in.**
+///
+/// # What this is for, and what it is *not*
+///
+/// **It is the reachability half and deliberately not the evidence half.** A gate that dropped the
+/// per-picture ceiling and submitted plain VBR would produce a perfectly good file from this test —
+/// a wrong one, but indistinguishable here from a right one by any amount of decoding. **The cap
+/// reaching the driver is `the_vcm_picture_cap_reaches_the_driver`,** which changes one number and
+/// watches the quantiser move. So this test is written to be the weaker claim it can support, plus
+/// the one assertion that catches the *substitution* rather than a wrong cap:
+///
+/// - **the gate submits the mode as a rate with a ceiling, and the ceiling is the number the
+///   derivation produces** — a mode that fell through the old `_ =>` arm would come back as
+///   `HevcBitrate::Vbr`, which has no ceiling at all, and the `let … else` below fails on it;
+/// - **the adapter asked for no quantiser**, because `HevcEncoderExport::build` refuses an encoder
+///   whose two halves disagree and this mode is rate-controlled;
+/// - **and the file is real**: six samples, none empty, ffprobe counting six decodable frames,
+///   ffmpeg silent, and every picture within this encoder's measured tolerance of the **source**.
+///
+/// # What is deliberately *not* claimed
+///
+/// **Nothing here says the export "matches ffmpeg"**, and nothing compares it to another encode. A
+/// hardware encoder and a software encoder are different algorithms, so bit-equality is not
+/// available at any level and the only reference that means anything is the pictures that went in.
+/// The tolerance is this file's own measured one for this encoder on this driver (mean 9.1/255, worst
+/// 21 for a rate-controlled mode), and the bounds are set from that with room above it.
+#[test]
+fn a_video_conference_hevc_export_is_a_file_that_decodes_to_the_pictures_that_went_in() {
+    use filmcraft_isobmff::{Brand, Mp4Writer, TrackConfig, WriteSample, WriterOptions};
+    let _guard = lock();
+    let Some(ffmpeg) = filmcraft_testkit::ffmpeg_or_skip("decoding the video-conference HEVC export") else { return };
+    let Some(ffprobe) = filmcraft_testkit::ffprobe_or_skip("counting the video-conference HEVC export's frames") else { return };
+    const PICTURES: usize = 6;
+
+    let mut settings = hevc_settings(String::new());
+    settings.bitrate_mode = BitrateMode::VideoConference;
+    // **The gate first, and its answer is the thing under test.** Not merely that the mode was
+    // accepted: the *ceiling* is what makes it video conference rather than VBR.
+    let config = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::FPS_30, &settings)
+        .unwrap_or_else(|why| panic!("a video-conference HEVC export was declined by the gate: {why}"));
+    let HevcBitrate::VideoConference { target, max, max_frame_bits } = config.bitrate else {
+        panic!(
+            "the gate took a video-conference export and submitted {:?}, which states no per-picture ceiling: the mode fell through to a \
+             variable bit rate, and the file would carry none of the guarantee its name promises",
+            config.bitrate
+        );
+    };
+    assert_eq!((target, max), (2_000_000, 4_000_000), "the rate is the settings' own target and ceiling, in bits per second");
+    assert_eq!(max_frame_bits, 66_667, "the ceiling is 2 Mbit/s over 30 frames, rounded up — 66 666.67 bits");
+    assert!(!config.bitrate.names_its_own_quantiser(), "a rate and a ceiling is rate-controlled, so the requests must name no quantiser");
+    assert_eq!(config.bitrate.quantiser(), None, "and there is no quantiser for a request to carry under this mode");
+    // **The one thing this test cannot check here, and where it is checked instead.** The
+    // *registered factory* hands back a `Box<dyn VideoEncoder>`, so the submission the adapter made
+    // is not observable from out here — which means "the ceiling reached the driver through the
+    // export" is not something this test could assert, and a test that looked as though it did would
+    // be the kind of oracle that cannot fail. It is checked one layer in instead, where it can be
+    // seen: `HevcBitrate::build` is the single function that turns this gate's fidelity into an
+    // encoder, and `hevc_export.rs`'s own tests assert that its video-conference arm hands
+    // `HevcEncoder` the ceiling rather than dropping it.
+
+    let built = vaapi_encoder_factory(Format::Hevc, WIDTH, HEIGHT, FrameRate::FPS_30, &settings)
+        .unwrap_or_else(|| panic!("the registered factory declined a video-conference HEVC export the gate accepts"))
+        .unwrap_or_else(|why| panic!("the factory declined a video-conference HEVC export the gate accepts: {why}"));
+    let mut encoder = built;
+
+    let sources: Vec<Vec<u8>> = (0..PICTURES as u32).map(|i| ramp_frame(WIDTH, HEIGHT, i)).collect();
+    let path = scratch("hevc-vcm.mp4");
+    let file = std::fs::File::create(&path).expect("creating the mp4");
+    let mut writer = Mp4Writer::new(file, WriterOptions::new(Brand::Mp4)).expect("a writer");
+    let mut track = None;
+    let mut packets = Vec::new();
+    for (index, rgba) in sources.iter().enumerate() {
+        let frame = EncoderFrame { width: WIDTH, height: HEIGHT, rgba, hdr: None, index: index as u64 };
+        let out = encoder.encode(&frame).unwrap_or_else(|e| panic!("picture {index} did not encode as video conference: {e}"));
+        assert_eq!(out.len(), 1, "picture {index} produced {} samples, not one", out.len());
+        for p in &out {
+            assert!(!p.data.is_empty(), "picture {index} produced an empty sample, which a muxer accepts and a player reads as a missing picture");
+        }
+        packets.extend(out);
+        if track.is_none() {
+            track = Some(writer.add_track(TrackConfig::new(encoder.sample_entry(), config.fps)).expect("a video track"));
+        }
+    }
+    for out in encoder.flush().expect("flush") {
+        packets.push(out);
+    }
+    assert_eq!(packets.len(), PICTURES, "the export produced {} samples for {PICTURES} pictures", packets.len());
+    let track = track.expect("a picture was encoded, so there is a track");
+    for (index, p) in packets.iter().enumerate() {
+        writer
+            .write_sample(track, WriteSample { data: &p.data, duration: p.duration, composition_offset: p.composition_offset, is_sync: p.key })
+            .unwrap_or_else(|e| panic!("sample {index}: {e}"));
+    }
+    writer.finish().expect("finishing the file");
+    eprintln!(
+        "video-conference HEVC export: {PICTURES} samples, {} carries {} coded bytes",
+        path.display(),
+        packets.iter().map(|p| p.data.len()).sum::<usize>()
+    );
+
+    // **The container, counted by ffmpeg's own demuxer** — a container that dropped a sample would
+    // hold fewer frames and report no error, which is what this file's own earlier probe did.
+    let counted = std::process::Command::new(ffprobe.as_os_str())
+        .args(["-v", "error", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", "-i"])
+        .arg(&path)
+        .output()
+        .expect("ffprobe");
+    let frames = String::from_utf8_lossy(&counted.stdout).trim().to_string();
+    assert_eq!(frames, PICTURES.to_string(), "{} holds {frames} decodable frame(s) for {PICTURES} pictures", path.display());
+
+    // **And the pictures, against the source** — through the luma the encoder was actually handed,
+    // because the RGBA is converted with a full BT.709 matrix before it reaches the driver and a
+    // decoded Y plane compared with a red channel is two colour spaces.
+    let raw = std::process::Command::new(ffmpeg.as_os_str())
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .output()
+        .expect("ffmpeg");
+    assert!(raw.stderr.is_empty(), "ffmpeg decoded the video-conference export with a diagnostic: {}", String::from_utf8_lossy(&raw.stderr));
+    let one = (WIDTH as usize) * (HEIGHT as usize);
+    assert_eq!(raw.stdout.len(), one * PICTURES, "ffmpeg returned {} bytes of luma for {PICTURES} pictures", raw.stdout.len());
+    // **The bounds are this encoder's own measured ones for a rate-controlled mode on this driver**
+    // (mean 9.1/255, worst 21), set with room above and nowhere near a wrong picture. A coarser
+    // ceiling would legitimately cost fidelity, so this is not a claim that any content survives
+    // any ceiling — it is the claim that *this* export came out right.
+    const TOLERANCE: f64 = 16.0;
+    const WORST: u8 = 48;
+    for index in 0..PICTURES {
+        let Some(got) = raw.stdout.get(index * one..(index + 1) * one) else { break };
+        let rgba = ramp_frame(WIDTH, HEIGHT, index as u32);
+        let (mut want, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        filmcraft_export::rgba_to_yuv420_8(&rgba, WIDTH as usize, HEIGHT as usize, &mut want, &mut u, &mut v);
+        let mut sum = 0u64;
+        let mut worst = 0u8;
+        let mut counted = 0u64;
+        for (&decoded, &source_byte) in got.iter().zip(want.iter()) {
+            let difference = decoded.abs_diff(source_byte);
+            sum += u64::from(difference);
+            worst = worst.max(difference);
+            counted += 1;
+        }
+        assert_eq!(counted, one as u64, "picture {index} compared {counted} samples of {one}");
+        let mean = sum as f64 / counted as f64;
+        assert!(mean <= TOLERANCE, "picture {index} is {mean:.1}/255 from the source, over a measured {TOLERANCE}");
+        assert!(worst <= WORST, "picture {index} has a sample {worst}/255 from the source, over a measured {WORST}");
     }
 }

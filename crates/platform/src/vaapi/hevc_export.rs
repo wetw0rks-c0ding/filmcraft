@@ -20,8 +20,9 @@
 //!
 //! # What the gate takes, and what it declines
 //!
-//! - **A bitrate, as `Cbr` or `Vbr1Pass`, or a quantiser, as `ConstantQuality`.** The three
-//!   [`HevcBitrate`] variants are the three fidelities [`HevcEncoder`] can be built with.
+//! - **A bitrate, as `Cbr` or `Vbr1Pass`, or a quantiser, as `ConstantQuality`, or a rate and a
+//!   per-picture ceiling, as `VideoConference`.** The four [`HevcBitrate`] variants are the four
+//!   fidelities [`HevcEncoder`] can be built with.
 //!   **`BitrateMode::ConstantQuality` used to be declined by name**, on the reason that "this gate
 //!   submits the bitrate" — a true statement about the gate offered as a statement about the driver.
 //!   It is taken now because `VA_RC_CQP` is in the driver's advertised mask, is what
@@ -30,6 +31,12 @@
 //!   and no wire to it, which is a missing connection rather than a missing capability — and for
 //!   HEVC specifically it was not a small one, because **HEVC has no software encoder to fall back
 //!   to**: a user who chose "Constant quality" on an HEVC export got "encoder not available".
+//!   **`BitrateMode::VideoConference` was declined for a second, stranger reason** — that
+//!   `BitrateMode` had no mode meaning it, which `9c75de0e` made false, and that no field held its
+//!   per-picture ceiling. Both are now answered: the mode is named above the backend and the ceiling
+//!   is derived by [`per_picture_ceiling`], whose argument for not being a settings field is the
+//!   whole of its documentation. The cap reaching the driver is measured, not assumed — see
+//!   `the_vcm_picture_cap_reaches_the_driver` in `tests/hevenc.rs`.
 //! - **A whole-multiple-of-8 picture size.** HEVC's sequence record carries **no crop**, so a size
 //!   that is not a whole number of the encoder's 8-sample minimum coding blocks cannot be expressed
 //!   at all. 640x360 and 1920x1080 both are; 641x361 does not.
@@ -92,6 +99,47 @@ pub enum HevcBitrate {
     /// [`ExportSettings::constant_quantiser`]'s range check is used and **its value is not
     /// reinterpreted**: a user who asks for QP 30 gets HEVC QP 30.
     ConstantQuantiser(u8),
+    /// **A variable bit rate with a ceiling on any one picture** — `BitrateMode::VideoConference`,
+    /// `VA_RC_VCM`, submitted as [`RateControl::VideoConference`].
+    ///
+    /// # It is `Vbr` plus a number, and the number is the whole difference
+    ///
+    /// The mode is a rate *and* a per-picture maximum (`VAEncMiscParameterBufferMaxFrameSize`,
+    /// `va.h:2753-2762`, in **bits**). It is a third variant rather than a flag on [`Self::Vbr`]
+    /// because `HevcBitrate` is a plain statement of fidelity that callers match on, and a boolean
+    /// that switched the picture cap off would be a mode the settings could express and this
+    /// backend would submit as something else.
+    ///
+    /// # Where the cap comes from, and why it is not a field on `ExportSettings`
+    ///
+    /// **It is derived in [`config_for`] from the two numbers the settings already state**, and the
+    /// derivation is one multiply and one divide: *the target rate's share of one picture's
+    /// duration* — `target_bps * rate.den / rate.num` bits. The reasons, because a derived number is
+    /// the kind of thing a reviewer should be able to argue with:
+    ///
+    /// - **Every input is already on the summary line.** `ExportSettings::summary` prints the target
+    ///   rate, the ceiling and the frame rate for this mode (it names a bitrate, so
+    ///   [`BitrateMode::names_a_bitrate`] is `true` and the rate pair is printed). A cap read from
+    ///   anywhere else would be a number the user was never shown.
+    /// - **A field nothing can set is the defect this mode was created to fix.** The whole reason
+    ///   `VA_RC_VCM` sat unwired was that a capability no setting could name never reaches a driver.
+    ///   A new `ExportSettings` field with no control behind it reproduces exactly that: reachable
+    ///   only from a hand-edited project file and a test. **Exposing it as a control is a UI change,
+    ///   and a real one** — it belongs in `crates/ui-egui`, not smuggled in as a field here.
+    /// - **It is not a bitrate and it is not a quantiser.** It bounds a *size*; it has no time base,
+    ///   and the same number means something different at 24 fps than at 60. Putting it in
+    ///   `bitrate_kbps` would be a rate that is not a rate; putting it beside `constant_qp` would be
+    ///   a number this mode does not state.
+    VideoConference {
+        /// The rate the controller aims at, in bits per second — `bitrate_kbps * 1000`.
+        target: u32,
+        /// The highest rate it may reach, in bits per second, from `max_bitrate_kbps` on the same
+        /// rule [`Self::Vbr`] uses.
+        max: u32,
+        /// **The maximum size of any one picture, in bits** — the derived cap, and the only number
+        /// here that is not a rate.
+        max_frame_bits: u32,
+    },
 }
 
 impl HevcBitrate {
@@ -107,6 +155,12 @@ impl HevcBitrate {
             // a request that does not match the mode it was built under. Carrying it in the encoder
             // too would be two places holding one number.
             Self::ConstantQuantiser(_) => HevcEncoder::at_constant_quantiser(display, size, 1),
+            // **The cap is passed here, unlike the quantiser above, and the difference is what the
+            // two controls are.** A quantiser is a property of a *picture* and the driver reads it
+            // from the picture record, so it rides on each request. A picture cap is a property of
+            // the *session's rate control* — one number for the whole stream, submitted as a misc
+            // buffer alongside the rate record — so it belongs to the config, exactly as the rate does.
+            Self::VideoConference { target, max, max_frame_bits } => HevcEncoder::at_video_conference(display, size, 1, target, max, max_frame_bits),
         }
     }
 
@@ -115,6 +169,11 @@ impl HevcBitrate {
     /// [`rate_control_mode_of`] is the other half of: an encoder whose mode names a quantiser must
     /// get requests that carry one, and [`HevcEncoderExport::build`] refuses the mismatch rather
     /// than letting the encoder refuse it one picture at a time.
+    ///
+    /// **`VideoConference` answers `false`, and it is the interesting one.** It states a rate, so the
+    /// rate controller picks each picture's quantiser exactly as it does under [`Self::Vbr`] — and
+    /// answering `true` would make every request in a VCM export refused at the first picture for
+    /// naming a quality the mode does not have.
     pub fn names_its_own_quantiser(&self) -> bool {
         matches!(*self, Self::ConstantQuantiser(_))
     }
@@ -123,11 +182,24 @@ impl HevcBitrate {
     ///
     /// `None` for a bitrate mode, which is the honest answer: **there is no quantiser to name**, and
     /// the rate controller picks each picture's. The adapter asks this rather than reaching into the
-    /// variant so that a fourth variant has to answer here.
+    /// variant so that a fifth variant has to answer here.
     pub fn quantiser(&self) -> Option<u8> {
         match *self {
             Self::ConstantQuantiser(qp) => Some(qp),
-            Self::Cbr(_) | Self::Vbr { .. } => None,
+            Self::Cbr(_) | Self::Vbr { .. } | Self::VideoConference { .. } => None,
+        }
+    }
+
+    /// **The per-picture ceiling this fidelity carries, in bits**, or `None` for a fidelity that
+    /// states none.
+    ///
+    /// Asked as a question for the same reason [`quantiser`](Self::quantiser) is: a variant that
+    /// grew a cap would find no arm and submit none, and nothing would fail. `None` is the answer
+    /// for CBR, VBR and constant quantiser — all three are correct answers, not a default.
+    pub fn max_frame_bits(&self) -> Option<u32> {
+        match *self {
+            Self::VideoConference { max_frame_bits, .. } => Some(max_frame_bits),
+            Self::Cbr(_) | Self::Vbr { .. } | Self::ConstantQuantiser(_) => None,
         }
     }
 }
@@ -160,10 +232,17 @@ pub struct HevcExportConfig {
 /// - **A bitrate of zero is refused rather than turned into something.** The settings layer floors a
 ///   target at 100 kbps before a factory is called, so a zero here is a caller that skipped it — and
 ///   the only honest answer to "encode at no bits per second" is an error, not a substituted number.
-/// - **A constant-quality export is refused rather than given a bitrate.** `BitrateMode::ConstantQuality`
-///   states a quantiser in [`ExportSettings::constant_qp`] and no rate at all. The H.264 gate's `_ =>`
-///   arm would turn it into a VBR and drop the quantiser on the floor; **this gate names it instead**,
-///   because a percentage-and-a-quantiser pair is one number where the settings stated another.
+/// - **Two passes**, which need the sequence rendered twice.
+///
+/// # What this gate takes, and what each one costs
+///
+/// - **A rate** (`Cbr`, `Vbr1Pass`) — [`HevcBitrate::Cbr`] / [`HevcBitrate::Vbr`], both of which are
+///   nothing but the settings' own two numbers in the record's own two fields.
+/// - **A quantiser** (`ConstantQuality`) — taken, with the number the user stated.
+/// - **A rate *and* a per-picture ceiling** (`VideoConference`) — [`HevcBitrate::VideoConference`],
+///   and the ceiling is the one number here FilmCraft computed rather than read. That is
+///   [`per_picture_ceiling`]'s whole subject, and the argument that it is the right computation
+///   rather than a missing field is on that function.
 ///
 /// # The refusals that *are* about what the records can express
 ///
@@ -239,11 +318,19 @@ pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
             })?;
             HevcBitrate::ConstantQuantiser(qp)
         }
-        _ => {
-            // **The bitrate, as the mode FilmCraft's own settings mean** — the same expression, in the same
-            // units, as the H.264 gate: `target_kbps` is the target, `max_kbps` is the ceiling, and a
-            // ceiling below the target is not a range (it becomes the 1.5x one, exactly as
-            // `ExportSettings::resolve` computes it, so the two backends cannot pick different ceilings).
+        // **The rate, as the mode FilmCraft's own settings mean** — the same expression, in the same
+        // units, as the H.264 gate: `target_kbps` is the target, `max_kbps` is the ceiling, and a
+        // ceiling below the target is not a range (it becomes the 1.5x one, exactly as
+        // `ExportSettings::resolve` computes it, so the two backends cannot pick different ceilings).
+        //
+        // **`Cbr`, `Vbr1Pass` and `VideoConference` are written out and there is no catch-all.** The
+        // arm this replaces turned `VideoConference` into a VBR and dropped the per-picture ceiling
+        // that is the only thing distinguishing it — so the gate submitted `VA_RC_VBR` while
+        // `ExportSettings::summary` printed "Video conference (VCM)". That is the same defect the
+        // constant-quality arm above was written to stop, in the arm that was supposed to prevent it:
+        // a mode the summary names and the encoder does not. An exhaustive match makes the sixth
+        // mode a compile error rather than an inherited branch.
+        mode => {
             let kbps = s.bitrate_kbps;
             if kbps == 0 {
                 return Err(format!(
@@ -257,14 +344,32 @@ pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
             // orders of magnitude too small: a file at 0.1% of the requested size with no error anywhere.
             let bps =
                 kbps.checked_mul(1000).ok_or_else(|| format!("a bitrate target of {kbps} kbps, which does not fit the record's bits-per-second field"))?;
-            match s.bitrate_mode {
+            let max_kbps = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps.saturating_mul(3) / 2);
+            let max_bps =
+                max_kbps.checked_mul(1000).ok_or_else(|| format!("a VBR ceiling of {max_kbps} kbps, which does not fit the record's bits-per-second field"))?;
+            match mode {
                 BitrateMode::Cbr => HevcBitrate::Cbr(bps),
-                _ => {
-                    let max_kbps = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps.saturating_mul(3) / 2);
-                    let max_bps = max_kbps
-                        .checked_mul(1000)
-                        .ok_or_else(|| format!("a VBR ceiling of {max_kbps} kbps, which does not fit the record's bits-per-second field"))?;
-                    HevcBitrate::Vbr { target: bps, max: max_bps }
+                BitrateMode::Vbr1Pass => HevcBitrate::Vbr { target: bps, max: max_bps },
+                // **The one arm the whole change is for, and the ceiling beside the rate is the mode.**
+                //
+                // `VA_RC_VCM` states *a rate and a maximum size for any one picture*, and the second
+                // is `VAEncMiscParameterBufferMaxFrameSize` in **bits** — a second misc buffer, not a
+                // field of the rate-control record, which is why the rate here is the same pair VBR
+                // submits. Submitting the VBR pair under the VCM attribute with no cap would be a mode
+                // whose distinguishing control is absent: the driver would see `VA_RC_VCM` and a rate,
+                // and nothing would say what any one picture is allowed to weigh.
+                BitrateMode::VideoConference => HevcBitrate::VideoConference { target: bps, max: max_bps, max_frame_bits: per_picture_ceiling(bps, rate)? },
+                // **The two modes this gate refused above, reaching an arm they cannot.** A `match`
+                // with no catch-all has to name them, and an arm that said nothing would be a claim
+                // a reader has to take on trust. So the arm says the one true thing: reaching here
+                // means the gate's own check above was removed or reordered, which is a bug in the
+                // gate and **not** an export this backend cannot do — and it names the two so the
+                // reader can go and look.
+                BitrateMode::Vbr2Pass | BitrateMode::ConstantQuality => {
+                    return Err(format!(
+                        "{mode:?} reached the bitrate submission after this gate's own refusal for it: the checks above this match \
+                         are the refusal, so getting here means one of them was removed or reordered, which is a bug in the gate"
+                    ));
                 }
             }
         }
@@ -314,6 +419,80 @@ pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
     // encodes.
     let gop = s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (f64::from(fps) * 2.0).round().max(1.0) as u32);
     Ok(HevcExportConfig { w, h, fps, rate, gop, bitrate })
+}
+
+/// **The maximum size of one picture, in bits, for a video-conference-mode export at
+/// `target_bps` — the target rate's share of one picture's duration.**
+///
+/// # Why this is a derivation and not a setting
+///
+/// `VA_RC_VCM` states *"a variable bit rate and a maximum frame size"* (`va.h:1113-1114` for the
+/// mode; `va.h:2744-2752` for the maximum), and the second half has no field on `ExportSettings`
+/// today. The two candidates were **a new settings field** and **a number derived from what the
+/// settings already say**, and this is the second one, for three reasons:
+///
+/// - **Every input is already on the summary line.** `ExportSettings::summary` prints the frame
+///   rate and, because [`BitrateMode::names_a_bitrate`] is `true` for this mode, the target rate.
+///   A cap the user cannot see is a cap the user cannot reason about, and a *field* would be a
+///   second number on the line — which is the honest alternative and the one to take if a control
+///   for it is ever built.
+/// - **A field with no control behind it is the defect this mode was created to fix.** `VA_RC_VCM`
+///   sat unwired for exactly one reason: a capability no setting could name never reaches a driver.
+///   Adding a field to `ExportSettings` that only a hand-edited project file and a test can set
+///   would reproduce the same dead end one layer up. **Making it a real control is a `crates/ui-egui`
+///   change, and until that exists a field would be a promise with no way to keep it.**
+/// - **It is not a bitrate.** It has no time base: the same number is a generous cap at 24 fps and a
+///   punishing one at 60. `bitrate_kbps` is a rate per second, and a number in that field with these
+///   units would be a rate that is not a rate.
+///
+/// # The arithmetic, and the hostile parts of it
+///
+/// `bits per picture = target_bps * rate.den / rate.num` — the target rate times the length of one
+/// picture. Three things are checked rather than assumed, because every one of them arrives from a
+/// project file or a UI field:
+///
+/// - **The rate is positive.** `rate.num` and `rate.den` are `i64` and a caller can hand over
+///   `0/1` or a negative numerator; a picture with no positive length has no share of a second.
+///   `config_for` checks the same two numbers later for the VUI, but the ceiling is computed before
+///   that check runs, so it checks them itself rather than relying on an ordering.
+/// - **The multiply is on `u64`.** `target_bps * den` is over `u32` past 4.29 Gbit/s at 1 fps and at
+///   far smaller numbers for a denominator above one, and a wrapped numerator is a per-picture cap
+///   of a few bits — a stream every picture of which is crushed to nothing, with no error anywhere.
+/// - **The quotient is rounded UP.** A ceiling is the largest a picture may be; `div_ceil` keeps it
+///   at or above the share it was derived from, where truncating would make the cap *tighter* than
+///   the rate it belongs to — a limit nobody chose, and one that gets tighter as the rate rises.
+///
+/// **A result of zero is refused here** rather than handed on. `MaxFrameSize::misc_buffer` refuses
+/// it too, but that is a driver's error at session creation; refusing it at the gate is where the
+/// numbers the user typed are still in hand.
+fn per_picture_ceiling(target_bps: u32, rate: FrameRate) -> Result<u32, String> {
+    if rate.num <= 0 || rate.den <= 0 {
+        return Err(format!(
+            "an invalid frame rate of {}/{}: the per-picture maximum is the target rate's share of one picture, and a picture of no \
+             positive length has no share of a second",
+            rate.num, rate.den
+        ));
+    }
+    let (Ok(num), Ok(den)) = (u64::try_from(rate.num), u64::try_from(rate.den)) else {
+        return Err(format!("a frame rate of {}/{} does not fit the arithmetic used to compute the per-picture maximum", rate.num, rate.den));
+    };
+    let numerator = u64::from(target_bps).checked_mul(den).ok_or_else(|| {
+        format!(
+            "a target of {target_bps} bits per second at {}/{} fps: the per-picture share overflows the 64-bit arithmetic used to compute it",
+            rate.num, rate.den
+        )
+    })?;
+    let per_picture = numerator.div_ceil(num);
+    if per_picture == 0 {
+        return Err(format!("a target of {target_bps} bits per second at {}/{} fps leaves no bits at all for one picture", rate.num, rate.den));
+    }
+    u32::try_from(per_picture).map_err(|_| {
+        format!(
+            "a target of {target_bps} bits per second at {}/{} fps asks for a per-picture maximum of {per_picture} bits, which does \
+             not fit VAEncMiscParameterBufferMaxFrameSize's 32-bit field (va.h:2757-2758)",
+            rate.num, rate.den
+        )
+    })
 }
 
 /// [`HevcEncoder`] as a [`VideoEncoder`]: RGBA pictures in, MP4 samples out.
@@ -884,7 +1063,9 @@ fn split_annex_b(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 /// The rate-control modes the driver reports for HEVC, by name, for a diagnostic.
 ///
 /// **HEVC's mask and not H.264's** (`0x14de` against `0x14d6` — the same eight modes less
-/// `VA_RC_VCM`), which is why the decline table can name a mode H.264's could not.
+/// `VA_RC_VCM`), which is why the H.264 gate declines the same mode by name: the one bit that
+/// separates the two masks is the whole of the difference between "this gate takes it" and "this
+/// gate refuses it, and here are the two numbers".
 pub fn driver_rate_control_modes_named() -> String {
     match crate::vaapi::open_display() {
         Ok(d) => crate::vaapi::VaEncoder::rate_control_names(HevcEncoder::driver_rate_control_modes(&d)),
@@ -909,5 +1090,72 @@ pub fn rate_control_mode_of(bitrate: HevcBitrate) -> Option<RateControl> {
         // expects it, so nothing is lost by this answer being `None` — and it is `None` for exactly
         // the reason `names_its_own_quantiser` is `true`, which is the pairing `build` checks.
         HevcBitrate::ConstantQuantiser(_) => None,
+        // **The one variant that carries a cap, and it carries it here too.** `VA_RC_VCM` is the
+        // only mode in this enum whose *distinguishing* number is not one of its rate numbers, and
+        // a `RateControl` without it would be a mode submitted with the ceiling dropped — the exact
+        // defect this variant was added to remove, one type down.
+        //
+        // **It is `Some` even though the requests name no quantiser**, which is the pairing
+        // [`HevcEncoderExport::build`] checks: `names_its_own_quantiser` is `false` and the mode is
+        // present, so the two agree that this is a rate-controlled encoder.
+        HevcBitrate::VideoConference { target, max, max_frame_bits } => Some(RateControl::VideoConference { target, max, max_frame_bits }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **`HevcBitrate::build` is the one function that turns this gate's fidelity into an encoder,
+    /// and the ceiling is the only number here that a build could quietly drop.**
+    ///
+    /// **Why this needs its own test.** Three other tests hold the pieces: the gate test checks what
+    /// `config_for` derived, the cap test builds an [`HevcEncoder`] itself and watches the quantiser
+    /// move, and the export test checks the file ffmpeg decodes. **None of them can see
+    /// `HevcBitrate::build`**, which is where the gate's fidelity and the encoder meet — and the
+    /// export test cannot, because the registered factory hands back a `Box<dyn VideoEncoder>` whose
+    /// submission is not observable from out here. A build that took the VCM arm and called
+    /// `at_variable_bitrate` would leave a VBR encoder wearing this mode's name, and every test above
+    /// it would still pass: the gate derived a ceiling nobody used, and the file decoded.
+    ///
+    /// **So each of the four variants is built and read back**, and the video-conference one is
+    /// checked for the number as well as the mode. This is the assertion a build that dropped the cap
+    /// fails.
+    #[test]
+    fn the_build_hands_the_ceiling_to_the_encoder_rather_than_dropping_it() {
+        let Ok(display) = crate::vaapi::open_display() else {
+            eprintln!("SKIPPED: no VA-API display, so no encoder could be built to ask");
+            return;
+        };
+        // **A rate with a ceiling, at the numbers the gate derives for 2 Mbit/s at 30 fps.**
+        let vcm = HevcBitrate::VideoConference { target: 2_000_000, max: 4_000_000, max_frame_bits: 66_667 };
+        let encoder = vcm.build(&display, (320, 240)).expect("a video-conference encoder of six 320x240 pictures");
+        assert_eq!(
+            encoder.config_attribute(),
+            super::super::encoder::RC_VCM,
+            "the encoder was created under VA_RC_VCM, and not under the mode this one is a near miss for"
+        );
+        assert_eq!(
+            encoder.max_frame_bits(),
+            Some(66_667),
+            "the ceiling this gate derived is the one the encoder was given — a build that took the VBR arm would return None"
+        );
+        // **And the other three, so "the VCM arm is the one that carries a cap" is a fact about the
+        // table rather than an inference from a single row.**
+        for (label, bitrate, expect_attribute, expect_cap) in [
+            ("CBR", HevcBitrate::Cbr(2_000_000), super::super::ffi::RC_CBR, None),
+            ("VBR", HevcBitrate::Vbr { target: 2_000_000, max: 4_000_000 }, super::super::ffi::RC_VBR, None),
+            ("VCM", vcm, super::super::encoder::RC_VCM, Some(66_667)),
+        ] {
+            let built = bitrate.build(&display, (320, 240)).unwrap_or_else(|why| panic!("a {label} encoder: {why}"));
+            assert_eq!(built.config_attribute(), expect_attribute, "{label} was built under the wrong attribute");
+            assert_eq!(built.max_frame_bits(), expect_cap, "{label} carries the wrong per-picture ceiling");
+        }
+        // **A constant quantiser is the fourth variant and it builds without a record**, so there is
+        // nothing to read a ceiling off — and the build must still succeed, because refusing it here
+        // would take constant-quality HEVC exports away to fix a variant that was working.
+        let cq = HevcBitrate::ConstantQuantiser(30).build(&display, (320, 240)).expect("a constant-quantiser encoder");
+        assert_eq!(cq.config_attribute(), super::super::ffi::RC_CQP, "a constant quantiser is built under VA_RC_CQP");
+        assert_eq!(cq.max_frame_bits(), None, "and states no per-picture ceiling");
     }
 }

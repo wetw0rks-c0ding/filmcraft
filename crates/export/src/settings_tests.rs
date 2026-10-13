@@ -730,3 +730,94 @@ fn video_conference_survives_a_settings_file() {
         assert_ne!(p.settings.bitrate_mode, BitrateMode::VideoConference, "{} selects a mode no default export should", p.name);
     }
 }
+
+/// **The per-picture ceiling is derived from numbers the summary already prints, and this is the
+/// test that holds that decision in place.**
+///
+/// # What the decision is, and why it is a test rather than a comment
+///
+/// `VA_RC_VCM` states *"a variable bit rate and a maximum frame size"* — the second half has no field
+/// on `ExportSettings`, and the hardware gates that take the mode have to supply a number. Two
+/// candidates: **a new settings field**, and **a number derived from what the settings already
+/// say**. The derivation won, on grounds that are checkable here:
+///
+/// - **every input is already on the summary line.** A cap the user cannot see is a cap the user
+///   cannot reason about, and a field would be a *second* number on that line rather than a derived
+///   one. **This test is the claim that the inputs are there**: the frame rate and the rate pair, for
+///   every format the mode is offered on.
+/// - **a field nothing can set is the defect the mode was created to fix.** `VA_RC_VCM` sat unwired
+///   for one reason — a capability no setting could name never reaches a driver — and adding a field
+///   no control can set would reproduce that one layer up. The honest test for that is this one: if
+///   a ceiling were read from a field, the summary would have to gain a line saying so, and the
+///   assertion below is written from the **summary's own text** so a field added without a word on
+///   the line would leave the derivation looking justified when it no longer is.
+///
+/// # What it would catch
+///
+/// A summary that stopped quoting a rate for this mode (which is what would happen if
+/// `names_a_bitrate` ever answered `false` for it), a summary that quoted a quantiser instead, or a
+/// backend that started reading a cap from somewhere the user cannot see. **Deliberate break:** print
+/// `QP n` for a VCM export and the second assertion fails; print the rate without the frame rate and
+/// the third fails.
+#[test]
+fn every_input_the_derived_per_picture_ceiling_needs_is_on_the_summary_line() {
+    let ten = Tick(10 * TICKS_PER_SECOND);
+    // **Two frame rates and three rate pairs, so the assertion is about the *kinds* of number rather
+    // than about one hand-picked example.** A summary that printed the rate for 25 fps and not for
+    // 60 — or a ceiling derived from a rate the line did not carry — would pass a single case.
+    for (rate, target, max) in [(FrameRate::FPS_25, 20_000u32, 30_000u32), (FrameRate::FPS_60, 2_000, 3_000), (FrameRate::new(30_000, 1_001), 8_000, 12_000)] {
+        for format in [Format::Hevc, Format::H264] {
+            let s = ExportSettings {
+                format,
+                bitrate_mode: BitrateMode::VideoConference,
+                bitrate_kbps: target,
+                max_bitrate_kbps: Some(max),
+                include_audio: false,
+                ..Default::default()
+            };
+            let said = s.summary(1920, 1080, rate, 48_000, ten).video;
+
+            // **(1) The rate, because the mode states one.** This is the same claim as the test
+            // above and it is restated here because it is an *input to a derived number*, not just a
+            // statement about the file: a ceiling computed from a rate the summary did not print
+            // would be FilmCraft computing a number on the user's behalf without showing its terms.
+            assert!(
+                said.contains(&format!("Target {:.2} Mbps", target as f64 / 1000.0)),
+                "{format:?} at {rate}: the summary does not quote the target the ceiling is derived from: {said}"
+            );
+            assert!(said.contains(&format!("Max {:.2} Mbps", max as f64 / 1000.0)), "{format:?} at {rate}: and it does not quote the ceiling rate: {said}");
+            // **(2) No quantiser, because the mode states none** — and a summary that printed one
+            // would be quoting a number this mode has no field for.
+            assert!(!said.contains("QP "), "{format:?} at {rate}: a video-conference export states no quantiser, so none may be printed: {said}");
+            // **(3) The frame rate, because the ceiling is the rate's share of *one picture*.** It
+            // has no other time base, so without this number the ceiling is not derivable by the
+            // reader at all. `r.rate.label()` is what the H.264 and H.265 branches both print, and
+            // this asserts it through the public summary rather than through `resolve`, so a mode
+            // that lost the line fails here and not in a backend.
+            assert!(
+                said.contains(&rate.label()),
+                "{format:?} at {rate}: the summary does not state the frame rate, and the per-picture ceiling is this rate's share of one \
+                 picture, so the reader cannot derive the number the backend will use: {said}"
+            );
+            // **(4) The mode's own name, and the size statement is the rate one.** The ceiling only
+            // ever *reduces* what the encoder produces, so the target rate stays the honest basis for
+            // an estimate; the point here is that the summary does not fall into the constant-quality
+            // wording, which is the only other branch that prints no rate.
+            assert!(said.contains("Video conference (VCM)"), "{format:?} at {rate}: {said}");
+            assert_ne!(s.estimate_bytes(1920, 1080, rate, 48_000, ten), 0, "{format:?} at {rate}: a mode that names a rate has a computable size");
+        }
+    }
+    // **And the field does not exist**, which is the other half of the decision and the part a
+    // summary assertion cannot see. Written as a search of the serialized settings: a new field
+    // would be visible in the JSON, so this fails the moment one is added — which is the moment a
+    // reviewer should be asked whether a control for it exists, rather than a field being smuggled in
+    // and the summary quietly growing a line nobody reads.
+    let written = serde_json::to_value(ExportSettings { bitrate_mode: BitrateMode::VideoConference, ..Default::default() }).unwrap();
+    let keys: Vec<String> = written.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+    for ceiling_field in ["max_frame_size_bits", "max_frame_bits", "max_picture_kbps", "max_frame_size"] {
+        assert!(
+            !keys.iter().any(|k| k == ceiling_field),
+            "a per-picture ceiling field ({ceiling_field}) has been added to ExportSettings: with no control behind it, it is reachable only from a hand-edited project file and a test"
+        );
+    }
+}

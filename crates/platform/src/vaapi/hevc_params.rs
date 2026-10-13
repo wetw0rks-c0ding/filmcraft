@@ -1051,6 +1051,12 @@ pub fn frame_rate_record(fps: u32) -> Result<Vec<u8>, String> {
 /// constant-quantiser rule applies hardest: **a caller who asked for a bitrate has not asked for a
 /// quality range**, and naming one here would be FilmCraft inventing a floor and a ceiling for a
 /// user's picture.
+///
+/// **`VA_RC_VCM` is one arm of this match and not a second function, because its cap is not in this
+/// record.** A per-picture maximum is `VAEncMiscParameterBufferMaxFrameSize` — a separate misc buffer
+/// with its own type word — so the two numbers this record carries are VCM's *rate* and VBR's are
+/// the same two. The cap is built and submitted in `hevc_submit`, which is also where the
+/// measurement that it reaches the driver lives.
 pub fn rate_control_record(mode: RateControl, window_ms: u32) -> Result<Vec<u8>, String> {
     let (bits_per_second, target_percentage) = match mode {
         RateControl::ConstantQuantiser => {
@@ -1068,15 +1074,17 @@ pub fn rate_control_record(mode: RateControl, window_ms: u32) -> Result<Vec<u8>,
             // rather than 0 says which of the two this is.
             (bps, 100)
         }
-        RateControl::Vbr { target, max } => {
+        RateControl::Vbr { target, max } | RateControl::VideoConference { target, max, .. } => {
             if target == 0 {
-                return Err("a VBR target of 0 bits per second".into());
+                return Err("a variable-bitrate target of 0 bits per second".into());
             }
             if max == 0 {
-                return Err("a VBR ceiling of 0 bits per second".into());
+                return Err("a variable-bitrate ceiling of 0 bits per second".into());
             }
             if max < target {
-                return Err(format!("a VBR ceiling of {max} bits per second below its target of {target}: the target would be unreachable by construction"));
+                return Err(format!(
+                    "a variable-bitrate ceiling of {max} bits per second below its target of {target}: the target would be unreachable by construction"
+                ));
             }
             // `target * 100` on **u64**: a u32 multiplication overflows past 42_949_672 bits per
             // second, about 43 Mbit/s, which a 4K export asks for routinely. A wrapped percentage is
