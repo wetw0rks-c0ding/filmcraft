@@ -85,25 +85,37 @@
 //!    claimed.** The corrected claim is the weaker, better one: *no difference between these records
 //!    accounted for the failure*, which is what re-running ffmpeg's own records through this
 //!    submission showed — they fail here exactly as ours do.
-//! 3. **The rate-control attribute was swept**, and this is the result:
+//! 3. **The rate-control attribute was swept**, and this is the result — **three times**, because each
+//!    earlier table measured something other than the modes:
 //!
-//! | `VAConfigAttribRateControl` | mode | outcome, with **no packed slice header supplied** |
-//! |---|---|---|
-//! | `0x02` | `VA_RC_CBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-//! | `0x04` | `VA_RC_VBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-//! | `0x08` | `VA_RC_VCM` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-//! | **`0x10`** | **`VA_RC_CQP`** — the one [`RateControl::ConstantQuantiser`] names | **`vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL`** |
-//! | `0x40` | `VA_RC_ICQ` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
-//! | `0x80` | `VA_RC_MB` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-//! | `0x400` | `VA_RC_QVBR` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
-//! | `0x1000` | `VA_RC_TCBRC` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
-//! | `0x01` / `0x20` / `0x100` / `0x200` / `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses them |
+//!    **The first sweep**, taken **with no packed slice header supplied**, which this driver refuses to
+//!    encode without. **Every mode failed for that one reason**, so it could not have told a
+//!    rate-control problem from the packed-header one:
 //!
-//! **That table was real, and it is why the rate control was ruled out**: it was swept *with* a
-//! buffer set the driver refuses, so every mode failed for the same reason and the sweep could not
-//! have distinguished a rate-control problem from the packed-header one. **With the slice header
-//! supplied, `VA_RC_CQP` — the mode this path names — encodes**, and the table's other seven modes
-//! are untested rather than refuted. [`hevc_rate_control_outcomes`] says so.
+//!    | `VAConfigAttribRateControl` | mode | outcome, with **no packed slice header supplied** |
+//!    |---|---|---|
+//!    | `0x02` | `VA_RC_CBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//!    | `0x04` | `VA_RC_VBR` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//!    | `0x08` | `VA_RC_VCM` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//!    | **`0x10`** | **`VA_RC_CQP`** — the one [`RateControl::ConstantQuantiser`] names | **`vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL`** |
+//!    | `0x40` | `VA_RC_ICQ` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
+//!    | `0x80` | `VA_RC_MB` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//!    | `0x400` | `VA_RC_QVBR` | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` |
+//!    | `0x1000` | `VA_RC_TCBRC` | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
+//!    | `0x01` / `0x20` / `0x100` / `0x200` / `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses them |
+//!
+//!    It correctly recorded that it could only conclude *"untested, not refuted"* for the other seven.
+//!
+//!    **The second sweep fixed the buffer set — and still had no control.** It refused `VA_RC_CQP` by
+//!    name in both columns, so the known-good mode appeared in neither and **the sweep had no passing
+//!    row at all**. A table in which every mode fails cannot distinguish a driver that refuses rate
+//!    control from a submission that is broken, which is why that sweep could not make its claim.
+//!
+//!    **The third sweep is the one [`hevc_rate_control_outcomes`] records**, with `VA_RC_CQP` swept and
+//!    asserted as the control: **CBR, VBR, VCM, CQP and MB all encode and decode**; ICQ and QVBR are
+//!    refuted (both fail at `vaEndPicture`, with and without a record, while five other modes succeeded
+//!    through the same call); and TCBRC fails on the record rather than the mode. **The rate control
+//!    was not the cause of anything, and now that is a measurement rather than a remaining unknown.**
 //!
 //! **What this rules out, so it is not re-tried:** a single out-of-range record field; the record set
 //! as a whole (ffmpeg's own records submitted through this path fail identically); the surface pool
@@ -197,7 +209,26 @@ const CTB: u32 = 64;
 /// VA_ENC_PACKED_HEADER_SLICE` (0x5) — chosen for what it states, and explicitly *not* the thing
 /// that fixed this path's readback failure.**
 ///
-/// # What the measurement says, because the first version of this note said the opposite
+/// **What the driver *advertises*, which is a different question from what it enforces.** This path
+/// configures `0x5` (`SEQUENCE | SLICE`), and the driver answers `VAConfigAttribEncPackedHeaders`
+/// (10) for `VAProfileHEVCMain` / `VAEntrypointEncSlice` with **`0x1f`** — all five flags,
+/// `NONE | SEQUENCE | PICTURE | SLICE | MISC | RAW_DATA` (`va.h:1199-1231`), measured with
+/// `vaGetConfigAttributes` on iHD 26.3.5. **`VA_ENC_PACKED_HEADER_SLICE` (0x4) is among them**, and
+/// that is the flag this path depends on.
+///
+/// **AV1's answer for the same attribute is `0x1b`, which excludes it** — because AV1 has no slice
+/// header, it takes a *frame* header, and `PICTURE` is the flag that says so
+/// ([`super::av1_submit::AV1_DRIVER_PACKED_HEADERS`]). **The two answers are the evidence that this
+/// attribute is not a free choice**: the same driver, the same attribute, answering differently per
+/// codec for a structural reason. So the attribute HEVC *does* advertise is a measurement, and
+/// [`HevcEncoder::driver_packed_headers`] asks it rather than carrying the number, because a
+/// different driver advertising a different set is information rather than a failure.
+///
+/// **And it is still not enforced**, which is the table below: every value from `0x0` to `0x5`
+/// encodes identically. **Advertising and enforcing are separate**, and this path relies on the
+/// second while the driver happens to do it and the first for the first time being legible.
+///
+/// # What the enforcement measurement says, because the first version of this note said the opposite
 ///
 /// | `VAConfigAttribEncPackedHeaders` | packed sequence + slice header buffers | outcome on iHD 26.3.5 |
 /// |---|---|---|
@@ -208,11 +239,10 @@ const CTB: u32 = 64;
 /// | `0x5` `SEQUENCE \| SLICE` | **not** submitted | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 /// | `0x3` `SEQUENCE \| PICTURE` | not submitted | `vaMapBuffer` → `VA_STATUS_ERROR_INTERNAL` |
 ///
-/// **The driver does not read this attribute on this path. What it refuses to encode without is the
-/// packed slice header buffer**, and every row of the top half encodes identically (184 / 51 / 45 /
-/// 43 / 55 / 48 bytes) whatever the attribute says. So the value is here because it must *state*
-/// what the application supplies — and an attribute that lies about its own buffer set is a
-/// different kind of wrong from one that happens not to be enforced.
+/// **What it refuses to encode without is the packed slice header buffer**, and every row of the top
+/// half encodes identically (184 / 51 / 45 / 43 / 55 / 48 bytes) whatever the attribute says. So the
+/// value is here because it must *state* what the application supplies — and an attribute that lies
+/// about its own buffer set is a different kind of wrong from one that happens not to be enforced.
 ///
 /// # Why `0x5` and not `0x3`, given that `0x3` also encodes
 ///
@@ -373,50 +403,109 @@ pub mod slice_types {
 /// "this driver cannot do VCM" — it can. It is that **nothing above this backend can ask for it**:
 /// [`super::encoder::RateControl`] has no variant for it, FilmCraft's `BitrateMode` has no mode that
 /// means "a variable bit rate with a per-picture cap", and `ExportSettings` has no field for the cap.
-/// A mode that appears in one codec's mask and not the other's, and that no setting above it can
-/// name, is exactly the kind of thing that gets accepted silently the moment a mask bit is forwarded
-/// into a config attribute — so it stays a **named refusal with a stated reason**, and the reason is
-/// now the absence of a way to ask for it rather than the driver's inability to answer.
+/// **Both of those files belong to the settings layer and neither is this backend's to grow**, which
+/// is why the measurement changed nothing here: wiring `VA_RC_VCM` needs a user-facing fidelity that
+/// does not exist yet, not a libva call. A mode that appears in one codec's mask and not the other's,
+/// and that no setting above it can name, is exactly the kind of thing that gets accepted silently
+/// the moment a mask bit is forwarded into a config attribute — so it stays a **named refusal with a
+/// stated reason**, and the reason is now the absence of a way to ask for it rather than the driver's
+/// inability to answer.
+///
+/// **`VA_RC_CQP` is the counter-example, and it is why this is a rule and not a shrug.** CQP was in
+/// the same position — unreachable through `RateControl`, and declined by the export gate on the
+/// reason that "this gate submits the bitrate" — and it was then **wired**, because its absence was a
+/// missing wire rather than a missing capability. **`VA_RC_VCM` is not the same case**, and the
+/// difference is the thing that would tell them apart: `BitrateMode` *has* a
+/// [`BitrateMode::ConstantQuality`](filmcraft_export::BitrateMode::ConstantQuality) that means
+/// exactly "a quantiser, no rate", so wiring CQP needed no new user-facing concept at all. **No
+/// `BitrateMode` means VCM**, so wiring it would mean inventing one — a product decision, stated as
+/// such rather than smuggled in with a libva change.
 pub const VCM: u32 = 0x0000_0008;
 
-/// `VA_RC_MB` (`va.h:1125`): **`0x00000080`**, the mode that moves quantiser between macroblocks.
+/// **`VA_RC_MB` (`va.h:1125`): **`0x00000080`**, and it is measured to encode — with a caveat that
+/// makes it a different kind of "works" from the other working rows.
+///
+/// # What was measured, and what the measurement means
+///
+/// Submitted on its own, `VA_RC_MB` **encodes and decodes**: six pictures, ffmpeg silent, mean
+/// 9.1/255 from the source. **Its sizes are `VA_RC_CQP`'s byte for byte** — `[184, 51, 45, 43, 55, 48]`
+/// under a rate-control record and under none.
+///
+/// **That is the finding, and it is not a second proof that MB works.** `va.h:1122-1125` is explicit
+/// that `VA_RC_MB` *"may be combined with other RC modes, except CQP"* — it is a **modifier on a base
+/// mode, not a base mode**. **A modifier submitted with nothing to modify produces the driver's
+/// unmodified output**, which is what a bare `0x80` measures and what byte-identical output to `CQP`
+/// looks like. The honest reading of this row is **"the driver accepts the submission"**, not "per
+/// macroblock control happened".
+///
+/// **The combination (`VA_RC_CBR | VA_RC_MB`) is named untested rather than claimed.** It is a
+/// different submission, and asserting anything about it without measuring it would repeat the exact
+/// mistake this file's sweep history is about — a claim shaped like a measurement.
 ///
 /// **Declared here rather than in [`super::ffi`] because `ffi.rs` is the FFI module and this
-/// constant exists only for the re-sweep**: the H.264 path has never submitted it, `RateControl` has
-/// no variant for it, and nothing outside this module names it. It is here because the re-sweep
+/// constant exists only for the sweep**: the H.264 path has never submitted it, `RateControl` has
+/// no variant for it, and nothing outside this module names it. It is here because the sweep
 /// submits **every mode the driver advertises** — including the ones nobody here has a record for —
 /// and a sweep that could only name four of the eight would be reporting the modes it can spell.
 pub const MB: u32 = 0x0000_0080;
 
 /// **What each rate-control mode this driver advertises did**, measured by submitting the same
-/// records under each one — **re-taken, because the first sweep's precondition no longer holds.**
+/// records under each one — **taken three times, because each earlier table was measuring something
+/// other than the modes.**
 ///
-/// # Why this table was taken twice
+/// # Why this table was taken more than once
 ///
-/// The first sweep was taken **without a packed slice header**, which this driver refuses to encode
+/// **The first sweep was taken without a packed slice header**, which this driver refuses to encode
 /// without. **So it answered "which mode encodes when the slice header is missing", not "which mode
-/// encodes"** — it could not have told a rate-control problem from a missing buffer — and it recorded
-/// that limitation, concluding that `VA_RC_ICQ` and `VA_RC_QVBR` were **untested, not refuted**.
+/// encodes"** — every mode failed for one reason that had nothing to do with the mode, and it
+/// correctly recorded that limitation, concluding that `VA_RC_ICQ` and `VA_RC_QVBR` were **untested,
+/// not refuted**.
 ///
-/// **A sweep whose precondition has changed is not carried forward.** The table below was re-taken
-/// with the same records, the same buffer set and the same buffer order a CBR export uses, changing
-/// **only** the `VAConfigAttribRateControl` value, and **each mode was submitted twice — once with a
-/// rate-control record and once with none — which is what separates a mode that fails from a record
-/// that fails.** Measured on iHD 26.3.5, six 320x240 pictures at 30 fps:
+/// **The second sweep fixed the buffer set and still had no control.** It re-took the table with the
+/// slice header supplied and each mode submitted twice — once with a rate-control record and once
+/// with none — which is what separates a mode that fails from a record that fails. **But
+/// `VA_RC_CQP` — the mode this path exports with, and the one known to work — was refused by both
+/// swept constructors**, so it appeared in neither column. A sweep in which no mode was the known-good
+/// one cannot be read: *"ICQ and QVBR fail"* then means only *"ICQ and QVBR failed in the same process
+/// in which nothing else had been shown to work"*, and a driver that refused rate control entirely
+/// would produce the same table.
 ///
-/// | attribute | mode | with CBR's record | with no record | what it is |
-/// |---|---|---|---|---|
-/// | `0x02` | `VA_RC_CBR` | encodes, mean 9.1/255 | encodes, mean 9.2/255 | works — what the export gate submits |
-/// | `0x04` | `VA_RC_VBR` | encodes, mean 9.1/255 | encodes, mean 9.1/255 | works — what the export gate submits |
-/// | `0x08` | `VA_RC_VCM` | **encodes**, mean 9.1/255 | encodes, mean 9.1/255 | **the driver runs it** |
-/// | **`0x10`** | **`VA_RC_CQP`** — what [`RateControl::ConstantQuantiser`] names | **not swept** | **not swept** | refused by [`HevcEncoder::at_swept_rate_control`]: it is submitted through the constructor that carries the quantiser's contract |
-/// | `0x40` | `VA_RC_ICQ` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **the same** | **refuted — the mode, not the record** |
-/// | `0x80` | `VA_RC_MB` | encodes, mean 9.1/255 | encodes, mean 9.1/255 | works |
-/// | `0x400` | `VA_RC_QVBR` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **the same** | **refuted — the mode, not the record** |
-/// | `0x1000` | `VA_RC_TCBRC` | **`vaRenderPicture` → invalid VABufferID for 9 encode buffers** | **encodes**, mean 9.2/255 | **fails on the record, not on the mode** |
-/// | `0x01`, `0x20`, `0x100`, `0x200`, `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses with `VA_STATUS_ERROR_INVALID_PARAMETER` | — | not offered |
+/// # The third sweep, and the one this table is
 ///
-/// **Three rows say something the first sweep could not.**
+/// **`VA_RC_CQP` is swept, and it is asserted first** — see [`CONTROL`]. The refusal was a defect in
+/// the *sweep*, not a fact about the mode: the constructor never refused a quantiser, only
+/// [`HevcEncoder::encode`] does, and only because `rate_controlled()` reads the **attribute**, under
+/// which `VA_RC_CQP` is exactly the mode a request naming a quantiser is right for. Measured on iHD
+/// 26.3.5 / libva 1.24, six 320x240 pictures at 30 fps, the same records and buffer order a CBR
+/// export uses, changing **only** `VAConfigAttribRateControl`:
+///
+/// | attribute | mode | with CBR's record | with no record | bytes mapped | ffmpeg | what it is |
+/// |---|---|---|---|---|---|---|
+/// | `0x02` | `VA_RC_CBR` | encodes, mean 9.1/255 | encodes, mean 9.2/255 | yes | **silent, 6/6 pictures** | works — what the export gate submits |
+/// | `0x04` | `VA_RC_VBR` | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | **silent, 6/6** | works — what the export gate submits |
+/// | `0x08` | `VA_RC_VCM` | **encodes**, mean 9.1/255 | encodes, mean 9.1/255 | yes | **silent, 6/6** | **the driver runs it** |
+/// | **`0x10`** | **`VA_RC_CQP` — THE CONTROL** | **encodes, mean 9.1/255**, sizes `[184, 51, 45, 43, 55, 48]` | **encodes, mean 9.1/255**, the same sizes | yes | **silent, 6/6** | **works, and is what the export gate submits for a constant-quality export** |
+/// | `0x40` | `VA_RC_ICQ` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **the same** | no | — | **refuted — the mode, not the record** |
+/// | `0x80` | `VA_RC_MB` | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | **silent, 6/6** | works — but see the note on `VA_RC_MB` below |
+/// | `0x400` | `VA_RC_QVBR` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **the same** | no | — | **refuted — the mode, not the record** |
+/// | `0x1000` | `VA_RC_TCBRC` | **`vaRenderPicture` → invalid VABufferID for 9 encode buffers** | **encodes**, mean 9.2/255 | with a record: no; without: yes | without: **silent, 6/6** | **fails on the record, not on the mode** |
+/// | `0x01`, `0x20`, `0x100`, `0x200`, `0x800` | not in the driver's `0x14de` mask | `vaCreateConfig` refuses with `VA_STATUS_ERROR_INVALID_PARAMETER` | — | — | — | not offered |
+///
+/// **Five of the eight encode and decode; the sweep's own control is one of them.** "Encodes" here
+/// means the whole end-to-end claim and not "a picture came back": bytes mapped out of the coded
+/// buffer, ffmpeg **silent**, **every** picture present, and every picture within the tolerance this
+/// encoder's own CQP runs measure (mean 9.1/255, worst 20-21). A mode that produced bytes no decoder
+/// could read would be the most expensive kind of untested, so that is the claim the table makes.
+///
+/// # What the control buys, and why its absence was not a small gap
+///
+/// **A sweep with no passing row cannot tell a driver that refuses rate control from a submission
+/// that is broken.** With `VA_RC_CQP` measured in the same process, against the same buffer set, the
+/// refutations below carry a weight they did not have: the same `vaEndPicture` call that failed for
+/// `ICQ` and `QVBR` **succeeded for five other modes seconds earlier**, so what failed was the mode.
+/// [`CONTROL`] is that row, stated as the thing the other rows are read against.
+///
+/// **Four rows say something neither earlier sweep could.**
 ///
 /// - **`VA_RC_ICQ` and `VA_RC_QVBR` are refuted, not untested.** They fail **both ways**, and that
 ///   pair is the whole argument: removing the rate-control record the mode objected to changed
@@ -430,6 +519,15 @@ pub const MB: u32 = 0x0000_0080;
 ///   FilmCraft's settings and [`RateControl`] have no way to *name* it, so the export gate declines it
 ///   as **unreachable rather than broken**. [`VCM`] keeps the constant and the mask measurement;
 ///   **the refusal reason has moved.**
+/// - **`VA_RC_MB` encodes, and its sizes are `VA_RC_CQP`'s byte for byte.** That is a finding rather
+///   than a duplicate row, and it is stated here so the table is not read as nine ways of saying the
+///   same thing. `va.h:1122-1125` is explicit that `VA_RC_MB` *"may be combined with other RC modes,
+///   except CQP"* — it is a **modifier**, not a base mode — and **a modifier submitted with nothing
+///   to modify produces the driver's unmodified output, which is what a bare `0x80` measures.** So
+///   "works" here is a weaker claim than the other working rows carry: it means **the driver accepts
+///   the submission**, not that per-macroblock control happened. The combination (`VA_RC_CBR |
+///   VA_RC_MB`) is **not measured** and is not claimed; it is named as untested rather than swept,
+///   because measuring it is a different sweep.
 ///
 /// # What this still rules out, so it is not tried again
 ///
@@ -441,19 +539,41 @@ pub const MB: u32 = 0x0000_0080;
 pub mod hevc_rate_control_outcomes {
     /// **What the table adds up to, in one line**, so a reader does not have to re-derive it.
     ///
-    /// **This is the re-taken sweep.** The first one was taken without a packed slice header — which
-    /// this driver refuses to encode without — so every mode failed for one reason that had nothing
-    /// to do with the mode, and it could only say the other seven were *untested, not refuted*.
-    /// **That precondition no longer holds and the table was re-taken**, each mode submitted both
-    /// with a rate-control record and with none so that a mode that fails could be told from a record
-    /// that fails.
-    pub const SUMMARY: &str = "re-measured on iHD 26.3.5 with the packed slice header supplied, which the first sweep omitted and \
-         which is why it could only call seven modes untested: VA_RC_CBR, VA_RC_VBR, VA_RC_MB and VA_RC_VCM all ENCODE (mean 9.1/255 \
-         from the source, ffmpeg silent); VA_RC_CQP is not swept because it is submitted through the constructor that carries the \
-         quantiser; VA_RC_ICQ and VA_RC_QVBR are now REFUTED rather than untested -- both fail at vaEndPicture with \
-         VA_STATUS_ERROR_INTERNAL WITH AND WITHOUT a rate-control record, so the failure is the MODE and not the record; and \
-         VA_RC_TCBRC fails on the RECORD rather than the mode (vaRenderPicture, invalid VABufferID for 9 encode buffers with \
-         CBR's record, and it encodes with none)";
+    /// **This is the third sweep, and it is the first with a control.** The first was taken without a
+    /// packed slice header — which this driver refuses to encode without — so every mode failed for
+    /// one reason unconnected to the mode. The second fixed the buffer set but **refused `VA_RC_CQP`
+    /// in both columns**, so it had no passing row at all and could not have told a mode that fails
+    /// from a submission that is broken. **The control row is what the other rows are read against**,
+    /// and it is asserted first.
+    pub const SUMMARY: &str = "third sweep on iHD 26.3.5 / libva 1.24, six 320x240 pictures each, WITH a passing control: VA_RC_CQP \
+         is swept in the same process against the same buffer set and ENCODES in both columns (mean 9.1/255 from the source, ffmpeg \
+         silent, 6/6 pictures, sizes 184/51/45/43/55/48), so a mode that fails below failed while five others succeeded through \
+         the same code path; VA_RC_CBR, VA_RC_VBR, VA_RC_VCM and VA_RC_MB all ENCODE and DECODE (mean 9.1/255, ffmpeg silent, 6/6); \
+         VA_RC_ICQ and VA_RC_QVBR are REFUTED rather than untested -- both fail at vaEndPicture with VA_STATUS_ERROR_INTERNAL \
+         WITH AND WITHOUT a rate-control record, so the failure is the MODE and not the record; VA_RC_TCBRC fails on the RECORD \
+         rather than the mode (vaRenderPicture, invalid VABufferID for 9 encode buffers with CBR's record, and it encodes with \
+         none); and VA_RC_MB's sizes are VA_RC_CQP's byte for byte, which is consistent with va.h calling VA_RC_MB a modifier that \
+         may be combined with other modes rather than a base mode, so the combination is named untested rather than claimed";
+
+    /// **The sweep's control, and what it is for.**
+    ///
+    /// **`VA_RC_CQP` is the mode this path exports with and the one known to work.** It was refused by
+    /// name by both swept constructors, which removed it from both columns and left the sweep with no
+    /// passing row — the exact state in which a table of failures proves nothing.
+    ///
+    /// **What a control buys, stated as the alternative.** Without it, "ICQ and QVBR fail" is
+    /// indistinguishable from "this driver's rate control is broken" and from "this submission is
+    /// broken", because all three produce the same table. With it, the same `vaEndPicture` call
+    /// succeeded for five modes seconds before failing for two, so **the failure is the mode**.
+    ///
+    /// **It is asserted, and asserted first**, so a sweep whose control fails stops rather than
+    /// reporting its other rows as findings.
+    pub const CONTROL: &str = "VA_RC_CQP is the control and it is asserted first: the same vaEndPicture, vaMapBuffer and \
+         ffmpeg decode that refute ICQ and QVBR are the ones CQP passed through, in the same process, with the same records, \
+         buffer set and buffer order. Without it, \"ICQ and QVBR fail\" is indistinguishable from \"this driver's rate control is \
+         broken\" and from \"this submission is broken\", because all three produce the same table -- so a sweep with no working \
+         control is not evidence about any mode, which is why this row exists and why its absence from the second sweep was a \
+         defect in that sweep rather than a property of the mode";
 }
 
 /// **The rate-control mask this driver reports for `VAProfileHEVCMain` / `VAEntrypointEncSlice`:**
@@ -806,16 +926,23 @@ impl HevcEncoder {
     /// submission works, and a mode that fails is only "does not work with CBR's record".
     /// [`HevcEncoder::at_swept_rate_control_without_a_record`] separates the two.
     ///
-    /// **`VA_RC_CQP` is refused here.** It is the mode [`HevcEncoder::at_constant_quantiser`]
-    /// submits, through the constructor that carries the quantiser's own contract, and an encoder
-    /// built here would refuse every request that named one — which is exactly what a constant
-    /// quantiser needs.
+    /// **`VA_RC_CQP` goes through here like every other mode, and it is the sweep's control.**
+    ///
+    /// It used to be refused by name, on the grounds that an encoder built here "cannot name the
+    /// quantiser it needs". **That was a defect in the sweep, not a fact about the mode**, and it
+    /// cost the sweep the one thing a sweep cannot do without: **a mode that is known to work,
+    /// measured in the same process against the same buffer set.** A table of modes that all fail,
+    /// with no row that passes, cannot tell a driver that refuses rate control from a driver that
+    /// refuses everything, and cannot tell a mode that is unsupported from a submission that is
+    /// broken. See [`hevc_rate_control_outcomes::CONTROL`].
+    ///
+    /// **What the refusal got wrong, precisely.** The constructor never refused a quantiser: the
+    /// *request* does, and only because [`HevcEncoder::rate_controlled`] is a property of the
+    /// **attribute** — `VA_RC_CQP` is not rate-controlled, so a request naming a quantiser is
+    /// exactly right for it and wrong for every other mode. An encoder built here under
+    /// `VA_RC_CQP` accepts `qp: Some(..)` and refuses `qp: None`, which is the constant-quantiser
+    /// contract, not a broken one.
     pub fn at_swept_rate_control(display: &Arc<Display>, size: (u32, u32), references: u32, attribute: u32, bits_per_second: u32) -> Result<Self, String> {
-        if attribute == super::ffi::RC_CQP {
-            return Err("VA_RC_CQP is not swept: it is what HevcEncoder::at_constant_quantiser submits, and this entry point builds an \
-                        encoder whose requests cannot name the quantiser it needs"
-                .into());
-        }
         Self::new_with_attribute(display, size, references, attribute, Some(RateControl::Cbr(bits_per_second)))
     }
 
@@ -827,10 +954,21 @@ impl HevcEncoder {
     /// about the submission changes**, so this isolates the one variable the two entry points differ
     /// in — which is the whole reason it is a second function rather than a flag read three frames
     /// away.
+    /// **A swept mode submitted with no rate-control record at all** — the control for
+    /// [`HevcEncoder::at_swept_rate_control`], and what tells a mode apart from a record.
+    ///
+    /// A mode that fails with a record and encodes without one is **failing on the record**, and the
+    /// honest refusal names that; a mode that fails both ways is failing on the mode. **Nothing else
+    /// about the submission changes**, so this isolates the one variable the two entry points differ
+    /// in — which is the whole reason this is a second function rather than a flag read three frames
+    /// away.
+    ///
+    /// **`VA_RC_CQP` submits no record here, which is the shape a constant quantiser wants**: the
+    /// picture record's `pic_init_qp` *is* that picture's quality, and a bitrate beside it would be a
+    /// second and independent statement about the same fidelity. It is also, for that reason, the
+    /// known-good submission this path exports with — so **this column is the sweep's control**,
+    /// not a corner of it. See [`hevc_rate_control_outcomes::CONTROL`].
     pub fn at_swept_rate_control_without_a_record(display: &Arc<Display>, size: (u32, u32), references: u32, attribute: u32) -> Result<Self, String> {
-        if attribute == super::ffi::RC_CQP {
-            return Err("VA_RC_CQP is not swept: it is what HevcEncoder::at_constant_quantiser submits".into());
-        }
         Self::new_with_attribute(display, size, references, attribute, None)
     }
 
@@ -944,6 +1082,28 @@ impl HevcEncoder {
     /// `VCM`. [`VCM`] explains what this backend does about the difference.
     pub fn driver_rate_control_modes(display: &Arc<Display>) -> u32 {
         ffi::Encoder::driver_rate_control_modes(display, Profile::HevcMain)
+    }
+
+    /// **What the driver answers `VAConfigAttribEncPackedHeaders` (10) for HEVC**, or `None` when it
+    /// will not say.
+    ///
+    /// # Why this is asked as a question rather than carried as a constant
+    ///
+    /// AV1's equivalent is a constant ([`super::av1_submit::AV1_DRIVER_PACKED_HEADERS`], `0x1b`)
+    /// because that file records the measurement beside the value it submits. **HEVC's note claims
+    /// the driver "does not read this attribute on this path"** ([`PACKED_HEADERS_FOR_HEVC`]) — every
+    /// value from `0x0` to `0x5` encodes identically — which is a claim about the driver's
+    /// *enforcement* and says nothing about what it *advertises*. Those are different questions, and
+    /// only the second one is what this asks.
+    ///
+    /// **`None` means "could not ask", never "nothing".** The two are the same answer on a libva
+    /// without `vaGetConfigAttributes` and a driver that declines the query, and a caller that read
+    /// `None` as `0x0` would be asserting a measurement nobody took.
+    pub fn driver_packed_headers(display: &Arc<Display>) -> Option<u32> {
+        display
+            .config_attributes(Profile::HevcMain, super::ffi::Entrypoint::EncSlice, &[ffi::CONFIG_ATTRIB_ENC_PACKED_HEADERS])
+            .ok()
+            .and_then(|values| values.first().copied())
     }
 
     /// **Which rate-control modes this backend will submit for HEVC, as a mask.**

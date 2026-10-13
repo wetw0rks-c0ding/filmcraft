@@ -51,8 +51,9 @@ use filmcraft_export::{BitrateMode, EncoderFrame, ExportSettings, FieldOrder, Fo
 use filmcraft_isobmff::{CodecConfig, SampleEntry};
 use filmcraft_platform::hardware_encode::{vaapi_config_for, vaapi_encoder_factory};
 use filmcraft_platform::vaapi::{
-    Display, H264_RATE_CONTROL_MASK, HEVC_RATE_CONTROL_MASK, HevcBitrate, HevcEncodeRequest, HevcEncoder, HevcExportConfig, MAX_REFERENCES, PictureKind,
-    Profile, VCM, check_hvcc_against_the_picture, hevc_available, hevc_config_for, hevc_rate_control_outcomes, open_display, ramp_shifted, slice_types,
+    Display, H264_RATE_CONTROL_MASK, HEVC_RATE_CONTROL_MASK, HevcBitrate, HevcEncodeRequest, HevcEncoder, HevcExportConfig, MAX_REFERENCES,
+    PACKED_HEADERS_FOR_HEVC, PictureKind, Profile, VCM, check_hvcc_against_the_picture, hevc_available, hevc_config_for, hevc_rate_control_outcomes,
+    open_display, ramp_shifted, slice_types,
 };
 use filmcraft_time::FrameRate;
 
@@ -384,6 +385,13 @@ fn sweep_mode(display: &std::sync::Arc<Display>, attribute: u32, bits_per_second
     if let Err(why) = encoder.key_frames_every(0) {
         return Swept::Refused(why);
     }
+    // **The request is built from what the driver was asked for, not from what the sweep is
+    // measuring.** `HevcEncoder::encode` refuses the pairing it was not built for, so a request is
+    // chosen from the encoder's own answer rather than from the attribute the caller passed in: a
+    // rate-controlled mode takes no quantiser and `VA_RC_CQP` must name one. **Reading the mode
+    // back off the encoder is what makes the control a control** — the known-good mode goes through
+    // exactly the submission an export gives it, with no accommodation made here for it.
+    let names_its_own_quantiser = !encoder.rate_controlled();
     let mut stream = Vec::new();
     let mut sizes = Vec::new();
     for frame in 0..pictures as u32 {
@@ -394,7 +402,16 @@ fn sweep_mode(display: &std::sync::Arc<Display>, attribute: u32, bits_per_second
         if let Err(why) = encoder.upload(&luma, &chroma) {
             return Swept::Refused(why);
         }
-        let request = if frame == 0 { HevcEncodeRequest::key_frame_at_rate() } else { HevcEncodeRequest::predicted_at_rate() };
+        let request = if names_its_own_quantiser {
+            match if frame == 0 { HevcEncodeRequest::key_frame(QP) } else { HevcEncodeRequest::predicted(QP) } {
+                Ok(r) => r,
+                Err(why) => return Swept::Refused(why),
+            }
+        } else if frame == 0 {
+            HevcEncodeRequest::key_frame_at_rate()
+        } else {
+            HevcEncodeRequest::predicted_at_rate()
+        };
         let request = if frame + 1 == pictures as u32 { request.last() } else { request };
         match encoder.encode(request) {
             Ok(picture) => {
@@ -438,30 +455,36 @@ fn sweep_mode(display: &std::sync::Arc<Display>, attribute: u32, bits_per_second
     Swept::Encoded { mean, worst, sizes, diagnostic, decoded_pictures, counted }
 }
 
-/// **The rate-control sweep, re-taken with a buffer set this driver accepts — and it is the
-/// measurement the old record said could not be taken.**
+/// **The rate-control sweep, taken for the third time — and the first with a working control.**
 ///
-/// # Why this sweep was re-taken rather than the recorded one extended
+/// # Why this sweep was taken three times
 ///
-/// The recorded sweep in [`hevc_rate_control_outcomes`] was taken **without a packed slice header**,
+/// The **first** sweep in [`hevc_rate_control_outcomes`] was taken **without a packed slice header**,
 /// which this driver refuses to encode without. **Every row of it therefore measured the buffer set,
-/// not the mode** — it could not have told a rate-control problem from a missing buffer, and the record
-/// said so. Its own conclusion was "`VA_RC_ICQ` and `VA_RC_QVBR` are **untested, not refuted**".
+/// not the mode** — it could not have told a rate-control problem from a missing buffer, and the
+/// record said so. Its own conclusion was "`VA_RC_ICQ` and `VA_RC_QVBR` are **untested, not
+/// refuted**", which was correct about its own evidence.
 ///
-/// **A sweep whose precondition has changed is not carried forward.** This one runs the same records,
-/// the same buffer set and the same buffer order that a CBR export uses, with the slice header
-/// supplied, and changes **only** the `VAConfigAttribRateControl` value. Measured on iHD 26.3.5:
+/// The **second** sweep fixed the buffer set — and **refused `VA_RC_CQP` in both columns**, because
+/// the swept constructors rejected it by name. So the known-good mode was in neither column and **the
+/// sweep had no passing row at all**. That is a defect in the sweep, not a property of the driver,
+/// and it is the one this test exists to not repeat: **a table in which every mode fails is
+/// indistinguishable from a broken submission**, and so cannot refute anything.
 ///
-/// | attribute | mode | with CBR's record | with no record | what it is |
-/// |---|---|---|---|---|
-/// | `0x02` | `VA_RC_CBR` | encodes, mean 9.1 | encodes, mean 9.2 | works; this is what the gate submits |
-/// | `0x04` | `VA_RC_VBR` | encodes, mean 9.1 | encodes, mean 9.1 | works; this is what the gate submits |
-/// | `0x08` | `VA_RC_VCM` | **encodes**, mean 9.1 | encodes, mean 9.1 | **works — it was the record, not the mode, that was missing** |
-/// | `0x10` | `VA_RC_CQP` | not swept | not swept | refused by the swept constructor: it is what a constant quantiser submits |
-/// | `0x40` | `VA_RC_ICQ` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **same** | **refuted, not untested** |
-/// | `0x80` | `VA_RC_MB` | encodes, mean 9.1 | encodes, mean 9.1 | works |
-/// | `0x400` | `VA_RC_QVBR` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **same** | **refuted, not untested** |
-/// | `0x1000` | `VA_RC_TCBRC` | **`vaRenderPicture` → invalid VABufferID** for 9 encode buffers | **encodes**, mean 9.2 | **fails on the record, not on the mode** |
+/// This one runs the same records, the same buffer set and the same buffer order a CBR export uses,
+/// with the slice header supplied, and changes **only** the `VAConfigAttribRateControl` value.
+/// Measured on iHD 26.3.5 / libva 1.24, six 320x240 pictures each:
+///
+/// | attribute | mode | with CBR's record | with no record | ffmpeg | what it is |
+/// |---|---|---|---|---|---|
+/// | `0x02` | `VA_RC_CBR` | encodes, mean 9.1 | encodes, mean 9.2 | silent, 6/6 | works; the gate submits this |
+/// | `0x04` | `VA_RC_VBR` | encodes, mean 9.1 | encodes, mean 9.1 | silent, 6/6 | works; the gate submits this |
+/// | `0x08` | `VA_RC_VCM` | **encodes**, mean 9.1 | encodes, mean 9.1 | silent, 6/6 | **works — the driver runs it** |
+/// | **`0x10`** | **`VA_RC_CQP` — THE CONTROL** | **encodes, mean 9.1**, sizes `[184, 51, 45, 43, 55, 48]` | **encodes, mean 9.1**, the same sizes | **silent, 6/6** | **works; the gate submits this for a constant-quality export** |
+/// | `0x40` | `VA_RC_ICQ` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **same** | — | **refuted, not untested** |
+/// | `0x80` | `VA_RC_MB` | encodes, mean 9.1 | encodes, mean 9.1 | silent, 6/6 | accepted — but its sizes are CQP's byte for byte, and `va.h` calls MB a *modifier*, so the combination is named untested rather than claimed |
+/// | `0x400` | `VA_RC_QVBR` | **`vaEndPicture` → `VA_STATUS_ERROR_INTERNAL`** | **same** | — | **refuted, not untested** |
+/// | `0x1000` | `VA_RC_TCBRC` | **`vaRenderPicture` → invalid VABufferID** for 9 encode buffers | **encodes**, mean 9.2 | without: silent, 6/6 | **fails on the record, not on the mode** |
 ///
 /// # What each row's *pair* of columns is for
 ///
@@ -469,21 +492,26 @@ fn sweep_mode(display: &std::sync::Arc<Display>, attribute: u32, bits_per_second
 /// separates a mode that fails from a record that fails**, and it is the only thing here that could
 /// have made either claim:
 ///
-/// - **ICQ and QVBR fail both ways.** That is the claim the old record could not make and this one
-///   can: the failure is the **mode**, because removing the record the mode objected to changed
-///   nothing. This is the direct answer to "`ICQ` and `QVBR` are untested, not refused".
+/// - **ICQ and QVBR fail both ways.** That is the claim the first record could not make: the failure
+///   is the **mode**, because removing the record the mode objected to changed nothing. This is the
+///   direct answer to "`ICQ` and `QVBR` are untested, not refused".
 /// - **TCBRC fails with a record and encodes without one.** That is a **record** failure, not a mode
 ///   failure — and it is exactly the distinction the sweep's two columns exist to draw.
-/// - **VCM encodes.** The old record named it a refusal because `RateControl` has no variant for it.
-///   **That reason is now falsified: the driver runs it.** What is still true — and what the decline
-///   table says — is that FilmCraft's settings and `RateControl` have no way to *name* it, so it is
-///   declined as unreachable rather than as broken.
+/// - **VCM encodes.** The first record named it a refusal because `RateControl` has no variant for it.
+///   **That reason is falsified: the driver runs it.** What is still true — and what the decline
+///   table says — is that FilmCraft's settings have no way to *name* it, so it is declined as
+///   unreachable rather than as broken.
 ///
 /// # What is asserted rather than printed
 ///
-/// The measurement is printed (a driver measurement belongs where a reader can see it), and **four
+/// The measurement is printed (a driver measurement belongs where a reader can see it), and **six
 /// things are asserted**, each of which fails if the sweep silently stops measuring:
 ///
+/// 0. **The control passes** — `VA_RC_CQP`, in the no-record column, encoded and decoded every
+///    picture. **This is asserted first and it is the assertion the rest of the table rests on.** A
+///    sweep whose control fails is not evidence about any mode: the modes that failed may have
+///    failed for the same reason the control did. Without it this test would be the second sweep's
+///    mistake, silently.
 /// 1. **Every mode the driver advertises is submitted** — a sweep that skipped a mode it could not
 ///    spell would report the modes it knows and call it a sweep.
 /// 2. **Anything that encodes, decodes**: ffmpeg returns **no diagnostic**, produces **every**
@@ -492,10 +520,13 @@ fn sweep_mode(display: &std::sync::Arc<Display>, attribute: u32, bits_per_second
 /// 3. **ICQ and QVBR are refuted rather than untested** — they fail *both ways*, which is the claim.
 /// 4. **No mode but TCBRC is record-dependent** — the two columns must agree for every other mode,
 ///    because a mode that encodes under one record and not the other is a finding to be recorded, not
-///    absorbed.
+///    absorbed. **`VA_RC_CQP` is in this loop and prints its own two columns**, for the stated
+///    reason that CQP's own submission is the no-record one.
+/// 5. **The mask, not a local table, decides what is swept.**
 ///
 /// **Deliberate break:** a driver that started accepting ICQ fails (3); one that stopped encoding
-/// under CBR fails (1) or (2); a sweep that stopped submitting modes fails (1).
+/// under CBR fails (1) or (2); a sweep that stopped submitting modes fails (1); **a sweep that lost
+/// its control fails (0), which is the break that matters most here.**
 #[test]
 fn the_rate_control_sweep_is_measured_with_a_buffer_set_this_driver_accepts() {
     let _guard = lock();
@@ -566,6 +597,30 @@ fn the_rate_control_sweep_is_measured_with_a_buffer_set_this_driver_accepts() {
     assert!(encoded(&with_record, 0x0000_0002).unwrap_or(false), "VA_RC_CBR did not encode: the gate submits this mode, so nothing downstream is reachable");
     assert!(encoded(&without_record, 0x0000_0002).unwrap_or(false), "VA_RC_CBR did not encode with no record either");
 
+    // **(0) THE CONTROL, and it is first because every other row depends on it.**
+    //
+    // **`VA_RC_CQP` is the mode this path exports with and the one known to work.** It used to be
+    // refused by name by the swept constructors, so it appeared in neither column and the sweep had
+    // **no passing row at all** — a table in which every mode fails cannot distinguish a driver
+    // that refuses rate control from a submission that is broken, and "ICQ and QVBR fail" meant
+    // only "ICQ and QVBR failed in the same process in which nothing worked".
+    //
+    // **So this is asserted first, and it is asserted on the strong claim** — that ffmpeg decoded
+    // every picture to the source, not merely that bytes came back — because that is the claim the
+    // other rows are read against. If this fails, **the rest of the sweep is not evidence** and the
+    // assertion below says so rather than reporting the other modes as findings.
+    if mask & 0x0000_0010 != 0 {
+        let control = encoded(&without_record, 0x0000_0010).unwrap_or(false);
+        assert!(
+            control,
+            "VA_RC_CQP — the sweep's CONTROL — did not encode in this process. Every other row of this sweep is measured against \
+             it, so a sweep whose control fails is not evidence about any mode: the modes that failed may have failed for the \
+             same reason the control did, and the modes that passed may have passed by luck"
+        );
+    } else {
+        panic!("this driver does not advertise VA_RC_CQP, so there is no control for the sweep and this test cannot measure anything");
+    }
+
     // **(3) ICQ and QVBR are refuted, not untested** — which is the claim the old record could not
     // make. Both must fail **both ways**: a mode that failed only with a record would be a record
     // failure, and the whole difference between the two columns would collapse.
@@ -586,8 +641,29 @@ fn the_rate_control_sweep_is_measured_with_a_buffer_set_this_driver_accepts() {
 
     // **(4) No mode but TCBRC is record-dependent**, and TCBRC's own two columns are printed because
     // the difference between them is the finding.
+    //
+    // **`VA_RC_CQP` is in this loop and used to be excluded from it.** It was excluded because it was
+    // refused by both constructors and so had no columns to compare — and leaving it out would have
+    // hidden the one row where the two columns are *expected* to differ. CQP's "with a record"
+    // column submits CBR's record under a `VA_RC_CQP` attribute, which is a contradiction the
+    // driver's own contract makes meaningless; it is measured, printed, and **excluded from the
+    // equality for the stated reason rather than by a silent skip**.
     for (attribute, name) in modes {
-        if mask & attribute == 0 || attribute == 0x0000_0010 {
+        if mask & attribute == 0 {
+            continue;
+        }
+        if attribute == 0x0000_0010 {
+            let record = encoded(&with_record, attribute).unwrap_or(false);
+            let none = encoded(&without_record, attribute).unwrap_or(false);
+            eprintln!(
+                "VA_RC_CQP: with CBR's record {record}, without record {none} — {}",
+                if record == none {
+                    "the record makes no difference"
+                } else {
+                    "a record DEPENDS on the attribute: CQP's own submission is the no-record one, so this is the \
+                     contradiction being measured, not a mode that needs a record"
+                }
+            );
             continue;
         }
         if attribute == 0x0000_1000 {
@@ -609,6 +685,63 @@ fn the_rate_control_sweep_is_measured_with_a_buffer_set_this_driver_accepts() {
             "{name} encodes under one rate-control record and not the other, and is not TCBRC: a record-dependent mode is a finding and must be recorded, not absorbed"
         );
     }
+}
+
+/// **What `VAConfigAttribEncPackedHeaders` answers for HEVC on this driver — the question AV1's
+/// `0x1b` raised, asked of HEVC for the same reason.**
+///
+/// **Why it was not obvious from the note it answers.** [`PACKED_HEADERS_FOR_HEVC`] records that
+/// this driver **does not enforce** the attribute: `0x0`, `0x2`, `0x3` and `0x5` all encode, and the
+/// picture sizes are the same under each. That is a claim about what the driver *does*, and it is
+/// what this milestone was built on. **What the driver *advertises* is a different question**, and
+/// AV1's `0x1b` — which excludes `VA_ENC_PACKED_HEADER_SLICE` — is the evidence that the two can
+/// differ: the AV1 note says so in as many words, that an AV1 encoder does not take slice headers
+/// because AV1 has no slice header.
+///
+/// **So HEVC's advertisement is measured here rather than inferred from its non-enforcement.** A
+/// driver that advertises `VA_ENC_PACKED_HEADER_SLICE` and one that does not are different claims,
+/// and only the first is a thing the application can rely on.
+///
+/// **The assertion is containment, not equality.** It says every flag this path configures is one
+/// the driver advertises, and that the submission's names its two flags. It does **not** pin the
+/// driver's number as a constant, because a driver that advertises more than this path submits is
+/// not a driver this path has stopped working on — pinning it would fail a test over a change that
+/// breaks nothing. The number is **printed**, so it is recorded without being a tripwire.
+///
+/// **Deliberate break:** a driver that stops advertising `SEQUENCE` or `SLICE` fails here, which is
+/// the driver change that would silently cost this path its pictures.
+#[test]
+fn the_packed_headers_the_driver_advertises_for_hevc_cover_the_two_this_path_submits() {
+    let Some(display) = display() else { return };
+    let advertised = HevcEncoder::driver_packed_headers(&display);
+    eprintln!("driver VAConfigAttribEncPackedHeaders for VAProfileHEVCMain = {advertised:#x?}");
+    let Some(advertised) = advertised else {
+        // **`None` is "could not ask", not "nothing".** A libva without `vaGetConfigAttributes`, or a
+        // driver that declines the query, both land here — and a test that asserted `0x0` here would
+        // be asserting a measurement nobody took.
+        eprintln!("the driver would not answer VAConfigAttribEncPackedHeaders for HEVC, so nothing is claimed about which flags it advertises");
+        return;
+    };
+    // The two flags this path actually submits, named from the constants rather than written as
+    // literals, so a change to what is submitted changes what is checked.
+    assert_eq!(
+        PACKED_HEADERS_FOR_HEVC & !advertised,
+        0,
+        "this path configures VAConfigAttribEncPackedHeaders {:#x}, which includes flags this driver does not advertise ({advertised:#x})",
+        PACKED_HEADERS_FOR_HEVC
+    );
+    // And the two are the ones it submits — a containment check alone would pass on a value of 0x7.
+    assert_eq!(PACKED_HEADERS_FOR_HEVC & 0x4, 0x4, "VA_ENC_PACKED_HEADER_SLICE is the flag this path depends on, and it is not configured");
+    assert_eq!(PACKED_HEADERS_FOR_HEVC & 0x1, 0x1, "VA_ENC_PACKED_HEADER_SEQUENCE is the flag the parameter sets go out under, and it is not configured");
+    eprintln!(
+        "this path configures {:#x} (SEQUENCE | SLICE); the driver advertises {advertised:#x}{}",
+        PACKED_HEADERS_FOR_HEVC,
+        if advertised & !PACKED_HEADERS_FOR_HEVC == 0 {
+            ", which is exactly the two this path submits"
+        } else {
+            ", which is more than the two this path submits"
+        }
+    );
 }
 
 /// **The rate-control mask is still what the recorded sweep was taken against, and the two codecs'
@@ -633,17 +766,36 @@ fn the_rate_control_mask_is_still_what_the_sweep_was_taken_against() {
     // be a stale record that reads exactly like a current one.
     let summary = hevc_rate_control_outcomes::SUMMARY;
     for (what, claim) in [
-        ("that this is the re-taken sweep", "re-measured on iHD 26.3.5"),
-        ("why the first sweep could not answer", "which the first sweep omitted"),
-        ("that the modes which encode are named", "VA_RC_CBR, VA_RC_VBR, VA_RC_MB and VA_RC_VCM all ENCODE"),
+        ("that this sweep has a passing control", "WITH a passing control"),
+        ("which mode is the control", "VA_RC_CQP is swept in the same process"),
+        ("that the control's numbers are recorded", "mean 9.1/255 from the source, ffmpeg silent, 6/6 pictures"),
+        ("that the modes which encode are named", "VA_RC_CBR, VA_RC_VBR, VA_RC_VCM and VA_RC_MB all ENCODE and DECODE"),
         ("that ICQ and QVBR are now refuted", "REFUTED rather than untested"),
         ("that their failure is the mode rather than the record", "the failure is the MODE and not the record"),
         ("that TCBRC is a record failure", "fails on the RECORD rather than the mode"),
+        ("that MB's duplicate sizes are a finding, not a second proof", "byte for byte"),
+        ("that the MB combination is named untested rather than claimed", "named untested rather than claimed"),
     ] {
         assert!(summary.contains(claim), "the recorded measurement no longer says {what} ({claim:?}): {summary}");
     }
-    // **And that the superseded claim is gone**, so the two sweeps cannot both be on the page.
+    // **And that the superseded claim is gone**, so the older sweeps cannot both be on the page.
     assert!(!summary.contains("untested, not refuted"), "the record still carries the superseded first sweep's conclusion: {summary}");
+    // **The control is recorded as a first-class part of the sweep, not as a footnote.** This is
+    // the assertion that keeps the defect from coming back silently: a record that named the control
+    // only in passing is a record whose next editor can drop it, and the sweep would be left with no
+    // passing row again — which is the exact state this sweep was corrected out of.
+    for (what, claim) in [
+        ("that the control exists and why", "VA_RC_CQP is the control"),
+        ("what a control buys over no control", "indistinguishable from"),
+        ("that the control is asserted first", "asserted first"),
+        ("what a sweep without one cannot do", "not evidence about any mode"),
+    ] {
+        assert!(
+            hevc_rate_control_outcomes::CONTROL.contains(claim),
+            "the recorded control no longer says {what} ({claim:?}): {}",
+            hevc_rate_control_outcomes::CONTROL
+        );
+    }
 }
 
 /// **The gate is the weaker one, and this file's own documentation says which gate it is.**
@@ -1246,16 +1398,44 @@ fn the_export_gate_takes_what_it_can_express_and_declines_the_rest_with_its_reas
         assert!(said.contains(why), "{name}: the decline says {said:?}, not the reason ({why:?}): {said}");
     }
 
-    // **A constant-quality export is declined by name, with the quantiser it stated in the message.**
-    // It is not one of the table above because the message carries a number, so matching on the
-    // number is what proves the gate read the settings rather than matching a substring.
+    // **`BitrateMode::ConstantQuality` is taken, and used to be declined — on a reason that was about
+    // the gate rather than about the driver.** The old assertion was that the gate *refused* the
+    // mode with the quantiser in the message. That reason ("this gate submits the bitrate") was true
+    // and proved nothing about `VA_RC_CQP`, which is in this driver's mask, is what
+    // `HevcEncoder::at_constant_quantiser` submits, and is measured encoding and decoding to the
+    // source in `the_rate_control_sweep_is_measured_with_a_buffer_set_this_driver_accepts`.
+    //
+    // **So the assertion is now that the quantiser reaches the encoder**, which is the claim that
+    // matters and the one the old test could not make. It is checked three ways, because each catches
+    // a different wiring mistake: that the mode is taken at all, that **the caller's own number**
+    // arrives (a gate that substituted its default would pass the first check), and that the
+    // bitrate says it names its own quantiser — which is what `HevcEncoderExport::build` checks the
+    // requests against, and which a gate that took the mode without wiring the request would fail.
     let mut cq = hevc_settings(String::new());
     cq.bitrate_mode = BitrateMode::ConstantQuality;
     cq.constant_qp = 30;
-    let Err(why_cq) = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::FPS_30, &cq) else {
-        panic!("a constant-quality export was accepted: it states a quantiser and no bitrate, and this gate submits the bitrate");
+    let taken_cq = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::FPS_30, &cq)
+        .expect("VA_RC_CQP is measured working, so a constant-quality HEVC export is one this backend can encode");
+    assert!(
+        taken_cq.bitrate.names_its_own_quantiser(),
+        "a constant-quality export is taken as a quantiser, and the bitrate must say so: {:?}",
+        taken_cq.bitrate
+    );
+    assert_eq!(
+        taken_cq.bitrate.quantiser(),
+        Some(30),
+        "the quantiser the settings stated is the one the encoder is asked for, not a default or a re-derived number"
+    );
+    // **A quantiser outside the range is still refused, and refused by number.** The mode being taken
+    // is not the same as the mode being unchecked: `constant_qp` arrives from a project file and a UI
+    // field, and a clamp would encode at the nearest quality instead of the one asked for.
+    let mut out_of_range = hevc_settings(String::new());
+    out_of_range.bitrate_mode = BitrateMode::ConstantQuality;
+    out_of_range.constant_qp = 60;
+    let Err(why_qp) = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::FPS_30, &out_of_range) else {
+        panic!("a quantiser of 60 was accepted: HEVC numbers them 0..=51, and a clamped one is a wrong picture that looks right");
     };
-    assert!(why_cq.contains("30"), "the decline names the quantiser the settings stated, not just the mode: {why_cq}");
+    assert!(why_qp.contains("51"), "the refusal names the range it enforces: {why_qp}");
 
     // **A fractional frame rate is taken, not rounded**, because the VUI states an exact rational:
     // `rate` carries 24000/1001 and `fps` is the whole number the *driver's* misc buffer carries,
@@ -1757,6 +1937,157 @@ fn a_hevc_export_through_the_gate_decodes_to_the_pictures_that_went_in() {
         let mean = sum as f64 / counted as f64;
         assert!(mean <= TOLERANCE, "muxed picture {index} is {mean:.1}/255 from the source, over a measured {TOLERANCE}");
         assert!(worst <= WORST, "muxed picture {index} has a sample {worst}/255 from the source, over a measured {WORST}");
+    }
+}
+
+/// **A constant-quality HEVC export reaches the driver, names the quantiser the settings stated, and
+/// produces a file ffmpeg decodes to the pictures that went in.**
+///
+/// # Why this is its own test and not a line in the one above
+///
+/// The gate test beside it asserts that a **bitrate** export works. **The quantiser path is a
+/// different wire, not the same one with a different number**: the gate resolves
+/// `BitrateMode::ConstantQuality` into [`HevcBitrate::ConstantQuantiser`], that builds the encoder
+/// through [`HevcEncoder::at_constant_quantiser`] instead of a bitrate constructor, and
+/// `HevcEncoderExport::encode` builds every request through `HevcEncodeRequest::key_frame(qp)` /
+/// `predicted(qp)` instead of the `*_at_rate` constructors. **`HevcEncoder::encode` refuses the
+/// pairing it was not built for**, so a gate that took the mode without rewiring the request would
+/// fail here at picture zero with an error about a quantiser — which is exactly the state this test
+/// exists to prevent, since the mode was taken without one for its whole life.
+///
+/// **The quantiser is checked to have an effect, because "it encoded" is not the claim.** A request
+/// that named the right quantiser to an encoder that ignored it would produce a file that decodes
+/// perfectly at the encoder's own default quality — the failure this whole branch is about, in a new
+/// place. So the same pictures are exported at two quantisers and the file sizes are compared: **a
+/// lower quantiser must produce the larger stream**, because that is the one directional prediction
+/// a lossy encoder's size makes. This is *not* a claim that the encoder "matches ffmpeg" — it is not
+/// compared to ffmpeg's encoder at all, only to the size its own setting implies.
+///
+/// **Deliberate break:** a gate that dropped the quantiser and used a default fails the size
+/// comparison; a gate that took the mode but left the requests naming no quantiser fails at the
+/// first picture; a `ConstantQuantiser(_)` that ignored its payload fails the size comparison too.
+#[test]
+fn a_constant_quality_hevc_export_encodes_at_the_quantiser_the_settings_stated() {
+    use filmcraft_isobmff::{Brand, Mp4Writer, TrackConfig, WriteSample, WriterOptions};
+    let _guard = lock();
+    let Some(ffmpeg) = filmcraft_testkit::ffmpeg_or_skip("decoding the constant-quality HEVC export") else { return };
+    let Some(ffprobe) = filmcraft_testkit::ffprobe_or_skip("counting the constant-quality HEVC export's frames") else { return };
+    if open_display().is_err() {
+        eprintln!("SKIPPED: no VA-API display");
+        return;
+    }
+    const PICTURES: usize = 6;
+
+    /// One export at `qp`, returning the muxed file's path and its total coded size.
+    fn export_at(qp: u8, tag: &str) -> (std::path::PathBuf, u64) {
+        let mut settings = hevc_settings(String::new());
+        settings.bitrate_mode = BitrateMode::ConstantQuality;
+        settings.constant_qp = qp;
+        // **The gate first, and its answer is what this test is about**: the mode must be taken and
+        // the caller's own number must be in it, not merely that an encoder appeared.
+        let config = hevc_config_for(Format::Hevc, WIDTH, HEIGHT, FrameRate::FPS_30, &settings)
+            .unwrap_or_else(|why| panic!("a constant-quality HEVC export at QP {qp} was declined: {why}"));
+        assert_eq!(config.bitrate.quantiser(), Some(qp), "the gate submitted a quantiser other than the one the settings stated");
+        assert!(config.bitrate.names_its_own_quantiser(), "a constant-quality export must be submitted as a quantiser, not as a rate");
+
+        let built = vaapi_encoder_factory(Format::Hevc, WIDTH, HEIGHT, FrameRate::FPS_30, &settings)
+            .unwrap_or_else(|| panic!("the registered factory declined a constant-quality HEVC export the gate accepts"))
+            .unwrap_or_else(|why| panic!("the factory declined a constant-quality HEVC export the gate accepts: {why}"));
+        let mut encoder = built;
+
+        let sources: Vec<Vec<u8>> = (0..PICTURES as u32).map(|i| ramp_frame(WIDTH, HEIGHT, i)).collect();
+        let path = scratch(&format!("hevc-cq-{tag}-qp{qp}.mp4"));
+        let file = std::fs::File::create(&path).expect("creating the mp4");
+        let mut writer = Mp4Writer::new(file, WriterOptions::new(Brand::Mp4)).expect("a writer");
+        let mut track = None;
+        let mut packets = Vec::new();
+        for (index, rgba) in sources.iter().enumerate() {
+            let frame = EncoderFrame { width: WIDTH, height: HEIGHT, rgba, hdr: None, index: index as u64 };
+            let out = encoder.encode(&frame).unwrap_or_else(|e| panic!("picture {index} did not encode at QP {qp} through the gate: {e}"));
+            assert_eq!(out.len(), 1, "picture {index} produced {} samples, not one", out.len());
+            packets.extend(out);
+            if track.is_none() {
+                track = Some(writer.add_track(TrackConfig::new(encoder.sample_entry(), config.fps)).expect("a video track"));
+            }
+        }
+        for out in encoder.flush().expect("flush") {
+            packets.push(out);
+        }
+        assert_eq!(packets.len(), PICTURES, "QP {qp}: the gate produced {} samples for {PICTURES} pictures", packets.len());
+        let track = track.expect("a picture was encoded, so there is a track");
+        for (index, p) in packets.iter().enumerate() {
+            writer
+                .write_sample(track, WriteSample { data: &p.data, duration: p.duration, composition_offset: p.composition_offset, is_sync: p.key })
+                .unwrap_or_else(|e| panic!("sample {index}: {e}"));
+        }
+        writer.finish().expect("finishing the file");
+        let coded: u64 = packets.iter().map(|p| p.data.len() as u64).sum();
+        (path, coded)
+    }
+
+    // **Two quantisers, and the directional check between them.** 26 is the origin of HEVC's own
+    // syntax (`SliceQPY = 26 + init_qp_minus26 + slice_qp_delta`, H.265 7.4.7.1) and 40 is a full
+    // nine steps above it, so the two are not a rounding difference in a tolerance.
+    let (fine_path, fine_bytes) = export_at(26, "fine");
+    let (coarse_path, coarse_bytes) = export_at(40, "coarse");
+    eprintln!("constant-quality HEVC export: QP 26 coded {fine_bytes} bytes, QP 40 coded {coarse_bytes} bytes");
+    assert!(
+        fine_bytes > coarse_bytes,
+        "QP 26 coded {fine_bytes} bytes and QP 40 coded {coarse_bytes}: a coarser quantiser cannot produce the larger stream, so the \
+         quantiser is not reaching the pictures (a gate that took the mode and then encoded at a default would produce two equal files)"
+    );
+
+    // **And the stream is a real one** — the end-to-end claim, which is the only one that means
+    // anything: every picture decodable, no diagnostic, and each within the tolerance this file has
+    // measured on this encoder.
+    for (label, path) in [("QP 26", &fine_path), ("QP 40", &coarse_path)] {
+        let counted = std::process::Command::new(ffprobe.as_os_str())
+            .args(["-v", "error", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", "-i"])
+            .arg(path)
+            .output()
+            .expect("ffprobe");
+        let frames = String::from_utf8_lossy(&counted.stdout).trim().to_string();
+        assert_eq!(frames, PICTURES.to_string(), "{label}: {} holds {frames} decodable frame(s) for {PICTURES} pictures", path.display());
+
+        let raw = std::process::Command::new(ffmpeg.as_os_str())
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-f", "rawvideo", "-pix_fmt", "gray", "-"])
+            .output()
+            .expect("ffmpeg");
+        assert!(raw.stderr.is_empty(), "{label}: ffmpeg decoded the export with a diagnostic: {}", String::from_utf8_lossy(&raw.stderr));
+        let one = (WIDTH as usize) * (HEIGHT as usize);
+        assert_eq!(raw.stdout.len(), one * PICTURES, "{label}: ffmpeg returned {} bytes of luma for {PICTURES} pictures", raw.stdout.len());
+        // **Against the converter's own luma, for the reason the bitrate export test gives at
+        // length**: the RGBA is converted with a full BT.709 matrix before it reaches the encoder, so
+        // comparing a decoded Y plane with an R' channel compares two colour spaces.
+        //
+        // **The tolerance is this encoder's measured one and it is the same for both quantisers.**
+        // A coarser quantiser genuinely loses more, so a per-quantiser bound would be a bound chosen
+        // to fit; this encoder's own CQP runs measure mean 9.1/255 and worst 21 at QP 26, and the
+        // sweep measures the same at QP 26 through the swept path. The bound is set from that
+        // measurement with room above it and nowhere near a wrong picture.
+        const TOLERANCE: f64 = 16.0;
+        const WORST: u8 = 48;
+        for index in 0..PICTURES {
+            let Some(got) = raw.stdout.get(index * one..(index + 1) * one) else { break };
+            let rgba = ramp_frame(WIDTH, HEIGHT, index as u32);
+            let (mut want, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+            filmcraft_export::rgba_to_yuv420_8(&rgba, WIDTH as usize, HEIGHT as usize, &mut want, &mut u, &mut v);
+            let mut sum = 0u64;
+            let mut worst = 0u8;
+            let mut counted = 0u64;
+            for (&decoded, &source_byte) in got.iter().zip(want.iter()) {
+                let difference = decoded.abs_diff(source_byte);
+                sum += u64::from(difference);
+                worst = worst.max(difference);
+                counted += 1;
+            }
+            assert_eq!(counted, one as u64, "{label} picture {index} compared {counted} samples of {one}");
+            let mean = sum as f64 / counted as f64;
+            assert!(mean <= TOLERANCE, "{label} picture {index} is {mean:.1}/255 from the source, over a measured {TOLERANCE}");
+            assert!(worst <= WORST, "{label} picture {index} has a sample {worst}/255 from the source, over a measured {WORST}");
+        }
     }
 }
 

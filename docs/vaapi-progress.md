@@ -443,26 +443,72 @@ the same claim as encoding AV1, and this section still does not make the second 
    was written here", not "nothing is set". **Gate on the returned status and poison the value you check**
    (`0xDEADBEEF` here) so "the driver never wrote this" and "the driver wrote zero" stay distinguishable.
 
-The rate-control sweep has the same shape as landmine 2, and now **states its own precondition**: it was
-taken with no packed slice header, which this driver refuses to encode without, so it measured the **buffer
-set** rather than the modes. Of the **eight** modes this driver advertises for HEVC Main (`0x14de`, expanded
-in the code as CBR, VBR, VCM, CQP, ICQ, MB, QVBR, TCBRC), **six failed at `vaMapBuffer`** and two
-(`VA_RC_ICQ`, `VA_RC_QVBR`) **at `vaEndPicture`** — and those two failing earlier is the signature of a
-buffer the driver wants and is not getting, not of a mode it dislikes. With the slice header supplied
-**`VA_RC_CQP` — the mode this path names — encodes**, and the other modes were **re-swept once pictures came
-back**, because the earlier sweep's precondition no longer held: it was taken before the path packed and
-submitted a slice header, so its result could not be read as either a pass or a refusal.
+The rate-control sweep has the same shape as landmine 2 and 3, and now **states its own precondition twice over** —
+because it was wrong twice, in two different ways, and the second failure is the one worth generalising from.
 
-Each mode was submitted **twice**, with a rate-control record and without, which is what separates a mode
-failure from a record failure — the same distinction the quantisation-buffer bisect turned on. **ICQ and QVBR
-fail with and without a record**, so the failure is the mode and both are **refuted**. TCBRC fails only with
-the record. CBR, VBR and MB encode.
+**The first sweep was taken with no packed slice header**, which this driver refuses to encode without, so it
+measured the **buffer set** rather than the modes. Of the **eight** modes this driver advertises for HEVC Main
+(`0x14de`, expanded in the code as CBR, VBR, VCM, CQP, ICQ, MB, QVBR, TCBRC), **six failed at `vaMapBuffer`** and
+two (`VA_RC_ICQ`, `VA_RC_QVBR`) **at `vaEndPicture`** — and those two failing earlier is the signature of a buffer
+the driver wants and is not getting, not of a mode it dislikes. With the slice header supplied **`VA_RC_CQP` —
+the mode this path names — encodes**, and the other modes were re-swept, because the earlier sweep's precondition
+no longer held.
+
+**The second sweep fixed the buffer set and still had no control.** It refused `VA_RC_CQP` by name in both columns,
+so the known-good mode appeared in neither and **the sweep had no passing row at all**. That is a defect in the
+*sweep*, not a property of the driver, and it is the more instructive of the two failures: **a table in which
+every mode fails cannot refute anything**, because "the modes this driver refuses" and "this submission is broken"
+and "this driver refuses rate control altogether" all produce the same table. A sweep needs a mode that is known
+to work, measured in the same process against the same buffer set, or its failures mean nothing.
+
+**The third sweep is the one recorded**, with `VA_RC_CQP` swept and **asserted first** as the control. Every mode
+was submitted **twice** — with a rate-control record and without — which is what separates a mode failure from a
+record failure. On iHD 26.3.5 / libva 1.24, six 320x240 pictures each, changing only `VAConfigAttribRateControl`:
+
+| mode | with CBR's record | with no record | bytes mapped | ffmpeg | verdict |
+|---|---|---|---|---|---|
+| `VA_RC_CBR` (0x02) | encodes, mean 9.1/255 | encodes, mean 9.2/255 | yes | silent, 6/6 | works — the gate submits it |
+| `VA_RC_VBR` (0x04) | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | silent, 6/6 | works — the gate submits it |
+| `VA_RC_VCM` (0x08) | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | silent, 6/6 | **the driver runs it** |
+| **`VA_RC_CQP` (0x10) — THE CONTROL** | **encodes, mean 9.1/255**, sizes `[184, 51, 45, 43, 55, 48]` | **encodes, mean 9.1/255**, same sizes | yes | **silent, 6/6** | **works — and is what the gate now submits for a constant-quality export** |
+| `VA_RC_ICQ` (0x40) | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` | the same | no | — | **refuted — the mode, not the record** |
+| `VA_RC_MB` (0x80) | encodes, mean 9.1/255 | encodes, mean 9.1/255 | yes | silent, 6/6 | accepted, but see below |
+| `VA_RC_QVBR` (0x400) | `vaEndPicture` → `VA_STATUS_ERROR_INTERNAL` | the same | no | — | **refuted — the mode, not the record** |
+| `VA_RC_TCBRC` (0x1000) | `vaRenderPicture` → invalid `VABufferID` for 9 encode buffers | encodes, mean 9.2/255 | with: no; without: yes | without: silent, 6/6 | **fails on the record, not the mode** |
+
+"Encodes" here is the end-to-end claim, not "a picture came back": bytes mapped out of the coded buffer, ffmpeg
+**silent**, **every** picture present, every picture within the tolerance this encoder's own CQP runs measure
+(mean 9.1/255, worst 20–21). **Five of the eight encode and decode.**
+
+**ICQ and QVBR fail with and without a record**, so the failure is the mode and both are **refuted** — and the
+refutation now carries weight it did not have before, because the same `vaEndPicture` call succeeded for five
+other modes seconds earlier. TCBRC fails only with the record.
 
 **`VA_RC_VCM` encodes**, at mean 9.1/255 with ffmpeg silent — which **falsifies the reason it was originally
 refused**. It is declined now for a different reason: nothing above the backend can name it, and a mode a
 caller cannot ask for is not a mode the path should accept. That is a statement about the settings surface,
 not about the driver, and the distinction matters: the earlier refusal would have been a claim about every
-driver.
+driver. **`VA_RC_CQP` is the counter-example that keeps this a rule and not a shrug** — it was in exactly the same
+position (unreachable through `RateControl`, and declined by the gate on the reason that "this gate submits the
+bitrate") and was then **wired**, because `BitrateMode::ConstantQuality` already meant "a quantiser, no rate", so
+wiring it needed no new user-facing concept. **No `BitrateMode` means VCM**, so wiring it would mean inventing
+one — a product decision, stated as such rather than smuggled in with a libva change.
+
+**`VA_RC_MB` encodes, and its sizes are `VA_RC_CQP`'s byte for byte** (`[184, 51, 45, 43, 55, 48]` under both a
+record and none). That is a finding rather than a duplicate row: `va.h:1122-1125` says `VA_RC_MB` *"may be
+combined with other RC modes, except CQP"* — a **modifier, not a base mode** — and a modifier with nothing to
+modify produces the driver's unmodified output. So "works" for MB means **the driver accepts the submission**, not
+that per-macroblock control happened. The combination (`VA_RC_CBR | VA_RC_MB`) is **named untested rather than
+claimed**.
+
+**`VAConfigAttribEncPackedHeaders` (10) answers `0x1f` for HEVC** — all five flags, `SEQUENCE | PICTURE | SLICE |
+MISC | RAW_DATA`, measured with `vaGetConfigAttributes`. **`VA_ENC_PACKED_HEADER_SLICE` (0x4) is among them**,
+which is the flag this path depends on. **AV1's answer for the same attribute on the same driver is `0x1b`, which
+excludes it** — because AV1 has no slice header, it takes a frame header, and `PICTURE` is the flag that says so.
+**The two answers are the evidence that this attribute is not a free choice**: same driver, same attribute,
+answering differently per codec for a structural reason. Note that advertising and enforcing are separate: every
+value from `0x0` to `0x5` encodes identically on this path, and what it refuses to encode without is the packed
+slice header **buffer**.
 
 ### 3.9 Reachability from the UI, and what is in progress
 
@@ -476,11 +522,22 @@ to one, so a failure during an export stops it with an error.
 
 **HEVC is reachable too**, through the same factory and the same `Once` (`11b351e`). A `Format::Hevc` export
 reaches the driver on a machine whose driver offers `VA_RC_CBR`/`VBR` and whose picture is a whole multiple of
-8 — 320x240 and 1920x1080 both are. Taken: a bitrate (`Cbr`, `Vbr1Pass`), one pass, progressive, square
-pixels, SDR, MP4/MOV. Declined, each with its reason: MXF (Annex B), two-pass, constant-quality (which names
-the quantiser it cannot honour), 0 kbps, HDR, non-square pixels, interlaced, fractional rate, non-8-multiple
-size. `Format::Hevc` reaches the format list through a probe that creates a real session, so a machine without
-the encoder does not advertise it.
+8 — 320x240 and 1920x1080 both are. Taken: a bitrate (`Cbr`, `Vbr1Pass`), **a quantiser (`ConstantQuality`)**,
+one pass, progressive, square pixels, SDR, MP4/MOV. Declined, each with its reason: MXF (Annex B), two-pass,
+0 kbps, HDR, non-square pixels, interlaced, fractional rate, non-8-multiple size. `Format::Hevc` reaches the
+format list through a probe that creates a real session, so a machine without the encoder does not advertise it.
+
+**`BitrateMode::ConstantQuality` is taken for HEVC, and used to be declined.** The refusal said "this gate submits
+the bitrate" — a true statement about the gate, offered as though it settled a question about the driver, which it
+did not. `VA_RC_CQP` is in the advertised mask, is what `HevcEncoder::at_constant_quantiser` submits, and is now
+measured encoding and decoding to the source. **For HEVC this was not a small gap**: there is no software HEVC
+encoder behind this one, so a user who picked "Constant quality" on an HEVC export got *encoder not available*
+rather than a slower file. The export test asserts the quantiser **reaches the pictures** rather than merely
+that an encoder appeared — the same six pictures exported at QP 26 and QP 40 must come out at different sizes,
+which is the one directional prediction a lossy encoder's output size makes. HEVC's QP scale is its own
+(`SliceQPY = 26 + init_qp_minus26 + slice_qp_delta`, H.265 7.4.7.1, so **26 is the origin, not H.264's
+midpoint**); both backends number 0 (best) to 51 (worst), so the range check is shared and the value is not
+reinterpreted.
 
 **A shipped HEVC preset now exists** (`29affc43`), so this subsection's earlier statement that FilmCraft
 shipped none is superseded by **§3.10**, which is the current per-preset table. The preset is conditional on
@@ -1015,11 +1072,20 @@ initialisation and this is the pattern that provokes it.
   §2.
 - **HEVC encode, what is still refused** — §3.9. Each refusal carries its measurement: reference depth > 1
   (measured on HEVC's own numbers, and the same silent-divergence signature H.264 shows), multi-slice
-  pictures, B pictures, `VA_RC_VCM` (**because nothing above the backend can name it**, not because the driver
-  refuses it — which the re-sweep falsified), `VA_RC_ICQ` and `VA_RC_QVBR` (refuted: they fail with and
-  without a record), TCBRC, constant-quality, a non-8-multiple picture size (no crop exists in HEVC's record
-  to ask for one with), a fractional frame rate, HDR, MXF, and non-square pixels. **No HEVC preset ships**, so
-  nothing here is reachable from one until one exists.
+  pictures, B pictures, `VA_RC_VCM` (**because nothing above the backend can name it** — `BitrateMode` has
+  no variant meaning "a variable bit rate with a per-picture cap", so wiring it is a settings-layer decision;
+  the driver itself runs it, which the third sweep measured), `VA_RC_ICQ` and `VA_RC_QVBR` (**refuted**:
+  both fail at `vaEndPicture` with and without a rate-control record, while five other modes succeeded
+  through the same call in the same process), TCBRC (fails on the record, not the mode), a non-8-multiple
+  picture size (no crop exists in HEVC's record to ask for one with), HDR, MXF, and non-square pixels.
+  **Constant-quality is no longer in this list**: `VA_RC_CQP` is measured working and is wired, with the
+  export test asserting the quantiser reaches the pictures. **No HEVC preset ships**, so nothing here is
+  reachable from one until one exists.
+- **`VA_RC_MB` combined with a base mode** — `va.h:1122-1125` calls `VA_RC_MB` a modifier that "may be
+  combined with other RC modes, except CQP", and the sweep submitted it alone. A bare `0x80` produces output
+  **byte-identical to `VA_RC_CQP`'s**, which is what a modifier with nothing to modify looks like. The
+  combination (`VA_RC_CBR | VA_RC_MB`) is **named untested rather than claimed**; measuring it is a separate
+  sweep, and asserting anything about it now would repeat the exact mistake the sweep history records.
 - **H.264 encode, what is still refused** — §3. Each refusal carries its measurement: reference depth > 1
   (measured on both codecs, §3.4), multi-slice pictures (a second coded segment is refused; reachable at 70
   pictures, refused unmeasured), B pictures (the driver reports it *could* — `VAConfigAttribEncMaxRefFrames`
@@ -1029,10 +1095,6 @@ initialisation and this is the pattern that provokes it.
   is written down where it is not known: the `wmmat` scale is stated nowhere in the header, and the two
   pointers it gives (the specification and a third-party decoder's source) are both outside what this tree
   may read under `AGENTS.md` §2.
-- **HEVC rate control beyond `VA_RC_CQP`** — the sweep that exonerated the modes was taken with no packed
-  slice header, so it measured the buffer set and not the modes: six of the eight modes the driver advertises
-  failed at `vaMapBuffer` and two at `vaEndPicture`. With the header supplied `VA_RC_CQP` encodes, so the
-  other seven are **untested rather than refuted** (§3.8). A re-sweep is in flight.
 - **The FFI guard does not check parameter width or signedness** — arity is bound mechanically, and holes
   are now pinned as gaps, but the Rust↔C type mapping is still a reviewer's job, and both header checks are
   skipped on GitHub runners where the headers are absent.

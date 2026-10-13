@@ -20,13 +20,16 @@
 //!
 //! # What the gate takes, and what it declines
 //!
-//! - **A bitrate, as `Cbr` or `Vbr1Pass`.** `BitrateMode::ConstantQuality` is **declined by name**
-//!   rather than mapped onto a rate: it states a quantiser, and the two numbers are alternatives (see
-//!   [`super::encoder::RateControl`]), so submitting a bitrate for it would encode at a rate nobody
-//!   chose. HEVC's `VA_RC_CQP` — which does take that quantiser — is measured (see
-//!   [`super::hevc_submit::hevc_rate_control_outcomes`]) and is what
-//!   [`HevcEncoder::at_constant_quantiser`] submits; **wiring it to this mode is not part of this
-//!   gate, so the export is declined rather than encoded at an invented rate.**
+//! - **A bitrate, as `Cbr` or `Vbr1Pass`, or a quantiser, as `ConstantQuality`.** The three
+//!   [`HevcBitrate`] variants are the three fidelities [`HevcEncoder`] can be built with.
+//!   **`BitrateMode::ConstantQuality` used to be declined by name**, on the reason that "this gate
+//!   submits the bitrate" — a true statement about the gate offered as a statement about the driver.
+//!   It is taken now because `VA_RC_CQP` is in the driver's advertised mask, is what
+//!   [`HevcEncoder::at_constant_quantiser`] submits, and is **measured encoding and decoding to the
+//!   source** ([`super::hevc_submit::hevc_rate_control_outcomes`]). The gate had a working encoder
+//!   and no wire to it, which is a missing connection rather than a missing capability — and for
+//!   HEVC specifically it was not a small one, because **HEVC has no software encoder to fall back
+//!   to**: a user who chose "Constant quality" on an HEVC export got "encoder not available".
 //! - **A whole-multiple-of-8 picture size.** HEVC's sequence record carries **no crop**, so a size
 //!   that is not a whole number of the encoder's 8-sample minimum coding blocks cannot be expressed
 //!   at all. 640x360 and 1920x1080 both are; 641x361 does not.
@@ -56,11 +59,18 @@ use std::sync::{Arc, OnceLock};
 
 /// The bitrate an export asks of this backend, in bits per second.
 ///
-/// The same three shapes as [`super::encoder::RateControl`] carries and for the same reason: the
-/// gate must express a **fidelity**, and the three constructors [`HevcEncoder`] offers are the three
-/// fidelities this backend can name. A fourth (`ConstantQuantiser`) is reached through
-/// [`HevcEncoder::at_constant_quantiser`] and is not something an export's bitrate can be
-/// translated into, which is why [`config_for`] declines that mode instead of guessing.
+/// The same shapes as [`super::encoder::RateControl`] carries and for the same reason: the gate must
+/// express a **fidelity**, and the constructors [`HevcEncoder`] offers are the fidelities this
+/// backend can name.
+///
+/// **`ConstantQuantiser` is here because the mode was measured, not because it was wished for.** The
+/// gate used to decline [`BitrateMode::ConstantQuality`] outright, on the grounds that "this gate
+/// submits the bitrate" — a statement about the gate, which was true, offered as though it were a
+/// statement about the driver. **It is not**: `VA_RC_CQP` is in this driver's advertised mask, it is
+/// the one mode [`HevcEncoder::at_constant_quantiser`] submits, and the rate-control sweep now
+/// measures it encoding and decoding to the source alongside a working control in the same process
+/// ([`super::hevc_submit::hevc_rate_control_outcomes`]). The gate had a working encoder and no way
+/// to name it, which is a missing wire rather than a missing capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HevcBitrate {
     /// A constant bit rate: the same number every second.
@@ -72,6 +82,16 @@ pub enum HevcBitrate {
         /// The highest rate it may reach.
         max: u32,
     },
+    /// **A fixed quantiser, and no rate at all** — `BitrateMode::ConstantQuality` as this driver can
+    /// actually express it.
+    ///
+    /// **The number is HEVC's, not H.264's, and the two scales are not the same number.** HEVC's is
+    /// `SliceQPY = 26 + init_qp_minus26 + slice_qp_delta` (H.265 7.4.7.1), so **26 is the origin and
+    /// not a midpoint the way H.264's is** — and the range is 0..=51 for a different reason than
+    /// H.264's is. Both backends number them 0 (best) to 51 (worst), so
+    /// [`ExportSettings::constant_quantiser`]'s range check is used and **its value is not
+    /// reinterpreted**: a user who asks for QP 30 gets HEVC QP 30.
+    ConstantQuantiser(u8),
 }
 
 impl HevcBitrate {
@@ -82,14 +102,33 @@ impl HevcBitrate {
         match *self {
             Self::Cbr(bps) => HevcEncoder::at_constant_bitrate(display, size, 1, bps),
             Self::Vbr { target, max } => HevcEncoder::at_variable_bitrate(display, size, 1, target, max),
+            // **The quantiser is not passed here.** It is a property of each *request*
+            // (`HevcEncodeRequest::predicted`), not of the config, and `HevcEncoder::encode` refuses
+            // a request that does not match the mode it was built under. Carrying it in the encoder
+            // too would be two places holding one number.
+            Self::ConstantQuantiser(_) => HevcEncoder::at_constant_quantiser(display, size, 1),
         }
     }
 
-    /// Whether requests into an encoder built this way may name a quantiser — which is never, and is
-    /// asked as a question so the adapter's choice of request cannot drift from the gate's.
+    /// Whether requests into an encoder built this way must name a quantiser — **which is asked as a
+    /// question so the adapter's choice of request cannot drift from the gate's**, and which
+    /// [`rate_control_mode_of`] is the other half of: an encoder whose mode names a quantiser must
+    /// get requests that carry one, and [`HevcEncoderExport::build`] refuses the mismatch rather
+    /// than letting the encoder refuse it one picture at a time.
     pub fn names_its_own_quantiser(&self) -> bool {
-        let _ = self;
-        false
+        matches!(*self, Self::ConstantQuantiser(_))
+    }
+
+    /// The quantiser requests into this encoder must carry, when [`names_its_own_quantiser`].
+    ///
+    /// `None` for a bitrate mode, which is the honest answer: **there is no quantiser to name**, and
+    /// the rate controller picks each picture's. The adapter asks this rather than reaching into the
+    /// variant so that a fourth variant has to answer here.
+    pub fn quantiser(&self) -> Option<u8> {
+        match *self {
+            Self::ConstantQuantiser(qp) => Some(qp),
+            Self::Cbr(_) | Self::Vbr { .. } => None,
+        }
     }
 }
 
@@ -169,36 +208,65 @@ pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
                     backend is handed each picture once"
             .into());
     }
-    if s.bitrate_mode == BitrateMode::ConstantQuality {
-        return Err(format!(
-            "a constant-quality export: it states a quantiser ({}) and no bitrate, and this gate submits the bitrate. \
-             FilmCraft's software encoders take that mode; this backend is declined for it rather than encoded at a rate nobody chose",
-            s.constant_qp
-        ));
-    }
-    // **The bitrate, as the mode FilmCraft's own settings mean** — the same expression, in the same
-    // units, as the H.264 gate: `target_kbps` is the target, `max_kbps` is the ceiling, and a
-    // ceiling below the target is not a range (it becomes the 1.5x one, exactly as
-    // `ExportSettings::resolve` computes it, so the two backends cannot pick different ceilings).
-    let kbps = s.bitrate_kbps;
-    if kbps == 0 {
-        return Err(format!(
-            "a bitrate target of 0 kbps: this backend submits the bitrate it is given rather than choosing one, and there is \
-             nothing here to convert. The settings layer floors a target at 100 kbps (ExportSettings::resolve), so a zero here \
-             is a caller that skipped it. The driver reports {} for rate control",
-            driver_rate_control_modes_named()
-        ));
-    }
-    // **kbit/s → bit/s, checked.** A `saturating_mul` would turn an overflow into a bitrate three
-    // orders of magnitude too small: a file at 0.1% of the requested size with no error anywhere.
-    let bps = kbps.checked_mul(1000).ok_or_else(|| format!("a bitrate target of {kbps} kbps, which does not fit the record's bits-per-second field"))?;
+    // **`BitrateMode::ConstantQuality` is taken, and it used to be declined — on a reason that was
+    // about this gate rather than about the driver.** The old message said "this gate submits the
+    // bitrate", which was true and was offered as though it settled the question. It does not: this
+    // gate could have submitted a quantiser, because **`VA_RC_CQP` is in the driver's advertised
+    // mask, is what [`HevcEncoder::at_constant_quantiser`] submits, and is measured encoding and
+    // decoding to the source** ([`super::hevc_submit::hevc_rate_control_outcomes`]). A user choosing
+    // "Constant quality, QP 30" on an HEVC export was told "encoder not available" — and, because
+    // HEVC has no software encoder to fall back to, that was the end of it rather than a slower file.
+    //
+    // **The quantiser is checked by the same accessor H.264 uses and is not reinterpreted.** HEVC
+    // numbers quantisers 0..=51 as H.264 does, but for a different reason: `SliceQPY = 26 +
+    // init_qp_minus26 + slice_qp_delta` (H.265 7.4.7.1) puts **26 at the origin, not in the middle**.
+    // Both are 0 (best) to 51 (worst), so the range check is shared; what a user gets is HEVC QP 30.
     let bitrate = match s.bitrate_mode {
-        BitrateMode::Cbr => HevcBitrate::Cbr(bps),
+        BitrateMode::ConstantQuality => {
+            // **The accessor's own error is not used, and the reason it is not is stated here rather
+            // than left as a `map_err(|_| ..)`.** It reads *"H.264 numbers them 0 (best) to 51
+            // (worst)"*, and this gate is HEVC's: forwarding it verbatim would point a user at the
+            // wrong codec for a number that is out of range in both. **The number itself is kept** —
+            // it is the input-derived value and the whole content of the refusal — and the HEVC
+            // statement is added to it. The accessor still does the checking, so the two backends
+            // cannot disagree about what "QP 30" is allowed to be.
+            let qp = s.constant_quantiser().map_err(|_| {
+                format!(
+                    "a quantiser of {}: this is an HEVC export, and HEVC numbers quantisers 0 (best) to 51 (worst) exactly as H.264 \
+                     does — the same range, named for this codec",
+                    s.constant_qp
+                )
+            })?;
+            HevcBitrate::ConstantQuantiser(qp)
+        }
         _ => {
-            let max_kbps = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps.saturating_mul(3) / 2);
-            let max_bps =
-                max_kbps.checked_mul(1000).ok_or_else(|| format!("a VBR ceiling of {max_kbps} kbps, which does not fit the record's bits-per-second field"))?;
-            HevcBitrate::Vbr { target: bps, max: max_bps }
+            // **The bitrate, as the mode FilmCraft's own settings mean** — the same expression, in the same
+            // units, as the H.264 gate: `target_kbps` is the target, `max_kbps` is the ceiling, and a
+            // ceiling below the target is not a range (it becomes the 1.5x one, exactly as
+            // `ExportSettings::resolve` computes it, so the two backends cannot pick different ceilings).
+            let kbps = s.bitrate_kbps;
+            if kbps == 0 {
+                return Err(format!(
+                    "a bitrate target of 0 kbps: this backend submits the bitrate it is given rather than choosing one, and there is \
+                     nothing here to convert. The settings layer floors a target at 100 kbps (ExportSettings::resolve), so a zero here \
+                     is a caller that skipped it. The driver reports {} for rate control",
+                    driver_rate_control_modes_named()
+                ));
+            }
+            // **kbit/s → bit/s, checked.** A `saturating_mul` would turn an overflow into a bitrate three
+            // orders of magnitude too small: a file at 0.1% of the requested size with no error anywhere.
+            let bps =
+                kbps.checked_mul(1000).ok_or_else(|| format!("a bitrate target of {kbps} kbps, which does not fit the record's bits-per-second field"))?;
+            match s.bitrate_mode {
+                BitrateMode::Cbr => HevcBitrate::Cbr(bps),
+                _ => {
+                    let max_kbps = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps.saturating_mul(3) / 2);
+                    let max_bps = max_kbps
+                        .checked_mul(1000)
+                        .ok_or_else(|| format!("a VBR ceiling of {max_kbps} kbps, which does not fit the record's bits-per-second field"))?;
+                    HevcBitrate::Vbr { target: bps, max: max_bps }
+                }
+            }
         }
     };
     if s.signal.is_hdr() {
@@ -265,6 +333,12 @@ pub struct HevcEncoderExport {
     v: Vec<u8>,
     /// Pictures handed to [`VideoEncoder::encode`] so far.
     done: u64,
+    /// **The quantiser each request must carry, or `None` when the rate controller picks it.**
+    ///
+    /// Held here rather than read back off `config.bitrate` because `config` is consumed by
+    /// [`Self::build`]'s call to `build()`, and holding the one number the request needs is what
+    /// keeps [`VideoEncoder::encode`] from having to know which variant it is serving.
+    quantiser: Option<u8>,
 }
 
 impl HevcEncoderExport {
@@ -274,16 +348,25 @@ impl HevcEncoderExport {
         let mut encoder = config.bitrate.build(&display, (config.w, config.h))?;
         encoder.at_rate_exact(config.rate)?;
         encoder.key_frames_every(config.gop)?;
+        let quantiser = config.bitrate.quantiser();
         // **The gate's own question, asked here rather than answered again.** A [`HevcBitrate`] that
-        // named its own quantiser would need a request that carries one, and building an encoder
-        // under a bitrate and then submitting a quantiser is the pairing
-        // [`HevcEncoder::encode`] refuses. [`rate_control_mode_of`] is what makes that a compile-time
-        // coupling rather than a comment: a new variant has to appear in both places.
+        // named its own quantiser needs a request that carries one, and a bitrate encoder given a
+        // quantiser is the pairing [`HevcEncoder::encode`] refuses. [`rate_control_mode_of`] is what
+        // makes that a compile-time coupling rather than a comment: a new variant has to appear in
+        // both places, and this check is where a variant that got one wrong is caught before the
+        // first picture rather than at it.
         if config.bitrate.names_its_own_quantiser() != rate_control_mode_of(config.bitrate).is_none() {
             return Err("this backend's bitrate says it names its own quantiser and its mode does not".into());
         }
+        // **And the number the requests will carry is the gate's own**, taken once here so
+        // `encode` cannot answer a different one on a later picture: a gate that passed a
+        // `ConstantQuantiser(_)` whose `quantiser()` disagreed with the variant would otherwise
+        // encode at a quantiser the settings never stated.
+        if config.bitrate.names_its_own_quantiser() != quantiser.is_some() {
+            return Err("this backend's bitrate names a quantiser and does not carry one".into());
+        }
         let duration = u32::try_from(rate.den).map_err(|_| format!("a frame duration of {} does not fit a u32", rate.den))?;
-        Ok(Self { encoder, w: config.w, h: config.h, duration, rate, y: Vec::new(), u: Vec::new(), v: Vec::new(), done: 0 })
+        Ok(Self { encoder, w: config.w, h: config.h, duration, rate, y: Vec::new(), u: Vec::new(), v: Vec::new(), done: 0, quantiser })
     }
 
     /// One sample per picture, at its own time.
@@ -346,11 +429,25 @@ impl VideoEncoder for HevcEncoderExport {
                 "VA-API HEVC: {e} (an HEVC export on this machine needs a picture size that is a whole number of 8-sample coding blocks)"
             ))
         })?;
-        // **No quantiser is named, and that is the whole point.** The gate built this encoder under
-        // a [`HevcBitrate`], so the picture's fidelity is that bitrate and there is no honest QP for
-        // this function to pass; `HevcEncodeRequest::predicted_at_rate` is the constructor that says
-        // so and `HevcEncoder::encode` refuses the other pairing rather than honouring one half.
-        let request = if f.index == 0 { HevcEncodeRequest::key_frame_at_rate() } else { HevcEncodeRequest::predicted_at_rate() };
+        // **The quantiser is named only when the gate's own mode names one.** Under a bitrate there is
+        // no honest QP for this function to pass — `HevcEncodeRequest::predicted_at_rate` is the
+        // constructor that says so, and `HevcEncoder::encode` refuses the other pairing rather than
+        // honouring one half. Under [`HevcBitrate::ConstantQuantiser`] the reverse is true and the
+        // pairing is not optional: the mode *is* the quantiser, and a request that omitted it would
+        // be refused one picture at a time. **The pairing comes from the bitrate, not from here**,
+        // which is what keeps `build`'s check and this line from drifting apart.
+        let request = match (self.quantiser, f.index == 0) {
+            (Some(qp), true) => match HevcEncodeRequest::key_frame(qp) {
+                Ok(r) => r,
+                Err(why) => return Err(ExportError::Encode(format!("VA-API HEVC: {why}"))),
+            },
+            (Some(qp), false) => match HevcEncodeRequest::predicted(qp) {
+                Ok(r) => r,
+                Err(why) => return Err(ExportError::Encode(format!("VA-API HEVC: {why}"))),
+            },
+            (None, true) => HevcEncodeRequest::key_frame_at_rate(),
+            (None, false) => HevcEncodeRequest::predicted_at_rate(),
+        };
         let picture = self
             .encoder
             .encode(request)
@@ -805,5 +902,12 @@ pub fn rate_control_mode_of(bitrate: HevcBitrate) -> Option<RateControl> {
     match bitrate {
         HevcBitrate::Cbr(bps) => Some(RateControl::Cbr(bps)),
         HevcBitrate::Vbr { target, max } => Some(RateControl::Vbr { target, max }),
+        // **`None` because `RateControl` has no constant-quantiser variant carrying the number** —
+        // its `ConstantQuantiser` is the unit variant that means "no record, the picture record's
+        // `pic_init_qp` is the quality", which is the same *mode* and a different *number*. The
+        // quantiser itself rides on the request (`HevcBitrate::quantiser`), where `HevcEncoder`
+        // expects it, so nothing is lost by this answer being `None` — and it is `None` for exactly
+        // the reason `names_its_own_quantiser` is `true`, which is the pairing `build` checks.
+        HevcBitrate::ConstantQuantiser(_) => None,
     }
 }
