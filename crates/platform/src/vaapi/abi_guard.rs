@@ -1261,7 +1261,8 @@ fn which(name: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Width and signedness — the one property of a declaration that changes no byte of a record.
+// ---------------------------------------------------------------------------------------------
+// Width, signedness and shape — the properties of a declaration that change no byte of a record.
 //
 // Everything above asks the C compiler for a **number**: a `sizeof`, an `offsetof`, the width of a
 // hole, a bit position. All of those are blind to the difference between a `u32` and an `i32`,
@@ -1270,66 +1271,164 @@ fn which(name: &str) -> Option<String> {
 // `INT32_MAX` and the crate reads a negative number, or the reverse, with nothing to notice and
 // nothing but a wrong picture to show for it.
 //
-// This section is deliberately **two records**, not the whole list, and it is additive: it touches
-// neither `SUBMITTED_RECORDS` nor the hole checks nor [`every_record_the_backend_submits_tiles_byte_for_byte`].
-// `VAPictureH264` is submitted for **every** H.264 picture and `VAImage` for every image the
-// backend maps; between them they hold a signed 32-bit field (`TopFieldOrderCnt`), a signed 8-bit
-// array (`component_order`), unsigned 16-bit fields, unsigned arrays and one nested record, which is
-// the range of shapes where a signedness mistake is possible at all. A record added here later is
-// added by writing its fields out, the same way [`SUBMITTED_RECORDS`] is.
+// This section is **every record in [`SUBMITTED_RECORDS`]**, not a sample of two, and it is
+// additive: it touches neither that list nor the hole checks nor
+// [`every_record_the_backend_submits_tiles_byte_for_byte`]. The sample it started as covered the
+// shapes a signedness mistake is possible in; the rest turned out to need three more shapes before
+// it could be checked at all, and each of those is a shape where a *wrong* answer was not
+// detectable by the two numbers above:
+//
+//   * **a flag union** — the C declarations carry bitfields (`seq_fields`, `pic_fields`,
+//     `slice_parsing_fields`, `LongSliceFlags`, the AV1 `*_fields` …), which Rust has no syntax
+//     for, so `ffi.rs` declares each as the union's own `value` word. `sizeof` is 4 for the union
+//     and for the word, so a Rust `u32` for a union whose `value` is a `uint16_t` is invisible to
+//     every other check in this file.
+//   * **an enumerated type** — C11 6.7.2.2p4 leaves the underlying type to the implementation, so
+//     there is a *shape* to check and no *signedness* to compare. `_Generic`'s `default:` bucket
+//     used to lump these in with unions and pointers, which is why more rows alone would not do it.
+//   * **a pointer** — `VACodedBufferSegment::buf` and `::next` are `void *` and nothing else, and a
+//     `u64` for either is the same eight bytes as a `uintptr_t`.
 //
 // The two sides are independent, which is what makes the comparison worth anything:
 //
-// * **C** — `_Generic` over the member, folded with `sizeof` into `sign * 256 + width`. This reads
-//   the header. Editing this file cannot change it.
+// * **C** — `_Generic` over the member, folded with `sizeof` into `sign * 256 + width`, plus
+//   `__builtin_classify_type(__typeof__(member))` for the shape. This reads the header. Editing
+//   this file cannot change it.
 // * **Rust** — [`CKindOf`], read off the type spelled in [`TYPED_RECORDS`]. That spelling is a
 //   transcription and is **not** trusted on its own: the tiling test already pins each field's width
 //   against `offset_of!` on the real struct, so a wrong width cannot survive it, and this section
-//   re-asserts the two tables' widths agree. What nothing else pinned is the **signedness**, and
-//   that is what the C compiler is being asked about here.
+//   re-asserts the two tables' widths agree for every field. What nothing else pinned is the
+//   **signedness** and the **shape**, and those are what the C compiler is being asked about.
+//
+// ### The one thing that is deliberately *not* checked
+//
+// `VADecPictureParameterBufferAV1::anchor_frames_list` is a `VASurfaceID *` in the header
+// (`va_dec_av1.h:330`) and a `u64` in `ffi.rs` — a real shape disagreement, settled deliberately on
+// the other side of the boundary and pinned by `ffi.rs`'s own
+// `the_pointer_shaped_field_is_an_address_and_not_a_pointer`. It is the one member of the 385 here
+// that this check does not cover, and it is named in [`NOT_CHECKED`] with the reason rather than
+// passed over.
 // ---------------------------------------------------------------------------------------------
 
-/// What a C compiler will say about the C type a Rust field's type stands for.
+/// A C compiler's [`__builtin_classify_type`] answers, as spelled in [`CK_PROLOGUE`].
 ///
-/// The C **spelling** deliberately does not matter. `VAStatus`, `VAGenericID`, `int32_t` and
-/// `unsigned int` are all four bytes; only the last of them is a different answer to the question
-/// this asks, and `_Generic` matches a typedef against its underlying type, so none of the others
-/// can be confused with it either.
+/// **The `__typeof__` is not decoration.** Given an *expression*, `__builtin_classify_type` reports
+/// an enumerated type as [`CK_INTEGER`] — the expression's type has already been converted to the
+/// underlying integer type by the conversions a builtin applies to an argument. Given the *type*,
+/// it reports [`CK_ENUMERAL`]. Both were measured on this target (GCC 16.2, clang 23.1), and the
+/// difference is the whole reason an enum can be told from an integer at all.
+const CK_INTEGER: i32 = 1;
+const CK_ENUMERAL: i32 = 3;
+const CK_POINTER: i32 = 5;
+const CK_RECORD: i32 = 12;
+const CK_UNION: i32 = 13;
+
+/// Which way round a C integer reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CKind {
-    /// A signed integer this many bytes wide: C's `int`, `int32_t`, `long`, …
-    Signed(usize),
-    /// The same, unsigned.
-    Unsigned(usize),
-    /// Not an integer at all: a nested record, a union or a pointer. C lays the bytes out and there
-    /// is no signedness to disagree about.
-    Nested,
+enum Sign {
+    Signed,
+    Unsigned,
 }
 
-impl CKind {
-    /// The number the C side is compared with, in `CKIND`'s `sign * 256 + width` encoding.
+impl Sign {
+    /// The number the C side is compared with for an integer of this signedness and `width`.
     ///
     /// In one place, so "the same signedness" is one number rather than a literal repeated in a
     /// generated string, and so flipping one bit of it is visibly a different value.
-    fn expected_code(self) -> i32 {
+    const fn code(self, width: usize) -> i32 {
         match self {
-            CKind::Signed(width) => 256 + width as i32,
-            CKind::Unsigned(width) => width as i32,
-            CKind::Nested => 0,
+            Sign::Unsigned => width as i32,
+            Sign::Signed => 256 + width as i32,
+        }
+    }
+
+    /// How a message names this signedness.
+    const fn spelling(self) -> &'static str {
+        match self {
+            Sign::Unsigned => "unsigned",
+            Sign::Signed => "signed",
+        }
+    }
+}
+
+/// What the C compiler must say about the header's member, given what our declaration says.
+///
+/// One enum rather than a bare signedness because the shapes are part of the answer: a declaration
+/// that stores a flag union's `value` word is *not* the same declaration as one that stores a
+/// plain `uint32_t`, and before [`CK_CLASS`] existed nothing here could tell them apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CKind {
+    /// The header's member is an integer of this signedness and this width.
+    Integer { sign: Sign, width: usize },
+    /// The header's member is a nested record. Its width is [`SubmittedField::width`]'s business;
+    /// there is no signedness to disagree about.
+    Record,
+    /// The header's member is a **union**, and the word this declaration stores inside it is this
+    /// integer. Both halves are asserted: the class on the member, the width and signedness on the
+    /// named word — which is why [`CKindOf::UNION_WORD`] carries a name.
+    UnionValue { sign: Sign, width: usize },
+    /// The header's member is an **enumerated type**. C11 6.7.2.2p4 leaves the underlying type to
+    /// the implementation, so there is no signedness to compare and none is claimed; what is
+    /// asserted is the shape, and the width by the cross-check against [`SUBMITTED_RECORDS`].
+    Enum,
+    /// The header's member is a pointer.
+    Pointer,
+}
+
+impl CKind {
+    /// The `__builtin_classify_type` class the header's member has to answer with.
+    const fn expected_class(self) -> i32 {
+        match self {
+            CKind::Integer { .. } => CK_INTEGER,
+            CKind::Record => CK_RECORD,
+            CKind::UnionValue { .. } => CK_UNION,
+            CKind::Enum => CK_ENUMERAL,
+            CKind::Pointer => CK_POINTER,
+        }
+    }
+
+    /// The number the header's member has to agree with, for the kinds that have one.
+    const fn code(self) -> Option<i32> {
+        match self {
+            CKind::Integer { sign, width } | CKind::UnionValue { sign, width } => Some(sign.code(width)),
+            CKind::Record | CKind::Enum | CKind::Pointer => None,
+        }
+    }
+
+    /// What our declaration says, in words, for the message a failure prints.
+    fn describe(self) -> String {
+        match self {
+            CKind::Integer { sign, width } => format!("a {} {width}-byte integer", sign.spelling()),
+            CKind::UnionValue { sign, width } => format!("the `value` word of a union, {} {width} bytes", sign.spelling()),
+            CKind::Record => "a nested record".to_string(),
+            CKind::Enum => "an enumerated type".to_string(),
+            CKind::Pointer => "a pointer".to_string(),
         }
     }
 }
 
 /// A Rust field type, read for what C will say about the C type it stands for.
+///
+/// The C **spelling** deliberately does not matter. `VAStatus`, `VAGenericID`, `int32_t` and
+/// `unsigned int` are all four bytes; only the last of them is a different answer to the question
+/// this asks, and `_Generic` matches a typedef against its underlying type, so none of the others
+/// can be confused with it either.
 trait CKindOf {
-    /// Signed or unsigned and how wide, or [`CKind::Nested`].
+    /// The shape, and where there is one the width and signedness, C has to agree with.
     const KIND: CKind;
     /// How many levels of array the type is nested in, so the C side can peel the same way.
     ///
     /// Peeling is needed because `_Generic` on an array **decays it to a pointer** (C11 6.3.2.1p3),
     /// which would silently answer "pointer" for every array member here — including
-    /// `int8_t component_order[4]`, where the answer that matters is `int8_t`.
+    /// `int8_t component_order[4]`, where the answer that matters is `int8_t`. A two-dimensional
+    /// array needs it twice: `int16_t chroma_weight_l0[32][2]` peeled once is still an array, and
+    /// `__builtin_classify_type` decays *that* to `int16_t *` as well, so a second `[0]` is the
+    /// only thing that reaches the `int16_t` we actually declared.
     const DEPTH: usize;
+    /// The name the header gives the union word this declaration stores, or `""` for a type that is
+    /// not a union. Every flag union in these records spells it `value` except
+    /// `VAGenericValue::value`, whose union holds `i`, `f`, `p` and `fn` (`va.h:1666-1675`).
+    const UNION_WORD: &'static str = "";
 }
 
 macro_rules! c_kind {
@@ -1341,41 +1440,140 @@ macro_rules! c_kind {
     )*};
 }
 c_kind!(
-    u8 => CKind::Unsigned(1),
-    i8 => CKind::Signed(1),
-    u16 => CKind::Unsigned(2),
-    i16 => CKind::Signed(2),
-    u32 => CKind::Unsigned(4),
-    i32 => CKind::Signed(4),
-    u64 => CKind::Unsigned(8),
-    i64 => CKind::Signed(8),
+    u8 => CKind::Integer { sign: Sign::Unsigned, width: 1 },
+    i8 => CKind::Integer { sign: Sign::Signed, width: 1 },
+    u16 => CKind::Integer { sign: Sign::Unsigned, width: 2 },
+    i16 => CKind::Integer { sign: Sign::Signed, width: 2 },
+    // `c_int`, `VAStatus` and `VAProfile`/`VAEntrypoint` all *are* `i32`, so one impl covers them.
+    // That collapse is also why the Rust type alone cannot tell a member the header declares as an
+    // enum from one it declares as an `int`: both spell `i32` here. [`HeaderEnum`] and [`FlagWord`]
+    // are how those two shapes are spelled apart.
+    u32 => CKind::Integer { sign: Sign::Unsigned, width: 4 },
+    i32 => CKind::Integer { sign: Sign::Signed, width: 4 },
+    // `VABufferID`, `VAImageID`, `VASurfaceID`, `c_uint` and `VAConfigAttrib::value` are all `u32`,
+    // for the same reason and with the same consequence.
+    u64 => CKind::Integer { sign: Sign::Unsigned, width: 8 },
+    i64 => CKind::Integer { sign: Sign::Signed, width: 8 },
+    // `size_t` and `uintptr_t`, which is what `VABufferInfo::handle` and `::mem_size` are.
+    usize => CKind::Integer { sign: Sign::Unsigned, width: 8 },
+    // `void *`, which is what `VACodedBufferSegment::buf` and `::next` are.
+    *mut c_void => CKind::Pointer,
 );
-/// An array of anything: the kind and the depth are the element's, because that is what the C side
-/// reaches once it has indexed its way in one level at a time.
+/// An array of anything: the kind is the element's and the depth grows, because that is what the C
+/// side reaches once it has indexed its way in one level at a time.
 impl<T: CKindOf, const N: usize> CKindOf for [T; N] {
     const KIND: CKind = T::KIND;
     const DEPTH: usize = T::DEPTH + 1;
 }
-/// The one nested record the two records here contain. A record added to [`TYPED_RECORDS`] with a
-/// field type that is neither an integer nor listed here does not compile, and the message says
-/// which field — so this list cannot fall behind the table without the build noticing.
-impl CKindOf for VaImageFormat {
-    const KIND: CKind = CKind::Nested;
+
+/// The nested records these fields hold. A record added to [`TYPED_RECORDS`] with a field type that
+/// is neither an integer, nor one of these, nor [`FlagWord`], nor [`HeaderEnum`] **does not compile**,
+/// and the error names the field — so the list cannot fall behind the table without the build noticing.
+macro_rules! c_record {
+    ($($ty:ty),* $(,)?) => {$(
+        impl CKindOf for $ty {
+            const KIND: CKind = CKind::Record;
+            const DEPTH: usize = 0;
+        }
+    )*};
+}
+c_record!(
+    VaImageFormat,
+    VaGenericValue,
+    VaPictureH264,
+    VaPictureHevc,
+    VaSegmentationStructAv1,
+    VaFilmGrainStructAv1,
+    VaWarpedMotionParamsAv1,
+    VaPictureParameterBufferVp9,
+    VaSegmentParameterVp9,
+    VaSliceParameterBufferVp9
+);
+
+/// A Rust type `ffi.rs` writes **in place of a C flag union**, saying which word of that union it
+/// holds and how wide that word is.
+///
+/// This is a trait on the *declared* type rather than a marker type with two type parameters on
+/// purpose. The two things a flag-union field needs are independent: the **width** the declaration
+/// occupies, which is `size_of` of what `ffi.rs` actually wrote, and the **word** inside the
+/// header's union that we read, whose signedness and width are what `CKIND` has to agree with. Those
+/// are the same thing for twenty-one of the twenty-two unions — `ffi.rs` declares the `value` word
+/// itself, so the field is a `uint32_t` and the word is a `uint32_t` — and **not** the same thing for
+/// `VAGenericValue::value`, where the declaration is the whole eight-byte union (`ffi.rs`'s
+/// `VaGenericValueValue`, which holds a `void *`) and the word read out of it is a four-byte `int32_t`
+/// named `i` (`va.h:1666-1675`). Two type parameters on a marker could not say both, because the
+/// marker itself has to be as wide as the declaration for the width cross-check to mean anything; two
+/// associated consts can, and it keeps the twenty-one ordinary rows in [`TYPED_RECORDS`] reading as
+/// the plain integers they are.
+trait FlagWordOf {
+    /// The word this declaration stores, as the header has to describe it.
+    const WORD: CKind;
+    /// The name the header gives that word inside the union.
+    const NAME: &'static str;
+}
+
+macro_rules! flag_word {
+    ($($ty:ty => $word:expr, $name:literal),* $(,)?) => {$(
+        impl FlagWordOf for $ty {
+            const WORD: CKind = $word;
+            const NAME: &'static str = $name;
+        }
+    )*};
+}
+flag_word!(
+    u32 => CKind::UnionValue { sign: Sign::Unsigned, width: 4 }, "value",
+    u16 => CKind::UnionValue { sign: Sign::Unsigned, width: 2 }, "value",
+    u8 => CKind::UnionValue { sign: Sign::Unsigned, width: 1 }, "value",
+    // The one union in these records whose integer word is not called `value`, and the one whose
+    // declared field is wider than the word: `ffi.rs` declares the whole union.
+    VaGenericValueValue => CKind::UnionValue { sign: Sign::Signed, width: 4 }, "i",
+);
+
+/// A field spelled `FlagWord<T>` in [`TYPED_RECORDS`]: `ffi.rs` stores a C flag union's word, because
+/// Rust has no bitfield syntax, so the packed word is stored on its own and `picture.rs` sets the bits.
+///
+/// `#[repr(transparent)]` is what keeps this honest rather than convenient: the type is exactly as
+/// wide as `T`, so the width cross-check against [`SUBMITTED_RECORDS`] reads the width of the type
+/// `ffi.rs` actually wrote down and `size_of::<FlagWord<u32>>() == 4` is a fact about `u32` rather
+/// than about this marker. Nothing is ever read out of it — the records are written through `ffi.rs`'s
+/// own field names — so the field is dead by construction.
+#[repr(transparent)]
+#[allow(dead_code, reason = "never read; it is here only so that repr(transparent) makes its width T's")]
+struct FlagWord<T: FlagWordOf>(T);
+
+impl<T: FlagWordOf> CKindOf for FlagWord<T> {
+    const KIND: CKind = T::WORD;
+    const DEPTH: usize = 0;
+    const UNION_WORD: &'static str = T::NAME;
+}
+
+/// A field the header declares as an **enumerated type** and this declaration spells as a plain
+/// integer. Five members are like that — see [`TYPED_RECORDS`] for the row each one is.
+///
+/// `#[repr(transparent)]` for the same reason as [`FlagWord`]: the width cross-check has to read the
+/// width of the type `ffi.rs` wrote down, and [`CKind::Enum`] has to say "C will not tell us the
+/// signedness of this one" instead of pretending to know it.
+#[repr(transparent)]
+#[allow(dead_code, reason = "never read; it is here for its size, which is what repr(transparent) makes equal to T's")]
+struct HeaderEnum<T: CKindOf>(T);
+
+impl<T: CKindOf> CKindOf for HeaderEnum<T> {
+    const KIND: CKind = CKind::Enum;
     const DEPTH: usize = 0;
 }
 
-/// One field of one of the two records above, with the type our declaration gives it.
+/// One field of one record, with the type our declaration gives it.
 struct TypedField {
     /// The member's name in `/usr/include/va/`.
     c_name: &'static str,
-    /// Our field's name, for the message a failure prints.
-    rust_name: &'static str,
     /// `size_of` of the field's type, cross-checked against [`SUBMITTED_RECORDS`] below.
     width: usize,
-    /// What our field's type says its signedness and width are.
+    /// What our field's type says its shape, width and signedness are.
     kind: CKind,
-    /// How far into the field's type the innermost scalar is.
+    /// How far into the field's type the thing C has to measure is.
     depth: usize,
+    /// The union word [`CKind::UnionValue`] measures, or `""` when there is none.
+    union_word: &'static str,
 }
 
 /// A record and its fields, in declaration order.
@@ -1392,29 +1590,38 @@ macro_rules! typed_records {
             fields: &[
                 $(TypedField {
                     c_name: $c_field,
-                    rust_name: stringify!($field),
                     width: size_of::<$fty>(),
                     kind: <$fty as CKindOf>::KIND,
                     depth: <$fty as CKindOf>::DEPTH,
+                    union_word: <$fty as CKindOf>::UNION_WORD,
                 }),*
             ],
         }),*]
     };
 }
 
-/// The two records [`TYPED_RECORDS`] is checked against, every field of each, with the Rust type the
+/// Every record [`SUBMITTED_RECORDS`] holds, every member of each, with the Rust type the
 /// declaration gives it.
 ///
-/// `VAPictureH264` (`va.h:3572-3581`) and `VAImage` (`va.h:4734-4775`). Nothing here restates the
-/// offsets or the sizes — those belong to [`SUBMITTED_RECORDS`], and this table is cross-checked
-/// against it — because the only thing it adds is the **type**.
+/// Nothing here restates an offset or a record's size — those belong to [`SUBMITTED_RECORDS`], and
+/// this table is cross-checked against it member by member — because the only thing it adds is the
+/// **type**. The rows are written out rather than generated because a row added here is the only
+/// way a new member becomes visible to this check, and a table generated from the header could not
+/// disagree with it.
+///
+/// `rust_name` is no longer spelled: [`TYPED_RECORDS`] is keyed on the C member name and
+/// [`SubmittedField::c_name`], which is what the cross-check below already compared, so the second
+/// transcription of each field's Rust name is one fewer place for the two tables to drift.
 static TYPED_RECORDS: &[TypedRecord] = typed_records![
-    "VAPictureH264" => [
-        ("picture_id", picture_id: VABufferID),
-        ("frame_idx", frame_idx: u32),
-        ("flags", flags: u32),
-        ("TopFieldOrderCnt", top_field_order_cnt: i32),
-        ("BottomFieldOrderCnt", bottom_field_order_cnt: i32),
+    "VAImageFormat" => [
+        ("fourcc", fourcc: u32),
+        ("byte_order", byte_order: u32),
+        ("bits_per_pixel", bits_per_pixel: u32),
+        ("depth", depth: u32),
+        ("red_mask", red_mask: u32),
+        ("green_mask", green_mask: u32),
+        ("blue_mask", blue_mask: u32),
+        ("alpha_mask", alpha_mask: u32),
         ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
     ],
     "VAImage" => [
@@ -1432,19 +1639,492 @@ static TYPED_RECORDS: &[TypedRecord] = typed_records![
         ("component_order", component_order: [i8; 4]),
         ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
     ],
+    // The three records a driver reads back, and the one with the most shapes in it: an enumerated
+    // type, a nested record and a union, all within sixteen bytes.
+    "VAConfigAttrib" => [
+        ("type", type_: HeaderEnum<VAStatus>),
+        ("value", value: c_uint),
+    ],
+    "VASurfaceAttrib" => [
+        ("type", type_: HeaderEnum<VAStatus>),
+        ("flags", flags: c_uint),
+        ("value", value: VaGenericValue),
+    ],
+    "VAGenericValue" => [
+        ("type", type_: HeaderEnum<VAStatus>),
+        ("value", value: FlagWord<VaGenericValueValue>),
+    ],
+    "VAPictureH264" => [
+        ("picture_id", picture_id: VABufferID),
+        ("frame_idx", frame_idx: u32),
+        ("flags", flags: u32),
+        ("TopFieldOrderCnt", top_field_order_cnt: i32),
+        ("BottomFieldOrderCnt", bottom_field_order_cnt: i32),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAPictureParameterBufferH264" => [
+        ("CurrPic", curr_pic: VaPictureH264),
+        ("ReferenceFrames", reference_frames: [VaPictureH264; 16]),
+        ("picture_width_in_mbs_minus1", picture_width_in_mbs_minus1: u16),
+        ("picture_height_in_mbs_minus1", picture_height_in_mbs_minus1: u16),
+        ("bit_depth_luma_minus8", bit_depth_luma_minus8: u8),
+        ("bit_depth_chroma_minus8", bit_depth_chroma_minus8: u8),
+        ("num_ref_frames", num_ref_frames: u8),
+        ("seq_fields", seq_fields: FlagWord<u32>),
+        ("num_slice_groups_minus1", num_slice_groups_minus1: u8),
+        ("slice_group_map_type", slice_group_map_type: u8),
+        ("slice_group_change_rate_minus1", slice_group_change_rate_minus1: u16),
+        ("pic_init_qp_minus26", pic_init_qp_minus26: i8),
+        ("pic_init_qs_minus26", pic_init_qs_minus26: i8),
+        ("chroma_qp_index_offset", chroma_qp_index_offset: i8),
+        ("second_chroma_qp_index_offset", second_chroma_qp_index_offset: i8),
+        ("pic_fields", pic_fields: FlagWord<u32>),
+        ("frame_num", frame_num: u16),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_MEDIUM]),
+    ],
+    // Two-dimensional arrays at their widest: `int16_t chroma_weight_l0[32][2]` needs peeling twice
+    // before `_Generic` sees the `int16_t` it has to judge, and `[[i16; 2]; 32]` is how that reads
+    // on our side.
+    "VASliceParameterBufferH264" => [
+        ("slice_data_size", slice_data_size: u32),
+        ("slice_data_offset", slice_data_offset: u32),
+        ("slice_data_flag", slice_data_flag: u32),
+        ("slice_data_bit_offset", slice_data_bit_offset: u16),
+        ("first_mb_in_slice", first_mb_in_slice: u16),
+        ("slice_type", slice_type: u8),
+        ("direct_spatial_mv_pred_flag", direct_spatial_mv_pred_flag: u8),
+        ("num_ref_idx_l0_active_minus1", num_ref_idx_l0_active_minus1: u8),
+        ("num_ref_idx_l1_active_minus1", num_ref_idx_l1_active_minus1: u8),
+        ("cabac_init_idc", cabac_init_idc: u8),
+        ("slice_qp_delta", slice_qp_delta: i8),
+        ("disable_deblocking_filter_idc", disable_deblocking_filter_idc: u8),
+        ("slice_alpha_c0_offset_div2", slice_alpha_c0_offset_div2: i8),
+        ("slice_beta_offset_div2", slice_beta_offset_div2: i8),
+        ("RefPicList0", ref_pic_list0: [VaPictureH264; 32]),
+        ("RefPicList1", ref_pic_list1: [VaPictureH264; 32]),
+        ("luma_log2_weight_denom", luma_log2_weight_denom: u8),
+        ("chroma_log2_weight_denom", chroma_log2_weight_denom: u8),
+        ("luma_weight_l0_flag", luma_weight_l0_flag: u8),
+        ("luma_weight_l0", luma_weight_l0: [i16; 32]),
+        ("luma_offset_l0", luma_offset_l0: [i16; 32]),
+        ("chroma_weight_l0_flag", chroma_weight_l0_flag: u8),
+        ("chroma_weight_l0", chroma_weight_l0: [[i16; 2]; 32]),
+        ("chroma_offset_l0", chroma_offset_l0: [[i16; 2]; 32]),
+        ("luma_weight_l1_flag", luma_weight_l1_flag: u8),
+        ("luma_weight_l1", luma_weight_l1: [i16; 32]),
+        ("luma_offset_l1", luma_offset_l1: [i16; 32]),
+        ("chroma_weight_l1_flag", chroma_weight_l1_flag: u8),
+        ("chroma_weight_l1", chroma_weight_l1: [[i16; 2]; 32]),
+        ("chroma_offset_l1", chroma_offset_l1: [[i16; 2]; 32]),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAIQMatrixBufferH264" => [
+        ("ScalingList4x4", scaling_list4x4: [[u8; 16]; 6]),
+        ("ScalingList8x8", scaling_list8x8: [[u8; 64]; 2]),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAPictureHEVC" => [
+        ("picture_id", picture_id: VABufferID),
+        ("pic_order_cnt", pic_order_cnt: i32),
+        ("flags", flags: u32),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAPictureParameterBufferHEVC" => [
+        ("CurrPic", curr_pic: VaPictureHevc),
+        ("ReferenceFrames", reference_frames: [VaPictureHevc; 15]),
+        ("pic_width_in_luma_samples", pic_width_in_luma_samples: u16),
+        ("pic_height_in_luma_samples", pic_height_in_luma_samples: u16),
+        ("pic_fields", pic_fields: FlagWord<u32>),
+        ("sps_max_dec_pic_buffering_minus1", sps_max_dec_pic_buffering_minus1: u8),
+        ("bit_depth_luma_minus8", bit_depth_luma_minus8: u8),
+        ("bit_depth_chroma_minus8", bit_depth_chroma_minus8: u8),
+        ("pcm_sample_bit_depth_luma_minus1", pcm_sample_bit_depth_luma_minus1: u8),
+        ("pcm_sample_bit_depth_chroma_minus1", pcm_sample_bit_depth_chroma_minus1: u8),
+        ("log2_min_luma_coding_block_size_minus3", log2_min_luma_coding_block_size_minus3: u8),
+        ("log2_diff_max_min_luma_coding_block_size", log2_diff_max_min_luma_coding_block_size: u8),
+        ("log2_min_transform_block_size_minus2", log2_min_transform_block_size_minus2: u8),
+        ("log2_diff_max_min_transform_block_size", log2_diff_max_min_transform_block_size: u8),
+        ("log2_min_pcm_luma_coding_block_size_minus3", log2_min_pcm_luma_coding_block_size_minus3: u8),
+        ("log2_diff_max_min_pcm_luma_coding_block_size", log2_diff_max_min_pcm_luma_coding_block_size: u8),
+        ("max_transform_hierarchy_depth_intra", max_transform_hierarchy_depth_intra: u8),
+        ("max_transform_hierarchy_depth_inter", max_transform_hierarchy_depth_inter: u8),
+        ("init_qp_minus26", init_qp_minus26: i8),
+        ("diff_cu_qp_delta_depth", diff_cu_qp_delta_depth: u8),
+        ("pps_cb_qp_offset", pps_cb_qp_offset: i8),
+        ("pps_cr_qp_offset", pps_cr_qp_offset: i8),
+        ("log2_parallel_merge_level_minus2", log2_parallel_merge_level_minus2: u8),
+        ("num_tile_columns_minus1", num_tile_columns_minus1: u8),
+        ("num_tile_rows_minus1", num_tile_rows_minus1: u8),
+        ("column_width_minus1", column_width_minus1: [u16; 19]),
+        ("row_height_minus1", row_height_minus1: [u16; 21]),
+        ("slice_parsing_fields", slice_parsing_fields: FlagWord<u32>),
+        ("log2_max_pic_order_cnt_lsb_minus4", log2_max_pic_order_cnt_lsb_minus4: u8),
+        ("num_short_term_ref_pic_sets", num_short_term_ref_pic_sets: u8),
+        ("num_long_term_ref_pic_sps", num_long_term_ref_pic_sps: u8),
+        ("num_ref_idx_l0_default_active_minus1", num_ref_idx_l0_default_active_minus1: u8),
+        ("num_ref_idx_l1_default_active_minus1", num_ref_idx_l1_default_active_minus1: u8),
+        ("pps_beta_offset_div2", pps_beta_offset_div2: i8),
+        ("pps_tc_offset_div2", pps_tc_offset_div2: i8),
+        ("num_extra_slice_header_bits", num_extra_slice_header_bits: u8),
+        ("st_rps_bits", st_rps_bits: u32),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_MEDIUM]),
+    ],
+    "VASliceParameterBufferHEVC" => [
+        ("slice_data_size", slice_data_size: u32),
+        ("slice_data_offset", slice_data_offset: u32),
+        ("slice_data_flag", slice_data_flag: u32),
+        ("slice_data_byte_offset", slice_data_byte_offset: u32),
+        ("slice_segment_address", slice_segment_address: u32),
+        ("RefPicList", ref_pic_list: [[u8; 15]; 2]),
+        ("LongSliceFlags", long_slice_flags: FlagWord<u32>),
+        ("collocated_ref_idx", collocated_ref_idx: u8),
+        ("num_ref_idx_l0_active_minus1", num_ref_idx_l0_active_minus1: u8),
+        ("num_ref_idx_l1_active_minus1", num_ref_idx_l1_active_minus1: u8),
+        ("slice_qp_delta", slice_qp_delta: i8),
+        ("slice_cb_qp_offset", slice_cb_qp_offset: i8),
+        ("slice_cr_qp_offset", slice_cr_qp_offset: i8),
+        ("slice_beta_offset_div2", slice_beta_offset_div2: i8),
+        ("slice_tc_offset_div2", slice_tc_offset_div2: i8),
+        ("luma_log2_weight_denom", luma_log2_weight_denom: u8),
+        ("delta_chroma_log2_weight_denom", delta_chroma_log2_weight_denom: i8),
+        ("delta_luma_weight_l0", delta_luma_weight_l0: [i8; 15]),
+        ("luma_offset_l0", luma_offset_l0: [i8; 15]),
+        ("delta_chroma_weight_l0", delta_chroma_weight_l0: [[i8; 2]; 15]),
+        ("ChromaOffsetL0", chroma_offset_l0: [[i8; 2]; 15]),
+        ("delta_luma_weight_l1", delta_luma_weight_l1: [i8; 15]),
+        ("luma_offset_l1", luma_offset_l1: [i8; 15]),
+        ("delta_chroma_weight_l1", delta_chroma_weight_l1: [[i8; 2]; 15]),
+        ("ChromaOffsetL1", chroma_offset_l1: [[i8; 2]; 15]),
+        ("five_minus_max_num_merge_cand", five_minus_max_num_merge_cand: u8),
+        ("num_entry_point_offsets", num_entry_point_offsets: u16),
+        ("entry_offset_to_subset_array", entry_offset_to_subset_array: u16),
+        ("slice_data_num_emu_prevn_bytes", slice_data_num_emu_prevn_bytes: u16),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW - 2]),
+    ],
+    "VADecPictureParameterBufferVP9" => [
+        ("frame_width", frame_width: u16),
+        ("frame_height", frame_height: u16),
+        ("reference_frames", reference_frames: [VASurfaceID; 8]),
+        ("pic_fields", pic_fields: FlagWord<u32>),
+        ("filter_level", filter_level: u8),
+        ("sharpness_level", sharpness_level: u8),
+        ("log2_tile_rows", log2_tile_rows: u8),
+        ("log2_tile_columns", log2_tile_columns: u8),
+        ("frame_header_length_in_bytes", frame_header_length_in_bytes: u8),
+        ("first_partition_size", first_partition_size: u16),
+        ("mb_segment_tree_probs", mb_segment_tree_probs: [u8; 7]),
+        ("segment_pred_probs", segment_pred_probs: [u8; 3]),
+        ("profile", profile: u8),
+        ("bit_depth", bit_depth: u8),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_MEDIUM]),
+    ],
+    // `segment_flags` is the narrowest flag union in the records — a `uint16_t`'s worth of bits in a
+    // union whose `value` word is a `uint16_t` — which is why it is measured rather than assumed to
+    // be the `u32` the other twenty-one are.
+    "VASegmentParameterVP9" => [
+        ("segment_flags", segment_flags: FlagWord<u16>),
+        ("filter_level", filter_level: [[u8; 2]; 4]),
+        ("luma_ac_quant_scale", luma_ac_quant_scale: i16),
+        ("luma_dc_quant_scale", luma_dc_quant_scale: i16),
+        ("chroma_ac_quant_scale", chroma_ac_quant_scale: i16),
+        ("chroma_dc_quant_scale", chroma_dc_quant_scale: i16),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VASliceParameterBufferVP9" => [
+        ("slice_data_size", slice_data_size: u32),
+        ("slice_data_offset", slice_data_offset: u32),
+        ("slice_data_flag", slice_data_flag: u32),
+        ("seg_param", seg_param: [VaSegmentParameterVp9; 8]),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    // The AV1 picture record: seven unions in one member list, one nested record each of two kinds,
+    // an eight-element surface array — and the one member this check does not cover, which is
+    // `anchor_frames_list`; see [`NOT_CHECKED`].
+    "VADecPictureParameterBufferAV1" => [
+        ("profile", profile: u8),
+        ("order_hint_bits_minus_1", order_hint_bits_minus_1: u8),
+        ("bit_depth_idx", bit_depth_idx: u8),
+        ("matrix_coefficients", matrix_coefficients: u8),
+        ("seq_info_fields", seq_info_fields: FlagWord<u32>),
+        ("current_frame", current_frame: VASurfaceID),
+        ("current_display_picture", current_display_picture: VASurfaceID),
+        ("anchor_frames_num", anchor_frames_num: u8),
+        ("frame_width_minus1", frame_width_minus1: u16),
+        ("frame_height_minus1", frame_height_minus1: u16),
+        ("output_frame_width_in_tiles_minus_1", output_frame_width_in_tiles_minus_1: u16),
+        ("output_frame_height_in_tiles_minus_1", output_frame_height_in_tiles_minus_1: u16),
+        ("ref_frame_map", ref_frame_map: [VASurfaceID; 8]),
+        ("ref_frame_idx", ref_frame_idx: [u8; 7]),
+        ("primary_ref_frame", primary_ref_frame: u8),
+        ("order_hint", order_hint: u8),
+        ("seg_info", seg_info: VaSegmentationStructAv1),
+        ("film_grain_info", film_grain_info: VaFilmGrainStructAv1),
+        ("tile_cols", tile_cols: u8),
+        ("tile_rows", tile_rows: u8),
+        ("width_in_sbs_minus_1", width_in_sbs_minus_1: [u16; 63]),
+        ("height_in_sbs_minus_1", height_in_sbs_minus_1: [u16; 63]),
+        ("tile_count_minus_1", tile_count_minus_1: u16),
+        ("context_update_tile_id", context_update_tile_id: u16),
+        ("pic_info_fields", pic_info_fields: FlagWord<u32>),
+        ("superres_scale_denominator", superres_scale_denominator: u8),
+        ("interp_filter", interp_filter: u8),
+        ("filter_level", filter_level: [u8; 2]),
+        ("filter_level_u", filter_level_u: u8),
+        ("filter_level_v", filter_level_v: u8),
+        ("loop_filter_info_fields", loop_filter_info_fields: FlagWord<u8>),
+        ("ref_deltas", ref_deltas: [i8; 8]),
+        ("mode_deltas", mode_deltas: [i8; 2]),
+        ("base_qindex", base_qindex: u8),
+        ("y_dc_delta_q", y_dc_delta_q: i8),
+        ("u_dc_delta_q", u_dc_delta_q: i8),
+        ("u_ac_delta_q", u_ac_delta_q: i8),
+        ("v_dc_delta_q", v_dc_delta_q: i8),
+        ("v_ac_delta_q", v_ac_delta_q: i8),
+        ("qmatrix_fields", qmatrix_fields: FlagWord<u16>),
+        ("mode_control_fields", mode_control_fields: FlagWord<u32>),
+        ("cdef_damping_minus_3", cdef_damping_minus_3: u8),
+        ("cdef_bits", cdef_bits: u8),
+        ("cdef_y_strengths", cdef_y_strengths: [u8; 8]),
+        ("cdef_uv_strengths", cdef_uv_strengths: [u8; 8]),
+        ("loop_restoration_fields", loop_restoration_fields: FlagWord<u16>),
+        ("wm", wm: [VaWarpedMotionParamsAv1; 7]),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_MEDIUM]),
+    ],
+    "VASegmentationStructAV1" => [
+        ("segment_info_fields", segment_info_fields: FlagWord<u32>),
+        ("feature_data", feature_data: [[i16; 8]; 8]),
+        ("feature_mask", feature_mask: [u8; 8]),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAFilmGrainStructAV1" => [
+        ("film_grain_info_fields", film_grain_info_fields: FlagWord<u32>),
+        ("grain_seed", grain_seed: u16),
+        ("num_y_points", num_y_points: u8),
+        ("point_y_value", point_y_value: [u8; 14]),
+        ("point_y_scaling", point_y_scaling: [u8; 14]),
+        ("num_cb_points", num_cb_points: u8),
+        ("point_cb_value", point_cb_value: [u8; 10]),
+        ("point_cb_scaling", point_cb_scaling: [u8; 10]),
+        ("num_cr_points", num_cr_points: u8),
+        ("point_cr_value", point_cr_value: [u8; 10]),
+        ("point_cr_scaling", point_cr_scaling: [u8; 10]),
+        ("ar_coeffs_y", ar_coeffs_y: [i8; 24]),
+        ("ar_coeffs_cb", ar_coeffs_cb: [i8; 25]),
+        ("ar_coeffs_cr", ar_coeffs_cr: [i8; 25]),
+        ("cb_mult", cb_mult: u8),
+        ("cb_luma_mult", cb_luma_mult: u8),
+        ("cb_offset", cb_offset: u16),
+        ("cr_mult", cr_mult: u8),
+        ("cr_luma_mult", cr_luma_mult: u8),
+        ("cr_offset", cr_offset: u16),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    // The only record whose enumerated member is a field of its own rather than a discriminator.
+    "VAWarpedMotionParamsAV1" => [
+        ("wmtype", wmtype: HeaderEnum<u32>),
+        ("wmmat", wmmat: [i32; 8]),
+        ("invalid", invalid: u8),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VASliceParameterBufferAV1" => [
+        ("slice_data_size", slice_data_size: u32),
+        ("slice_data_offset", slice_data_offset: u32),
+        ("slice_data_flag", slice_data_flag: u32),
+        ("tile_row", tile_row: u16),
+        ("tile_column", tile_column: u16),
+        ("tg_start", tg_start: u16),
+        ("tg_end", tg_end: u16),
+        ("anchor_frame_idx", anchor_frame_idx: u8),
+        ("tile_idx_in_tile_list", tile_idx_in_tile_list: u16),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    // The record libva writes a chain of into: the two pointers are the only `void *` in any record
+    // the backend submits, and they are the only members here whose C class is a pointer.
+    "VACodedBufferSegment" => [
+        ("size", size: u32),
+        ("bit_offset", bit_offset: u32),
+        ("status", status: u32),
+        ("reserved", reserved: u32),
+        ("buf", buf: *mut c_void),
+        ("next", next: *mut c_void),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VABufferInfo" => [
+        ("handle", handle: usize),
+        ("type", buffer_type: u32),
+        ("mem_type", mem_type: u32),
+        ("mem_size", mem_size: usize),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAEncSequenceParameterBufferH264" => [
+        ("seq_parameter_set_id", seq_parameter_set_id: u8),
+        ("level_idc", level_idc: u8),
+        ("intra_period", intra_period: u32),
+        ("intra_idr_period", intra_idr_period: u32),
+        ("ip_period", ip_period: u32),
+        ("bits_per_second", bits_per_second: u32),
+        ("max_num_ref_frames", max_num_ref_frames: u32),
+        ("picture_width_in_mbs", picture_width_in_mbs: u16),
+        ("picture_height_in_mbs", picture_height_in_mbs: u16),
+        ("seq_fields", seq_fields: FlagWord<u32>),
+        ("bit_depth_luma_minus8", bit_depth_luma_minus8: u8),
+        ("bit_depth_chroma_minus8", bit_depth_chroma_minus8: u8),
+        ("num_ref_frames_in_pic_order_cnt_cycle", num_ref_frames_in_pic_order_cnt_cycle: u8),
+        ("offset_for_non_ref_pic", offset_for_non_ref_pic: i32),
+        ("offset_for_top_to_bottom_field", offset_for_top_to_bottom_field: i32),
+        ("offset_for_ref_frame", offset_for_ref_frame: [i32; 256]),
+        ("frame_cropping_flag", frame_cropping_flag: u8),
+        ("frame_crop_left_offset", frame_crop_left_offset: u32),
+        ("frame_crop_right_offset", frame_crop_right_offset: u32),
+        ("frame_crop_top_offset", frame_crop_top_offset: u32),
+        ("frame_crop_bottom_offset", frame_crop_bottom_offset: u32),
+        ("vui_parameters_present_flag", vui_parameters_present_flag: u8),
+        ("vui_fields", vui_fields: FlagWord<u32>),
+        ("aspect_ratio_idc", aspect_ratio_idc: u8),
+        ("sar_width", sar_width: u32),
+        ("sar_height", sar_height: u32),
+        ("num_units_in_tick", num_units_in_tick: u32),
+        ("time_scale", time_scale: u32),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAEncPictureParameterBufferH264" => [
+        ("CurrPic", curr_pic: VaPictureH264),
+        ("ReferenceFrames", reference_frames: [VaPictureH264; 16]),
+        ("coded_buf", coded_buf: VABufferID),
+        ("pic_parameter_set_id", pic_parameter_set_id: u8),
+        ("seq_parameter_set_id", seq_parameter_set_id: u8),
+        ("last_picture", last_picture: u8),
+        ("frame_num", frame_num: u16),
+        ("pic_init_qp", pic_init_qp: u8),
+        ("num_ref_idx_l0_active_minus1", num_ref_idx_l0_active_minus1: u8),
+        ("num_ref_idx_l1_active_minus1", num_ref_idx_l1_active_minus1: u8),
+        ("chroma_qp_index_offset", chroma_qp_index_offset: i8),
+        ("second_chroma_qp_index_offset", second_chroma_qp_index_offset: i8),
+        ("pic_fields", pic_fields: FlagWord<u32>),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAEncSliceParameterBufferH264" => [
+        ("macroblock_address", macroblock_address: u32),
+        ("num_macroblocks", num_macroblocks: u32),
+        ("macroblock_info", macroblock_info: VABufferID),
+        ("slice_type", slice_type: u8),
+        ("pic_parameter_set_id", pic_parameter_set_id: u8),
+        ("idr_pic_id", idr_pic_id: u16),
+        ("pic_order_cnt_lsb", pic_order_cnt_lsb: u16),
+        ("delta_pic_order_cnt_bottom", delta_pic_order_cnt_bottom: i32),
+        ("delta_pic_order_cnt", delta_pic_order_cnt: [i32; 2]),
+        ("direct_spatial_mv_pred_flag", direct_spatial_mv_pred_flag: u8),
+        ("num_ref_idx_active_override_flag", num_ref_idx_active_override_flag: u8),
+        ("num_ref_idx_l0_active_minus1", num_ref_idx_l0_active_minus1: u8),
+        ("num_ref_idx_l1_active_minus1", num_ref_idx_l1_active_minus1: u8),
+        ("RefPicList0", ref_pic_list0: [VaPictureH264; 32]),
+        ("RefPicList1", ref_pic_list1: [VaPictureH264; 32]),
+        ("luma_log2_weight_denom", luma_log2_weight_denom: u8),
+        ("chroma_log2_weight_denom", chroma_log2_weight_denom: u8),
+        ("luma_weight_l0_flag", luma_weight_l0_flag: u8),
+        ("luma_weight_l0", luma_weight_l0: [i16; 32]),
+        ("luma_offset_l0", luma_offset_l0: [i16; 32]),
+        ("chroma_weight_l0_flag", chroma_weight_l0_flag: u8),
+        ("chroma_weight_l0", chroma_weight_l0: [[i16; 2]; 32]),
+        ("chroma_offset_l0", chroma_offset_l0: [[i16; 2]; 32]),
+        ("luma_weight_l1_flag", luma_weight_l1_flag: u8),
+        ("luma_weight_l1", luma_weight_l1: [i16; 32]),
+        ("luma_offset_l1", luma_offset_l1: [i16; 32]),
+        ("chroma_weight_l1_flag", chroma_weight_l1_flag: u8),
+        ("chroma_weight_l1", chroma_weight_l1: [[i16; 2]; 32]),
+        ("chroma_offset_l1", chroma_offset_l1: [[i16; 2]; 32]),
+        ("cabac_init_idc", cabac_init_idc: u8),
+        ("slice_qp_delta", slice_qp_delta: i8),
+        ("disable_deblocking_filter_idc", disable_deblocking_filter_idc: u8),
+        ("slice_alpha_c0_offset_div2", slice_alpha_c0_offset_div2: i8),
+        ("slice_beta_offset_div2", slice_beta_offset_div2: i8),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    // The header's record is a struct with a `VAEncMiscParameterType` discriminator and a flexible
+    // `uint32_t data[]` tail (`va.h:2475-2478`), so `type` is the whole of it that has a name. Our
+    // declaration is the four-byte header on its own, which is what a `vaCreateBuffer` of this size
+    // asks for.
+    "VAEncMiscParameterBuffer" => [
+        ("type", type_: HeaderEnum<u32>),
+    ],
+    "VAEncMiscParameterFrameRate" => [
+        ("framerate", framerate: u32),
+        ("framerate_flags", framerate_flags: FlagWord<u32>),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAEncMiscParameterQuantization" => [
+        ("quantization_flags", quantization_flags: FlagWord<u32>),
+        ("va_reserved", va_reserved: u32),
+    ],
+    // The record with no hole, so the tiling test proves nothing on it and this one has to carry it.
+    // Four of its twelve members are `uint32_t` and one is a flag union's `value` word: the two are
+    // the same four bytes, which is exactly why the shape assertion is not optional here.
+    "VAEncMiscParameterRateControl" => [
+        ("bits_per_second", bits_per_second: u32),
+        ("target_percentage", target_percentage: u32),
+        ("window_size", window_size: u32),
+        ("initial_qp", initial_qp: u32),
+        ("min_qp", min_qp: u32),
+        ("basic_unit_size", basic_unit_size: u32),
+        ("rc_flags", rc_flags: FlagWord<u32>),
+        ("ICQ_quality_factor", icq_quality_factor: u32),
+        ("max_qp", max_qp: u32),
+        ("quality_factor", quality_factor: u32),
+        ("target_frame_size", target_frame_size: u32),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    // The one record here that is not a libva record, and the only one whose C name needs `struct`
+    // spelled in front of it — which is why the probe declares its instance rather than writing
+    // `((R *)0)->m`: a C struct has no typedef, so there is no `R` to write.
+    "struct drm_prime_handle" => [
+        ("handle", handle: u32),
+        ("flags", flags: u32),
+        ("fd", fd: c_int),
+    ],
 ];
 
-/// The C half of the width-and-signedness check, as macros the generated source uses.
+/// Members of [`SUBMITTED_RECORDS`] that this check deliberately does **not** cover, each with the
+/// reason it is not settled here.
+///
+/// This is a named list rather than a silent omission because a check that quietly stops covering a
+/// field reads exactly like one that never covered it: [`every_submitted_record_agrees_with_the_header_on_width_and_signedness`]
+/// asserts that the set of uncovered members is precisely the `padding_*` fields — which C has no
+/// name for and so no type to compare — plus these. Adding a row here is therefore a claim somebody
+/// has to read, and removing a member from [`SUBMITTED_RECORDS`] while leaving its row here fails.
+const NOT_CHECKED: &[(&str, &str, &str)] = &[(
+    "VADecPictureParameterBufferAV1",
+    "anchor_frames_list",
+    "the header declares a `VASurfaceID *` (`va_dec_av1.h:330`) and `ffi.rs` declares a `u64`, on \
+     purpose: the field is an address into a list the application owns, large-scale tile is declined, \
+     and `record_bytes` flattens the record before any address in it could escape. So this is a \
+     genuine shape disagreement between the header and the declaration, and the check that can see it \
+     is the one that would have to call the declaration wrong. It is settled in `ffi.rs` instead — \
+     `the_pointer_shaped_field_is_an_address_and_not_a_pointer` there pins the field's width with \
+     `size_of_val` against `size_of::<*mut c_void>()`, and the record's `Send + Sync` is what fails to \
+     compile if the field ever becomes a raw pointer — and repeating the same claim in a second file \
+     would be a second thing to keep in step, not a second guard. Add it here as `FlagWord` of a \
+     pointer type if `ffi.rs` ever changes its mind.",
+)];
+
+/// The C half of the shape, width and signedness check, as macros the generated source uses.
 ///
 /// `CKIND(x)` is the one number both sides agree or disagree on. `_Generic` produces the sign — it
 /// matches the controlling expression's type against a list of *distinct* C types, so a typedef
 /// answers as its underlying type without its spelling appearing anywhere below — and `sizeof`
-/// produces the width. `default: 2` is "not an integer at all": a record, a union, a pointer, or
-/// an enumerated type, each of which lands there by a different route.
+/// produces the width. `default: 2` is "not an integer at all", and it is only ever reached for a
+/// `float`, a `double` or a type that is not a number, because [`CK_CLASS`] is what tells the five
+/// non-integer shapes apart.
+///
+/// **`CK_CLASS` takes a `__typeof__` and that is load-bearing.** `__builtin_classify_type(member)`
+/// reports an enumerated member as an integer, because the argument is converted to the enum's
+/// underlying type first; `__builtin_classify_type(__typeof__(member))` reports it as
+/// [`CK_ENUMERAL`]. The same applies to an array, which decays to a pointer as an argument and stays
+/// an array as a type — so the class assertion is also how a member that stopped being an array is
+/// caught.
 ///
 /// `char` is listed apart from `signed char` and gets its **own** code (3) on purpose: plain
-/// `char`'s signedness is implementation-defined and is signed only on this target. Neither record
-/// declares one, so no member lands on 3; if one ever did, the comparison would fail rather than
+/// `char`'s signedness is implementation-defined and is signed only on this target. No member here
+/// declares one, so no field lands on 3; if one ever did, the comparison would fail rather than
 /// quietly assume a signedness the header never promised.
 const CK_PROLOGUE: &str = "\
 #define CK_SIGN(x) _Generic((x), \
@@ -1459,121 +2139,214 @@ const CK_PROLOGUE: &str = "\
     default: 2)
 #define CKIND(x) (CK_SIGN(x) * 256 + (int)sizeof(x))
 #define CK_CLASS(x) __builtin_classify_type(__typeof__(x))
-#define CK_INTEGER 1
-#define CK_RECORD 12
-#define CK_P1(x) (x)[0]
 ";
 
-/// The C source for the width-and-signedness check: one assertion pair per field, over
+/// The C source for the shape, width and signedness check: one assertion pair per member, over
 /// [`TYPED_RECORDS`].
 ///
-/// `rewrite` is handed `(record, field, expected)` and returns the number the C side is compared
-/// with. The real check passes [`CKind::expected_code`] through; the test that proves the check can
-/// fail passes a function that returns a deliberately wrong number for two named fields, and
-/// asserts the compiler rejects the result. **A check that cannot fail is worse than no check**,
-/// so that failure is a committed test rather than something a reviewer has to take on trust.
-fn typed_kind_source(rewrite: impl Fn(&str, &str, i32) -> i32) -> String {
-    let mut source = String::from("#include <stdint.h>\n#include <va/va.h>\n");
+/// Every record gets a real **instance** rather than the `((R *)0)->member` this used to spell, and
+/// it is not a style choice. The peel an array needs — `m[0]`, and `m[0][0]` for the two-dimensional
+/// ones — is an address computation off a null pointer, and clang's `-Wnull-dereference` fires on it
+/// even inside `_Static_assert`. A named object of the record's own type has the same types, the
+/// same offsets and no warning.
+///
+/// `rewrite` is handed `(record, member, kind)` and returns the kind the C side is compared with.
+/// The real check passes [`CKindOf::KIND`] through; the test that proves the check can fail passes a
+/// function that returns a deliberately wrong kind for six named members, and asserts the compiler
+/// rejects the result. **A check that cannot fail is worse than no check**, so that failure is a
+/// committed test rather than something a reviewer has to take on trust.
+fn typed_kind_source(rewrite: impl Fn(&str, &str, CKind) -> CKind) -> String {
+    let mut source = String::from(
+        "#include <stdint.h>\n#include <va/va.h>\n#include <va/va_drm.h>\n#include <va/va_dec_av1.h>\n\
+         #include <va/va_dec_hevc.h>\n#include <va/va_dec_vp9.h>\n#include <va/va_enc_h264.h>\n#include <drm/drm.h>\n",
+    );
     source.push_str(CK_PROLOGUE);
-    for record in TYPED_RECORDS {
+    for (index, record) in TYPED_RECORDS.iter().enumerate() {
+        source.push_str(&format!("static {r} ck_rec_{index};\n", r = record.c_name));
+    }
+    for (index, record) in TYPED_RECORDS.iter().enumerate() {
         source.push_str(&format!("\n/* {} */\n", record.c_name));
         for field in record.fields {
-            let member = format!("((({} *)0)->{})", record.c_name, field.c_name);
-            // The innermost scalar, one `[0]` per level of the Rust type — see `CKindOf::DEPTH`.
-            let peeled = match field.depth {
-                0 => member.clone(),
-                1 => format!("CK_P1({member})"),
-                other => panic!("{}.{} is an array nested {other} deep and the probe only peels one level", record.c_name, field.c_name),
-            };
-            let label = format!("{}.{}", record.c_name, field.c_name);
-            let expected = rewrite(record.c_name, field.c_name, field.kind.expected_code());
-            match field.kind {
-                CKind::Nested => source.push_str(&format!(
-                    "_Static_assert(CK_CLASS({member}) == CK_RECORD, \"{label}: we declare a nested record and the header declares something else here\");\n"
-                )),
-                kind => source.push_str(&format!(
-                    "_Static_assert(CK_CLASS({peeled}) == CK_INTEGER, \"{label}: we declare a {kind:?} and the header's member is not an integer type\");\n\
-                     _Static_assert(CKIND({peeled}) == {expected}, \"{label}: we declare {kind:?} and the header declares a different width or signedness\");\n"
-                )),
+            // The member itself, then one `[0]` per level of the Rust type — see `CKindOf::DEPTH`.
+            let mut peeled = format!("ck_rec_{index}.{}", field.c_name);
+            for _ in 0..field.depth {
+                peeled.push_str("[0]");
             }
+            let label = format!("{}.{}", record.c_name, field.c_name);
+            let kind = rewrite(record.c_name, field.c_name, field.kind);
+            source.push_str(&format!(
+                "_Static_assert(CK_CLASS({peeled}) == {class}, \"{label}: we declare {ours}, and the header declares a member of a different shape\");\n",
+                class = kind.expected_class(),
+                ours = kind.describe(),
+            ));
+            let Some(code) = kind.code() else { continue };
+            // For a union the number is about the *word inside it*, which is the one thing this
+            // declaration actually stores; for everything else it is about the member itself.
+            let measured = match kind {
+                CKind::UnionValue { .. } => {
+                    assert!(!field.union_word.is_empty(), "{label}: spelled as a flag union, but its type names no word of that union to measure");
+                    format!("{peeled}.{}", field.union_word)
+                }
+                _ => peeled.clone(),
+            };
+            source.push_str(&format!(
+                "_Static_assert(CKIND({measured}) == {code}, \"{label}: we declare {ours}, and the header declares a different width or signedness\");\n",
+                ours = kind.describe(),
+            ));
         }
     }
     source
 }
 
-/// The two records above agree with `/usr/include/va/` on every field's **width and signedness**,
-/// and with [`SUBMITTED_RECORDS`] on every field's width.
+/// Every record the backend submits agrees with `/usr/include/va/` on every member's **shape, width
+/// and signedness**, and with [`SUBMITTED_RECORDS`] on every member's width.
 ///
-/// The width half of that second claim is what keeps this section honest. The type spelled in
+/// The width half of the second claim is what keeps this section honest. The type spelled in
 /// [`TYPED_RECORDS`] is a transcription, so a wrong one would otherwise be able to agree with
 /// itself: `size_of` of a mistyped type is the size of the type that was written down, not of the
 /// field. Comparing each width with the row [`SUBMITTED_RECORDS`] already pinned ties it to
 /// `offset_of!` on the real struct — which is what the tiling test uses to prove the fields cover
-/// the record — so the two tables cannot drift apart on width, and the signedness is left with
-/// nothing to hide behind.
+/// the record — so the two tables cannot drift apart on width, and the signedness and the shape are
+/// left with nothing to hide behind. Both markers — [`FlagWord`] and [`HeaderEnum`] — are
+/// `#[repr(transparent)]`, so a marked field's width *is* the width of the type underneath it and
+/// the cross-check reads the declaration rather than the marker.
+///
+/// The coverage assertion is the other half of the claim: every member [`SUBMITTED_RECORDS`] names
+/// that is not a `padding_*` field — which C gives no name to, and so no type — is either in
+/// [`TYPED_RECORDS`] or listed in [`NOT_CHECKED`] with a reason. A new record added to
+/// [`SUBMITTED_RECORDS`] therefore cannot join the list without this test naming it.
 #[test]
-fn the_two_checked_records_agree_with_the_header_on_width_and_signedness() {
-    let Some(cc) = require_headers_and_compiler("the_two_checked_records_agree_with_the_header_on_width_and_signedness") else {
+fn every_submitted_record_agrees_with_the_header_on_width_and_signedness() {
+    let Some(cc) = require_headers_and_compiler("every_submitted_record_agrees_with_the_header_on_width_and_signedness") else {
         return;
     };
-    let mut seen = 0usize;
+    let mut checked = 0usize;
     for record in TYPED_RECORDS {
-        assert!(!record.fields.is_empty(), "{}: no fields listed, so the loop below proved nothing", record.c_name);
+        assert!(!record.fields.is_empty(), "{}: no members listed, so the loop below proved nothing", record.c_name);
         let submitted = SUBMITTED_RECORDS
             .iter()
             .find(|r| r.c_name == record.c_name)
-            .unwrap_or_else(|| panic!("{} is not in SUBMITTED_RECORDS, so its widths cannot be cross-checked", record.c_name));
+            .unwrap_or_else(|| panic!("{} is in TYPED_RECORDS but not in SUBMITTED_RECORDS, so it is not a record this backend submits", record.c_name));
         for field in record.fields {
             let row = submitted
                 .fields
                 .iter()
-                .find(|f| f.rust_name == field.rust_name)
-                .unwrap_or_else(|| panic!("{}.{} is not in the SUBMITTED_RECORDS row for {}", record.c_name, field.rust_name, record.c_name));
+                .find(|f| f.c_name == field.c_name)
+                .unwrap_or_else(|| panic!("{}.{} is not a member the header names in SUBMITTED_RECORDS", record.c_name, field.c_name));
             assert_eq!(
                 field.width, row.width,
                 "{}.{}: the type written in TYPED_RECORDS is {} bytes wide and the type the SUBMITTED_RECORDS row pinned is {} — one of the two tables is stale",
-                record.c_name, field.rust_name, field.width, row.width
+                record.c_name, field.c_name, field.width, row.width
             );
-            seen += 1;
+            checked += 1;
         }
     }
-    assert_eq!(seen, 19, "every field of both records was cross-checked against SUBMITTED_RECORDS");
-    let out = compile_probe(&cc, "va-typed-kind", &typed_kind_source(|_, _, expected| expected));
-    assert!(out.status.success(), "{} disagrees with our declarations about a field's width or its signedness:\n{}", cc, String::from_utf8_lossy(&out.stderr));
+    // The coverage claim, in both directions. A member that stopped being checked without being named
+    // is the failure mode this is here to prevent, and an excuse outliving the member it excuses is
+    // the other one.
+    let mut uncovered = Vec::new();
+    for record in SUBMITTED_RECORDS {
+        for field in record.fields {
+            if field.c_name == "-" {
+                continue; // a `padding_*` field: C gives the gap no name, so there is no type to compare
+            }
+            let covered = TYPED_RECORDS.iter().find(|r| r.c_name == record.c_name).is_some_and(|r| r.fields.iter().any(|f| f.c_name == field.c_name));
+            let excused = NOT_CHECKED.iter().any(|(r, f, _)| *r == record.c_name && *f == field.c_name);
+            if !covered && !excused {
+                uncovered.push(format!("{}.{}", record.c_name, field.c_name));
+            }
+        }
+    }
+    assert!(
+        uncovered.is_empty(),
+        "{} member(s) of SUBMITTED_RECORDS are neither in TYPED_RECORDS nor in NOT_CHECKED, so this check silently stopped covering {}: {}",
+        uncovered.len(),
+        if uncovered.len() == 1 { "it" } else { "them" },
+        uncovered.join(", ")
+    );
+    for (record, field, reason) in NOT_CHECKED {
+        assert!(!reason.trim().is_empty(), "{record}.{field}: listed as not checked with no reason given");
+        assert!(
+            SUBMITTED_RECORDS.iter().any(|r| r.c_name == *record && r.fields.iter().any(|f| f.c_name == *field)),
+            "{record}.{field} is listed in NOT_CHECKED but is not a member of that record any more, so the excuse outlived what it excuses"
+        );
+    }
+    assert_eq!(checked, 384, "every member of every record was cross-checked against SUBMITTED_RECORDS");
+    assert_eq!(TYPED_RECORDS.len(), 30, "every record this backend submits is checked");
+    let out = compile_probe(&cc, "va-typed-kind", &typed_kind_source(|_, _, kind| kind));
+    assert!(
+        out.status.success(),
+        "{cc} disagrees with our declarations about a member's shape, its width or its signedness:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
-/// **The width-and-signedness check is proved able to fail, in the direction it exists for**, by
-/// running the real generator and the real compiler against a deliberately wrong declaration.
+/// **The check is proved able to fail, in each of the three directions it now exists for**, by
+/// running the real generator and the real compiler against declarations that are wrong on purpose.
 ///
-/// This test hands [`typed_kind_source`] two fields whose expected numbers are wrong on purpose:
+/// A check extended from nineteen assertions to seven hundred without re-proving it red is an
+/// untested extension, so every direction this section added is exercised here with a deliberately
+/// wrong answer: the member asked about is a **newly covered** one each time, not one of the two this
+/// started with, and each is the *correct* answer with one thing changed, so the source compiled here
+/// differs from the one the test above compiles in exactly that and nowhere else.
 ///
-/// * `VAPictureH264.TopFieldOrderCnt` — we declare `i32`, the header declares `int32_t`, and the
-///   number compared against is the one an `unsigned int` would produce. **A Rust `i32` for a C
-///   `uint32_t`**;
-/// * `VAImage.num_palette_entries` — the same, on the other record, so the proof covers both.
+/// * `VASliceParameterBufferHEVC.slice_qp_delta` — we declare `i8`, the header declares `int8_t`,
+///   and the number compared against is the one an `unsigned char` produces. **A Rust `i8` for a C
+///   signed 8-bit field read with the wrong sign** — the same byte, a different answer for every
+///   negative quantiser offset;
+/// * `VASegmentParameterVP9.luma_ac_quant_scale` — the signedness is right and the width is not: a
+///   four-byte number compared against the header's two-byte `int16_t`. The tiling test catches a
+///   width that is wrong on its own, because the next member moves; what it cannot catch is a width
+///   wrong *and* the next one compensating, which is exactly what a hand-written width table invites;
+/// * `VADecPictureParameterBufferAV1.seq_info_fields` — the **flag-union shape**, which is new: the
+///   source claims the header declares a plain `uint32_t` where it declares the sequence-parameter
+///   union, and **both** assertions fire — the class wants 1 where the compiler says 13, and the
+///   number wants 4 where the compiler measures `CK_SIGN` on a union and gets its `default: 2`
+///   bucket;
+/// * `VAWarpedMotionParamsAV1.wmtype` — the **enumerated shape**, also new, the same way round: the
+///   source claims a plain `uint32_t` where the header declares `VAWarpedMotionType`, and only the
+///   class assertion fires, because there is no signedness to compare for an enum and claiming one
+///   would be the bug;
+/// * `VAPictureH264.TopFieldOrderCnt` and `VAImage.num_palette_entries`, the two this check started
+///   with, kept so that the original proof is not lost when the rest of the table moves.
 ///
-/// Each is the *correct* number for that field with the signedness flipped, so the source compiled
-/// here differs from the one the test above compiles in exactly that and nowhere else. The compiler
-/// must **reject** it, and its output must name both fields — a failure a reader cannot act on is
-/// not much better than no failure.
+/// The compiler must **reject** it, and its output must name all six — a failure a reader cannot act
+/// on is not much better than no failure.
 #[test]
-fn the_width_and_signedness_check_rejects_a_field_declared_with_the_wrong_signedness() {
-    let Some(cc) = require_headers_and_compiler("the_width_and_signedness_check_rejects_a_field_declared_with_the_wrong_signedness") else {
+fn the_shape_width_and_signedness_check_rejects_a_declaration_that_is_wrong() {
+    let Some(cc) = require_headers_and_compiler("the_shape_width_and_signedness_check_rejects_a_declaration_that_is_wrong") else {
         return;
     };
-    let source = typed_kind_source(|record, field, expected| match (record, field) {
-        // signed 4 -> unsigned 4: the same four bytes, read with the wrong sign.
-        ("VAPictureH264", "TopFieldOrderCnt") | ("VAImage", "num_palette_entries") => 4,
-        _ => expected,
+    let source = typed_kind_source(|record, field, kind| match (record, field) {
+        // signed 1 -> unsigned 1: the same byte, read with the wrong sign.
+        ("VAPictureH264", "TopFieldOrderCnt") | ("VAImage", "num_palette_entries") | ("VASliceParameterBufferHEVC", "slice_qp_delta") => {
+            CKind::Integer { sign: Sign::Unsigned, width: 1 }
+        }
+        // signed 2 -> signed 4: the right sign, twice the width.
+        ("VASegmentParameterVP9", "luma_ac_quant_scale") => CKind::Integer { sign: Sign::Signed, width: 4 },
+        // A flag union read as a plain integer: the shape is wrong, and so is the number.
+        ("VADecPictureParameterBufferAV1", "seq_info_fields") => CKind::Integer { sign: Sign::Unsigned, width: 4 },
+        // An enumerated type read as a plain integer: the shape is wrong.
+        ("VAWarpedMotionParamsAV1", "wmtype") => CKind::Integer { sign: Sign::Unsigned, width: 4 },
+        _ => kind,
     });
     let out = compile_probe(&cc, "va-typed-kind-wrong", &source);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(!out.status.success(), "{} accepted two fields compared against the wrong signedness, so the check is not checking anything:\n{source}", cc);
-    for field in ["VAPictureH264.TopFieldOrderCnt", "VAImage.num_palette_entries"] {
+    assert!(
+        !out.status.success(),
+        "{cc} accepted six members compared against the wrong shape, width or signedness, so the check is not checking anything:\n{source}"
+    );
+    for field in [
+        "VAPictureH264.TopFieldOrderCnt",
+        "VAImage.num_palette_entries",
+        "VASliceParameterBufferHEVC.slice_qp_delta",
+        "VASegmentParameterVP9.luma_ac_quant_scale",
+        "VADecPictureParameterBufferAV1.seq_info_fields",
+        "VAWarpedMotionParamsAV1.wmtype",
+    ] {
         assert!(
             stderr.contains(field),
-            "{} rejected the wrong-signedness source but did not name {field}, so the failure would not tell a reader which declaration to fix:\n{stderr}",
-            cc
+            "{cc} rejected the wrong source but did not name {field}, so the failure would not tell a reader which declaration to fix:\n{stderr}"
         );
     }
 }
@@ -1638,11 +2411,11 @@ fn the_abi_guard_ran_on_this_machine_or_announced_that_it_did_not() {
         &format!("#include <va/va.h>\n_Static_assert(sizeof(VAPictureH264) == {}, \"VAPictureH264\");\n", size_of::<VaPictureH264>()),
     );
     assert!(out.status.success(), "{cc} is installed but rejected the headers:\n{}", String::from_utf8_lossy(&out.stderr));
-    let src = typed_kind_source(|_, _, expected| expected);
+    let src = typed_kind_source(|_, _, kind| kind);
     let out = compile_probe(&cc, "va-guard-alive-kind", &src);
     assert!(
         out.status.success(),
-        "{cc} is installed but rejected the width-and-signedness source, so the guard would have been failing rather than skipping:\n{}",
+        "{cc} is installed but rejected the shape-width-and-signedness source, so the guard would have been failing rather than skipping:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -1682,7 +2455,7 @@ fn require_headers_and_compiler(what: &str) -> Option<String> {
 /// Compile `source` with `-fsyntax-only` and hand the raw result back, compiling or not.
 ///
 /// The caller asserts on `status`, so a *failing* compile is a usable value rather than an error:
-/// [`the_width_and_signedness_check_rejects_a_field_declared_with_the_wrong_signedness`] needs one.
+/// [`the_shape_width_and_signedness_check_rejects_a_declaration_that_is_wrong`] needs one.
 fn compile_probe(cc: &str, stem: &str, source: &str) -> std::process::Output {
     let dir = std::env::temp_dir().join(format!("filmcraft-{stem}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{cc}: cannot create {}: {e}", dir.display()));
