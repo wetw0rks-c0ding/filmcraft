@@ -38,6 +38,29 @@ use std::sync::{Arc, MutexGuard, OnceLock};
 /// `VADisplay` (`va.h:260`): an opaque, window-system dependent display handle, `void *` to us.
 type VADisplay = *mut c_void;
 
+// A C field that is a pointer is declared as a pointer, unless the driver never sees it. Every
+// pointer-typed member of every record declared in this file was read out of `/usr/include/va/`, and
+// there are four of them:
+//
+//   VaCodedBufferSegment::buf                     void *          va.h:3957       *mut c_void
+//   VaCodedBufferSegment::next                    void *          va.h:3962       *mut c_void
+//   VaGenericValueValue::pointer                  void *          va.h:1672       *mut c_void
+//   VaPictureParameterBufferAv1::anchor_frames_list
+//                                               VASurfaceID *   va_dec_av1.h:330  u64, on purpose
+//
+// The first two are filled in by libva and the third is what a `VASurfaceAttrib` value can hold;
+// all three carry bytes the driver means something by.
+//
+// The last is the only exception and the only one that needs an argument; the driver's own doc says
+// why ("For large scale tile applications" — va_dec_av1.h:313), this backend declines large-scale
+// tile, and the field's own comment is where the rest of the argument lives.
+// `the_pointer_shaped_field_is_an_address_and_not_a_pointer` in this module's tests pins the choice,
+// and measures that field against `*mut c_void` rather than trusting it.
+//
+// Everything else in these records — every `VASurfaceID`, `VAImageID`, `VABufferID` and
+// `VAContextID` — is a `VAGenericID`, and `VABufferInfo::handle` / `::mem_size` are `uintptr_t` /
+// `size_t` (va.h:4031, va.h:4044), which `usize` is exactly.
+
 /// `VAGenericID` (`va.h:1580`): the `unsigned int` behind every libva handle. The five handles are
 /// named apart below because the C API does — a `VABufferID` in a call out is not a `VAConfigID` —
 /// and the three the decode loop has not called yet are `allow(dead_code)` rather than unnamed.
@@ -1193,7 +1216,7 @@ pub struct VaWarpedMotionParamsAv1 {
 ///
 /// | bytes | between | why |
 /// |---|---|---|
-/// | 17-23 (7) | `anchor_frames_num`, `anchor_frames_list` | the C field is a `VASurfaceID *`, so it is 8-aligned |
+/// | 17-23 (7) | `anchor_frames_num`, `anchor_frames_list` | the C field is a `VASurfaceID *`, so it is 8-aligned — and is declared here as the address, not as a pointer |
 /// | 81-83 (3) | `order_hint`, `seg_info` | `VASegmentationStructAV1` is 4-aligned |
 /// | 674-675 (2) | `context_update_tile_id`, `pic_info_fields` | that union's `value` is a `uint32_t` |
 /// | 703 (1) | `v_ac_delta_q`, `qmatrix_fields` | that union's `value` is a `uint16_t` |
@@ -1242,13 +1265,32 @@ pub struct VaPictureParameterBufferAv1 {
     /// **The C layout's seven-byte hole, at offsets 17-23.** `anchor_frames_list` is a pointer in C
     /// and so 8-aligned; 17 is not.
     pub padding_after_anchor_frames_num: [u8; 7],
-    /// `anchor_frames_list`: the C field is a `VASurfaceID *` (`va_dec_av1.h:330`), **eight bytes
-    /// wide**, declared here as the address itself so that the record stays `Copy` and every byte of
-    /// it is initialised. It is a pointer into a list the **application** owns and populates
-    /// (`va_dec_av1.h:312-329`), so an address is meaningless to a record that is built once and
-    /// copied into a libva buffer; large-scale tile is declined and this is zero. The width is
-    /// pinned against C's `sizeof` of the pointer, so a platform where it is not eight is a red
-    /// build rather than a silent misdeclaration.
+    /// **The one field in this file whose C declaration is a pointer and whose Rust declaration is
+    /// not: `anchor_frames_list` is a `VASurfaceID *` (`va_dec_av1.h:330`) spelled as the `u64` an
+    /// address occupies. This is a decision, not a transcription slip, and it is pinned by
+    /// `the_pointer_shaped_field_is_an_address_and_not_a_pointer` — read that test before changing
+    /// this line.**
+    ///
+    /// It is a pointer into a list the **application** owns and populates
+    /// (`va_dec_av1.h:312-329`: anchor frames are registered with `vaCreateBuffer`), so the address
+    /// is meaningless to a record that is built once and flattened by [`record_bytes`] into a
+    /// `Vec<u8>`. Nothing follows it, in this crate or in a driver, because **large-scale tile is
+    /// declined**: `anchor_frames_num` is zero, there is no list, and the eight bytes written are
+    /// those of a null pointer — which is what a driver reads before it reads the count.
+    ///
+    /// The width is still held to C's: `the_pointer_shaped_field_is_an_address_and_not_a_pointer`
+    /// compares this field's `size_of_val` against `size_of::<*mut c_void>()`, so a platform where
+    /// a C pointer is not eight bytes is a red build rather than a silent misdeclaration.
+    ///
+    /// A `*mut c_void` here would be a hazard wearing an accuracy's clothes. It would add a type
+    /// this record has no use for and that a later edit could dereference; it would make the record
+    /// `!Send`/`!Sync` — an invisible break, whose only cure at the far end of the crate is an
+    /// `unsafe impl Send` (this file already carries three for FFI-loaded libraries), which is the
+    /// shortcut `AGENTS.md` §0.2 exists to stop; and it would buy nothing a single byte of layout
+    /// can measure. The three genuine pointer fields here — [`VaCodedBufferSegment::buf`] and
+    /// [`VaCodedBufferSegment::next`] (`va.h:3957`, `va.h:3962`) and
+    /// [`VaGenericValueValue::pointer`] (`va.h:1672`) — are all `*mut c_void`, because all three are
+    /// written by a driver and their bytes mean something.
     pub anchor_frames_list: u64,
     /// "Picture resolution minus 1. Picture original resolution. **If SuperRes is enabled, this is
     /// the upscaled resolution**" (`va_dec_av1.h:332-336`). Upscaled, not coded — which is why a
@@ -4543,7 +4585,7 @@ mod abi_guard;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{offset_of, size_of};
+    use std::mem::{align_of_val, offset_of, size_of, size_of_val};
 
     /// The loader and the mandatory `vaInitialize` work on a machine that has them: both libraries
     /// open, every required symbol resolves, and the display reports a version and a profile list.
@@ -4962,6 +5004,62 @@ mod tests {
         assert_eq!(offset_of!(VaSliceParameterBufferAv1, padding_before_tile_idx_in_tile_list), 21, "the one-byte hole: tile_idx_in_tile_list is a uint16_t");
         assert_eq!(offset_of!(VaSliceParameterBufferAv1, tile_idx_in_tile_list), 22);
         assert_eq!(offset_of!(VaSliceParameterBufferAv1, va_reserved), 24);
+    }
+
+    /// **The one C pointer this file declares as an integer is declared as an integer on purpose,
+    /// is exactly as wide as the pointer C declares, and is null in every record built here.**
+    ///
+    /// `VADecPictureParameterBufferAV1::anchor_frames_list` is `VASurfaceID *`
+    /// (`va_dec_av1.h:330`). Rust declares it `u64`. That is the only such pair in the file — the note
+    /// by the type aliases at the top of this module lists the other three pointer fields, all of
+    /// them `*mut c_void` — and it is the one a reader is most entitled to suspect, because a pointer
+    /// and a 64-bit integer are the same eight bytes at the same offset: `sizeof`, `offsetof` and the
+    /// ABI guard's width-and-signedness check all stay green whichever of the two is written, so
+    /// nothing but a statement of intent can tell a deliberate choice from a transcription slip.
+    ///
+    /// So the intent is stated here, in halves that fail for **different** reasons, because one half
+    /// alone would pass either way:
+    ///
+    /// - `Send + Sync` is what makes the record hold no raw pointer. A `*mut c_void` member is
+    ///   `!Send` and `!Sync` by definition, so the moment this field is changed to one the bound
+    ///   below stops being satisfied and **the crate stops compiling** — before the change can look
+    ///   finished. That is the discriminating case, and it is a compile error rather than a failed
+    ///   assertion precisely so that it cannot be deleted as flaky.
+    /// - The width assertion is what makes the `u64` honest rather than convenient. It reads the
+    ///   field's *own* size through `size_of_val`, not `size_of::<u64>()`, so it fails if the field
+    ///   is narrowed (`u32`: 4 ≠ 8) and fails on any target where a C pointer is not eight bytes —
+    ///   which is exactly the platform on which declaring this as a 64-bit integer *would* be a lie.
+    ///   Swap in `size_of::<u64>()` and it becomes the tautology this file must not contain.
+    ///
+    /// The value assertions are why the choice is safe rather than merely tidy: the only address
+    /// ever written here is the null one, so no address a Rust variable ever held can be read back
+    /// through this field, in this process or in a driver.
+    ///
+    /// What this does **not** pin: that the record stays `Send + Sync` for its own sake. The record
+    /// is flattened by [`record_bytes`] on the thread that builds it, so nothing here depends on it
+    /// today. It is pinned because losing it is silent — a `!Send` record surfaces as a compile error
+    /// far from the change that caused it, and the usual repair is an `unsafe impl Send`.
+    #[test]
+    fn the_pointer_shaped_field_is_an_address_and_not_a_pointer() {
+        fn no_raw_pointer_fields<T: Send + Sync>() {}
+
+        no_raw_pointer_fields::<VaPictureParameterBufferAv1>();
+
+        let pic = VaPictureParameterBufferAv1::default();
+
+        assert_eq!(
+            size_of_val(&pic.anchor_frames_list),
+            size_of::<*mut c_void>(),
+            "anchor_frames_list must occupy exactly the slot the header's VASurfaceID * occupies (va_dec_av1.h:330)"
+        );
+        assert_eq!(align_of_val(&pic.anchor_frames_list), align_of::<*mut c_void>(), "and be aligned as one — that is what puts it at 24 rather than 17");
+
+        assert_eq!(pic.anchor_frames_list, 0, "large-scale tile is declined, so the list pointer is null");
+        assert_eq!(pic.anchor_frames_num, 0, "and the list it points at is empty");
+        let raw = record_bytes(&pic);
+        let at = offset_of!(VaPictureParameterBufferAv1, anchor_frames_list);
+        let eight_bytes = raw.get(at..).and_then(|b| b.get(..8));
+        assert_eq!(eight_bytes, Some(&[0u8; 8][..]), "the eight bytes a driver reads at offset 24 are a null pointer's");
     }
 
     /// **The AV1 bitfield words are declared at the width the C compiler measures, and the member
