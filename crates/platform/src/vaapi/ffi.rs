@@ -25,7 +25,7 @@
 //! actually installed ([`Display::probe_image_layout`]) — libva has no `sizeof` / `offsetof` of its
 //! own to ask, so a behavioural check is the only way to hold the declaration to the driver.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 
 use super::drm;
 use std::mem::size_of;
@@ -325,6 +325,22 @@ pub const CONFIG_ATTRIB_ENC_MAX_REF_FRAMES: VaBufferType = 13;
 /// `VAConfigAttribEncSliceStructure` (`va.h:743-758`): the slice layouts the driver accepts,
 /// against `VA_ENC_SLICE_STRUCTURE_*` (`va.h:1251-1263`).
 pub const CONFIG_ATTRIB_ENC_SLICE_STRUCTURE: VaBufferType = 15;
+/// The value every record carries into [`Display::config_attributes`], so that "the driver wrote
+/// zero" and "the driver wrote nothing at all" are two different facts rather than one.
+///
+/// **`0xDEADBEEF` and not `0`, because `0` is a legitimate answer and a real one.** Two encode
+/// attributes have a documented zero that means something: `VA_ENC_PACKED_HEADER_NONE` (`va.h:1199`,
+/// "driver does not support any packed headers mode") and `VA_ENC_INTERLACED_NONE` (`va.h:1237`,
+/// "driver does not support interlaced coding"). Poisoning with zero therefore says nothing at all
+/// about the records a driver declines to write — the two answers are the same number.
+///
+/// **This is measured, not theoretical: `VAConfigAttribEncInterlaced` (11) answers `0x00000000`
+/// for every encode profile this driver advertises** (14 of 14, at `VAEntrypointEncSlice` — H.264
+/// Main/High/ConstrainedBaseline, HEVC Main/Main10, and the six profiles at 24/26/27/29/30/31, and
+/// AV1), so on this machine the poisoned-with-zero reading was silently reporting "no answer" as
+/// "the answer is zero" on every one of them. The sentinel is spelled out rather than left
+/// implicit because callers compare against it: it is what [`config_attributes_from`] refuses on.
+pub const CONFIG_ATTRIB_POISON: u32 = 0xDEAD_BEEF;
 // `VA_ENC_SLICE_STRUCTURE_*` (`va.h:1251-1263`) is **not** declared here. A whole-picture slice is
 // `macroblock_address = 0, num_macroblocks = picture_width_in_mbs * picture_height_in_mbs`, which is
 // an arbitrary run of macroblocks rather than a power of two in rows (640x368 is 23 rows), so
@@ -2607,7 +2623,11 @@ fn dl_error() -> String {
     // SAFETY: `dlerror` returns either NULL or a NUL-terminated string owned by the loader that is
     // valid until the next `dlerror` call, and copies it out before making another.
     let p = unsafe { dlerror() };
-    if p.is_null() { "unknown error".to_string() } else { string_from(p) }
+    if p.is_null() {
+        "unknown error".to_string()
+    } else {
+        string_from(p)
+    }
 }
 
 /// A NUL-terminated C string as owned Rust text, at most [`MAX_DRIVER_STRING`] bytes: a driver
@@ -2634,7 +2654,11 @@ impl Api {
         // SAFETY: `error_str` is `vaErrorStr` (`va.h:403`), which takes a status and returns a
         // NUL-terminated string (or null for a code it does not know) and does nothing else.
         let text = string_from(unsafe { error_str(s) });
-        if text.is_empty() { format!("VA-API status {s}") } else { text }
+        if text.is_empty() {
+            format!("VA-API status {s}")
+        } else {
+            text
+        }
     }
 }
 
@@ -2789,7 +2813,12 @@ impl Display {
     /// encoder may do at all.
     ///
     /// Each returned value is what the driver wrote back into the record, so the caller compares it
-    /// against the bit it cares about rather than assuming the attribute was honoured.
+    /// against the bit it cares about rather than assuming the attribute was honoured. **Every
+    /// record is handed to libva carrying [`CONFIG_ATTRIB_POISON`], not zero**, because zero is a
+    /// legitimate answer for two of these attributes ([`CONFIG_ATTRIB_ENC_PACKED_HEADERS`] and
+    /// `VAConfigAttribEncInterlaced`), so a record libva declines to write would otherwise be
+    /// reported as "the attribute is zero". See [`config_attributes_from`], which is where that
+    /// decision is made and where it is tested.
     pub fn config_attributes(&self, profile: Profile, entrypoint: Entrypoint, types: &[VaBufferType]) -> Result<Vec<u32>, String> {
         if types.is_empty() {
             return Ok(Vec::new());
@@ -2801,18 +2830,18 @@ impl Display {
             return Err("this libva has no vaGetConfigAttributes, so it cannot say what the driver supports for a configuration".into());
         };
         let _gate = self.gate();
-        // SAFETY: the display is initialised; `attribs` is a live array of `types.len()` records
-        // initialised to zero, which is what libva expects to be handed, and its length is the count
-        // passed, so libva writes exactly into `attribs` and reads no further.
-        let values = unsafe {
-            let mut attribs: Vec<VaConfigAttrib> = types.iter().map(|t| VaConfigAttrib { type_: *t, value: 0 }).collect();
-            let st = get(self.dpy, profile.bits(), entrypoint.bits(), attribs.as_mut_ptr(), attribs.len() as c_int);
-            if st != OK {
-                return Err(format!("vaGetConfigAttributes failed: {}", self.api.status_text(st)));
-            }
-            attribs.into_iter().map(|a| a.value).collect()
-        };
-        Ok(values)
+        // SAFETY: the display is initialised; `attribs` is a live array of `types.len()` records,
+        // each initialised to `CONFIG_ATTRIB_POISON` rather than to zero, and its length is the
+        // count passed, so libva writes exactly into `attribs` and reads no further. The poison is
+        // the point of the initialisation: libva declines a (profile, entrypoint) pair by returning
+        // its status and *leaving the caller's record alone*, so a record that still holds the
+        // poison afterwards is one libva declined to answer — which zero cannot express, because
+        // zero is also the answer `VA_ENC_PACKED_HEADER_NONE` and `VA_ENC_INTERLACED_NONE` give.
+        let mut attribs: Vec<VaConfigAttrib> = types.iter().map(|t| VaConfigAttrib { type_: *t, value: CONFIG_ATTRIB_POISON }).collect();
+        // SAFETY: as above, plus the profile and entry point, which are plain integers libva
+        // compares, and `types.len()`, which is the count of records just allocated.
+        let st = unsafe { get(self.dpy, profile.bits(), entrypoint.bits(), attribs.as_mut_ptr(), attribs.len() as c_int) };
+        config_attributes_from(st, &self.api.status_text(st), attribs)
     }
 
     /// Whether the installed driver fills a `VAImage` the way this module declares it: libva has
@@ -2851,6 +2880,62 @@ impl Drop for Display {
             close_fd(fd);
         }
     }
+}
+
+/// What `vaGetConfigAttributes` actually left in `attribs`, given the `VAStatus` it returned.
+///
+/// This is the whole of the decision [`Display::config_attributes`] makes, split out from the FFI
+/// call so it can be tested against records libva and records a fake both produce — a property that
+/// cannot be checked by reading the call site, because what is being tested is what the *driver*
+/// does to the array.
+///
+/// ## The rule: gate on the status, then on the poison — never on the value
+///
+/// libva declines a (profile, entry point) pair by **returning a status and leaving the caller's
+/// record untouched**, so two questions have to be asked in order and neither may be replaced by
+/// the other:
+///
+/// 1. **`status != VA_STATUS_SUCCESS`** — the driver refused. `Err`, because nothing was measured.
+/// 2. **`status == VA_STATUS_SUCCESS` and a record still holds [`CONFIG_ATTRIB_POISON]`** — the
+///    driver reported success but declined to write this particular attribute. `Err` naming the
+///    attribute, because the record carries a number this code put there and not one the driver
+///    chose.
+///
+/// The order matters and is why this is not written as one condition. Checking the poison first
+/// would turn every refusal into "attribute N went unanswered", which names a *specific* attribute
+/// for a refusal that named none; checking the value alone would report `0` — which for
+/// [`CONFIG_ATTRIB_ENC_PACKED_HEADERS`] and `VAConfigAttribEncInterlaced` is a real, meaningful
+/// answer, and the whole reason the records are poisoned with `0xDEADBEEF` rather than zero.
+///
+/// **A refusal is an error rather than the poison or `None`, for one reason: it is the only answer
+/// every existing caller already treats as "not a measurement".** Each of the three in-tree callers
+/// has a documented meaning for `Err` and none for the other two — `driver_max_reference_frames`
+/// returns `(0, 0)` and logs "the driver's reference depth is unknown",
+/// `driver_rate_control_modes` returns `0` and documents it as "the driver did not say", and
+/// `driver_packed_headers` returns `None` and documents that as "could not ask, never nothing".
+/// Returning the poison would push `0xDEADBEEF` into those call sites as an apparent measurement,
+/// which is worse than the ambiguity it fixes: `& 0xffff` on it is 48879 reference frames.
+/// Returning `None` would change three signatures and every call site for no extra information.
+/// The failure is rare enough that it does not matter, and where it does occur the message names
+/// the attribute so the caller can re-ask without it.
+///
+/// **A legitimate zero is not affected by any of this**: `status == VA_STATUS_SUCCESS` with a
+/// written `0` returns `Ok([0])`, which is [`Display::config_attributes`]'s ordinary answer and is
+/// what `VA_ENC_INTERLACED_NONE` and `VA_ENC_PACKED_HEADER_NONE` mean.
+fn config_attributes_from(status: VAStatus, status_text: &str, attribs: Vec<VaConfigAttrib>) -> Result<Vec<u32>, String> {
+    if status != OK {
+        return Err(format!("vaGetConfigAttributes failed: {status_text}"));
+    }
+    // The driver said yes and then left a record holding the number this code wrote into it. The
+    // attribute's own id is named so the caller can re-ask for the others, and so a driver that
+    // does this is identifiable in a log rather than looking like an attribute of zero.
+    let Some(unanswered) = attribs.iter().find(|a| a.value == CONFIG_ATTRIB_POISON) else {
+        return Ok(attribs.into_iter().map(|a| a.value).collect());
+    };
+    Err(format!(
+        "vaGetConfigAttributes reported success but left attribute {} at the {CONFIG_ATTRIB_POISON:#010x} poison it was handed, so the driver declined to answer for it and no value was measured",
+        unanswered.type_
+    ))
 }
 
 /// Whether a driver-filled `VAImage` describes an NV12 image of `width` x `height` in the planes it
