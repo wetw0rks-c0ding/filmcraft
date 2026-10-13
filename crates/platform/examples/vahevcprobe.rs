@@ -149,10 +149,15 @@ fn capabilities(display: &Arc<Display>) {
     println!(
         "VAConfigAttribRateControl = {rc:#06x} (H.264's on the same driver is {H264_RATE_CONTROL_MASK:#06x}; this path's measured constant is {HEVC_RATE_CONTROL_MASK:#06x})"
     );
+    // **Not "refused" any more, and the reason is a measured difference between two masks rather
+    // than a property of the mode.** The HEVC path drives VA_RC_VCM; the H.264 gate refuses it
+    // because H.264's own mask on this same driver differs from HEVC's by exactly this bit. So the
+    // two answers below are the finding: the same driver, the same query, one bit apart.
     println!(
-        "  VA_RC_VCM ({VCM:#010x}) is {}in this mask and {}in H.264's — refused, see HevcEncoder::refused_rate_control",
+        "  VA_RC_VCM ({VCM:#010x}) is {}in HEVC's mask and {}in H.264's — {} this path",
         if rc & VCM != 0 { "" } else { "not " },
-        if H264_RATE_CONTROL_MASK & VCM != 0 { "" } else { "not " }
+        if H264_RATE_CONTROL_MASK & VCM != 0 { "" } else { "not " },
+        if rc & VCM != 0 { "so the HEVC gate drives it" } else { "so the HEVC gate cannot offer it" }
     );
     println!("  refused by this path: {}", HevcEncoder::refused_rate_control(rc).join(", ").as_str());
     // **The rate-control outcomes, printed where the mask is.** The mask says which modes the driver
