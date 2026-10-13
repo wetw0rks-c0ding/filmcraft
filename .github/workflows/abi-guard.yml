@@ -1,0 +1,122 @@
+# The VA-API FFI guard, on a runner that can actually run it.
+#
+# `crates/platform/src/vaapi/abi_guard.rs` (with `hevc_abi.rs` and `av1_abi.rs`) compiles C against
+# the installed libva and DRM headers and checks every hand-declared record against what a compiler
+# measures: widths, signedness, compiler holes as named gaps, and the arity of every entry point. It
+# is the only oracle for the ~1.4 MB of hand-written `extern "C"` in `vaapi/ffi.rs`, and the check
+# that would have caught the wrong-arity `vaSyncBuffer`. It skips — printing `SKIPPED` — where the
+# headers are not installed, and `cargo test` swallows a passing test's output, so with no runner
+# that installs them the guard was local-only assurance: green on every GitHub runner, checking
+# nothing. This workflow is the runner that installs them.
+#
+# Two things the runner's own packages do not provide. Both were measured rather than assumed: the
+# guard was run here against each real header set, with the header path swapped under it, and the
+# run decided both.
+#
+# * **libva >= 2.24.** `VAConfigAttribEncVP9` first appears in libva's `va.h` in 2.24, and
+#   `av1_abi`'s C oracle static-asserts it. Against the 2.17.0 and 2.22.0 headers the guard fails on
+#   `the_av1_enc_constants_are_what_the_header_declares`; 2.24.0 and 2.24.1 both pass. `ubuntu-latest`
+#   (26.04) ships libva 2.23.0 and Debian trixie ships 2.22.0, so the pinned `libva-dev` below is
+#   taken from Debian's package pool instead of from apt.
+# * **`/usr/include/drm`.** The guard compiles `#include <drm/drm.h>` (abi_guard.rs:1089), but Debian's
+#   and Ubuntu's `libdrm-dev` install the headers as `/usr/include/libdrm/*.h` — neither ships a
+#   `/usr/include/drm`. Without the symlink below the guard cannot run at all and
+#   `the_abi_guard_ran_on_this_machine_or_announced_that_it_did_not` fails naming that path, which is
+#   the intended behaviour (a guard that did not run must not read as a guard that did).
+#
+# **Licence.** libva is LGPL, so it is never linked: its symbols are resolved at run time out of the
+# system's own library, and the ruling for that `dlopen` was approved 2026-10-08 (ADR 0001,
+# docs/vaapi-progress.md §8). What this workflow adds is a distro's *public headers* on a throwaway
+# runner, so a C compiler has something to measure — it is a test oracle, not a dependency. Only
+# `usr/include/va/` is copied out of the package; libva's libraries, binaries and code are not
+# installed, linked, bundled or executed here, nothing LGPL enters this repository or any binary, and
+# `AGENTS.md` §2 is unchanged: the headers are read, libva's source is never read.
+name: ABI guard
+
+on:
+  push:
+    branches: [main, release]
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - crates/platform/**
+      - .github/workflows/abi-guard.yml
+  # The guard compares declarations against *installed* headers, so a header moving under us changes
+  # no file in this repository and nothing in a pull request can see it. A weekly run can.
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: abi-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # libva 2.24.1: the first line whose va.h declares VAConfigAttribEncVP9 (2.23 does not, and the
+  # guard fails against it). Bump deliberately, with the same reasoning as the craft-fonts ref in
+  # release.yml: the pin is the header version the declarations are checked against, and it is the
+  # one thing in this workflow that is a judgement rather than a default.
+  LIBVA_DEV_VERSION: 2.24.1-2
+  # **Pinned to a value that is not `skip`, on purpose.** abi_guard.rs reads FILMCRAFT_ABI_GUARD=skip
+  # as "this machine cannot check the declarations" and every check then passes while verifying
+  # nothing — the exact state this workflow exists to end, and a green run that reads as coverage.
+  # Nothing here can set it to `skip`: the value is a literal in this file, no workflow input, matrix
+  # leg or expression reaches it, and cargo's `[env]` in `.cargo/config.toml` does not override a
+  # variable already in the environment unless it sets `force = true`.
+  FILMCRAFT_ABI_GUARD: run
+
+jobs:
+  guard:
+    name: libva ABI guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: abi-guard-linux
+      - name: Install the headers the guard measures against
+        run: |
+          sudo apt-get update
+          # gcc is the C compiler every check in the guard shells out to; libdrm-dev ships the DRM
+          # headers the one non-libva record is static-asserted against.
+          sudo apt-get install -y --no-install-recommends gcc libdrm-dev
+          # Headers only. dpkg-deb -x rather than dpkg -i because libva-dev depends on five runtime
+          # packages this job never loads, and none of them is wanted: the guard compiles C, it does
+          # not run libva.
+          curl -fsSL -o "$RUNNER_TEMP/libva-dev.deb" \
+            "http://deb.debian.org/debian/pool/main/libv/libva/libva-dev_${LIBVA_DEV_VERSION}_amd64.deb"
+          dpkg-deb -x "$RUNNER_TEMP/libva-dev.deb" "$RUNNER_TEMP/libva-dev"
+          sudo cp -r "$RUNNER_TEMP/libva-dev/usr/include/va" /usr/include/
+          # Same headers, the name the guard includes them by. See the header comment.
+          if [ ! -e /usr/include/drm/drm.h ]; then
+            sudo ln -sfn /usr/include/libdrm /usr/include/drm
+          fi
+          # Fail here, naming the file, rather than leaving it to be rediscovered inside the test
+          # output: the tests below fail too, but not in a way that says which header is missing.
+          for h in va.h va_drm.h va_dec_av1.h va_dec_hevc.h va_dec_vp9.h va_enc_h264.h; do
+            if [ ! -f "/usr/include/va/$h" ]; then
+              echo "::error::libva ${h} is not installed, so the ABI guard cannot run"; exit 1
+            fi
+          done
+          if [ ! -f /usr/include/drm/drm.h ]; then
+            echo "::error::/usr/include/drm/drm.h is missing, so the ABI guard cannot run"; exit 1
+          fi
+          echo "va: $(sed -n 's/^#define VA_VERSION_S *"\(.*\)"/\1/p' /usr/include/va/va_version.h)"
+          cc --version | head -1
+      # The guard's 27 checks are unit tests in the platform crate's lib target — the only header-
+      # reading tests in the tree — so that target is the cheapest command that runs every one of
+      # them. Unfiltered on purpose: a name filter would run today's three guard modules and silently
+      # stop running a fourth one added next month, which is a green run that checks nothing.
+      # FILMCRAFT_ABI_GUARD above means a missing header fails this rather than skipping it.
+      - name: Run the ABI guard
+        run: cargo test -p filmcraft-platform --lib

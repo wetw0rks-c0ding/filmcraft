@@ -1166,13 +1166,28 @@ initialisation and this is the pattern that provokes it.
   is written down where it is not known: the `wmmat` scale is stated nowhere in the header, and the two
   pointers it gives (the specification and a third-party decoder's source) are both outside what this tree
   may read under `AGENTS.md` §2.
-- **The FFI guard does not check parameter width or signedness** — arity is bound mechanically, and holes
-  are now pinned as gaps, but the Rust↔C type mapping is still a reviewer's job, and both header checks are
-  skipped on GitHub runners where the headers are absent.
+- **The FFI guard, and what CI does with it** — arity is bound mechanically, holes are pinned as gaps and
+  each field's width and signedness is checked too, and `.github/workflows/abi-guard.yml` now runs
+  `cargo test -p filmcraft-platform --lib` on every push to `main`/`release`, on pull requests that touch
+  the platform crate, and weekly. 27 of that target's tests are the guard — the three `abi` modules that
+  read or compile against the installed headers — and
+  `the_abi_guard_ran_on_this_machine_or_announced_that_it_did_not` **fails** rather than skipping when the
+  headers are not installed, so a green run means the guard ran rather than that nothing went wrong. Two
+  facts about the runner, both measured here against the real headers, are why the workflow is not just
+  `apt-get install libva-dev`: the guard needs **libva ≥ 2.24**
+  (`VAConfigAttribEncVP9` first appears in 2.24's `va.h`; 2.17.0 and 2.22.0 both fail, and `ubuntu-latest`
+  ships 2.23.0), so `libva-dev` 2.24.1 is pinned from Debian's package pool and only its `usr/include/va`
+  is copied onto the runner; and it needs **`/usr/include/drm`**, which Debian's and Ubuntu's
+  `libdrm-dev` do not provide (they install `/usr/include/libdrm/*.h`), so the workflow symlinks it.
+  **What CI still does not run is `cargo test`** — the workspace, the integration targets and the
+  fixtures are out of scope here and remain local gates.
 - **iHD writes no packed parameter sets** — it accepts the mode, returns `0x3`, emits no NAL 7/8. Whether
   that is this driver or this submission is open. (This is the *decode-side* statement and is separate from
   the encode-side finding that the driver writes no slice header of its own either, §3.5.)
 - **`crates/golden/tests/golden.rs:742` builds a `wgpu::Instance` per test** — the exact pattern that faulted
   `crates/gpu`'s suite at every thread count ≥ 2, in a second binary, unfixed; §7.
 - **libva licence** — approved 2026-10-08 for the run-time `dlopen` (ADR 0001). The ruling rests on libva
-  staying behind `dlopen`; linking it would void it.
+  staying behind `dlopen`; linking it would void it. CI installs libva's **public headers** and nothing
+  else — no library, no binary, no code, nothing vendored into this tree — so a C compiler has a header
+  to measure against. That is a test oracle and not a dependency, and it changes nothing about the
+  ruling.
