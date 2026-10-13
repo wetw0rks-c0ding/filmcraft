@@ -25,6 +25,12 @@
 //! Both skip, with a note on stdout, where the thing they need is not installed, so neither can turn
 //! a machine red for the wrong reason. Where the headers *are* installed — every machine that can
 //! run the VA-API backend at all — they are an assertion, not a courtesy.
+//!
+//! **A note on stdout is not loud**, though: `cargo test` captures a passing test's output, so on a
+//! machine without the headers every check above returns early and the suite is green while nothing
+//! was verified. [`the_abi_guard_ran_on_this_machine_or_announced_that_it_did_not`] at the end of
+//! this file is the one test here that fails in that state instead, and it is what a reader of a
+//! green run should look for.
 
 use super::*;
 use std::mem::{offset_of, size_of};
@@ -1252,4 +1258,440 @@ fn which(name: &str) -> Option<String> {
         let candidate = dir.join(name);
         candidate.is_file().then(|| candidate.to_string_lossy().into_owned())
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Width and signedness — the one property of a declaration that changes no byte of a record.
+//
+// Everything above asks the C compiler for a **number**: a `sizeof`, an `offsetof`, the width of a
+// hole, a bit position. All of those are blind to the difference between a `u32` and an `i32`,
+// because the two are the same four bytes at the same offset in a struct of the same size. They
+// compile, they link, they pass every check in this file — and then the driver writes a value above
+// `INT32_MAX` and the crate reads a negative number, or the reverse, with nothing to notice and
+// nothing but a wrong picture to show for it.
+//
+// This section is deliberately **two records**, not the whole list, and it is additive: it touches
+// neither `SUBMITTED_RECORDS` nor the hole checks nor [`every_record_the_backend_submits_tiles_byte_for_byte`].
+// `VAPictureH264` is submitted for **every** H.264 picture and `VAImage` for every image the
+// backend maps; between them they hold a signed 32-bit field (`TopFieldOrderCnt`), a signed 8-bit
+// array (`component_order`), unsigned 16-bit fields, unsigned arrays and one nested record, which is
+// the range of shapes where a signedness mistake is possible at all. A record added here later is
+// added by writing its fields out, the same way [`SUBMITTED_RECORDS`] is.
+//
+// The two sides are independent, which is what makes the comparison worth anything:
+//
+// * **C** — `_Generic` over the member, folded with `sizeof` into `sign * 256 + width`. This reads
+//   the header. Editing this file cannot change it.
+// * **Rust** — [`CKindOf`], read off the type spelled in [`TYPED_RECORDS`]. That spelling is a
+//   transcription and is **not** trusted on its own: the tiling test already pins each field's width
+//   against `offset_of!` on the real struct, so a wrong width cannot survive it, and this section
+//   re-asserts the two tables' widths agree. What nothing else pinned is the **signedness**, and
+//   that is what the C compiler is being asked about here.
+// ---------------------------------------------------------------------------------------------
+
+/// What a C compiler will say about the C type a Rust field's type stands for.
+///
+/// The C **spelling** deliberately does not matter. `VAStatus`, `VAGenericID`, `int32_t` and
+/// `unsigned int` are all four bytes; only the last of them is a different answer to the question
+/// this asks, and `_Generic` matches a typedef against its underlying type, so none of the others
+/// can be confused with it either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CKind {
+    /// A signed integer this many bytes wide: C's `int`, `int32_t`, `long`, …
+    Signed(usize),
+    /// The same, unsigned.
+    Unsigned(usize),
+    /// Not an integer at all: a nested record, a union or a pointer. C lays the bytes out and there
+    /// is no signedness to disagree about.
+    Nested,
+}
+
+impl CKind {
+    /// The number the C side is compared with, in `CKIND`'s `sign * 256 + width` encoding.
+    ///
+    /// In one place, so "the same signedness" is one number rather than a literal repeated in a
+    /// generated string, and so flipping one bit of it is visibly a different value.
+    fn expected_code(self) -> i32 {
+        match self {
+            CKind::Signed(width) => 256 + width as i32,
+            CKind::Unsigned(width) => width as i32,
+            CKind::Nested => 0,
+        }
+    }
+}
+
+/// A Rust field type, read for what C will say about the C type it stands for.
+trait CKindOf {
+    /// Signed or unsigned and how wide, or [`CKind::Nested`].
+    const KIND: CKind;
+    /// How many levels of array the type is nested in, so the C side can peel the same way.
+    ///
+    /// Peeling is needed because `_Generic` on an array **decays it to a pointer** (C11 6.3.2.1p3),
+    /// which would silently answer "pointer" for every array member here — including
+    /// `int8_t component_order[4]`, where the answer that matters is `int8_t`.
+    const DEPTH: usize;
+}
+
+macro_rules! c_kind {
+    ($($ty:ty => $kind:expr),* $(,)?) => {$(
+        impl CKindOf for $ty {
+            const KIND: CKind = $kind;
+            const DEPTH: usize = 0;
+        }
+    )*};
+}
+c_kind!(
+    u8 => CKind::Unsigned(1),
+    i8 => CKind::Signed(1),
+    u16 => CKind::Unsigned(2),
+    i16 => CKind::Signed(2),
+    u32 => CKind::Unsigned(4),
+    i32 => CKind::Signed(4),
+    u64 => CKind::Unsigned(8),
+    i64 => CKind::Signed(8),
+);
+/// An array of anything: the kind and the depth are the element's, because that is what the C side
+/// reaches once it has indexed its way in one level at a time.
+impl<T: CKindOf, const N: usize> CKindOf for [T; N] {
+    const KIND: CKind = T::KIND;
+    const DEPTH: usize = T::DEPTH + 1;
+}
+/// The one nested record the two records here contain. A record added to [`TYPED_RECORDS`] with a
+/// field type that is neither an integer nor listed here does not compile, and the message says
+/// which field — so this list cannot fall behind the table without the build noticing.
+impl CKindOf for VaImageFormat {
+    const KIND: CKind = CKind::Nested;
+    const DEPTH: usize = 0;
+}
+
+/// One field of one of the two records above, with the type our declaration gives it.
+struct TypedField {
+    /// The member's name in `/usr/include/va/`.
+    c_name: &'static str,
+    /// Our field's name, for the message a failure prints.
+    rust_name: &'static str,
+    /// `size_of` of the field's type, cross-checked against [`SUBMITTED_RECORDS`] below.
+    width: usize,
+    /// What our field's type says its signedness and width are.
+    kind: CKind,
+    /// How far into the field's type the innermost scalar is.
+    depth: usize,
+}
+
+/// A record and its fields, in declaration order.
+struct TypedRecord {
+    /// The struct's name in `/usr/include/va/`.
+    c_name: &'static str,
+    fields: &'static [TypedField],
+}
+
+macro_rules! typed_records {
+    ($($c_record:literal => [ $( ($c_field:literal, $field:ident : $fty:ty) ),* $(,)? ]),* $(,)?) => {
+        &[$(TypedRecord {
+            c_name: $c_record,
+            fields: &[
+                $(TypedField {
+                    c_name: $c_field,
+                    rust_name: stringify!($field),
+                    width: size_of::<$fty>(),
+                    kind: <$fty as CKindOf>::KIND,
+                    depth: <$fty as CKindOf>::DEPTH,
+                }),*
+            ],
+        }),*]
+    };
+}
+
+/// The two records [`TYPED_RECORDS`] is checked against, every field of each, with the Rust type the
+/// declaration gives it.
+///
+/// `VAPictureH264` (`va.h:3572-3581`) and `VAImage` (`va.h:4734-4775`). Nothing here restates the
+/// offsets or the sizes — those belong to [`SUBMITTED_RECORDS`], and this table is cross-checked
+/// against it — because the only thing it adds is the **type**.
+static TYPED_RECORDS: &[TypedRecord] = typed_records![
+    "VAPictureH264" => [
+        ("picture_id", picture_id: VABufferID),
+        ("frame_idx", frame_idx: u32),
+        ("flags", flags: u32),
+        ("TopFieldOrderCnt", top_field_order_cnt: i32),
+        ("BottomFieldOrderCnt", bottom_field_order_cnt: i32),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+    "VAImage" => [
+        ("image_id", image_id: VAImageID),
+        ("format", format: VaImageFormat),
+        ("buf", buf: VABufferID),
+        ("width", width: u16),
+        ("height", height: u16),
+        ("data_size", data_size: u32),
+        ("num_planes", num_planes: u32),
+        ("pitches", pitches: [u32; 3]),
+        ("offsets", offsets: [u32; 3]),
+        ("num_palette_entries", num_palette_entries: i32),
+        ("entry_bytes", entry_bytes: i32),
+        ("component_order", component_order: [i8; 4]),
+        ("va_reserved", va_reserved: [u32; VA_PADDING_LOW]),
+    ],
+];
+
+/// The C half of the width-and-signedness check, as macros the generated source uses.
+///
+/// `CKIND(x)` is the one number both sides agree or disagree on. `_Generic` produces the sign — it
+/// matches the controlling expression's type against a list of *distinct* C types, so a typedef
+/// answers as its underlying type without its spelling appearing anywhere below — and `sizeof`
+/// produces the width. `default: 2` is "not an integer at all": a record, a union, a pointer, or
+/// an enumerated type, each of which lands there by a different route.
+///
+/// `char` is listed apart from `signed char` and gets its **own** code (3) on purpose: plain
+/// `char`'s signedness is implementation-defined and is signed only on this target. Neither record
+/// declares one, so no member lands on 3; if one ever did, the comparison would fail rather than
+/// quietly assume a signedness the header never promised.
+const CK_PROLOGUE: &str = "\
+#define CK_SIGN(x) _Generic((x), \
+    _Bool: 0, \
+    char: 3, \
+    signed char: 1, unsigned char: 0, \
+    short: 1, unsigned short: 0, \
+    int: 1, unsigned int: 0, \
+    long: 1, unsigned long: 0, \
+    long long: 1, unsigned long long: 0, \
+    float: 3, double: 3, \
+    default: 2)
+#define CKIND(x) (CK_SIGN(x) * 256 + (int)sizeof(x))
+#define CK_CLASS(x) __builtin_classify_type(__typeof__(x))
+#define CK_INTEGER 1
+#define CK_RECORD 12
+#define CK_P1(x) (x)[0]
+";
+
+/// The C source for the width-and-signedness check: one assertion pair per field, over
+/// [`TYPED_RECORDS`].
+///
+/// `rewrite` is handed `(record, field, expected)` and returns the number the C side is compared
+/// with. The real check passes [`CKind::expected_code`] through; the test that proves the check can
+/// fail passes a function that returns a deliberately wrong number for two named fields, and
+/// asserts the compiler rejects the result. **A check that cannot fail is worse than no check**,
+/// so that failure is a committed test rather than something a reviewer has to take on trust.
+fn typed_kind_source(rewrite: impl Fn(&str, &str, i32) -> i32) -> String {
+    let mut source = String::from("#include <stdint.h>\n#include <va/va.h>\n");
+    source.push_str(CK_PROLOGUE);
+    for record in TYPED_RECORDS {
+        source.push_str(&format!("\n/* {} */\n", record.c_name));
+        for field in record.fields {
+            let member = format!("((({} *)0)->{})", record.c_name, field.c_name);
+            // The innermost scalar, one `[0]` per level of the Rust type — see `CKindOf::DEPTH`.
+            let peeled = match field.depth {
+                0 => member.clone(),
+                1 => format!("CK_P1({member})"),
+                other => panic!("{}.{} is an array nested {other} deep and the probe only peels one level", record.c_name, field.c_name),
+            };
+            let label = format!("{}.{}", record.c_name, field.c_name);
+            let expected = rewrite(record.c_name, field.c_name, field.kind.expected_code());
+            match field.kind {
+                CKind::Nested => source.push_str(&format!(
+                    "_Static_assert(CK_CLASS({member}) == CK_RECORD, \"{label}: we declare a nested record and the header declares something else here\");\n"
+                )),
+                kind => source.push_str(&format!(
+                    "_Static_assert(CK_CLASS({peeled}) == CK_INTEGER, \"{label}: we declare a {kind:?} and the header's member is not an integer type\");\n\
+                     _Static_assert(CKIND({peeled}) == {expected}, \"{label}: we declare {kind:?} and the header declares a different width or signedness\");\n"
+                )),
+            }
+        }
+    }
+    source
+}
+
+/// The two records above agree with `/usr/include/va/` on every field's **width and signedness**,
+/// and with [`SUBMITTED_RECORDS`] on every field's width.
+///
+/// The width half of that second claim is what keeps this section honest. The type spelled in
+/// [`TYPED_RECORDS`] is a transcription, so a wrong one would otherwise be able to agree with
+/// itself: `size_of` of a mistyped type is the size of the type that was written down, not of the
+/// field. Comparing each width with the row [`SUBMITTED_RECORDS`] already pinned ties it to
+/// `offset_of!` on the real struct — which is what the tiling test uses to prove the fields cover
+/// the record — so the two tables cannot drift apart on width, and the signedness is left with
+/// nothing to hide behind.
+#[test]
+fn the_two_checked_records_agree_with_the_header_on_width_and_signedness() {
+    let Some(cc) = require_headers_and_compiler("the_two_checked_records_agree_with_the_header_on_width_and_signedness") else {
+        return;
+    };
+    let mut seen = 0usize;
+    for record in TYPED_RECORDS {
+        assert!(!record.fields.is_empty(), "{}: no fields listed, so the loop below proved nothing", record.c_name);
+        let submitted = SUBMITTED_RECORDS
+            .iter()
+            .find(|r| r.c_name == record.c_name)
+            .unwrap_or_else(|| panic!("{} is not in SUBMITTED_RECORDS, so its widths cannot be cross-checked", record.c_name));
+        for field in record.fields {
+            let row = submitted
+                .fields
+                .iter()
+                .find(|f| f.rust_name == field.rust_name)
+                .unwrap_or_else(|| panic!("{}.{} is not in the SUBMITTED_RECORDS row for {}", record.c_name, field.rust_name, record.c_name));
+            assert_eq!(
+                field.width, row.width,
+                "{}.{}: the type written in TYPED_RECORDS is {} bytes wide and the type the SUBMITTED_RECORDS row pinned is {} — one of the two tables is stale",
+                record.c_name, field.rust_name, field.width, row.width
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 19, "every field of both records was cross-checked against SUBMITTED_RECORDS");
+    let out = compile_probe(&cc, "va-typed-kind", &typed_kind_source(|_, _, expected| expected));
+    assert!(out.status.success(), "{} disagrees with our declarations about a field's width or its signedness:\n{}", cc, String::from_utf8_lossy(&out.stderr));
+}
+
+/// **The width-and-signedness check is proved able to fail, in the direction it exists for**, by
+/// running the real generator and the real compiler against a deliberately wrong declaration.
+///
+/// This test hands [`typed_kind_source`] two fields whose expected numbers are wrong on purpose:
+///
+/// * `VAPictureH264.TopFieldOrderCnt` — we declare `i32`, the header declares `int32_t`, and the
+///   number compared against is the one an `unsigned int` would produce. **A Rust `i32` for a C
+///   `uint32_t`**;
+/// * `VAImage.num_palette_entries` — the same, on the other record, so the proof covers both.
+///
+/// Each is the *correct* number for that field with the signedness flipped, so the source compiled
+/// here differs from the one the test above compiles in exactly that and nowhere else. The compiler
+/// must **reject** it, and its output must name both fields — a failure a reader cannot act on is
+/// not much better than no failure.
+#[test]
+fn the_width_and_signedness_check_rejects_a_field_declared_with_the_wrong_signedness() {
+    let Some(cc) = require_headers_and_compiler("the_width_and_signedness_check_rejects_a_field_declared_with_the_wrong_signedness") else {
+        return;
+    };
+    let source = typed_kind_source(|record, field, expected| match (record, field) {
+        // signed 4 -> unsigned 4: the same four bytes, read with the wrong sign.
+        ("VAPictureH264", "TopFieldOrderCnt") | ("VAImage", "num_palette_entries") => 4,
+        _ => expected,
+    });
+    let out = compile_probe(&cc, "va-typed-kind-wrong", &source);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "{} accepted two fields compared against the wrong signedness, so the check is not checking anything:\n{source}", cc);
+    for field in ["VAPictureH264.TopFieldOrderCnt", "VAImage.num_palette_entries"] {
+        assert!(
+            stderr.contains(field),
+            "{} rejected the wrong-signedness source but did not name {field}, so the failure would not tell a reader which declaration to fix:\n{stderr}",
+            cc
+        );
+    }
+}
+
+/// **This machine actually ran the guard, or said out loud that it did not.**
+///
+/// Every other check in this module opens with `if the header is not there { eprintln!("SKIPPED");
+/// return }`, which makes it **pass while checking nothing**. `cargo test` captures a passing test's
+/// output, so the note reaches nobody: the run is green, this file reads as an assertion, and a
+/// runner without `libva-dev` reports that a hand-declared FFI layer is verified when nothing ran. A
+/// guard that does that is worse than no guard, because it reads as assurance it never gave.
+///
+/// This test cannot do anything about those `eprintln!`s without changing checks that currently
+/// work, so it does the next best thing and makes **itself** the visible one: on a machine with the
+/// headers it compiles and runs a probe, so "available" means "working", not merely "a file is
+/// there"; on a machine without them it **fails**, naming everything that went unchecked — unless
+/// [`ACKNOWLEDGE_ENV`] says `skip`, which is the one way past it and is a claim that the person
+/// setting it knows the guard did not run.
+///
+/// **The honest answer about CI is that it does not run there at all.** This repository's workflows
+/// are `packaging-lint.yml`, `release.yml` and `windows-arm64.yml`; none of them runs `cargo test`,
+/// and none installs `libva-dev`. So there is currently no GitHub runner for this guard to skip on,
+/// and wiring one up (a workflow step that installs `libva-dev` and runs
+/// `cargo test -p filmcraft-platform`) is the change that would make the rest of this module worth
+/// having on every commit. That is outside this file; this test is the part that can live here.
+#[test]
+fn the_abi_guard_ran_on_this_machine_or_announced_that_it_did_not() {
+    let mut missing: Vec<String> = Vec::new();
+    for file in ["va.h", "va_drm.h", "va_dec_av1.h", "va_dec_hevc.h", "va_dec_vp9.h", "va_enc_h264.h"] {
+        if !std::path::Path::new(LIBVA_HEADERS).join(file).is_file() {
+            missing.push(format!("{LIBVA_HEADERS}/{file}"));
+        }
+    }
+    if !drm_headers_present() {
+        missing.push(format!("{DRM_HEADERS}/drm.h"));
+    }
+    let cc = ["cc", "gcc", "clang"].into_iter().find_map(which);
+    if cc.is_none() {
+        missing.push("a C compiler (cc, gcc or clang)".to_string());
+    }
+    if !missing.is_empty() {
+        if std::env::var(ACKNOWLEDGE_ENV).as_deref() == Ok("skip") {
+            eprintln!(
+                "{ACKNOWLEDGE_ENV}=skip: this machine cannot run the ABI guard — {} missing. Nothing about the hand-declared ABI was verified here.",
+                missing.join(", ")
+            );
+            return;
+        }
+        panic!(
+            "the ABI guard did not run on this machine: {} missing.\n\
+             Every other test in this module passed **without checking anything**, because each of them skips when this is true.\n\
+             Install the headers (`libva-dev` and `libdrm-dev` on Debian/Ubuntu) and a C compiler, or set {ACKNOWLEDGE_ENV}=skip to record, in writing, that this machine cannot check the declarations.",
+            missing.join(", ")
+        );
+    }
+    // "The headers are installed" is not "the guard works". Compile and run something, so the pass
+    // below means a C compiler read them.
+    let cc = cc.unwrap_or_else(|| panic!("the compiler disappeared between the check and the use of it"));
+    let out = compile_probe(
+        &cc,
+        "va-guard-alive",
+        &format!("#include <va/va.h>\n_Static_assert(sizeof(VAPictureH264) == {}, \"VAPictureH264\");\n", size_of::<VaPictureH264>()),
+    );
+    assert!(out.status.success(), "{cc} is installed but rejected the headers:\n{}", String::from_utf8_lossy(&out.stderr));
+    let src = typed_kind_source(|_, _, expected| expected);
+    let out = compile_probe(&cc, "va-guard-alive-kind", &src);
+    assert!(
+        out.status.success(),
+        "{cc} is installed but rejected the width-and-signedness source, so the guard would have been failing rather than skipping:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Set to `skip` to let this module's tests pass **without checking anything**, on a machine that
+/// has no libva headers. Setting it is a claim that whoever set it knows the guard did not run.
+const ACKNOWLEDGE_ENV: &str = "FILMCRAFT_ABI_GUARD";
+
+/// `None` only ever comes back on the acknowledged path, so the caller can `return` and the test
+/// still reads as a decision somebody made rather than as a silent skip.
+fn require_headers_and_compiler(what: &str) -> Option<String> {
+    let cc = ["cc", "gcc", "clang"].into_iter().find_map(which);
+    let mut absent: Vec<String> = Vec::new();
+    if !std::path::Path::new(LIBVA_HEADERS).join("va.h").is_file() {
+        absent.push(format!("{LIBVA_HEADERS}/va.h"));
+    }
+    if !drm_headers_present() {
+        absent.push(format!("{DRM_HEADERS}/drm.h"));
+    }
+    if cc.is_none() {
+        absent.push("a C compiler (cc, gcc or clang)".to_string());
+    }
+    if absent.is_empty() {
+        return cc;
+    }
+    if std::env::var(ACKNOWLEDGE_ENV).as_deref() == Ok("skip") {
+        eprintln!("{ACKNOWLEDGE_ENV}=skip: `{what}` did NOT run — {} missing.", absent.join(", "));
+        return None;
+    }
+    panic!(
+        "`{what}` cannot run here, and a guard that does not run is not a guard: {}.\n\
+         Install `libva-dev` and `libdrm-dev`, or set {ACKNOWLEDGE_ENV}=skip to record in writing that this machine cannot check the declarations.",
+        absent.join(", ")
+    );
+}
+
+/// Compile `source` with `-fsyntax-only` and hand the raw result back, compiling or not.
+///
+/// The caller asserts on `status`, so a *failing* compile is a usable value rather than an error:
+/// [`the_width_and_signedness_check_rejects_a_field_declared_with_the_wrong_signedness`] needs one.
+fn compile_probe(cc: &str, stem: &str, source: &str) -> std::process::Output {
+    let dir = std::env::temp_dir().join(format!("filmcraft-{stem}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{cc}: cannot create {}: {e}", dir.display()));
+    let path = dir.join("probe.c");
+    std::fs::write(&path, source.as_bytes()).unwrap_or_else(|e| panic!("{cc}: cannot write {}: {e}", path.display()));
+    let out = std::process::Command::new(cc)
+        .args(["-fsyntax-only", path.to_str().unwrap_or_default()])
+        .output()
+        .unwrap_or_else(|e| panic!("running {cc} on {} failed: {e}", path.display()));
+    let _ = std::fs::remove_dir_all(&dir);
+    out
 }
