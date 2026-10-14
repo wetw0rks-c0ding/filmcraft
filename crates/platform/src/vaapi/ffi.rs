@@ -25,7 +25,7 @@
 //! actually installed ([`Display::probe_image_layout`]) — libva has no `sizeof` / `offsetof` of its
 //! own to ask, so a behavioural check is the only way to hold the declaration to the driver.
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 
 use super::drm;
 use std::mem::size_of;
@@ -364,6 +364,24 @@ pub const CONFIG_ATTRIB_ENC_SLICE_STRUCTURE: VaBufferType = 15;
 /// "the answer is zero" on every one of them. The sentinel is spelled out rather than left
 /// implicit because callers compare against it: it is what [`config_attributes_from`] refuses on.
 pub const CONFIG_ATTRIB_POISON: u32 = 0xDEAD_BEEF;
+/// `VA_ATTRIB_NOT_SUPPORTED` (`va.h:1521`, "if an attribute is not applicable for a given
+/// profile/entrypoint pair, then set the value to the following"): the value libva **writes** into a
+/// record to say *this attribute does not apply here*.
+///
+/// **It is a refusal the driver reports as success, and it is not [`CONFIG_ATTRIB_POISON`].** The two
+/// sentinels are disjoint and they answer different questions: the poison means *libva never wrote
+/// this record*, which is how a (profile, entry point) pair it will not accept refuses, and
+/// `0x80000000` means *libva wrote this record, and what it wrote is "not applicable"*. Checking
+/// the status alone passes both, so `config_attributes` checks this sentinel separately.
+///
+/// **Measured, not theoretical.** Poisoned with `0xDEADBEEF`, one attribute per call, on iHD 26.3.5
+/// / libva 1.24: `VA_STATUS_SUCCESS` and `0x80000000` for **38 of 59** ids at `VAProfileH264Main`,
+/// 38 at `VAProfileH264High`, **39** at `VAProfileHEVCMain` and 38 at `VAProfileAV1Profile0`, all at
+/// `VAEntrypointEncSlice` — and for **none** of those 236 reads did the poison survive. The clearest
+/// pair is one call's worth of contrast: `VAConfigAttribEncHEVCFeatures` (50) answers `0x80000000`
+/// at `VAProfileH264High` and `0x01900464` at `VAProfileHEVCMain`. A record holding this value is a
+/// *measurement of "not applicable"* and never a number about the attribute.
+pub const VA_ATTRIB_NOT_SUPPORTED: u32 = 0x8000_0000;
 // `VA_ENC_SLICE_STRUCTURE_*` (`va.h:1251-1263`) is **not** declared here. A whole-picture slice is
 // `macroblock_address = 0, num_macroblocks = picture_width_in_mbs * picture_height_in_mbs`, which is
 // an arbitrary run of macroblocks rather than a power of two in rows (640x368 is 23 rows), so
@@ -2665,11 +2683,7 @@ fn dl_error() -> String {
     // SAFETY: `dlerror` returns either NULL or a NUL-terminated string owned by the loader that is
     // valid until the next `dlerror` call, and copies it out before making another.
     let p = unsafe { dlerror() };
-    if p.is_null() {
-        "unknown error".to_string()
-    } else {
-        string_from(p)
-    }
+    if p.is_null() { "unknown error".to_string() } else { string_from(p) }
 }
 
 /// A NUL-terminated C string as owned Rust text, at most [`MAX_DRIVER_STRING`] bytes: a driver
@@ -2696,11 +2710,7 @@ impl Api {
         // SAFETY: `error_str` is `vaErrorStr` (`va.h:403`), which takes a status and returns a
         // NUL-terminated string (or null for a code it does not know) and does nothing else.
         let text = string_from(unsafe { error_str(s) });
-        if text.is_empty() {
-            format!("VA-API status {s}")
-        } else {
-            text
-        }
+        if text.is_empty() { format!("VA-API status {s}") } else { text }
     }
 }
 
@@ -2861,6 +2871,16 @@ impl Display {
     /// `VAConfigAttribEncInterlaced`), so a record libva declines to write would otherwise be
     /// reported as "the attribute is zero". See [`config_attributes_from`], which is where that
     /// decision is made and where it is tested.
+    ///
+    /// **The returned vector is positionally aligned with `types`, and `Err` covers a refusal that
+    /// arrives *inside* a `VA_STATUS_SUCCESS`.** A driver answers an attribute that does not apply to
+    /// the pair with [`VA_ATTRIB_NOT_SUPPORTED`] (`va.h:1521`) and **reports success** — measured
+    /// here for 38 of 59 ids at `VAProfileH264Main` / `EncSlice` and 39 at `VAProfileHEVCMain` — so
+    /// `Ok` never contains that number and a caller that indexed `values[0]` is indexing the id it
+    /// asked about. Two refusals reach this call and both are `Err`: the pair being declined (a
+    /// non-`OK` status, records untouched) and an attribute being declined (success, record
+    /// overwritten). Neither is a measurement, and both land in the one channel the three in-tree
+    /// callers already document as "not a measurement".
     pub fn config_attributes(&self, profile: Profile, entrypoint: Entrypoint, types: &[VaBufferType]) -> Result<Vec<u32>, String> {
         if types.is_empty() {
             return Ok(Vec::new());
@@ -2879,6 +2899,9 @@ impl Display {
         // its status and *leaving the caller's record alone*, so a record that still holds the
         // poison afterwards is one libva declined to answer — which zero cannot express, because
         // zero is also the answer `VA_ENC_PACKED_HEADER_NONE` and `VA_ENC_INTERLACED_NONE` give.
+        // It says nothing about an attribute the driver declines *inside* a success: that one is
+        // reported by overwriting the record with `VA_ATTRIB_NOT_SUPPORTED`, so the poison cannot
+        // detect it and `config_attributes_from` tests for that sentinel in its own right.
         let mut attribs: Vec<VaConfigAttrib> = types.iter().map(|t| VaConfigAttrib { type_: *t, value: CONFIG_ATTRIB_POISON }).collect();
         // SAFETY: as above, plus the profile and entry point, which are plain integers libva
         // compares, and `types.len()`, which is the count of records just allocated.
@@ -2931,39 +2954,70 @@ impl Drop for Display {
 /// cannot be checked by reading the call site, because what is being tested is what the *driver*
 /// does to the array.
 ///
-/// ## The rule: gate on the status, then on the poison — never on the value
+/// ## The rule: gate on the status, then on the poison, then on `VA_ATTRIB_NOT_SUPPORTED`
 ///
-/// libva declines a (profile, entry point) pair by **returning a status and leaving the caller's
-/// record untouched**, so two questions have to be asked in order and neither may be replaced by
-/// the other:
+/// **There are two refusals here and they do not look alike, and an earlier revision of this note
+/// handled them as one.** "Gate on the returned `VAStatus`, never on the value" is right for the
+/// *pair* and wrong for the *attribute*, and both are answered by this one call:
 ///
-/// 1. **`status != VA_STATUS_SUCCESS`** — the driver refused. `Err`, because nothing was measured.
-/// 2. **`status == VA_STATUS_SUCCESS` and a record still holds [`CONFIG_ATTRIB_POISON]`** — the
-///    driver reported success but declined to write this particular attribute. `Err` naming the
-///    attribute, because the record carries a number this code put there and not one the driver
-///    chose.
+/// 1. **`status != VA_STATUS_SUCCESS`** — libva declined the (profile, entry point) pair outright.
+///    `Err`, because nothing was measured.
+/// 2. **`status == VA_STATUS_SUCCESS` and a record still holds [`CONFIG_ATTRIB_POISON]`** — the pair
+///    was accepted and libva then declined to write this record, so the number in it is one this
+///    code put there. `Err` naming the attribute.
+/// 3. **`status == VA_STATUS_SUCCESS` and a record holds [`VA_ATTRIB_NOT_SUPPORTED]`** — the pair was
+///    accepted, the record **was** written, and what the driver wrote is "this attribute does not
+///    apply here" (`va.h:1521`). `Err` naming the attribute.
 ///
-/// The order matters and is why this is not written as one condition. Checking the poison first
-/// would turn every refusal into "attribute N went unanswered", which names a *specific* attribute
-/// for a refusal that named none; checking the value alone would report `0` — which for
+/// **Step 3 was missing, and it is not the same fact as step 2.** For a pair libva leaves the
+/// caller's record alone, so the surviving poison is the only signal there is and gating on the
+/// status is sufficient. For an attribute it does the opposite: it **overwrites the record** and
+/// returns success, so the poison is gone, `status` is `0`, and the sentinel is the only thing in
+/// the array that says anything. Measured here (iHD 26.3.5 / libva 1.24, one id per call, poisoned
+/// with `0xDEADBEEF`): `VA_STATUS_SUCCESS` with `0x80000000` for **38 of 59** ids at
+/// `VAProfileH264Main` / `EncSlice`, 38 at `VAProfileH264High`, **39** at `VAProfileHEVCMain`, 38 at
+/// `VAProfileAV1Profile0` — and a surviving poison at a supported pair **zero** times in those 236
+/// reads, which is exactly why step 2 cannot be what catches a declined attribute.
+///
+/// The order matters and is why this is not written as one condition. Checking the poison before the
+/// status would name a *specific* attribute for a refusal that named none; checking the value alone
+/// would report `0` — which for
 /// [`CONFIG_ATTRIB_ENC_PACKED_HEADERS`] and `VAConfigAttribEncInterlaced` is a real, meaningful
-/// answer, and the whole reason the records are poisoned with `0xDEADBEEF` rather than zero.
+/// answer, and the whole reason the records are poisoned with `0xDEADBEEF` rather than zero. The
+/// poison is tested before the sentinel because a surviving poison means the driver did not honour
+/// the array contract at all, which is the more serious of the two faults and the one a log most
+/// needs to name.
 ///
-/// **A refusal is an error rather than the poison or `None`, for one reason: it is the only answer
-/// every existing caller already treats as "not a measurement".** Each of the three in-tree callers
-/// has a documented meaning for `Err` and none for the other two — `driver_max_reference_frames`
-/// returns `(0, 0)` and logs "the driver's reference depth is unknown",
+/// **A refusal is an error rather than the poison, the sentinel, or `None`, for one reason: it is the
+/// only answer every existing caller already treats as "not a measurement".** Each of the three
+/// in-tree callers has a documented meaning for `Err` and none for the others —
+/// `driver_max_reference_frames` returns `(0, 0)` and logs "the driver's reference depth is unknown",
 /// `driver_rate_control_modes` returns `0` and documents it as "the driver did not say", and
 /// `driver_packed_headers` returns `None` and documents that as "could not ask, never nothing".
 /// Returning the poison would push `0xDEADBEEF` into those call sites as an apparent measurement,
 /// which is worse than the ambiguity it fixes: `& 0xffff` on it is 48879 reference frames.
-/// Returning `None` would change three signatures and every call site for no extra information.
-/// The failure is rare enough that it does not matter, and where it does occur the message names
-/// the attribute so the caller can re-ask without it.
+/// **Returning the sentinel would be worse still, because it survives both halves of the number
+/// `driver_max_reference_frames` reads**: `0x80000000 & 0xffff` is `0`, indistinguishable from a
+/// driver that answered zero, and `0x80000000 >> 16` is 32768 reference frames in list 1.
+/// **Dropping such a record is not available either**, and the reason is positional rather than
+/// aesthetic: all three callers read `values.first()`, and `driver_max_reference_frames` asks for
+/// `MAX_REF_FRAMES` *and* `ENC_SLICE_STRUCTURE` in one call, so removing a record that came back
+/// `VA_ATTRIB_NOT_SUPPORTED` would slide `ENC_SLICE_STRUCTURE`'s answer into slot 0 and report
+/// `0x0000003c` as a reference depth. `Err` is also the only one of the four that needs no signature
+/// change, which is why it is the one that can land without touching a caller.
+///
+/// **The cost, stated: one record that is not applicable costs the caller the values of the other
+/// records in the same call.** That is the price of not inventing a shape for "some of these were
+/// measured and some were not". For the one multi-attribute call in the tree it is free, because
+/// `driver_max_reference_frames` reads only slot 0 and `ENC_SLICE_STRUCTURE` is answered wherever
+/// `MAX_REF_FRAMES` is (measured: `0x0000003c` at `VAProfileH264Main`, `0x0000000c` at
+/// `VAProfileHEVCMain`). The message names the attribute, so a caller can re-ask for the others.
 ///
 /// **A legitimate zero is not affected by any of this**: `status == VA_STATUS_SUCCESS` with a
 /// written `0` returns `Ok([0])`, which is [`Display::config_attributes`]'s ordinary answer and is
-/// what `VA_ENC_INTERLACED_NONE` and `VA_ENC_PACKED_HEADER_NONE` mean.
+/// what `VA_ENC_INTERLACED_NONE` and `VA_ENC_PACKED_HEADER_NONE` mean. Nor is a written value that
+/// merely carries the high bit among others: only the exact sentinel is a refusal, because
+/// `VA_ATTRIB_NOT_SUPPORTED` is that one number and not a mask.
 fn config_attributes_from(status: VAStatus, status_text: &str, attribs: Vec<VaConfigAttrib>) -> Result<Vec<u32>, String> {
     if status != OK {
         return Err(format!("vaGetConfigAttributes failed: {status_text}"));
@@ -2971,13 +3025,26 @@ fn config_attributes_from(status: VAStatus, status_text: &str, attribs: Vec<VaCo
     // The driver said yes and then left a record holding the number this code wrote into it. The
     // attribute's own id is named so the caller can re-ask for the others, and so a driver that
     // does this is identifiable in a log rather than looking like an attribute of zero.
-    let Some(unanswered) = attribs.iter().find(|a| a.value == CONFIG_ATTRIB_POISON) else {
-        return Ok(attribs.into_iter().map(|a| a.value).collect());
-    };
-    Err(format!(
-        "vaGetConfigAttributes reported success but left attribute {} at the {CONFIG_ATTRIB_POISON:#010x} poison it was handed, so the driver declined to answer for it and no value was measured",
-        unanswered.type_
-    ))
+    if let Some(unanswered) = attribs.iter().find(|a| a.value == CONFIG_ATTRIB_POISON) {
+        return Err(format!(
+            "vaGetConfigAttributes reported success but left attribute {} at the {CONFIG_ATTRIB_POISON:#010x} poison it was handed, so the driver declined to answer for it and no value was measured",
+            unanswered.type_
+        ));
+    }
+    // The driver said yes, wrote every record, and one of them says "not applicable". Status 0 here
+    // is the driver reporting success at the *pair* level while declining the *attribute*, so the
+    // status cannot be the gate and the record cannot be passed through: `0x80000000` is not a
+    // property of the attribute, and every number derived from it downstream is a fiction. Checked
+    // separately from the poison above because the two are disjoint (`0xDEADBEEF` is never written
+    // by libva) and name different faults: that one is a record libva declined to touch, this one is
+    // a record libva filled with a refusal.
+    if let Some(not_applicable) = attribs.iter().find(|a| a.value == VA_ATTRIB_NOT_SUPPORTED) {
+        return Err(format!(
+            "vaGetConfigAttributes reported success but answered attribute {} with {VA_ATTRIB_NOT_SUPPORTED:#010x}, which is VA_ATTRIB_NOT_SUPPORTED (va.h:1521): the attribute does not apply to this profile and entry point, so no value was measured",
+            not_applicable.type_
+        ));
+    }
+    Ok(attribs.into_iter().map(|a| a.value).collect())
 }
 
 /// Whether a driver-filled `VAImage` describes an NV12 image of `width` x `height` in the planes it
@@ -5567,6 +5634,136 @@ mod tests {
         }
         assert_eq!(RtFormat::Nv12.bits(), YUV420);
         assert_eq!(RtFormat::Yuv420_10.bits(), YUV420_10);
+    }
+
+    /// The two sentinels a poisoned `VAConfigAttrib` array can come back holding mean different
+    /// faults, so they must not be conflated into one check. `CONFIG_ATTRIB_POISON` is the number
+    /// *this* code wrote and libva left alone; `VA_ATTRIB_NOT_SUPPORTED` is the number libva wrote
+    /// on purpose. Collapsing them would make either check miss its own case.
+    #[test]
+    fn the_two_refusal_sentinels_are_the_header_s_and_distinct() {
+        assert_eq!(VA_ATTRIB_NOT_SUPPORTED, 0x8000_0000, "VA_ATTRIB_NOT_SUPPORTED is 0x80000000 (va.h:1521)");
+        assert_eq!(CONFIG_ATTRIB_POISON, 0xDEAD_BEEF);
+        assert_ne!(
+            VA_ATTRIB_NOT_SUPPORTED, CONFIG_ATTRIB_POISON,
+            "a record that survived the poison and a record libva filled with a refusal are different facts"
+        );
+    }
+
+    /// **A driver that answers `VA_ATTRIB_NOT_SUPPORTED` and reports success has not measured
+    /// anything**, so the record must not reach a caller as a value. This is the hole: `status` is
+    /// `0` and the poison is gone, so a decision that gates on the status and the poison alone lets
+    /// `0x80000000` through and `& 0xffff` on it reads as 0 reference frames while `>> 16` reads as
+    /// 32768.
+    #[test]
+    fn a_not_supported_attribute_is_an_error_and_not_a_value() {
+        // What iHD 26.3.5 / libva 1.24 does: status 0, poison gone, value 0x80000000.
+        let record = VaConfigAttrib { type_: CONFIG_ATTRIB_RATE_CONTROL, value: VA_ATTRIB_NOT_SUPPORTED };
+        let Err(why) = config_attributes_from(OK, "VA_STATUS_SUCCESS", vec![record]) else {
+            panic!("VA_ATTRIB_NOT_SUPPORTED came back as a measured attribute value");
+        };
+        assert!(why.contains("VA_ATTRIB_NOT_SUPPORTED"), "the error must name the sentinel: {why}");
+        assert!(why.contains("attribute 5"), "the error must name the attribute asked for: {why}");
+        assert!(why.contains("reported success"), "the error must say the driver reported success anyway: {why}");
+    }
+
+    /// One refused record costs the whole call, deliberately: the vector is read positionally by
+    /// every caller, so a record removed from the middle would slide its neighbour into the slot a
+    /// caller is about to read as an answer about a different attribute.
+    #[test]
+    fn one_not_supported_record_refuses_the_whole_call() {
+        let attribs = vec![
+            VaConfigAttrib { type_: CONFIG_ATTRIB_ENC_MAX_REF_FRAMES, value: 0x0001_0003 },
+            VaConfigAttrib { type_: CONFIG_ATTRIB_ENC_SLICE_STRUCTURE, value: VA_ATTRIB_NOT_SUPPORTED },
+        ];
+        let Err(why) = config_attributes_from(OK, "VA_STATUS_SUCCESS", attribs) else {
+            panic!("a half-measured call must not be returned as Ok");
+        };
+        // Slot 0 was measured (MAX_REF_FRAMES = 13, ENC_SLICE_STRUCTURE = 15). Reporting it would
+        // be right for a per-record type and is exactly what cannot happen here, so the message has
+        // to say which record was the problem and not blame the one that answered.
+        assert!(why.contains("attribute 15"), "the refused attribute must be named: {why}");
+        assert!(!why.contains("attribute 13"), "the measured attribute is not the problem: {why}");
+    }
+
+    /// What the refusals must not swallow: every value a driver really wrote still comes back, in
+    /// the order it was asked for, including the documented zero answers and a value that merely
+    /// has the top bit set among others (the sentinel is one number, not a mask).
+    ///
+    /// `VAConfigAttribEncInterlaced` is 11 (`va.h:698`) and is written as the number here because
+    /// `CONFIG_ATTRIB_INTERLACED` lives in the HEVC submission module, which depends on this one and
+    /// not the other way round.
+    #[test]
+    fn every_written_value_still_comes_back_in_order() {
+        const INTERLACED: VaBufferType = 11;
+        let attribs = vec![
+            VaConfigAttrib { type_: CONFIG_ATTRIB_RATE_CONTROL, value: 0x0000_14de },
+            // VA_ENC_PACKED_HEADER_NONE (10) and VA_ENC_INTERLACED_NONE (11): zero is a real answer.
+            VaConfigAttrib { type_: CONFIG_ATTRIB_ENC_PACKED_HEADERS, value: 0 },
+            VaConfigAttrib { type_: INTERLACED, value: 0 },
+            // The high bit among others is not the sentinel: VA_ATTRIB_NOT_SUPPORTED is 0x80000000.
+            VaConfigAttrib { type_: CONFIG_ATTRIB_ENC_MAX_REF_FRAMES, value: 0x8000_0003 },
+        ];
+        let Ok(values) = config_attributes_from(OK, "VA_STATUS_SUCCESS", attribs) else {
+            panic!("four written records are not a refusal");
+        };
+        assert_eq!(values, vec![0x0000_14de, 0, 0, 0x8000_0003]);
+    }
+
+    /// The other refusal, unchanged: a pair libva will not accept leaves the record alone and the
+    /// poison says so. Both refusals are `Err`, and neither is the other's message.
+    #[test]
+    fn a_surviving_poison_is_still_the_poisons_own_error() {
+        let record = VaConfigAttrib { type_: CONFIG_ATTRIB_RATE_CONTROL, value: CONFIG_ATTRIB_POISON };
+        let Err(why) = config_attributes_from(OK, "VA_STATUS_SUCCESS", vec![record]) else {
+            panic!("a record libva never wrote is not a measurement");
+        };
+        assert!(why.contains("poison"), "the poison keeps its own message: {why}");
+        assert!(!why.contains("VA_ATTRIB_NOT_SUPPORTED"), "the two refusals are not the same fact: {why}");
+    }
+
+    /// The same decision against the real driver, on the real question: **does `config_attributes`
+    /// ever hand a caller `0x80000000`?** This is red-able on this machine without any fake,
+    /// because iHD answers `VAConfigAttribEncHEVCFeatures` (50) with `0x80000000` and
+    /// `VA_STATUS_SUCCESS` for `VAProfileH264High` — the very pair the VP9 note records — while
+    /// answering `0x01900464` for `VAProfileHEVCMain` from the same call on the same display. The
+    /// sweep is what makes the test falsifiable: it asks every id, so a driver that declines an
+    /// attribute this backend never asks about still trips it, and the "at least one real answer"
+    /// check is what stops a function that merely always errors from passing.
+    #[test]
+    fn no_attribute_the_driver_declines_comes_back_as_a_value() {
+        let Ok(api) = load() else {
+            eprintln!("SKIPPED: no libva");
+            return;
+        };
+        let Ok(display) = Display::new(&api) else {
+            eprintln!("SKIPPED: no VA display");
+            return;
+        };
+        let mut answered = 0;
+        let mut declined = 0;
+        for id in 0..=58 {
+            // Ids the driver may answer for an H.264 High encode config, swept on their own so one
+            // refusal cannot hide the others behind it.
+            match display.config_attributes(Profile::H264High, Entrypoint::EncSlice, &[id]) {
+                Ok(values) => {
+                    for (slot, value) in values.iter().enumerate() {
+                        assert_ne!(*value, VA_ATTRIB_NOT_SUPPORTED, "attribute {id} came back as a value at slot {slot}: {value:#010x}");
+                    }
+                    answered += 1;
+                }
+                Err(why) => {
+                    // A refusal must say *why*, and the driver declining an attribute is a different
+                    // message from the driver declining the whole pair.
+                    assert!(!why.is_empty(), "attribute {id} was refused with no reason");
+                    declined += 1;
+                }
+            }
+        }
+        // The two counts are the measurement, and neither zero is an acceptable answer: a sweep that
+        // refuses everything would satisfy the loop above while proving nothing about the driver.
+        assert!(answered > 0, "no H.264 High encode attribute was answered at all, so the sweep measured nothing");
+        assert!(declined > 0, "no H.264 High encode attribute was declined, so this run never reached the case under test");
     }
 
     /// A driver count is what sizes the array handed to it, so both ends are bounded.
