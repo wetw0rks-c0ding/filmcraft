@@ -234,8 +234,14 @@ pub fn available() -> bool {
 /// zero as "cannot tell" and works at the depth the caller asked for.
 ///
 /// On the machine this milestone was written for (Intel Arc B580, iHD 26.3.5) this answers
-/// **(1, 1)**: one reference in each list, which is exactly enough for the P chain
-/// `examples/vaencprobe.rs` measures.
+/// **(3, 1)** for H.264 — list 0 in the bottom 16 bits and list 1 in the top, per
+/// `va.h:710-712`. HEVC answers **(3, 3)**. An earlier revision of this comment said `(1, 1)`,
+/// which this driver does not report; `examples/vaencprobe.rs` prints the live reading.
+///
+/// **That the driver advertises three is not a claim that three work.** One is exactly enough
+/// for the P chain the probe measures, and a reference depth above 1 **silently diverges** on
+/// this driver rather than erroring — `encoder.rs` refuses `refs > 1` for that reason. What is
+/// measured here is what the driver *offers*; what is usable is a smaller number, chosen.
 pub fn max_reference_frames(display: &Display) -> (u32, u32) {
     ffi::Encoder::driver_max_reference_frames(display, ffi::Profile::H264Main)
 }
