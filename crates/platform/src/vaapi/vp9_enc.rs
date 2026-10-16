@@ -87,17 +87,18 @@
 //!
 //! `vaGetConfigAttributes` was called for all four VP9 profiles against **all three** encode
 //! entrypoints — 12 (profile, entrypoint) pairs — sweeping every attribute id the driver itself
-//! advertises (`vaMaxNumConfigAttributes` returns **59**, so ids 1-58 were each read). For every
-//! pair and every one of the 58 attributes, the answer was the same:
+//! advertises (`vaMaxNumConfigAttributes` returns **59**, and `va.h:1610-1612` says the caller's
+//! array must hold *at least* that many entries, so the ids in range are **`0..=58`, 59 of them**).
+//! For every pair and every one of the 59 attributes, the answer was the same:
 //!
 //! ```text
 //! -- VP9Profile0/EncSlice    (profile=19 ep=6  VAEntrypointEncSlice)
 //!    VAConfigAttribRateControl  id=  5 status=UNSUPPORTED_ENTRYPOINT(13)  value=3735928559 (0xdeadbeef)
 //!    VAConfigAttribEncVP9       id= 58 status=UNSUPPORTED_ENTRYPOINT(13)  value=3735928559 (0xdeadbeef)
-//!    ... (all 58 attributes, same status, same untouched poison)
-//! -- VP9Profile0/EncSliceLP  (profile=19 ep=8  VAEntrypointEncSliceLP)   ... all 58 the same
-//! -- VP9Profile0/EncPicture  (profile=19 ep=7  VAEntrypointEncPicture)   ... all 58 the same
-//! -- VP9Profile1/2/3          ... all three entrypoints each, all 58 attributes, the same
+//!    ... (all 59 attributes, same status, same untouched poison)
+//! -- VP9Profile0/EncSliceLP  (profile=19 ep=8  VAEntrypointEncSliceLP)   ... all 59 the same
+//! -- VP9Profile0/EncPicture  (profile=19 ep=7  VAEntrypointEncPicture)   ... all 59 the same
+//! -- VP9Profile1/2/3          ... all three entrypoints each, all 59 attributes, the same
 //! ```
 //!
 //! `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` is `13` (`va.h:277`), and the poison survives
@@ -105,35 +106,51 @@
 //!
 //! ### The sweep is exhaustive, and the control is in the same pass
 //!
-//! An earlier revision of this note *said* it swept all 58 attributes but had actually sampled a
-//! handful, so "all 58 answer identically" was an inference from a sample. It is now a count, with
+//! An earlier revision of this note *said* it swept all the attributes but had actually sampled a
+//! handful, so "every id answers identically" was an inference from a sample. It is now a count, with
 //! the three controls read through the same loop in the same process:
 //!
 //! ```text
-//! asked=870  refused(status != 0)=696  answered(status=0, real value)=174  status=0 but POISON INTACT=0
+//! asked=885  refused(status != 0)=708  status=0=177  status=0 but POISON INTACT=0
+//!            of the 177 status=0 reads: 62 carried a real value, 115 were VA_ATTRIB_NOT_SUPPORTED
 //!
-//!   870 = 696 VP9 reads (4 profiles x 3 encode entrypoints x 58 attribute ids)
-//!       + 174 control reads (H264High=7, HEVCMain=17, AV1Profile0=32 at EncSlice, 58 ids each)
+//!   885 = 708 VP9 reads (4 profiles x 3 encode entrypoints x 59 attribute ids)
+//!       + 177 control reads (H264High=7, HEVCMain=17, AV1Profile0=32 at EncSlice, 59 ids each)
 //! ```
 //!
-//! **Not one of the 174 answering reads is a VP9 one**, and the last counter is the one that closes
+//! **Not one of the 177 answering reads is a VP9 one**, and the last counter is the one that closes
 //! the "did it just decline to write?" question outright: a `VA_STATUS_SUCCESS` that left the
-//! `0xDEADBEEF` poison in place happened **zero** times in 870 reads. So the driver does not answer
+//! `0xDEADBEEF` poison in place happened **zero** times in 885 reads. So the driver does not answer
 //! some VP9 attributes and refuse others — for VP9 it returns early on every id it knows, while
 //! the very next read in the same loop, for another codec, returns a populated word.
 //!
-//! `174` is also worth reading as what a *working* encoder looks like on this machine: H.264
-//! answered 20 of its 58 ids, HEVC 19, AV1 20. A codec the driver genuinely encodes does not
-//! answer 58 of 58 — it answers the subset that applies to it and `VA_ATTRIB_NOT_SUPPORTED`
-//! (`0x80000000`) for the rest. VP9's answer is not a small subset. It is none of them.
+//! **`177` is a status count, not a count of real answers**, and the difference is the whole reason
+//! the next paragraph exists. `177` is every control read, and every one of them returned
+//! `VA_STATUS_SUCCESS`; only **62** of those carried a populated word, the other 115 came back
+//! `VA_ATTRIB_NOT_SUPPORTED`. A driver the sweep has genuinely reached answers the id; a driver
+//! that has not answers the status.
+//!
+//! What a *working* encoder looks like on this machine, counting only ids answered with a real
+//! value: **H.264 answered 21 of its 59 ids, HEVC 20, AV1 21.** A codec the driver genuinely encodes
+//! does not answer 59 of 59 — it answers the subset that applies to it and
+//! `VA_ATTRIB_NOT_SUPPORTED` (`0x80000000`) for the rest. VP9's answer is not a small subset. It is
+//! none of them.
 //!
 //! **These three counts are ids answered with a real value, not ids whose status was zero.** The
-//! status is `VA_STATUS_SUCCESS` for all 58 ids of every control, asked one id at a time and in a
-//! single batched call alike, so "the status was zero" would read 58/58/58 and say nothing. HEVC's
-//! 19 are ids `5, 10, 11, 13, 14, 15, 18, 19, 21, 23, 25, 27, 28, 29, 35, 39, 41, 50, 51`; the other
-//! 39 come back `0x80000000`. An earlier revision of this note said 18. Re-measuring the sweep
-//! gives 19 on every run, so 18 does not reproduce and is not the figure this file rests on — and
-//! either way it does not touch the VP9 answer, which is 0 of 696.
+//! status is `VA_STATUS_SUCCESS` for all 59 ids of every control, asked one id at a time and in a
+//! single batched call alike, so "the status was zero" would read 59/59/59 and say nothing. HEVC's
+//! 20 are ids `0, 5, 10, 11, 13, 14, 15, 18, 19, 21, 23, 25, 27, 28, 29, 35, 39, 41, 50, 51`; the
+//! other 39 come back `0x80000000`. An earlier revision of this note said 18, and a later one said
+//! 19 — both were counts over a range that stopped at id 58. Re-measuring the sweep over the ids the
+//! header actually puts in range, `0..=58`, gives 20 on every run, so neither older figure is the
+//! number this file rests on — and either way none of them touches the VP9 answer, which is 0 of
+//! 708.
+//!
+//! **`id 0` is `VAConfigAttribRTFormat` (`va.h:620`), and the two older sweeps never asked it.**
+//! That is where the off-by-one came from: `vaMaxNumConfigAttributes` returning 59 was read as "the
+//! last id is 58, so ask 1..=58", when it is a *buffer size* and `va.h:1610-1612` requires an array
+//! holding *at least* that many entries — indices `0..=58`. Every codec here answers id 0, so
+//! dropping it costs each control exactly one. The counts above are over the full range.
 //!
 //! ## 2a. The call a submission path cannot get past
 //!
@@ -158,8 +175,8 @@
 //!
 //! **Three**, not one, and all in the same process, on the same display, through the same
 //! `dlsym`'ed function pointers, on the same loop that produced every VP9 refusal. The control
-//! profiles are the header's own: **`VAProfileH264High` = 7** (`va.h:507`), **`VAProfileHEVCMain`
-//! = 17** (`va.h:518`) and **`VAProfileAV1Profile0` = 32** (`va.h:531`) — all three are easy to get
+//! profiles are the header's own: **`VAProfileH264High` = 7** (`va.h:512`), **`VAProfileHEVCMain`
+//! = 17** (`va.h:522`) and **`VAProfileAV1Profile0` = 32** (`va.h:537`) — all three are easy to get
 //! wrong, because H.264's *Baseline* is 5 and AV1's is not 256. A probe that guesses them wrong does
 //! not fail loudly: it reads `VA_STATUS_ERROR_UNSUPPORTED_PROFILE` (12) for its supposed controls
 //! and looks exactly like a driver declining every codec. That is the failure mode this section
@@ -266,7 +283,7 @@
 //!
 //! | Claim | Status | What it rests on |
 //! |---|---|---|
-//! | This driver advertises no VP9 encoder | **Measured** | 4 profiles, 3 encode entrypoints, 870 poisoned attribute reads, `vaCreateConfig`, three working controls |
+//! | This driver advertises no VP9 encoder | **Measured** | 4 profiles, 3 encode entrypoints, 885 poisoned attribute reads, `vaCreateConfig`, three working controls |
 //! | libva fully expresses VP9 encode | **Established** | `va.h:115`/`:121` module index, the shipped `va_enc_vp9.h` record set, `VAConfigAttribEncVP9` = 58 with a stated field layout, `nm -D` on `libva.so.2` |
 //! | Some other VA-API driver accepts VP9 encode | **Unknown — not determinable here** | nothing in the headers or the library records what drivers implement |
 //!
@@ -390,9 +407,9 @@ mod tests {
     #[test]
     fn the_control_profiles_are_the_ones_va_h_declares() {
         // H.264 Baseline is 5 and H.264 Main is 6, so "H.264" is not a profile number at all.
-        assert_eq!(super::super::ffi::H264_HIGH, 7, "va.h:507 VAProfileH264High");
-        assert_eq!(super::super::ffi::HEVC_MAIN, 17, "va.h:518 VAProfileHEVCMain");
-        // `VAProfileAV1Profile0 = 32` (`va.h:531`) is recorded in the module note rather than
+        assert_eq!(super::super::ffi::H264_HIGH, 7, "va.h:512 VAProfileH264High");
+        assert_eq!(super::super::ffi::HEVC_MAIN, 17, "va.h:522 VAProfileHEVCMain");
+        // `VAProfileAV1Profile0 = 32` (`va.h:537`) is recorded in the module note rather than
         // asserted: `ffi` declares no constant for it, and `assert_eq!(32, 32)` would be a literal
         // compared with itself.
     }
