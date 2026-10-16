@@ -1243,8 +1243,11 @@ about an encode.
   picture that looks right is worse than an error.
 - **The VCM per-picture cap is derived**, not user-selectable. Correct for the settings as given; a real
   control is a `ui-egui` change and is the last known gap between this and shippable.
-- **`cargo fmt --check` is red on 3 pre-existing hunks** in `ffi.rs`, from the `config_attributes` commit and
-  unrelated to any finding. Absorb them or pin the toolchain — a decision, not an accident.
+- **`cargo fmt --check` was red on 3 pre-existing hunks** in `ffi.rs`, from the `config_attributes` commit and
+  unrelated to any finding. Those hunks were then absorbed into `c01f46df` by the agent that fixed them rather
+  than landing as a commit of their own, and `cargo fmt --check` reads clean at that commit. It has **not been
+  re-verified since** — see the queue below, item 5. Whether they belonged in their own commit is a
+  presentation question, not a correctness one.
 - **One line can silently weaken the ABI guard.** `CK_CLASS` requires `__typeof__`; without it the union
   and pointer *shape* checks become passes rather than failures. Every other line in that file fails loudly
   when broken; this one does not.
@@ -1254,5 +1257,39 @@ about an encode.
 Upstream PR **#408** covers the same scope under a parallel architecture the maintainer has already asked to
 be rebuilt onto main's `vaapi::va` + `Accel`; it is `CONFLICTING`, has never run CI, and its author has not
 pushed since 2026-10-09. This branch does **not** hook the L0 codec crates, and its contribution is the
-reproducible verification rather than a second FFI. Coordination has been offered on #408 rather than
-competing, and whether to rebase onto `0.7.2` and split into separate PRs is the open question.
+reproducible verification rather than a second FFI.
+
+**Settled 2026-10-16: no further outreach.** Coordination was offered on #408 and went unanswered for four
+days. The standing decision is that upstream merges the work or it does not; **this branch's goal is that it
+works here**, so effort goes to usability rather than to persuading anyone. The one upstream artefact that is
+already prepared and waiting is branch **`hevc-encode-records`** (`79de26a1`), branched from `upstream/main`:
+the HEVC encode records with their ABI pins, declarations only, deliberately overlapping nothing that PR #1256
+declares. It stays un-PR'd until #1256 lands, because #1256's H.264 encode port owns the session those records
+would plug into.
+
+### Standing queue — continue from here without asking
+
+Per the global `AGENTS.md`: **autonomy is the default.** Proceed, dispatch and loop without checking in; the only
+things that warrant stopping are destructive or irreversible, security-sensitive, side effects outside this
+worktree, or genuinely unknowable. Nothing below is any of those.
+
+**Serialization rule.** Two agents must never edit the same file, and — the failure mode that actually bites —
+**only one agent may touch `crates/` at a time.** Two concurrent `cargo fmt` runs over one crate reformat each
+other's half-written edits and lose work. Work that is genuinely disjoint (YAML-only, or a different worktree)
+runs in parallel; Rust work queues.
+
+| # | work | files | state |
+|---|---|---|---|
+| 1 | **VCM per-picture cap becomes user-settable** — `ExportSettings::max_frame_size: Option<u32>`, `None` still derives. Unit trap: `va.h:2757` says the driver's `max_frame_size` is **in bits** while every other rate on the struct is kbps. | `crates/export/src/lib.rs`, `crates/export/src/settings_tests.rs`, `crates/platform/src/vaapi/hevc_export.rs`, `crates/ui-egui` | in flight |
+| 2 | **Pin every third-party action to a SHA** — every `uses:` in `.github/`. Precedent already in `windows-arm64.yml`. | `.github/workflows/*.yml` | **done**, `a4e23195` |
+| 3 | **Pin the ABI-guard runner image** — `runs-on: ubuntu-latest` is the last floating input in the job that compiles the C oracle. | `.github/workflows/abi-guard.yml` | in flight |
+| 4 | **Fix the stale count** — `vp9_enc.rs:126` says H.264 answers "20 of 58" attribute ids; it measures **21 of 59** (ids `0..=58`). Small, but it does not reproduce as written. | `crates/platform/src/vaapi/vp9_enc.rs` | queued — serializes behind #1 |
+| 5 | **Re-verify `cargo fmt --check`** on a clean tree and record the result in *Honest limits* above. | — | queued behind #1 |
+| 6 | **A regression test for the `CK_CLASS` line.** Without `__typeof__` the union and pointer *shape* checks silently become passes rather than failures — every other line in `abi_guard.rs` fails loudly when broken, and this one does not. | `crates/platform/src/vaapi/abi_guard.rs`, `abi_tests.rs` | queued behind #1 |
+| 7 | `stash@{0}` — debug scaffolding from a blocked readback, exported to `.tmpwork/stash0.patch` so nothing is lost. | — | **needs the go-ahead**: destructive, and the one item here that is |
+
+**Do not do these.** Do not rebase this branch — the attempt stopped at commit 5 of 104 because upstream's 519-line
+split `ffi.rs` and our 922-line monolith do not merge, and it re-imposes an architectural decision the maintainer
+already made. Do not fold item 4 or item 6 into an unrelated commit. Do not break-test with `git checkout`,
+`git stash` or `git reset --hard`; **use file copies under `TMPDIR=$PWD/.tmpwork`** — that has destroyed work on
+this branch twice. `/tmp` is full; `TMPDIR` must be set.
