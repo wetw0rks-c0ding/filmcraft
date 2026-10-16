@@ -301,18 +301,28 @@ open, and the code says which half is which.
 
 **No hardware VP9 encoder on this driver.** All four `VAProfileVP9Profile0..3` are advertised, and **every one
 offers `VAEntrypointVLD` and nothing else**. Asking anyway — `vaGetConfigAttributes` for every (profile,
-encode entrypoint) pair, across **every attribute id the driver knows** (`vaMaxNumConfigAttributes` = 59, so
-ids 1–58) — returns `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` for **all 12 pairs** (4 profiles × all **three**
-encode entrypoints: `EncSlice` 6, `EncPicture` 7, `EncSliceLP` **8**), with the poison left intact.
+encode entrypoint) pair, across **every attribute id the driver knows** (`vaMaxNumConfigAttributes` = 59, and
+`va.h:1610-1612` requires an `attribut_list` holding *at least* that many entries, so the ids in range are
+**`0..=58`, 59 of them**) — returns `VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT` for **all 12 pairs** (4 profiles ×
+all **three** encode entrypoints: `EncSlice` 6, `EncPicture` 7, `EncSliceLP` **8**), with the poison left intact.
 
-**The sweep is exhaustive and its control is in the same pass: `asked=870 refused=696 answered=174`, and
-none of the 174 is a VP9 one.** A `VA_STATUS_SUCCESS` that left the `0xDEADBEEF` poison in place happened
-**zero** times in 870 reads, so this is not "the driver answered some VP9 attributes and declined others" —
+**The sweep is exhaustive and its control is in the same pass: `asked=885 refused=708 status=0=177`, and
+none of the 177 is a VP9 one.** A `VA_STATUS_SUCCESS` that left the `0xDEADBEEF` poison in place happened
+**zero** times in 885 reads, so this is not "the driver answered some VP9 attributes and declined others" —
 it declines every id it knows while the next read in the same loop, for another codec, returns a populated
-word. The three controls are H.264 High, HEVC Main and AV1 profile 0, which between them answer 20, 19 and 20
-of their 58 ids: a codec this driver really encodes answers the subset that applies to it and
+word. **177 is a status count, not a count of real answers**: only 62 of those reads carried a populated
+word and the other 115 were `VA_ATTRIB_NOT_SUPPORTED`. The three controls are H.264 High, HEVC Main and
+AV1 profile 0, which between them answer **21, 20 and 21 of their 59 ids**: a codec this driver really
+encodes answers the subset that applies to it and
 `VA_ATTRIB_NOT_SUPPORTED` for the rest, and VP9's answer is none of them. `vaCreateConfig` — the first call a
 submission path would make — likewise refuses every VP9 pair while succeeding for all three controls.
+
+**An off-by-one, and where it came from.** An earlier revision of this section swept **ids 1–58**, read
+`vaMaxNumConfigAttributes` = 59 as "the last id is 58", and reported 20/19/20 "of 58". Those three counts are
+right for the range swept; the range is the defect, because 59 is a *buffer size* and the ids it puts in
+range are `0..=58`. The dropped id is **0**, `VAConfigAttribRTFormat` (`va.h:620`), and every control
+answers it — so each control loses exactly one. Re-measured over the full range the controls answer 21, 20
+and 21, and the totals move from 870 to 885. The VP9 answer is unaffected either way: **0 of 708**.
 
 `va_enc_vp9.h` and `VAConfigAttribEncVP9` (**58**) **do** exist in the installed headers, so this is **the
 driver declining a codec libva can express**, not an API gap.
@@ -321,7 +331,7 @@ driver declining a codec libva can express**, not an API gap.
 
 | Claim | Status |
 |---|---|
-| This driver advertises no VP9 encoder | **Measured** — 12 pairs, 58 attribute ids, `vaCreateConfig`, three working controls |
+| This driver advertises no VP9 encoder | **Measured** — 12 pairs, 59 attribute ids, `vaCreateConfig`, three working controls |
 | libva fully expresses VP9 encode | **Established** from the installed headers and `nm -D` on `libva.so.2` |
 | Some other VA-API driver accepts VP9 encode | **Unknown — not determinable here** |
 
