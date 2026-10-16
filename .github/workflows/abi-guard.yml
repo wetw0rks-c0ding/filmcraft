@@ -15,9 +15,13 @@
 #
 # * **libva >= 2.24.** `VAConfigAttribEncVP9` first appears in libva's `va.h` in 2.24, and
 #   `av1_abi`'s C oracle static-asserts it. Against the 2.17.0 and 2.22.0 headers the guard fails on
-#   `the_av1_enc_constants_are_what_the_header_declares`; 2.24.0 and 2.24.1 both pass. `ubuntu-latest`
-#   (26.04) ships libva 2.23.0 and Debian trixie ships 2.22.0, so the pinned `libva-dev` below is
-#   taken from Debian's package pool instead of from apt.
+#   `the_av1_enc_constants_are_what_the_header_declares`; 2.24.0 and 2.24.1 both pass. No distro this
+#   job could install from has it: Ubuntu 24.04 ships libva 2.20.0, Ubuntu 26.04 ships 2.23.0 and
+#   Debian trixie ships 2.22.0, so the pinned `libva-dev` below is taken from Debian's package pool
+#   instead of from apt. That is 2.24.1-2 out of Debian 14 (`forky`, the current testing release). The
+#   URL names the exact version rather than a suite, so the pool cannot hand back a different libva
+#   under this path — but a superseded version does eventually leave the pool, and then this fetch
+#   404s and says so, which is the correct time to notice rather than a silent header change.
 # * **`/usr/include/drm`.** The guard compiles `#include <drm/drm.h>` (abi_guard.rs:1089), but Debian's
 #   and Ubuntu's `libdrm-dev` install the headers as `/usr/include/libdrm/*.h` — neither ships a
 #   `/usr/include/drm`. Without the symlink below the guard cannot run at all and
@@ -76,7 +80,36 @@ env:
 jobs:
   guard:
     name: libva ABI guard
-    runs-on: ubuntu-latest
+    # **An explicit release, not `ubuntu-latest`.** Pinning `LIBVA_DEV_VERSION` ended the drift in
+    # this job's *libva*; the image itself kept floating, and the image is where `gcc` comes from —
+    # the guard probes `["cc", "gcc", "clang"]` in that order, so the compiler that measures these
+    # records was whatever the selected image shipped. `ubuntu-latest` moves on GitHub's schedule and
+    # not on ours: actions/runner-images documents the `-latest` migration as gradual, over one to
+    # two months, precisely so a label can change under a workflow that never changed.
+    #
+    # `ubuntu-24.04` rather than `ubuntu-26.04`. Both are the same for this job's inputs — neither
+    # ships a libva the guard accepts, which is why the headers come from Debian's pool either way —
+    # so the choice is about maturity, not capability. 24.04 is the release `-latest` resolves to in
+    # upstream's published table today and the one this file's other assumptions were written against,
+    # while 26.04 is that table's migration target and is still inside the window upstream calls out.
+    # (This comment previously said `ubuntu-latest` *was* 26.04. Which of the two it means this month
+    # is not observable from a worktree, and it changes nothing here.)
+    #
+    # **What the pin does not cover.** A label pins the release, not the image: point releases,
+    # security updates, and everything installed from apt still move. The two that matter are `gcc`
+    # and `libdrm-dev`, neither version-pinned — see the apt step below for why that is a decision
+    # rather than an oversight.
+    #
+    # **This has not been run on this label.** A workflow cannot be executed from a worktree, so
+    # nothing here has watched this job go green on `ubuntu-24.04`; treat it as a reviewed
+    # configuration, not a passing run. *Checked:* the label exists and maps to this release in
+    # actions/runner-images' table; the pinned `.deb` URL resolves, its SHA-256 matches Debian's own
+    # index for that version, and its `usr/include/va/` carries all six headers the loop below demands;
+    # `libdrm-dev` from this release ships `drm_prime_handle` where the symlink below expects it, and
+    # nothing outside `gcc`/`libdrm-dev` is reachable from `filmcraft-platform`'s test build that the
+    # image would have to supply. *Asserted, not checked:* that `cargo test -p filmcraft-platform --lib`
+    # passes on it.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -89,6 +122,17 @@ jobs:
           sudo apt-get update
           # gcc is the C compiler every check in the guard shells out to; libdrm-dev ships the DRM
           # headers the one non-libva record is static-asserted against.
+          #
+          # Neither is version-pinned, and that is a decision rather than an oversight. `libdrm-dev`
+          # is the one that could move a measured number — it is where `struct drm_prime_handle`
+          # comes from — but an exact Ubuntu version is superseded by the next security update and
+          # then *removed from the archive*, so pinning one would trade slow drift for a hard
+          # `Version '...' not found` failure arriving on Canonical's schedule. The durable fix is
+          # the same shape as the libva fix above: fetch a pinned artifact instead of apt-resolving
+          # one. That is its own change, and it is the follow-up this leaves behind.
+          #
+          # `gcc` is asked for out of habit, not need — the image already carries it (4:13.2.0-7ubuntu1
+          # on ubuntu-24.04), so this line is usually a no-op that keeps a leaner runner from failing.
           sudo apt-get install -y --no-install-recommends gcc libdrm-dev
           # Headers only. dpkg-deb -x rather than dpkg -i because libva-dev depends on five runtime
           # packages this job never loads, and none of them is wanted: the guard compiles C, it does
