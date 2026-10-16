@@ -1254,12 +1254,17 @@ about an encode.
 - **Reference depth > 1 silently diverges** on this driver, on both H.264 and HEVC. It does not error — it
   renders, syncs, decodes cleanly, and is *wrong from the third picture on*. It is refused because a wrong
   picture that looks right is worse than an error.
-- **The VCM per-picture cap is derived**, not user-selectable. Correct for the settings as given; a real
-  control is a `ui-egui` change and is the last known gap between this and shippable.
+- **The VCM per-picture cap is now user-selectable** (`a677e712`, `f75aac4b`, `29dd04b8`). `ExportSettings::max_frame_size`
+  carries it in **bytes**; the driver's `max_frame_size` is in **bits** (`va.h:2757-2758`) and the single conversion is
+  `checked_mul(BITS_PER_BYTE)` at `hevc_export.rs:563`. `None` still derives `per_picture_ceiling`, so a project written
+  before the field keeps its meaning, and the summary names which of the two is in force. **What replaced it as the known
+  gap: the derivation exists twice.** `crates/ui-egui/src/panels/export_mode.rs` carries its own copy of the arithmetic,
+  because `filmcraft-platform` is only a *dev*-dependency of `filmcraft-ui-egui` and the layering gate forbids a real one.
+  The two are pinned together by `export_ui.rs:270`, which has already caught one real disagreement.
 - **`cargo fmt --check` was red on 3 pre-existing hunks** in `ffi.rs`, from the `config_attributes` commit and
   unrelated to any finding. Those hunks were then absorbed into `c01f46df` by the agent that fixed them rather
-  than landing as a commit of their own, and `cargo fmt --check` reads clean at that commit. It has **not been
-  re-verified since** — see the queue below, item 5. Whether they belonged in their own commit is a
+  than landing as a commit of their own. **Re-verified clean on this branch at `95cbdde0`** (queue item 5, now done),
+  and it has stayed clean through the record-verification commits. Whether the hunks belonged in their own commit is a
   presentation question, not a correctness one.
 - **One line can silently weaken the ABI guard.** `CK_CLASS` requires `__typeof__`; without it the union
   and pointer *shape* checks become passes rather than failures. Every other line in that file fails loudly
@@ -1293,11 +1298,11 @@ runs in parallel; Rust work queues.
 
 | # | work | files | state |
 |---|---|---|---|
-| 1 | **VCM per-picture cap becomes user-settable** — `ExportSettings::max_frame_size: Option<u32>`, `None` still derives. Unit trap: `va.h:2757` says the driver's `max_frame_size` is **in bits** while every other rate on the struct is kbps. | `crates/export/src/lib.rs`, `crates/export/src/settings_tests.rs`, `crates/platform/src/vaapi/hevc_export.rs`, `crates/ui-egui` | in flight |
+| 1 | **VCM per-picture cap becomes user-settable** — `ExportSettings::max_frame_size: Option<u32>`, `None` still derives. Unit trap: `va.h:2757` says the driver's `max_frame_size` is **in bits** while every other rate on the struct is kbps. | `crates/export/src/lib.rs`, `crates/export/src/settings_tests.rs`, `crates/platform/src/vaapi/hevc_export.rs`, `crates/ui-egui` | **done**, `a677e712` + `f75aac4b` + `29dd04b8` |
 | 2 | **Pin every third-party action to a SHA** — every `uses:` in `.github/`. Precedent already in `windows-arm64.yml`. | `.github/workflows/*.yml` | **done**, `a4e23195` |
-| 3 | **Pin the ABI-guard runner image** — `runs-on: ubuntu-latest` is the last floating input in the job that compiles the C oracle. | `.github/workflows/abi-guard.yml` | in flight |
+| 3 | **Pin the ABI-guard runner image** — `runs-on: ubuntu-latest` is the last floating input in the job that compiles the C oracle. | `.github/workflows/abi-guard.yml` | **done**, `19392dbd` |
 | 4 | **Fix the stale count** — `vp9_enc.rs` said H.264 answers "20 of 58" attribute ids. Re-measured over the range the header actually puts in range, `0..=58`, it is **21 of 59**: `vaMaxNumConfigAttributes` returns 59 as a *buffer size*, and `va.h:1610-1612` requires an array holding at least that many, so the old sweep dropped id 0 (`VAConfigAttribRTFormat`) that every control answers. HEVC 20, AV1 21; totals 885/708/177; VP9 still 0 of 708. | `crates/platform/src/vaapi/vp9_enc.rs`, `docs/vaapi-progress.md` | **done**, `423d751a` |
-| 5 | **Re-verify `cargo fmt --check`** on a clean tree and record the result in *Honest limits* above. | — | queued behind #1 |
+| 5 | **Re-verify `cargo fmt --check`** on a clean tree and record the result in *Honest limits* above. | — | **done**, `95cbdde0` |
 | 6 | **A regression test for the `CK_CLASS` line.** Without `__typeof__` the union and pointer *shape* checks silently become passes rather than failures — every other line in `abi_guard.rs` fails loudly when broken, and this one does not. | `crates/platform/src/vaapi/abi_guard.rs`, `abi_tests.rs` | queued behind #1 |
 | 7 | `stash@{0}` — debug scaffolding from a blocked readback, exported to `.tmpwork/stash0.patch` so nothing is lost. | — | **needs the go-ahead**: destructive, and the one item here that is |
 
