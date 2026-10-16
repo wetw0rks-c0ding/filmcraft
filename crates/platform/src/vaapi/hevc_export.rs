@@ -597,7 +597,15 @@ pub fn derived_picture_cap_bytes(target_kbps: u32, rate: FrameRate) -> Result<u3
     // **Up, not to nearest**, and then floored at the value the control offers: a derivation below
     // 1 kB (a 100 kbit/s target at 60 fps is 1 667 bits, which is 209 bytes) would otherwise hand
     // the panel a default its own slider cannot represent and this gate would refuse.
-    Ok(bits.div_ceil(BITS_PER_BYTE).max(filmcraft_export::MIN_MAX_FRAME_SIZE_BYTES))
+    // **Then clamped to the range this gate can actually apply.** `picture_cap_bits` multiplies by
+    // `BITS_PER_BYTE` into a 32-bit field, so it refuses anything above `u32::MAX / BITS_PER_BYTE`;
+    // rounding *up* to a whole byte crosses that line for a `bits` in the top seven values of the
+    // range, which would hand the panel a default its own gate rejects. The two bounds are 1 kB and
+    // ~512 MB and cannot cross, so `clamp` is safe here (`AGENTS.md` §0 forbids it only when they
+    // might). This makes the invariant structural instead of resting on `bits` being unreachable —
+    // which it is today, since `target_kbps * 1000` has to fit a `u32` and every frame rate divides
+    // it back down, but a derivation provable only by that coincidence is not one to rely on.
+    Ok(bits.div_ceil(BITS_PER_BYTE).clamp(filmcraft_export::MIN_MAX_FRAME_SIZE_BYTES, u32::MAX / BITS_PER_BYTE))
 }
 
 /// [`HevcEncoder`] as a [`VideoEncoder`]: RGBA pictures in, MP4 samples out.
