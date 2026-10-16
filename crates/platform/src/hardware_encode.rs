@@ -1450,6 +1450,70 @@ mod gate_against_summary {
             assert!(why.contains(&format!("quantiser ({qp})")), "QP {qp}: the decline quotes the same number the summary did: {why}");
         }
     }
+
+    /// **A per-picture cap the user set does not make H.264 take the mode — and the refusal is the
+    /// driver's, unchanged.**
+    ///
+    /// # What could have gone wrong, and would have been invisible
+    ///
+    /// `ExportSettings` now carries `max_frame_size`, so the mode's second number *is* nameable in
+    /// the settings. The obvious wrong turn is for this gate to conclude that the mode is now
+    /// expressible — it has a number for the cap — and submit it. **That would produce a perfectly
+    /// plausible H.264 file at the right size with the one guarantee the mode names silently
+    /// absent**, which is the defect this refusal was written to remove, re-entered from the other
+    /// side.
+    ///
+    /// **And no number would reveal it.** The refusal rests on a measurement — the advertised mask,
+    /// `H264_RATE_CONTROL_MASK` against `HEVC_RATE_CONTROL_MASK`, one bit apart — so a cap cannot
+    /// make this driver accept `VA_RC_VCM` for H.264. A gate that forwarded the mode would simply be
+    /// wrong about a machine it never asked.
+    ///
+    /// **So this asks both gates about the same settings object**, with a cap set and with none, and
+    /// requires the H.264 answer to be character-identical either way while the H.265 answer carries
+    /// the cap.
+    #[test]
+    fn a_cap_the_user_set_does_not_make_h264_take_the_mode() {
+        for cap in [None, Some(1_000u32), Some(64_000), Some(536_870_911)] {
+            let mut s = settings(BitrateMode::VideoConference);
+            s.max_frame_size = cap;
+            let label = match cap {
+                Some(b) => format!("{b} bytes"),
+                None => "no cap".to_string(),
+            };
+
+            // **The H.264 gate, asked through `config_for` and through the function that decides.**
+            let Err(why) = config_for(Format::H264, W, H, FPS, &s) else {
+                panic!("{label}: a video-conference H.264 export was accepted by a gate whose driver does not offer VA_RC_VCM for H.264");
+            };
+            assert!(why.contains("VA_RC_VCM"), "{label}: the refusal is still the mode's, by name: {why}");
+            // **The measurement is still in it**, and the two masks being one bit apart is what makes
+            // the refusal true rather than merely cautious.
+            assert!(
+                why.contains(&format!("{H264_RATE_CONTROL_MASK:#x}")) && why.contains(&format!("{HEVC_RATE_CONTROL_MASK:#x}")),
+                "{label}: the refusal still carries both measured masks: {why}"
+            );
+            let mut plain = s.clone();
+            plain.max_frame_size = None;
+            assert_eq!(refuses(&s), refuses(&plain), "{label}: setting a cap must not change what this gate decides, one character of it");
+
+            // **And the H.265 gate, the one that takes the mode, does take it — with the user's
+            // number when one is set.** `hevc_config_for` is Linux-only and so is this whole module,
+            // so this is the same machine's answer, not a cross-platform claim.
+            let mut h = s.clone();
+            h.format = Format::Hevc;
+            let Ok(config) = crate::vaapi::hevc_config_for(Format::Hevc, W, H, FPS, &h) else {
+                panic!("{label}: the H.265 gate declined a video-conference export");
+            };
+            let crate::vaapi::HevcBitrate::VideoConference { target, max, max_frame_bits } = config.bitrate else {
+                panic!("{label}: H.265 took the mode without a per-picture cap: {:?}", config.bitrate);
+            };
+            assert_eq!((target, max), (2_000_000, 4_000_000), "{label}: the rate pair is the settings' own, on either cap");
+            match cap {
+                Some(bytes) => assert_eq!(max_frame_bits, bytes * 8, "{label}: H.265 submits the user's {bytes} bytes as {} bits", u64::from(bytes) * 8),
+                None => assert_eq!(max_frame_bits, 66_667, "no cap: H.265 derives one, 2 Mbit/s over 30 frames"),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

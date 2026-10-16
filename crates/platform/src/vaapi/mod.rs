@@ -135,7 +135,13 @@ pub use picture::{Vp9Frame, Vp9Reference, Vp9ReferenceSet, Vp9State, vp9_decline
 // settings must be, and the factory that is asked. `HevcExportConfig` is the derived numbers,
 // `HevcBitrate` the fidelity, `hevc_config_for` the decline table, and
 // `check_hvcc_against_the_picture` the cross-check the `hvcC` gets on every picture.
-pub use hevc_export::{HevcBitrate, HevcEncoderExport, HevcExportConfig, check_hvcc_against_the_picture, config_for as hevc_config_for, hevc_available};
+// `derived_picture_cap_bytes` is the one item here the *export panel* asks rather than the factory:
+// it is the cap a video-conference export would derive, in the unit `ExportSettings::max_frame_size`
+// holds, so the panel's own control can show the default it would be overriding without carrying a
+// second copy of the derivation.
+pub use hevc_export::{
+    HevcBitrate, HevcEncoderExport, HevcExportConfig, check_hvcc_against_the_picture, config_for as hevc_config_for, derived_picture_cap_bytes, hevc_available,
+};
 // AV1, the same three shapes for the same three reasons: `Av1State` is the per-decode reference
 // state (`refresh_frame_flags` has no member in the AV1 *decode* record — see `picture::av1`'s
 // module note for the header lines that is checked against), `Av1ReferenceSet` is the eight slots the

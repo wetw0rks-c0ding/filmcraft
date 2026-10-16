@@ -358,7 +358,27 @@ pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
                 // submits. Submitting the VBR pair under the VCM attribute with no cap would be a mode
                 // whose distinguishing control is absent: the driver would see `VA_RC_VCM` and a rate,
                 // and nothing would say what any one picture is allowed to weigh.
-                BitrateMode::VideoConference => HevcBitrate::VideoConference { target: bps, max: max_bps, max_frame_bits: per_picture_ceiling(bps, rate)? },
+                //
+                // **Two sources, one place each.** `ExportSettings::max_frame_size` is the user's own
+                // figure and is converted by [`picture_cap_bits`], which is the only place the ×8
+                // happens; when the field is `None` the cap is [`per_picture_ceiling`]'s derivation
+                // from the target rate and the frame rate, exactly as it was before the field existed.
+                // **Which of the two is in force is stated on the summary line**
+                // (`ExportSettings::summary`, `Format::Hevc`) — the whole of the codebase's rule that
+                // a number FilmCraft puts in a file is a number the summary accounts for.
+                //
+                // **A cap the user set makes the rate no longer an input to the cap** — the rate is
+                // still an input to the *target*, printed above it as `Target`, and the derivation is
+                // simply not taken. Nothing is compared between the two: a user who sets a cap larger
+                // than the derivation is asking for a looser bound, not for a correction.
+                BitrateMode::VideoConference => HevcBitrate::VideoConference {
+                    target: bps,
+                    max: max_bps,
+                    max_frame_bits: match s.max_frame_size {
+                        Some(bytes) => picture_cap_bits(bytes)?,
+                        None => per_picture_ceiling(bps, rate)?,
+                    },
+                },
                 // **The two modes this gate refused above, reaching an arm they cannot.** A `match`
                 // with no catch-all has to name them, and an arm that said nothing would be a claim
                 // a reader has to take on trust. So the arm says the one true thing: reaching here
@@ -421,26 +441,39 @@ pub fn config_for(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
     Ok(HevcExportConfig { w, h, fps, rate, gop, bitrate })
 }
 
+/// **Bits in one byte: the factor between [`ExportSettings::max_frame_size`]'s unit and the
+/// driver's.** `va.h:2757-2758` states the driver's field as *"Maximum size of a frame (in bits)"*;
+/// nothing on `ExportSettings` is denominated in bits, so this constant is the whole of the
+/// conversion and it is named rather than written as a literal at the one site that uses it.
+const BITS_PER_BYTE: u32 = 8;
+
 /// **The maximum size of one picture, in bits, for a video-conference-mode export at
 /// `target_bps` — the target rate's share of one picture's duration.**
 ///
-/// # Why this is a derivation and not a setting
+/// # This is the *default* now, not the only way
 ///
 /// `VA_RC_VCM` states *"a variable bit rate and a maximum frame size"* (`va.h:1113-1114` for the
-/// mode; `va.h:2744-2752` for the maximum), and the second half has no field on `ExportSettings`
-/// today. The two candidates were **a new settings field** and **a number derived from what the
-/// settings already say**, and this is the second one, for three reasons:
+/// mode; `va.h:2744-2752` for the maximum). **`ExportSettings::max_frame_size` now holds the
+/// second half, in bytes, with a control behind it in the export panel**, and [`picture_cap_bits`]
+/// converts it for the driver; this function is what runs when that field is `None`.
 ///
-/// - **Every input is already on the summary line.** `ExportSettings::summary` prints the frame
-///   rate and, because [`BitrateMode::names_a_bitrate`] is `true` for this mode, the target rate.
-///   A cap the user cannot see is a cap the user cannot reason about, and a *field* would be a
-///   second number on the line — which is the honest alternative and the one to take if a control
-///   for it is ever built.
+/// **The derivation stayed the default rather than becoming a second required number, for the
+/// reason it was chosen the first time, which the field did not weaken:**
+///
+/// - **A settings file that predates the field must keep meaning something.** `None` is not "unset
+///   pending an answer": it is the value every export written before this change already had, so a
+///   project file that has never heard of the field gets a byte-identical cap.
+/// - **Every input of the derivation is on the summary line, and the line now says which cap is in
+///   force.** `ExportSettings::summary` prints the frame rate and, because
+///   [`BitrateMode::names_a_bitrate`] is `true` for this mode, the target rate — and for
+///   `max_frame_size: None` it prints `max picture derived from the <target> target at <rate>`, so
+///   a reader can compute the figure below themselves. With a cap set, the line prints the user's
+///   own figure instead and says it is theirs. **Whichever cap reaches the driver is accounted for
+///   on the line; that is the rule, and it is why a derived number needs no field.**
 /// - **A field with no control behind it is the defect this mode was created to fix.** `VA_RC_VCM`
 ///   sat unwired for exactly one reason: a capability no setting could name never reaches a driver.
-///   Adding a field to `ExportSettings` that only a hand-edited project file and a test can set
-///   would reproduce the same dead end one layer up. **Making it a real control is a `crates/ui-egui`
-///   change, and until that exists a field would be a promise with no way to keep it.**
+///   That is why the field arrived **with** the export-panel control rather than before it: a field
+///   only a hand-edited project file and a test can set reproduces the same dead end one layer up.
 /// - **It is not a bitrate.** It has no time base: the same number is a generous cap at 24 fps and a
 ///   punishing one at 60. `bitrate_kbps` is a rate per second, and a number in that field with these
 ///   units would be a rate that is not a rate.
@@ -493,6 +526,78 @@ fn per_picture_ceiling(target_bps: u32, rate: FrameRate) -> Result<u32, String> 
             rate.num, rate.den
         )
     })
+}
+
+/// **The user's own picture cap, in the unit the driver wants: bytes × 8 bits, checked, in the one
+/// place in FilmCraft that does it.**
+///
+/// # Why the field is in bytes and this function is in bits
+///
+/// `VAEncMiscParameterBufferMaxFrameSize::max_frame_size` is *"Maximum size of a frame (in bits)"*
+/// (`/usr/include/va/va.h:2757-2758`). `ExportSettings::max_frame_size` is in **bytes**, because
+/// every other number on that struct is a rate in kbps or a count, and a bit-denominated field is
+/// the one a reader is most likely to misread by a factor of eight.
+///
+/// **So this is the factor of 8, written once, as `checked_mul`.** A second `* 8` anywhere in the
+/// codebase would be a second place for it to be wrong, and a wrong one would be invisible: a cap
+/// eight times too small produces a file, and eight times too large produces a file. The summary
+/// line and the export panel both speak bytes and kB; neither of them ever multiplies.
+///
+/// # Why it is checked rather than saturating
+///
+/// - **The floor.** [`filmcraft_export::MIN_MAX_FRAME_SIZE_BYTES`] is FilmCraft's own policy, not a
+///   limit of H.265, and the export panel's slider starts there — so what a user can type is what
+///   this takes. Below it the function refuses rather than submitting a cap that cannot be
+///   anything but destructive, and the message names both ways out.
+/// - **The multiply.** `u32::MAX / 8` is 536 870 911 bytes; a hand-edited project file can name more
+///   and a `saturating_mul` would answer 4 294 967 288 — a cap ~512 MiB a picture, silently, where
+///   the honest answer is that the driver's field does not hold it.
+fn picture_cap_bits(bytes: u32) -> Result<u32, String> {
+    if bytes < filmcraft_export::MIN_MAX_FRAME_SIZE_BYTES {
+        return Err(format!(
+            "a maximum picture size of {bytes} bytes: this cap is FilmCraft's own, not a limit of any codec, and the smallest it \
+             takes is {} bytes (1 kB). Raise it, or clear the cap so it is derived from the target rate",
+            filmcraft_export::MIN_MAX_FRAME_SIZE_BYTES
+        ));
+    }
+    bytes.checked_mul(BITS_PER_BYTE).ok_or_else(|| {
+        format!(
+            "a maximum picture size of {bytes} bytes: {bytes} × {BITS_PER_BYTE} bits does not fit \
+             VAEncMiscParameterBufferMaxFrameSize's 32-bit max_frame_size field (va.h:2757-2758), which tops out at {} bytes",
+            u32::MAX / BITS_PER_BYTE
+        )
+    })
+}
+
+/// **The cap this gate would derive for `target_kbps` at `rate`, in BYTES — the value the export
+/// panel puts in its own control when the user asks for one.**
+///
+/// # Why the panel asks the gate rather than computing it
+///
+/// **A panel that showed its own arithmetic would be a second copy of the derivation**, in a crate
+/// that cannot reach this one, and the two would agree until someone edited one. So the panel asks
+/// here, and the answer is rounded to whole bytes so it is a value [`picture_cap_bits`] accepts and
+/// a value the field can hold.
+///
+/// **Rounding is UP**, for the same reason [`per_picture_ceiling`] rounds its quotient up: the
+/// figure is offered as the *default* a user is overriding, and a default that quietly tightened the
+/// cap the export would otherwise have had would be a limit nobody chose. A user who leaves the
+/// default and turns the cap on has asked for "the cap as I would have had it, rounded up to a whole
+/// kB" — never for something tighter than the derivation.
+///
+/// **A `None` here is the export panel's business, not this function's**: it answers with the number
+/// or with the error the derivation itself would give, and the panel decides what to do when there
+/// is none. On a platform with no VA-API HEVC gate there is no derivation to show at all, which is
+/// why this lives behind the module's own `cfg` rather than in the export crate.
+pub fn derived_picture_cap_bytes(target_kbps: u32, rate: FrameRate) -> Result<u32, String> {
+    let bps = target_kbps
+        .checked_mul(1000)
+        .ok_or_else(|| format!("a target of {target_kbps} kbps does not fit the arithmetic used to derive a per-picture maximum"))?;
+    let bits = per_picture_ceiling(bps, rate)?;
+    // **Up, not to nearest**, and then floored at the value the control offers: a derivation below
+    // 1 kB (a 100 kbit/s target at 60 fps is 1 667 bits, which is 209 bytes) would otherwise hand
+    // the panel a default its own slider cannot represent and this gate would refuse.
+    Ok(bits.div_ceil(BITS_PER_BYTE).max(filmcraft_export::MIN_MAX_FRAME_SIZE_BYTES))
 }
 
 /// [`HevcEncoder`] as a [`VideoEncoder`]: RGBA pictures in, MP4 samples out.
@@ -1105,6 +1210,129 @@ pub fn rate_control_mode_of(bitrate: HevcBitrate) -> Option<RateControl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filmcraft_export::{BitrateMode, ExportSettings, Format, HardwareEncoding};
+
+    /// **The user's cap reaches the driver in bits, and the factor of eight is pinned here.**
+    ///
+    /// # Why this test exists at all
+    ///
+    /// `ExportSettings::max_frame_size` is in **bytes**; `VAEncMiscParameterBufferMaxFrameSize::
+    /// max_frame_size` is in **bits** (`/usr/include/va/va.h:2757-2758`). **Exactly one function in
+    /// FilmCraft bridges the two** — [`picture_cap_bits`] — and a slip in it is invisible everywhere
+    /// else: a cap eight times too small and a cap eight times too large both encode to a file. So
+    /// the multiplication is asserted from both sides, with numbers that cannot be right by
+    /// accident:
+    ///
+    /// - **64 000 bytes → 512 000 bits.** A factor-of-8 slip in either direction gives 8 000 or
+    ///   4 096 000, and neither is 512 000.
+    /// - **The largest value that fits**, `u32::MAX / 8` bytes, and the first that does not.
+    ///
+    /// **The rate is asserted to be irrelevant to a cap the user set** — the same cap at 24, 30 and
+    /// 60 fps — which is the one behavioural difference between `Some` and `None` and the reason
+    /// `per_picture_ceiling` is not consulted on this path at all.
+    #[test]
+    fn the_user_cap_reaches_the_driver_in_bits() {
+        // **The whole `HevcExportConfig` path, not the helper alone**: the arm in `config_for` is
+        // where a cap could be computed and then dropped, or dropped and re-derived.
+        let cap_of = |bytes: Option<u32>, rate: FrameRate| {
+            let s = ExportSettings {
+                format: Format::Hevc,
+                hardware_encoding: HardwareEncoding::Auto,
+                bitrate_mode: BitrateMode::VideoConference,
+                bitrate_kbps: 2_000,
+                max_bitrate_kbps: Some(4_000),
+                max_frame_size: bytes,
+                ..Default::default()
+            };
+            let Ok(config) = config_for(Format::Hevc, 640, 360, rate, &s) else {
+                panic!("a video-conference H.265 export was declined by the gate");
+            };
+            match config.bitrate {
+                HevcBitrate::VideoConference { target, max, max_frame_bits } => (target, max, max_frame_bits),
+                other => panic!("the mode fell out of video conference and was submitted as {other:?}"),
+            }
+        };
+
+        // **The factor of 8, pinned, at three sizes spanning the control's range.**
+        for (bytes, bits) in [(1_000u32, 8_000u32), (64_000, 512_000), (536_870_911, 4_294_967_288)] {
+            let (target, max, cap) = cap_of(Some(bytes), FrameRate::FPS_30);
+            assert_eq!((target, max), (2_000_000, 4_000_000), "{bytes} bytes: the rate pair is still the settings' own");
+            assert_eq!(cap, bits, "{bytes} bytes is {bits} bits, not {bytes} bits and not {} bits", u64::from(bytes) * 8);
+        }
+        // **And the rate is not an input to it**: the same cap at three frame rates, all equal. A
+        // cap that moved with the rate would be the derivation leaking onto this path.
+        let caps: Vec<u32> = [FrameRate::FPS_24, FrameRate::FPS_30, FrameRate::FPS_60].iter().map(|r| cap_of(Some(64_000), *r).2).collect();
+        assert_eq!(caps, [512_000, 512_000, 512_000], "a cap the user set is the same cap at every frame rate, because the rate is no longer an input to it");
+        // **And `None` is still the derivation** — the same settings with the field unset give the
+        // target rate's share of a picture, which at 2 Mbit/s and 30 fps is 66 666.67 bits.
+        assert_eq!(cap_of(None, FrameRate::FPS_30).2, 66_667, "with no cap set the gate derives one, exactly as it did before the field existed");
+        assert_eq!(cap_of(None, FrameRate::FPS_60).2, 33_334, "and the derivation still moves with the rate, which is what makes it a derivation");
+
+        // **A cap that does not fit the driver's field is refused, not wrapped.** 536 870 912 bytes
+        // is the first value whose ×8 is over `u32::MAX`; a `saturating_mul` would answer 4 294 967
+        // 288 — a cap of half a gigabyte a picture, with no error anywhere.
+        let Err(why) = picture_cap_bits(536_870_912) else {
+            panic!("a cap of 536 870 912 bytes was accepted, and its bit count does not fit the driver's 32-bit field");
+        };
+        assert!(why.contains("536870912") || why.contains("536_870_912"), "the refusal names the value: {why}");
+        assert!(why.contains("va.h:2757-2758"), "and the header line it is about: {why}");
+        // **And the values below the floor, which the panel cannot offer.** Two classes: nothing at
+        // all, and something a person typed as a byte count.
+        for bytes in [0u32, 1, 999] {
+            let Err(why) = picture_cap_bits(bytes) else {
+                panic!("a cap of {bytes} bytes was accepted, below the {MIN} the control offers", MIN = filmcraft_export::MIN_MAX_FRAME_SIZE_BYTES);
+            };
+            assert!(why.contains(&bytes.to_string()), "{bytes} bytes: the refusal names what was typed: {why}");
+        }
+    }
+
+    /// **The panel's default is the derivation, in whole bytes, and never tighter than it.**
+    ///
+    /// The export panel offers this figure when a user turns the cap on, so it has to be the number
+    /// the export would otherwise have used — and a panel that computed its own would be a second
+    /// copy of the arithmetic that agrees with this one until somebody edits one of them.
+    #[test]
+    fn the_panels_default_cap_is_the_derivation_in_whole_bytes() {
+        // 2 Mbit/s at 30 fps is 66 667 bits = 8 334 bytes, which is **not** a whole number of
+        // kilobytes — so the panel's own slider rounds, and this asserts which way.
+        assert_eq!(
+            derived_picture_cap_bytes(2_000, FrameRate::FPS_30),
+            Ok(8_334),
+            "66 667 bits is 8 334 bytes when the remainder of a byte is rounded up, never 8 333"
+        );
+        // **Rounded UP, so a default can never be tighter than what the export would have had.**
+        for kbps in [100u32, 500, 2_000, 20_000] {
+            for rate in [FrameRate::FPS_24, FrameRate::FPS_25, FrameRate::FPS_30, FrameRate::FPS_60] {
+                let Ok(bytes) = derived_picture_cap_bytes(kbps, rate) else { panic!("{kbps} kbps at {rate}: no default could be computed") };
+                let Ok(bits) = picture_cap_bits(bytes) else {
+                    panic!("{kbps} kbps at {rate}: the panel's own default of {bytes} bytes would be refused by the gate");
+                };
+                let derived = per_picture_ceiling(kbps * 1000, rate).expect("the derivation itself");
+                assert!(
+                    bits >= derived,
+                    "{kbps} kbps at {rate}: the default of {bytes} bytes ({bits} bits) is below the derived {derived} bits, so turning the cap on would have made it tighter than leaving it alone"
+                );
+            }
+        }
+        // **The floor holds at the bottom**: a target so low the derivation is under 1 kB still
+        // yields a default the control and the gate both accept.
+        let low = derived_picture_cap_bytes(100, FrameRate::FPS_60).unwrap_or_else(|e| panic!("100 kbps at 60 fps: {e}"));
+        assert!(
+            low >= filmcraft_export::MIN_MAX_FRAME_SIZE_BYTES,
+            "a derivation of 1 667 bits is 209 bytes, below the control's own floor, so the default is the floor: {low}"
+        );
+        assert_eq!(picture_cap_bits(low).map(|b| b >= 8_000), Ok(true), "and the floor is a value the gate takes");
+        // **The derivation's own errors reach the panel**, rather than a default of zero: an invalid
+        // frame rate and a target that does not fit the arithmetic are refusals, not figures.
+        assert!(
+            derived_picture_cap_bytes(2_000, FrameRate::new(0, 1)).is_err(),
+            "a frame rate of 0/1 has no share of a second, so there is no default to show"
+        );
+        assert!(
+            derived_picture_cap_bytes(u32::MAX, FrameRate::FPS_30).is_err(),
+            "a target that does not fit bits per second is an error, not a wrapped number"
+        );
+    }
 
     /// **`HevcBitrate::build` is the one function that turns this gate's fidelity into an encoder,
     /// and the ceiling is the only number here that a build could quietly drop.**
