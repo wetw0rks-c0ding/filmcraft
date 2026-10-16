@@ -731,15 +731,16 @@ fn video_conference_survives_a_settings_file() {
     }
 }
 
-/// **The per-picture ceiling is derived from numbers the summary already prints, and this is the
-/// test that holds that decision in place.**
+/// **The per-picture ceiling is derived from numbers the summary already prints, or is the user's
+/// own figure — and whichever it is, the summary line says so. This is the test that holds that
+/// decision in place.**
 ///
 /// # What the decision is, and why it is a test rather than a comment
 ///
-/// `VA_RC_VCM` states *"a variable bit rate and a maximum frame size"* — the second half has no field
-/// on `ExportSettings`, and the hardware gates that take the mode have to supply a number. Two
-/// candidates: **a new settings field**, and **a number derived from what the settings already
-/// say**. The derivation won, on grounds that are checkable here:
+/// `VA_RC_VCM` states *"a variable bit rate and a maximum frame size"*, and the second half now has
+/// a field: `ExportSettings::max_frame_size`, in bytes, set from the export panel. Two candidates
+/// existed — **a new settings field** and **a number derived from what the settings already say** —
+/// and the derivation is what a `None` means, on grounds that are checkable here:
 ///
 /// - **every input is already on the summary line.** A cap the user cannot see is a cap the user
 ///   cannot reason about, and a field would be a *second* number on that line rather than a derived
@@ -747,18 +748,22 @@ fn video_conference_survives_a_settings_file() {
 ///   every format the mode is offered on.
 /// - **a field nothing can set is the defect the mode was created to fix.** `VA_RC_VCM` sat unwired
 ///   for one reason — a capability no setting could name never reaches a driver — and adding a field
-///   no control can set would reproduce that one layer up. The honest test for that is this one: if
-///   a ceiling were read from a field, the summary would have to gain a line saying so, and the
-///   assertion below is written from the **summary's own text** so a field added without a word on
-///   the line would leave the derivation looking justified when it no longer is.
+///   no control can set would reproduce that one layer up. **That is why the field arrived with the
+///   export-panel control rather than before it**, and why the assertion below is written from the
+///   **summary's own text**: a cap read from a field, with nothing on the line saying so, is
+///   exactly the failure this test is for — and now it is checkable in both directions, because a
+///   summary that failed to say *which* cap is in force would leave a reader unable to tell a
+///   derived cap from their own.
 ///
 /// # What it would catch
 ///
 /// A summary that stopped quoting a rate for this mode (which is what would happen if
-/// `names_a_bitrate` ever answered `false` for it), a summary that quoted a quantiser instead, or a
-/// backend that started reading a cap from somewhere the user cannot see. **Deliberate break:** print
-/// `QP n` for a VCM export and the second assertion fails; print the rate without the frame rate and
-/// the third fails.
+/// `names_a_bitrate` ever answered `false` for it), a summary that quoted a quantiser instead, a
+/// summary that named the derived cap on an export whose cap the user set (or printed the user's
+/// figure as if FilmCraft had derived it), or a backend that read a cap from somewhere the summary
+/// does not account for. **Deliberate break:** print `QP n` for a VCM export and the second
+/// assertion fails; print the rate without the frame rate and the third fails; drop the
+/// `max picture …` clause from either case and the last two fail.
 #[test]
 fn every_input_the_derived_per_picture_ceiling_needs_is_on_the_summary_line() {
     let ten = Tick(10 * TICKS_PER_SECOND);
@@ -805,19 +810,232 @@ fn every_input_the_derived_per_picture_ceiling_needs_is_on_the_summary_line() {
             // wording, which is the only other branch that prints no rate.
             assert!(said.contains("Video conference (VCM)"), "{format:?} at {rate}: {said}");
             assert_ne!(s.estimate_bytes(1920, 1080, rate, 48_000, ten), 0, "{format:?} at {rate}: a mode that names a rate has a computable size");
+            // **(5) The derived cap names its terms, and only H.265 has one.** The H.265 backend
+            // derives the cap from the target and the frame rate, so the line says where it comes
+            // from rather than printing the result — the result is a backend-side number and
+            // re-deriving it here would duplicate the arithmetic in a crate that must not depend on
+            // the backend. The H.264 encoders apply no per-picture cap at all (the VA-API H.264 gate
+            // declines the mode; the software encoder takes it as a variable rate), so the H.264 line
+            // must not claim a cap is in force. **Deliberate break:** print the clause for H.264 and
+            // this fails.
+            if format == Format::Hevc {
+                assert!(
+                    said.contains(&format!("max picture derived from the {:.2} Mbps target at {}", target as f64 / 1000.0, rate.label())),
+                    "{format:?} at {rate}: the cap in force is derived, and the line must say from what: {said}"
+                );
+                assert!(
+                    !said.contains("max picture ") || said.contains("max picture derived"),
+                    "{format:?} at {rate}: no cap is set, so no figure may be printed as one: {said}"
+                );
+            } else {
+                assert!(!said.contains("max picture"), "{format:?} applies no per-picture cap, so none may be named: {said}");
+            }
         }
     }
-    // **And the field does not exist**, which is the other half of the decision and the part a
-    // summary assertion cannot see. Written as a search of the serialized settings: a new field
-    // would be visible in the JSON, so this fails the moment one is added — which is the moment a
-    // reviewer should be asked whether a control for it exists, rather than a field being smuggled in
-    // and the summary quietly growing a line nobody reads.
-    let written = serde_json::to_value(ExportSettings { bitrate_mode: BitrateMode::VideoConference, ..Default::default() }).unwrap();
-    let keys: Vec<String> = written.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
-    for ceiling_field in ["max_frame_size_bits", "max_frame_bits", "max_picture_kbps", "max_frame_size"] {
+
+    // **The other half: a cap the user set is stated as theirs, in their own unit, and the derived
+    // wording is gone.** Written over the same rates and formats as the loop above, so a summary
+    // that printed the derived clause beside a set cap would fail at every rate rather than at one
+    // hand-picked example. **Three separate numbers, not one**: a summary that printed the target
+    // rate's share of a picture *as* a cap would be printing a backend number the backend will not
+    // use.
+    for (rate, target, max) in [(FrameRate::FPS_25, 20_000u32, 30_000u32), (FrameRate::FPS_60, 2_000, 3_000), (FrameRate::new(30_000, 1_001), 8_000, 12_000)] {
+        for (bytes, kb) in [(64_000u32, "64.0"), (1_000, "1.0"), (250_001, "250.0")] {
+            let s = ExportSettings {
+                format: Format::Hevc,
+                bitrate_mode: BitrateMode::VideoConference,
+                bitrate_kbps: target,
+                max_bitrate_kbps: Some(max),
+                max_frame_size: Some(bytes),
+                include_audio: false,
+                ..Default::default()
+            };
+            let said = s.summary(1920, 1080, rate, 48_000, ten).video;
+            assert!(
+                said.contains(&format!("max picture {kb} KB (the cap you set)")),
+                "{bytes} bytes at {rate}: the summary states the cap the user set, in kB: {said}"
+            );
+            assert!(!said.contains("derived from"), "{bytes} bytes at {rate}: the cap is the user's, so the line must not still claim it is derived: {said}");
+            // **The rate is still an input to the *target*, and the target is still printed.** A cap
+            // the user set removes the frame rate from the cap's arithmetic — not from the export.
+            assert!(said.contains(&format!("Target {:.2} Mbps", target as f64 / 1000.0)), "{bytes} bytes at {rate}: the target rate is still stated: {said}");
+            assert!(
+                said.contains(&rate.label()),
+                "{bytes} bytes at {rate}: and so is the frame rate, which every other number on the line is relative to: {said}"
+            );
+        }
+        // **The bytes→kB rendering is `/ 1000`, and this is where the factor of eight is caught on
+        // this side of it.** The driver wants bits and the backend multiplies by 8
+        // (`vaapi/hevc_export.rs`); if the summary printed *bits* — 64 000 bytes as "512.0 KB" — a
+        // reader checking the two against each other would see two different caps and have no way
+        // to tell which one the driver gets. The backend's own factor of 8 is pinned in
+        // `the_user_cap_reaches_the_driver_in_bits`.
+        let s = ExportSettings { format: Format::Hevc, bitrate_mode: BitrateMode::VideoConference, max_frame_size: Some(512_000), ..Default::default() };
+        let said = s.summary(1920, 1080, rate, 48_000, ten).video;
+        assert!(said.contains("max picture 512.0 KB (the cap you set)"), "512 000 bytes is 512.0 kB, not the 4 096 000 bits it converts to: {said}");
+    }
+
+    // **And the field exists, which is the other half of the decision and the part a summary
+    // assertion cannot see.** This used to assert the *absence* of every per-picture ceiling field,
+    // on the grounds that a field with no control behind it is reachable only from a hand-edited
+    // project file and a test. `max_frame_size` is now that field, **with a control** in
+    // `crates/ui-egui`'s export panel (`export.video.maxFrameSize`), so the assertion is the
+    // positive form of what it was: the field is on `ExportSettings`, the JSON names it, and a
+    // summary that read it without accounting for it on the line — the defect the old assertion
+    // existed to catch — fails above.
+    let written = serde_json::to_value(ExportSettings {
+        format: Format::Hevc,
+        bitrate_mode: BitrateMode::VideoConference,
+        max_frame_size: Some(64_000),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(written["maxFrameSize"], 64_000, "the cap is a field on ExportSettings, in bytes, under its camelCase name");
+    // **The number on the line is the number in the field, byte for byte — for three values, and
+    // through the public summary rather than through the private clause.** The factor of eight is
+    // the backend's business (`vaapi/hevc_export.rs`), but a summary that printed the *bits* would
+    // show 512 000 bytes as "512.0 KB" when the driver receives 4 096 000 — two different numbers
+    // for one setting, and a reader with no way to tell which one is in the file.
+    for bytes in [1_000u32, 64_000, 512_000] {
+        let said = ExportSettings { format: Format::Hevc, bitrate_mode: BitrateMode::VideoConference, max_frame_size: Some(bytes), ..Default::default() }
+            .summary(1920, 1080, FrameRate::FPS_25, 48_000, ten)
+            .video;
         assert!(
-            !keys.iter().any(|k| k == ceiling_field),
-            "a per-picture ceiling field ({ceiling_field}) has been added to ExportSettings: with no control behind it, it is reachable only from a hand-edited project file and a test"
+            said.contains(&format!("max picture {:.1} KB (the cap you set)", bytes as f64 / 1000.0)),
+            "{bytes} bytes is printed as itself, not as its bit count: {said}"
         );
     }
+    // **A cap of no other unit is *not* on this struct**, so a later reader cannot find a second
+    // spelling of the same number and wonder which one the backend reads.
+    let keys: Vec<String> = written.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+    for ceiling_field in ["maxFrameSizeBits", "maxFrameBits", "maxPictureKbps", "maxFrameKbps"] {
+        assert!(
+            !keys.iter().any(|k| k == ceiling_field),
+            "a second per-picture ceiling field ({ceiling_field}) has been added to ExportSettings: the backend reads one, and two unit spellings of one number is how the factor of eight gets introduced"
+        );
+    }
+}
+
+/// **A settings file written before `ExportSettings::max_frame_size` existed loads unchanged, and the
+/// export it describes keeps the cap it always had — the derived one.**
+///
+/// # Why this is a test and not a consequence of `#[serde(default)]`
+///
+/// The container attribute makes the *deserialisation* work; it says nothing about what the loaded
+/// settings then **mean**. A field that defaulted to something other than `None` — a plausible 8 kB,
+/// say — would load every project written before it silently onto a different cap from the one its
+/// author chose by leaving it alone, and nothing anywhere would report a change. So this asserts
+/// the *behaviour*: `None` in, the derived wording on the summary line out, and a file that does
+/// name the field round-trips under the same name and the same number.
+///
+/// **The blob below is copied from the shape of a stored settings file before the field existed**
+/// (the same list `settings_written_before_auto_still_deserialise` uses), so it fails the moment the
+/// struct stops accepting a file of that age — which is the day a project written by the current
+/// release stops opening.
+#[test]
+fn settings_written_before_the_picture_cap_still_deserialise() {
+    let ten = Tick(10 * TICKS_PER_SECOND);
+    let stored = serde_json::json!({
+        "format": "hevc",
+        "path": "/home/u/Movies/out.mp4",
+        "scale": 1.0,
+        "includeAudio": false,
+        "quality": 90,
+        "bitrateKbps": 2000,
+        "burnCaptions": false,
+        "fieldOrder": "progressive",
+        "bitrateMode": "videoConference",
+        "constantQp": 26,
+        "maxBitrateKbps": 3000,
+        "multiplexer": "mp4",
+        "audio": { "codec": "aac", "sampleRate": 48000, "channels": 2, "bitrateKbps": 320, "bits": 16 }
+    });
+    let s: ExportSettings = serde_json::from_value(stored).unwrap_or_else(|e| panic!("a settings file written before the picture cap: {e}"));
+    assert_eq!(
+        s.max_frame_size, None,
+        "a file that names no cap has no cap, and must not be given one: leaving it unset is how its author asked for the derived cap"
+    );
+    // **The derived cap is what this file has always meant**, and the line says so rather than
+    // printing a figure the backend would have to derive.
+    let said = s.summary(1920, 1080, FrameRate::FPS_25, 48_000, ten).video;
+    assert!(
+        said.contains("max picture derived from the 2.00 Mbps target at 25 fps"),
+        "an export from before the field existed derives its cap, as it always did: {said}"
+    );
+    assert!(!said.contains("KB (the cap you set)"), "and prints no figure for one that was never set: {said}");
+
+    // **And the field round-trips when it is named**: same camelCase name, same number, in bytes.
+    for bytes in [1_000u32, 64_000, 536_870_911] {
+        let set = ExportSettings { max_frame_size: Some(bytes), ..s.clone() };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["maxFrameSize"], bytes, "{bytes} bytes is written under the field's own name");
+        let back: ExportSettings = serde_json::from_value(json).unwrap_or_else(|e| panic!("{bytes} bytes: {e}"));
+        assert_eq!(back.max_frame_size, Some(bytes), "{bytes} bytes survives a save and a load, and a u32 is not read as something else");
+    }
+    // **And a written file that names the cap reads back as the user's own on the summary line**,
+    // which is the other half of a round trip: the number survives, and so does what it means.
+    let set: ExportSettings = serde_json::from_value(
+        serde_json::to_value(ExportSettings {
+            format: Format::Hevc,
+            bitrate_mode: BitrateMode::VideoConference,
+            bitrate_kbps: 2_000,
+            max_frame_size: Some(64_000),
+            include_audio: false,
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        set.summary(1920, 1080, FrameRate::FPS_25, 48_000, ten).video.contains("max picture 64.0 KB (the cap you set)"),
+        "a loaded cap is stated as the user's own figure, in kB"
+    );
+    // **Every built-in preset round-trips whole**, as the field's own doc claims: a preset library
+    // saved before this field must still load, and every one of them ships with no cap.
+    for p in builtin_presets() {
+        let back: ExportPreset = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap_or_else(|e| panic!("{}: {e}", p.name));
+        assert_eq!(back.settings.max_frame_size, None, "{} round-trips with no cap, as it was written", p.name);
+    }
+}
+
+/// **A per-picture cap the panel's slider cannot reach is refused with a message naming the number
+/// and the two ways out — and nothing wraps, clamps or panics on the way.**
+///
+/// **Four classes of hostile value, one test, because the classes are the same failure in
+/// different clothes**: a number a user can type, a slider a user cannot, and a hand-edited project
+/// file can put *any* of them in. `0` and `1` are the two a slider with the wrong minimum produces;
+/// `u32::MAX / 8 + 1` is the first value whose byte→bit conversion does not fit the driver's field,
+/// and the one a hand-edited file reaches.
+///
+/// **Every one of them is an error naming the value**, and `MIN_MAX_FRAME_SIZE_BYTES` itself is
+/// accepted — a refusal that also rejected the floor would make the control unusable, and one that
+/// accepted the floor plus everything below it would not be a floor.
+#[test]
+fn a_picture_cap_the_panel_cannot_offer_is_refused_by_name() {
+    for bytes in [0u32, 1, 999, MIN_MAX_FRAME_SIZE_BYTES - 1] {
+        let s = ExportSettings { format: Format::Hevc, bitrate_mode: BitrateMode::VideoConference, max_frame_size: Some(bytes), ..Default::default() };
+        let Err(e) = s.validate() else {
+            panic!("a cap of {bytes} bytes was accepted, below the {MIN_MAX_FRAME_SIZE_BYTES} bytes the control offers");
+        };
+        let why = e.to_string();
+        assert!(why.contains(&bytes.to_string()), "the refusal names the number the user typed: {why}");
+        assert!(why.contains("1 kB") || why.contains(&MIN_MAX_FRAME_SIZE_BYTES.to_string()), "and what would be accepted instead: {why}");
+    }
+    // **The floor itself, and the largest value that converts**, are both taken. The largest is
+    // `u32::MAX / 8` bytes = 536 870 911, whose bit count is 4 294 967 288 — one below the field's
+    // maximum, and the one value a test can use to tell a checked conversion from a saturating one:
+    // a `saturating_mul` would answer 4 294 967 288 here *and* for every larger value, so the
+    // overflow case below is what separates them.
+    for bytes in [MIN_MAX_FRAME_SIZE_BYTES, 64_000, u32::MAX / 8] {
+        let s = ExportSettings { format: Format::Hevc, bitrate_mode: BitrateMode::VideoConference, max_frame_size: Some(bytes), ..Default::default() };
+        s.validate().unwrap_or_else(|e| panic!("a cap of {bytes} bytes was refused: {e}"));
+    }
+    // **A settings file is not the only place a cap arrives, and the check is not gated on the mode
+    // or the format either.** A hand-written `ExportSettings` can reach a backend without passing
+    // through `validate` at all, which is why the gate checks it again; what this asserts is that
+    // the settings layer refuses a nonsense cap whatever else the settings say, so the user is told
+    // at the panel rather than at a backend they never reach.
+    let nonsense = ExportSettings { format: Format::ProRes, max_frame_size: Some(0), ..Default::default() };
+    assert!(nonsense.validate().is_err(), "a cap below the floor is refused whatever the format is, since no format reads it");
+    assert!(ExportSettings::default().validate().is_ok(), "and a settings object with no cap is not an error");
 }

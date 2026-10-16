@@ -222,6 +222,18 @@ fn default_constant_qp() -> u8 {
     26
 }
 
+/// **The smallest per-picture cap FilmCraft takes, in bytes — 1 kB.** The floor of the
+/// [`ExportSettings::max_frame_size`] control.
+///
+/// **It is a policy, not a fact about a codec, and it is said here once so the panel's slider and
+/// the HEVC gate's refusal cannot drift apart.** The gate declines anything below it and the panel
+/// starts there, so *what a user can type is exactly what the backend takes* — which is the whole
+/// point of naming the number in one place. Nothing in H.265's syntax is being claimed: 1 kB is not
+/// a minimum picture (a flat 16×16 picture codes to far less than that), it is the smallest figure
+/// the control offers, and the refusal says so in those words rather than dressing the policy up as
+/// a limit of the format.
+pub const MIN_MAX_FRAME_SIZE_BYTES: u32 = 1_000;
+
 /// Every Export-mode setting. Serialized in camelCase; every field is optional on input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -292,6 +304,31 @@ pub struct ExportSettings {
     pub hardware_encoding: HardwareEncoding,
     /// VBR maximum bitrate (None = 1.5 × target).
     pub max_bitrate_kbps: Option<u32>,
+    /// **The largest any one picture may weigh, in BYTES** — [`BitrateMode::VideoConference`]'s
+    /// second number, and the only field here that is a size rather than a rate or a count.
+    /// `None` = derive it from the target rate and the frame rate, as this backend always has.
+    ///
+    /// **Why bytes, when the driver's own field is in bits.** `VAEncMiscParameterBufferMaxFrameSize::
+    /// max_frame_size` is *"Maximum size of a frame (in bits)"* (`/usr/include/va/va.h:2757-2758`) —
+    /// and every other rate on this struct is kbps, so a number in bits would be the only one of its
+    /// unit here and the one a reader is most likely to misread by a factor of eight. **Bytes are
+    /// the unit the summary and the panel print, and the ×8 happens in exactly one place**: the
+    /// VA-API HEVC gate, where the user's field is converted for the driver
+    /// (`crates/platform/src/vaapi/hevc_export.rs`). Nothing else multiplies it by eight.
+    ///
+    /// **It has no time base, which is why it is not a bitrate.** The same cap is generous at 24 fps
+    /// and punishing at 60, so it is never stated in kbps — that would be a rate that is not a rate.
+    ///
+    /// **Only the H.265 hardware export reads it.** Both H.264 gates decline
+    /// [`BitrateMode::VideoConference`] by name and FilmCraft's software H.264 encoder takes the mode
+    /// as a variable rate, so no H.264 file carries a per-picture cap — [`ExportSettings::summary`]
+    /// says so on the line rather than printing a number nothing will apply.
+    ///
+    /// **Older files load unchanged.** The struct's own `#[serde(default)]` is what makes a settings
+    /// file written before this field existed deserialise into `None`, i.e. into the derivation this
+    /// field's default preserves; `settings_written_before_the_picture_cap_still_deserialise` holds
+    /// that, and `ExportSettings::validate` refuses a value below [`MIN_MAX_FRAME_SIZE_BYTES`].
+    pub max_frame_size: Option<u32>,
     /// Adaptive bitrate (the Match Source presets): bits per pixel per frame; replaces
     /// `bitrate_kbps` with `width × height × fps × bpp / 1000`.
     pub adaptive_bitrate: Option<f32>,
@@ -474,6 +511,7 @@ impl Default for ExportSettings {
             constant_qp: default_constant_qp(),
             hardware_encoding: HardwareEncoding::default(),
             max_bitrate_kbps: None,
+            max_frame_size: None,
             adaptive_bitrate: None,
             keyframe_distance: None,
             render_at_max_depth: false,
@@ -508,6 +546,23 @@ impl ExportSettings {
         // clamp, so this is where a user is told instead of getting the nearest quality silently.
         if self.bitrate_mode == BitrateMode::ConstantQuality && self.video_format().is_h26x() {
             self.constant_quantiser()?;
+        }
+        // **A per-picture cap below the panel's own floor is refused here, once, for every
+        // backend** — the same reasoning as the quantiser above: it is a number the settings state
+        // outright, clamping it would be a limit the user never chose, and the one backend that
+        // reads it refuses it again at its own gate. **Two checks of one number is not
+        // duplication**: this one runs on every export and on every machine, so a user on a platform
+        // with no HEVC encoder is told at the panel rather than at a gate they never reach; that one
+        // runs where the number is handed to a driver, and a hand-written `ExportSettings` can reach
+        // a gate without passing through here.
+        if let Some(bytes) = self.max_frame_size {
+            if bytes < MIN_MAX_FRAME_SIZE_BYTES {
+                return Err(ExportError::Unsupported(format!(
+                    "a maximum picture size of {bytes} bytes: this cap is FilmCraft's own, not a limit of any codec, and the \
+                     smallest it takes is {MIN_MAX_FRAME_SIZE_BYTES} bytes (1 kB). Raise it, or clear the cap to have it derived \
+                     from the target rate instead"
+                )));
+            }
         }
         Ok(())
     }

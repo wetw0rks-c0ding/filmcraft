@@ -732,6 +732,23 @@ impl ExportSettings {
                         // `constant_qp` for a mode that states no quantiser.
                         v += &format!(", QP {}", self.constant_qp);
                     }
+                    // **A per-picture cap an H.264 export cannot use, named as such.**
+                    //
+                    // `VideoConference` states two numbers and this format applies neither of them
+                    // beyond the rate: the VA-API H.264 gate declines the mode by name (its
+                    // advertised mask lacks `VA_RC_VCM` — `hardware_encode::vaapi_export::refuses`
+                    // carries the measurement) and FilmCraft's own software H.264 encoder takes the
+                    // mode as a variable rate of the target and its ceiling, with no cap per
+                    // picture. So a cap in the settings would be a number on a line that describes a
+                    // file, attached to nothing. **The line says that instead of printing it as
+                    // though something would apply it** — and only when one is actually set, since
+                    // the derived case is not a cap on this format either and has no number to
+                    // mislead anyone with.
+                    if self.bitrate_mode == BitrateMode::VideoConference {
+                        if let Some(bytes) = self.max_frame_size {
+                            v += &format!(", a maximum picture of {:.1} KB is set, which FilmCraft's H.264 encoders do not apply", bytes as f64 / 1000.0);
+                        }
+                    }
                     v += &format!(", keyframe every {} frames", r.keyint);
                 }
                 Format::Hevc => {
@@ -743,6 +760,33 @@ impl ExportSettings {
                         };
                     } else {
                         v += &format!(", QP {}", self.constant_qp);
+                    }
+                    // **Which per-picture cap is in force, and where the number came from.** This is
+                    // the one format that reads [`Self::max_frame_size`], so this is the one branch
+                    // that states a cap — and it states the number *and* its origin, because a bare
+                    // figure is a figure the user cannot reason about:
+                    //
+                    // - **set**: the figure is theirs, printed in the unit the field holds (kB; the
+                    //   field is bytes), and labelled as theirs.
+                    // - **not set**: no figure at all, only **the terms the H.265 gate derives it
+                    //   from** — the target rate and the frame rate, both already printed above and
+                    //   both named here so a reader can compute it. The gate's own arithmetic is
+                    //   `target_bps * rate.den / rate.num` bits, and FilmCraft cannot state the
+                    //   result here without duplicating that arithmetic in a crate that must not
+                    //   depend on the backend; **the terms are what this line carries**, which is
+                    //   exactly the claim
+                    //   `every_input_the_derived_per_picture_ceiling_needs_is_on_the_summary_line`
+                    //   has always held.
+                    if self.bitrate_mode == BitrateMode::VideoConference {
+                        v += &match self.max_frame_size {
+                            Some(bytes) => format!(", max picture {:.1} KB (the cap you set)", bytes as f64 / 1000.0),
+                            // **`{label} fps`, not `{label}`: `FrameRate::label` is the bare rational
+                            // ("25", "29.97", "30000/1001") and the line above it adds the unit
+                            // itself. A cap quoted "at 25" would name a number with no unit beside a
+                            // rate in Mbps, and the whole claim of this clause is that its terms are
+                            // enough to derive the figure.
+                            None => format!(", max picture derived from the {} target at {} fps", mbps(r.target_kbps), r.rate.label()),
+                        };
                     }
                     v += &format!(", keyframe every {} frames", r.keyint);
                 }
