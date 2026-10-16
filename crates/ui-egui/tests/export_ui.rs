@@ -251,6 +251,97 @@ fn h265_shows_the_h264_family_controls_without_the_h264_only_ones() {
     d.snapshot("export-h265");
 }
 
+/// **The per-picture maximum is a control on the H.265 panel, it starts at the figure the gate
+/// would derive, and a value set through it survives a save and a load.**
+///
+/// # What this holds in place
+///
+/// Three separate things, which is why they are one test: **the control exists and is gated on the
+/// mode**, **the default it offers is the number the backend would have used**, and **the number the
+/// user drags to is the number a project file keeps**.
+///
+/// The middle one is the pin that matters. `derived_picture_cap_bytes` in the panel and
+/// `per_picture_ceiling` in `vaapi::hevc_export` are two expressions of one number — the panel
+/// cannot call the gate, because `filmcraft-ui-egui` is deliberately OS-independent and
+/// `filmcraft-platform` is its *dev*-dependency. **This test is where the two are compared**, which
+/// `filmcraft-platform` being a dev-dependency of this crate is exactly what makes possible; a copy
+/// with nothing tying it to the original would drift silently.
+#[test]
+fn the_h265_picture_cap_is_a_control_that_starts_at_the_derived_figure_and_survives_a_reload() {
+    use filmcraft_engine::export::{BitrateMode, ExportSettings, Format, MIN_MAX_FRAME_SIZE_BYTES};
+    use filmcraft_engine::time::FrameRate;
+
+    let mut d = Driver::new("vcm");
+    d.ok("ui.set", json!({"mode": "export"}));
+    d.frames(4);
+    // **The rate is named rather than inherited from the demo project**, because the cap is that
+    // rate's share of one picture: the panel reads `resolved_rate`, so a test that let the sequence
+    // decide its rate would be asserting a different figure every time the demo project's rate
+    // changed — and, worse, would agree with a *wrong* copy of the derivation.
+    d.app().ui.export.settings = ExportSettings { format: Format::Hevc, frame_rate: Some(FrameRate::FPS_30), ..Default::default() };
+    d.frames(3);
+
+    // **The control is the mode's alone.** A CBR H.265 export has no per-picture maximum, so a
+    // control there would be a knob with nothing behind it.
+    assert!(!d.has("export.video.maxFrameSizeOn"), "H.265 in CBR has no picture cap to set");
+    d.app().ui.export.settings.bitrate_mode = BitrateMode::VideoConference;
+    d.app().ui.export.settings.bitrate_kbps = 2_000;
+    d.frames(4);
+    assert!(d.has("export.video.maxFrameSizeOn"), "video conference does: {id}", id = "maxFrameSizeOn");
+
+    // **The default is the derivation, pinned against the gate's own arithmetic.** 2 Mbit/s over
+    // 30 fps is 66 667 bits, which is 8 334 bytes when the remainder of a byte goes up.
+    let want = filmcraft_platform::vaapi::derived_picture_cap_bytes(2_000, FrameRate::FPS_30)
+        .unwrap_or_else(|e| panic!("the gate could not derive a cap for 2 Mbit/s at 30 fps: {e}"));
+    assert_eq!(want, 8_334, "the gate's own figure: 66 667 bits is 8 334 bytes");
+
+    // **The figure is on screen before the cap is set**, which is the whole point of showing it: a
+    // number FilmCraft would otherwise have used is the number the user needs in order to replace it.
+    let derived_el = d.ok("ui.elements", json!({"prefix": "export.video.maxFrameSizeDerived"}));
+    let said = derived_el.as_array().map(|a| a.iter().map(|e| e["label"].as_str().unwrap_or_default()).collect::<Vec<_>>().join(" | ")).unwrap_or_default();
+    assert!(said.contains("8.3 KB"), "the panel says what the cap would be without it: {said}");
+
+    // **Turning it on starts the field at that figure, not at a round number of ours.**
+    d.click("export.video.maxFrameSizeOn");
+    assert_eq!(d.app().ui.export.settings.max_frame_size, Some(want), "the toggle seeds the cap the export would have derived");
+    assert!(d.has("export.video.maxFrameSize"), "and the field appears: maxFrameSize");
+    let sum = d.ok("ui.elements", json!({"prefix": "export.summary"}))[0]["label"].as_str().unwrap().to_string();
+    assert!(sum.contains("max picture 8.3 KB (the cap you set)"), "and the summary line says the cap is the user's now: {sum}");
+
+    // **The field writes what the user set, in the field's own unit — bytes.** Set through the
+    // control channel rather than by dragging, which is the same field the widget writes.
+    d.ok("ui.set", json!({"export": {"settings": {"maxFrameSize": 64_000}}}));
+    d.frames(3);
+    assert_eq!(d.app().ui.export.settings.max_frame_size, Some(64_000), "the panel holds the bytes the user typed, not kilobytes");
+
+    // **And it survives a save and a load — the project's own serializer, then the preset library on
+    // disk.** A control that writes a field nothing reads back is exactly the dead end the export
+    // crate's summary test used to guard against, and this is the other half of that guard: the
+    // number a project file keeps is the number the control shows.
+    let saved = serde_json::to_value(&d.app().ui.export.settings).unwrap();
+    assert_eq!(saved["maxFrameSize"], 64_000, "a project file keeps the bytes");
+    let reloaded: ExportSettings = serde_json::from_value(saved).unwrap();
+    assert_eq!(reloaded.max_frame_size, Some(64_000), "and reads them back");
+    d.ok("ui.set", json!({"export": {"manager": {"saveName": "VCM Review"}}}));
+    d.frames(2);
+    d.click("presetManager.save");
+    assert!(d.dir.join("data/export-presets.json").exists(), "the preset library is written to the data directory");
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(d.dir.join("data/export-presets.json")).unwrap()).unwrap();
+    let saved_cap = stored.to_string().contains("64000");
+    assert!(saved_cap, "the saved preset carries the cap, not a rounded or defaulted one: {stored}");
+    // **And the floor the panel offers is the floor the gate accepts**, so the two cannot disagree
+    // about what a user may type.
+    assert_eq!(MIN_MAX_FRAME_SIZE_BYTES, 1_000, "1 kB: the smallest figure this control offers");
+    let smallest = ExportSettings {
+        format: Format::Hevc,
+        bitrate_mode: BitrateMode::VideoConference,
+        max_frame_size: Some(MIN_MAX_FRAME_SIZE_BYTES),
+        ..Default::default()
+    };
+    smallest.validate().unwrap_or_else(|e| panic!("the control's own minimum was refused by the settings: {e}"));
+    d.snapshot("export-vcm");
+}
+
 #[test]
 fn preset_manager_search_favourite_save_apply() {
     let mut d = Driver::new("manager");

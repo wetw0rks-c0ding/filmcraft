@@ -2930,3 +2930,68 @@ fn a_video_conference_hevc_export_is_a_file_that_decodes_to_the_pictures_that_we
         assert!(worst <= WORST, "picture {index} has a sample {worst}/255 from the source, over a measured {WORST}");
     }
 }
+
+/// **A cap the user set in the settings reaches the driver's record as that many *bits* — through
+/// the registered factory, not through the gate alone.**
+///
+/// # Why this is not the gate test again
+///
+/// `hevc_export.rs`'s own tests read what `config_for` produced, and
+/// `the_build_hands_the_ceiling_to_the_encoder_rather_than_dropping_it` reads what
+/// `HevcBitrate::build` handed a *hand-constructed* record. **Neither can see the two together**,
+/// and neither sees the unit conversion: a factory that dropped the cap, or a gate that converted in
+/// the wrong unit, would leave both of them passing. `encoder.max_frame_bits()` is the driver's own
+/// record — what `VAEncMiscParameterBufferMaxFrameSize` was given — so this is the end of the chain:
+/// **settings object → gate → factory → driver record**.
+///
+/// **The numbers are written out rather than derived, because a test that recomputes the gate's own
+/// expression passes whatever the gate computed.** 64 000 bytes at eight bits to the byte is 512 000
+/// bits; with no cap set, 2 Mbit/s over 30 frames is 66 667. **Two caps that differ by an order of
+/// magnitude**, so a field left over from the previous case cannot make the second look right.
+///
+/// **And the two are asked at two frame rates**, because a cap the user set does not move with the
+/// rate and a derived one does — the one behavioural difference between the two paths, seen from
+/// the far end.
+#[test]
+fn a_picture_cap_the_user_set_reaches_the_driver_record() {
+    let _guard = lock();
+    let Ok(display) = filmcraft_platform::vaapi::open_display() else {
+        eprintln!("SKIPPED: no VA-API display, so no driver record could be built to ask");
+        return;
+    };
+    for (bytes, rate, want) in [
+        (Some(64_000u32), FrameRate::FPS_30, 512_000u32),
+        (Some(64_000), FrameRate::FPS_60, 512_000),
+        (Some(1_000), FrameRate::FPS_30, 8_000),
+        (None, FrameRate::FPS_30, 66_667),
+        (None, FrameRate::FPS_60, 33_334),
+    ] {
+        let mut settings = hevc_settings(String::new());
+        settings.bitrate_mode = BitrateMode::VideoConference;
+        settings.max_frame_size = bytes;
+        let label = match bytes {
+            Some(b) => format!("{b} bytes"),
+            None => "no cap".to_string(),
+        };
+        let config = filmcraft_platform::vaapi::hevc_config_for(Format::Hevc, WIDTH, HEIGHT, rate, &settings)
+            .unwrap_or_else(|why| panic!("{label} at {rate}: the gate declined an export it takes: {why}"));
+        let filmcraft_platform::vaapi::HevcBitrate::VideoConference { target, max, max_frame_bits } = config.bitrate else {
+            panic!("{label} at {rate}: the gate did not submit a video-conference record: {:?}", config.bitrate);
+        };
+        // **The driver's own record, read back.** The registered factory hands back a
+        // `Box<dyn VideoEncoder>`, from which no submission is observable — which is why this builds
+        // the encoder the gate's numbers describe and asks *it* what `max_frame_size` holds.
+        let encoder = filmcraft_platform::vaapi::HevcEncoder::at_video_conference(&display, (WIDTH, HEIGHT), 1, target, max, max_frame_bits)
+            .unwrap_or_else(|why| panic!("{label} at {rate}: no encoder was built for these numbers: {why}"));
+        assert_eq!(
+            encoder.max_frame_bits(),
+            Some(want),
+            "{label} at {rate}: the driver's VAEncMiscParameterBufferMaxFrameSize holds {want} bits (the field is in bits, va.h:2757-2758), and \
+             not the byte count, and not the other cap's number"
+        );
+        // **And the gate's record is already in bits, which is where the ×8 happened.** Asserting
+        // both is what makes a slip in either place visible: a gate that handed the byte count
+        // through would fail the first, a driver-side conversion would fail the second.
+        assert_eq!(max_frame_bits, want, "{label} at {rate}: the gate's own record carries bits, not bytes");
+    }
+}

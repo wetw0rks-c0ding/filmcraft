@@ -555,14 +555,14 @@ impl ExportSettings {
         // with no HEVC encoder is told at the panel rather than at a gate they never reach; that one
         // runs where the number is handed to a driver, and a hand-written `ExportSettings` can reach
         // a gate without passing through here.
-        if let Some(bytes) = self.max_frame_size {
-            if bytes < MIN_MAX_FRAME_SIZE_BYTES {
-                return Err(ExportError::Unsupported(format!(
-                    "a maximum picture size of {bytes} bytes: this cap is FilmCraft's own, not a limit of any codec, and the \
-                     smallest it takes is {MIN_MAX_FRAME_SIZE_BYTES} bytes (1 kB). Raise it, or clear the cap to have it derived \
-                     from the target rate instead"
-                )));
-            }
+        if let Some(bytes) = self.max_frame_size
+            && bytes < MIN_MAX_FRAME_SIZE_BYTES
+        {
+            return Err(ExportError::Unsupported(format!(
+                "a maximum picture size of {bytes} bytes: this cap is FilmCraft's own, not a limit of any codec, and the \
+                 smallest it takes is {MIN_MAX_FRAME_SIZE_BYTES} bytes (1 kB). Raise it, or clear the cap to have it derived \
+                 from the target rate instead"
+            )));
         }
         Ok(())
     }

@@ -511,6 +511,18 @@ impl ExportSettings {
         matches!(self.format, Format::PngSequence | Format::TiffSequence | Format::BmpSequence)
     }
 
+    /// The frame rate an export will encode at: the settings' own rate when it names a usable one,
+    /// else the sequence's.
+    ///
+    /// **Named, because two callers need the rule and neither should restate it.**
+    /// [`Self::resolve`] reads the output rate through this, so the pipeline and the summary agree by
+    /// construction; and the export panel's per-picture-cap control needs the *same* rate, because
+    /// the cap it derives (or shows as a default) is that rate's share of one picture — a panel that
+    /// guessed the rate would offer a default for a rate the export will not encode at.
+    pub fn resolved_rate(&self, seq_rate: FrameRate) -> FrameRate {
+        self.frame_rate.filter(|r| r.num > 0 && r.den > 0).unwrap_or(seq_rate)
+    }
+
     /// Output size, rate, audio format and bitrate for a sequence of `seq_w`×`seq_h` at `seq_rate`.
     pub fn resolve(&self, seq_w: u32, seq_h: u32, seq_rate: FrameRate, seq_sr: u32) -> Resolved {
         let (mut w, mut h) = match self.frame_size {
@@ -521,7 +533,7 @@ impl ExportSettings {
             w &= !1;
             h &= !1;
         }
-        let rate = self.frame_rate.filter(|r| r.num > 0 && r.den > 0).unwrap_or(seq_rate);
+        let rate = self.resolved_rate(seq_rate);
         let fps = rate.num as f64 / rate.den as f64;
         let target = match self.adaptive_bitrate {
             Some(bpp) if bpp > 0.0 => ((w as f64 * h as f64 * fps * bpp as f64) / 1000.0).round() as u32,
@@ -744,10 +756,10 @@ impl ExportSettings {
                     // though something would apply it** — and only when one is actually set, since
                     // the derived case is not a cap on this format either and has no number to
                     // mislead anyone with.
-                    if self.bitrate_mode == BitrateMode::VideoConference {
-                        if let Some(bytes) = self.max_frame_size {
-                            v += &format!(", a maximum picture of {:.1} KB is set, which FilmCraft's H.264 encoders do not apply", bytes as f64 / 1000.0);
-                        }
+                    if self.bitrate_mode == BitrateMode::VideoConference
+                        && let Some(bytes) = self.max_frame_size
+                    {
+                        v += &format!(", a maximum picture of {:.1} KB is set, which FilmCraft's H.264 encoders do not apply", bytes as f64 / 1000.0);
                     }
                     v += &format!(", keyframe every {} frames", r.keyint);
                 }

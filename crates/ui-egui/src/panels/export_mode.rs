@@ -22,8 +22,8 @@
 use egui::{Align2, Color32, Rect, Sense, pos2, vec2};
 use filmcraft_engine::export::presets::{DEFAULT_PRESET, preset_key};
 use filmcraft_engine::export::{
-    AudioCodec, BitrateMode, ExportSettings, FieldOrder, Format, H264Profile, HardwareEncoding, Multiplexer, MxfVideoCodec, Placement, Scaling, TextOverlay,
-    builtin_presets, format_bytes,
+    AudioCodec, BitrateMode, ExportSettings, FieldOrder, Format, H264Profile, HardwareEncoding, MIN_MAX_FRAME_SIZE_BYTES, Multiplexer, MxfVideoCodec,
+    Placement, Scaling, TextOverlay, builtin_presets, format_bytes,
 };
 use filmcraft_engine::time::{FrameRate, Tick};
 use serde::{Deserialize, Serialize};
@@ -305,11 +305,31 @@ fn row<R>(ui: &mut egui::Ui, t: &Tokens, label: &str, add: impl FnOnce(&mut egui
 
 /// A combo box over `options` (label, enabled); returns the chosen index.
 fn combo(ui: &mut egui::Ui, reg: &mut Reg, id: &str, selected: &str, options: &[(String, bool)], width: f32) -> Option<usize> {
+    let options: Vec<(String, Option<&str>)> = options.iter().map(|(l, on)| (l.clone(), if *on { None } else { Some(REASON_UNSUPPORTED) })).collect();
+    combo_hints(ui, reg, id, selected, &options, width)
+}
+
+/// The hover text a disabled option carries when the caller did not say why it is disabled.
+const REASON_UNSUPPORTED: &str = "Not supported by FilmCraft's encoders yet";
+
+/// A combo box whose options can each say **why** they are disabled; returns the chosen index.
+///
+/// **A disabled entry is a claim, and a generic tooltip makes it a vague one.** "Not supported by
+/// FilmCraft's encoders yet" is true for a mode no backend has, and misleading for one a backend has
+/// and this machine's driver does not offer — so the caller names the reason and the panel shows
+/// that. An option that is disabled but selected still renders as selected, which is what a
+/// settings file naming it needs: the value is visible and the reason is on hover, rather than the
+/// combo silently disagreeing with the summary line beside it.
+fn combo_hints(ui: &mut egui::Ui, reg: &mut Reg, id: &str, selected: &str, options: &[(String, Option<&str>)], width: f32) -> Option<usize> {
     let mut chosen = None;
     let r = egui::ComboBox::from_id_salt(id).selected_text(selected).width(width).show_ui(ui, |ui| {
-        for (i, (label, enabled)) in options.iter().enumerate() {
-            let resp = ui.add_enabled(*enabled, egui::Button::selectable(label == selected, label));
-            let resp = if *enabled { resp } else { resp.on_disabled_hover_text("Not supported by FilmCraft's encoders yet") };
+        for (i, (label, reason)) in options.iter().enumerate() {
+            let enabled = reason.is_none();
+            let resp = ui.add_enabled(enabled, egui::Button::selectable(label == selected, label));
+            let resp = match reason {
+                Some(why) => resp.on_disabled_hover_text(*why),
+                None => resp,
+            };
             reg.add(format!("{id}.option.{i}"), resp.rect, label.clone());
             if resp.clicked() {
                 chosen = Some(i);
@@ -322,6 +342,40 @@ fn combo(ui: &mut egui::Ui, reg: &mut Reg, id: &str, selected: &str, options: &[
 
 fn opts(labels: &[&str]) -> Vec<(String, bool)> {
     labels.iter().map(|l| (l.to_string(), true)).collect()
+}
+
+/// **The picture cap a video-conference H.265 export derives for these settings at `rate`, in whole
+/// bytes — what the panel's own control starts from, so the number a user would be overriding is on
+/// screen before they override it.**
+///
+/// **This is a second expression of `vaapi::hevc_export::per_picture_ceiling`, and it is here
+/// because the panel cannot ask the gate.** `filmcraft-ui-egui` is deliberately OS-independent and
+/// web-portable — `filmcraft-platform` is a *dev*-dependency of this crate for that reason, and the
+/// layering gate forbids this layer depending on the platform's — so the gate's number cannot be
+/// named here at all. A copy pinned by a test is the smallest thing that satisfies both: the
+/// derivation stays in one place for every export, and
+/// `the_panel_default_is_the_cap_the_gate_would_derive` in `tests/export_ui.rs` fails the day the
+/// two expressions disagree.
+///
+/// **Every input is checked, because all of them come from a project file.** A rate with no positive
+/// length has no share of a second — and either number would be a **division by zero**, so this
+/// returns the control's floor instead of dividing; a target that does not fit bits per second has
+/// no share either. **The floor is what the control offers and what the gate accepts**, so the
+/// fallback is a value a user can still change rather than an error to swallow.
+fn derived_picture_cap_bytes(s: &ExportSettings, rate: FrameRate) -> u32 {
+    let bits = || -> u32 {
+        let (Some(num), Some(den)) = (u64::try_from(rate.num).ok().filter(|n| *n > 0), u64::try_from(rate.den).ok().filter(|d| *d > 0)) else {
+            return MIN_MAX_FRAME_SIZE_BYTES;
+        };
+        let Some(bps) = s.bitrate_kbps.checked_mul(1000) else { return MIN_MAX_FRAME_SIZE_BYTES };
+        let Some(share) = u64::from(bps).checked_mul(den).map(|n| n.div_ceil(num)) else { return MIN_MAX_FRAME_SIZE_BYTES };
+        u32::try_from(share).unwrap_or(u32::MAX)
+    }();
+    // **Rounded up to whole bytes, floored at the control's minimum, and capped at the largest
+    // value the gate's byte → bit conversion can carry** — `u32::MAX / 8`. A default the gate would
+    // refuse is worse than no default: it fails the export at the last moment, after the user has
+    // been told the panel offered it.
+    bits.min(u32::MAX / 8).div_ceil(8).max(MIN_MAX_FRAME_SIZE_BYTES)
 }
 
 fn section(ui: &mut egui::Ui, reg: &mut Reg, open: &mut Vec<String>, key: &str, title: &str, t: &Tokens) -> bool {
@@ -463,7 +517,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.add_space(8.0);
         let s = &mut ex.settings;
         if s.has_video() && section(ui, &mut reg, &mut ex.open_sections, "video", "Video", &t) {
-            video_section(ui, &mut reg, s, &t, seq_w, seq_h);
+            video_section(ui, &mut reg, s, &t, seq_w, seq_h, seq_rate);
         }
         if (s.has_audio()
             || !s.has_video()
@@ -545,7 +599,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     reg.flush(app);
 }
 
-fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &Tokens, seq_w: u32, seq_h: u32) {
+fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &Tokens, seq_w: u32, seq_h: u32, seq_rate: FrameRate) {
     // frame size
     let mut match_size = s.frame_size.is_none();
     row(ui, t, "Frame Size", |ui| {
@@ -629,9 +683,31 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
             }
             row(ui, t, "Bitrate Encoding", |ui| {
                 // a hardware encoder has one pass: H.265 offers no two-pass mode
-                let o = [BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass];
-                let labels: Vec<(String, bool)> = o.iter().map(|m| (m.label().to_string(), !(hevc && *m == BitrateMode::Vbr2Pass))).collect();
-                if let Some(i) = combo(ui, reg, "export.video.bitrateMode", s.bitrate_mode.label(), &labels, 140.0) {
+                let o = [BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass, BitrateMode::VideoConference];
+                // **Video conference is offered for H.265 and refused for H.264, with the reason on
+                // the entry rather than in a tooltip that says only "not supported yet".** The mode
+                // is *a rate and a maximum size for any one picture* (`VA_RC_VCM`), and of the two
+                // formats only H.265 has a FilmCraft encoder that applies the second half: the
+                // VA-API H.264 gate declines the mode because this driver's advertised mask for
+                // H.264 lacks the bit its H.265 mask has (`hardware_encode::vaapi_export::refuses`
+                // carries the measurement), and the software H.264 encoder takes the mode as a
+                // variable rate. Offering it there would promise a guarantee the file cannot carry.
+                let why_h264 = "No H.264 encoder applies this mode's per-picture maximum: the VA-API H.264 rate-control mask \
+                                (0x14d6) is the H.265 one (0x14de) less VA_RC_VCM, and the built-in H.264 encoder has no such cap";
+                let why_hevc = "The H.265 encoder is handed one picture at a time and encodes once: a two-pass export renders the sequence \
+                                again to measure it";
+                let modes: Vec<(String, Option<&str>)> = o
+                    .iter()
+                    .map(|m| {
+                        let why = match m {
+                            _ if hevc && *m == BitrateMode::Vbr2Pass => Some(why_hevc),
+                            _ if !hevc && *m == BitrateMode::VideoConference => Some(why_h264),
+                            _ => None,
+                        };
+                        (m.label().to_string(), why)
+                    })
+                    .collect();
+                if let Some(i) = combo_hints(ui, reg, "export.video.bitrateMode", s.bitrate_mode.label(), &modes, 140.0) {
                     s.bitrate_mode = o[i];
                 }
             });
@@ -657,6 +733,49 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                         if drag(ui, reg, "export.video.max", &mut mbps, 0.1..=1000.0, 0.1, " Mbps", 1) {
                             s.max_bitrate_kbps = Some((mbps * 1000.0).round() as u32);
                         }
+                    });
+                }
+            }
+            // **The per-picture maximum, for the one mode that has one, and only on the format that
+            // applies it.** `VA_RC_VCM` is a variable bit rate *and* a ceiling on any single picture;
+            // H.265 is the only FilmCraft export that hands that ceiling to an encoder, so this is
+            // where the control belongs. Nothing is shown for H.264, whose gates decline the mode
+            // and whose built-in encoder takes it as a plain variable rate — a control there would
+            // be a knob that changes no file.
+            //
+            // **The derived figure is on screen whether or not the cap is set**, because a number
+            // FilmCraft would have used on the user's behalf is exactly the number they need to see
+            // before replacing it. Turning the toggle on therefore starts the field at that figure,
+            // not at a round number of FilmCraft's choosing.
+            if hevc && s.bitrate_mode == BitrateMode::VideoConference {
+                let rate = s.resolved_rate(seq_rate);
+                let derived = derived_picture_cap_bytes(s, rate);
+                row(ui, t, "Max Picture Size", |ui| {
+                    let mut on = s.max_frame_size.is_some();
+                    if check(ui, reg, "export.video.maxFrameSizeOn", &mut on, "Limit every single picture") {
+                        s.max_frame_size = on.then_some(derived);
+                    }
+                });
+                if let Some(bytes) = s.max_frame_size.as_mut() {
+                    // **Kilobytes on screen, bytes in the field, and the ×1 000 is the only place
+                    // that conversion happens.** The slider's step is 0.1 kB, so what a user drags to
+                    // is stored exactly and nothing is rounded behind their back.
+                    let mut kb = f64::from(*bytes) / 1000.0;
+                    if drag(ui, reg, "export.video.maxFrameSize", &mut kb, 1.0..=131_072.0, 1.0, " KB", 1) {
+                        let moved = (kb * 1000.0).round();
+                        // **`clamp`, not a cast**: the drag is bounded, and a value from `ui.set` or a
+                        // preset can be anything, so the float that reaches this line is treated as
+                        // hostile — no NaN, no negative, nothing above what the gate can convert.
+                        *bytes = moved.clamp(f64::from(MIN_MAX_FRAME_SIZE_BYTES), f64::from(u32::MAX / 8)) as u32;
+                    }
+                } else {
+                    row(ui, t, "", |ui| {
+                        let text = format!("Derived from the target rate: {:.1} KB a picture", f64::from(derived) / 1000.0);
+                        let r = ui.label(egui::RichText::new(&text).color(t.text_dim).size(11.5));
+                        // **Registered like every other label here**, so an agent driving the panel
+                        // can read the figure FilmCraft would have used — the number it is about to
+                        // put into a file on the user's behalf.
+                        reg.add("export.video.maxFrameSizeDerived", r.rect, text);
                     });
                 }
             }
