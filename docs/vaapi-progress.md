@@ -387,7 +387,9 @@ C-measured width:
 | `VAEncPictureParameterBufferAV1` | 1032 | 1 (bytes 538-539) |
 | `VAEncTileGroupBufferAV1` | 20 | 1 (bytes 2-3) |
 
-Plus **100 bit positions across eight unions and three attribute unions, all measured by running C**, and a
+Plus **100 bit positions — 68 across the eight record unions above and 32 across the four
+  attribute-value records `VAConfigAttribValEncAV1` (15), `…Ext1` (4), `…Ext2` (5) and
+  `VARefFrameCtrlAV1` (8), all measured by running C**, and a
 struct↔table join check that exists because shrinking a hole in the *struct* left `sizeof` and every
 `offsetof` unchanged so all the pins passed green — the compiler re-inserts the byte. Twelve deliberate
 breaks were made; eleven were caught on the first attempt, and the escape is what the join check was added
