@@ -1266,9 +1266,20 @@ about an encode.
   than landing as a commit of their own. **Re-verified clean on this branch at `95cbdde0`** (queue item 5, now done),
   and it has stayed clean through the record-verification commits. Whether the hunks belonged in their own commit is a
   presentation question, not a correctness one.
-- **One line can silently weaken the ABI guard.** `CK_CLASS` requires `__typeof__`; without it the union
-  and pointer *shape* checks become passes rather than failures. Every other line in that file fails loudly
-  when broken; this one does not.
+- **The shape check used to be recorded here as the one line that could silently weaken the ABI guard. It cannot, and the
+  claim did not reproduce.** It said `CK_CLASS`'s `__typeof__` was load-bearing because without it the union and pointer
+  *shape* checks "become passes rather than failures". Broken two ways and measured, **both loud**:
+  - `CK_CLASS(x)` → `__builtin_classify_type(x)`, dropping `__typeof__`: **3 tests fail.** The C compiler rejects the
+    `_Static_assert`s outright on `VAConfigAttrib.type`, `VASurfaceAttrib.type`, `VAGenericValue.type`,
+    `VAPictureParameterBufferH264.num_slice_groups_minus1`, `VAWarpedMotionParamsAV1.wmtype` and
+    `VASliceParameterBufferAV1.tg_start`, naming every one.
+  - Deleting the `CK_CLASS` `_Static_assert` emission entirely: **1 test fails.** `expected_class` goes dead — a warning —
+    but `the_shape_width_and_signedness_check_rejects_a_declaration_that_is_wrong` panics, because the deliberate break it
+    injects into `VAWarpedMotionParamsAV1.wmtype` is a *shape* break: with no class assertion the compiler stops naming
+    that member, and the test reports precisely that.
+
+  The shape half of the guard is therefore red-able in both directions, and **queue item 6 closes as a premise that did not
+  reproduce** rather than shipping a second, redundant test.
 
 ### Position with respect to upstream
 
@@ -1303,7 +1314,7 @@ runs in parallel; Rust work queues.
 | 3 | **Pin the ABI-guard runner image** — `runs-on: ubuntu-latest` is the last floating input in the job that compiles the C oracle. | `.github/workflows/abi-guard.yml` | **done**, `19392dbd` |
 | 4 | **Fix the stale count** — `vp9_enc.rs` said H.264 answers "20 of 58" attribute ids. Re-measured over the range the header actually puts in range, `0..=58`, it is **21 of 59**: `vaMaxNumConfigAttributes` returns 59 as a *buffer size*, and `va.h:1610-1612` requires an array holding at least that many, so the old sweep dropped id 0 (`VAConfigAttribRTFormat`) that every control answers. HEVC 20, AV1 21; totals 885/708/177; VP9 still 0 of 708. | `crates/platform/src/vaapi/vp9_enc.rs`, `docs/vaapi-progress.md` | **done**, `423d751a` |
 | 5 | **Re-verify `cargo fmt --check`** on a clean tree and record the result in *Honest limits* above. | — | **done**, `95cbdde0` |
-| 6 | **A regression test for the `CK_CLASS` line.** Without `__typeof__` the union and pointer *shape* checks silently become passes rather than failures — every other line in `abi_guard.rs` fails loudly when broken, and this one does not. | `crates/platform/src/vaapi/abi_guard.rs`, `abi_tests.rs` | queued behind #1 |
+| 6 | **A regression test for the `CK_CLASS` line.** _Claimed:_ without `__typeof__` the union and pointer *shape* checks silently become passes rather than failures. **Measured: both breaks are loud** — dropping `__typeof__` fails 3 tests (the C compiler rejects `VAConfigAttrib.type` and five others), deleting the `CK_CLASS` `_Static_assert` emission fails 1 (the deliberate shape break in `VAWarpedMotionParamsAV1.wmtype` stops being named). Closed as a premise that did not reproduce; see *Honest limits*. | `crates/platform/src/vaapi/abi_guard.rs`, `abi_tests.rs` | **closed** |
 | 7 | `stash@{0}` — debug scaffolding from a blocked readback, exported to `.tmpwork/stash0.patch` so nothing is lost. | — | **needs the go-ahead**: destructive, and the one item here that is |
 
 **Do not do these.** Do not rebase this branch — the attempt stopped at commit 5 of 104 because upstream's 519-line
