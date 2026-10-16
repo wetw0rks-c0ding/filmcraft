@@ -387,7 +387,7 @@ C-measured width:
 | `VAEncPictureParameterBufferAV1` | 1032 | 1 (bytes 538-539) |
 | `VAEncTileGroupBufferAV1` | 20 | 1 (bytes 2-3) |
 
-Plus **100 bit positions across nine unions and three attribute unions, all measured by running C**, and a
+Plus **100 bit positions across eight unions and three attribute unions, all measured by running C**, and a
 struct↔table join check that exists because shrinking a hole in the *struct* left `sizeof` and every
 `offsetof` unchanged so all the pins passed green — the compiler re-inserts the byte. Twelve deliberate
 breaks were made; eleven were caught on the first attempt, and the escape is what the join check was added
@@ -976,7 +976,7 @@ precedent does not transfer, and `crates/av1` should not get `pub mod bits;` for
 headers do not settle, and both were wrong first:
 
 - `lr_unit_shift` inverts to 256 → shift **2**, 64 → shift 0 — *the bigger the unit, the larger the
-  shift*, from `size = 256 >> (2 - shift)` at `header.rs:1154`. Submitted backwards,
+  shift*, from `size = 256 >> (2 - shift)` at `header.rs:1156`. Submitted backwards,
   `av1_loop_restoration.mp4` decoded **18 of 96**.
 - `yframe_restoration_type` carries the **specification's** `FrameRestorationType` (NONE/WIENER/
   SGRPROJ/SWITCHABLE = 0/1/2/3), not the bitstream's two-bit field. `va_dec_av1.h:606-618` documents
@@ -1040,7 +1040,8 @@ them — which is why they are here and not merely in a commit message:
 - **A desync bug that was not there.** `luma_offset_lX` was suspected absent from HEVC's `pred_weight_table`.
   It is present — clause 7.3.6.3, in the same `for(i)` body as `delta_luma_weight`, and present since v1.
 - **A struct miscounted while verifying.** `struct drm_prime_handle` was confirmed as 8 bytes from five
-  lines of a header; line 932 holds a third field. The verification read as rigorous and was wrong.
+  lines of a header; line 933 of `/usr/include/drm/drm.h` holds a third field (`__s32 fd`). The
+  verification read as rigorous and was wrong.
 - **A libva constant that does not exist.** `VAProfileH265Enc` was named as the profile to ask for when
   HEVC encode was first planned. `grep -rn "VAProfileH265Enc" /usr/include/va/` returns **nothing**, and there
   is not even a separate encode profile: **libva reuses the codec profile with an encode entrypoint** —
@@ -1293,7 +1294,7 @@ runs in parallel; Rust work queues.
 | 1 | **VCM per-picture cap becomes user-settable** — `ExportSettings::max_frame_size: Option<u32>`, `None` still derives. Unit trap: `va.h:2757` says the driver's `max_frame_size` is **in bits** while every other rate on the struct is kbps. | `crates/export/src/lib.rs`, `crates/export/src/settings_tests.rs`, `crates/platform/src/vaapi/hevc_export.rs`, `crates/ui-egui` | in flight |
 | 2 | **Pin every third-party action to a SHA** — every `uses:` in `.github/`. Precedent already in `windows-arm64.yml`. | `.github/workflows/*.yml` | **done**, `a4e23195` |
 | 3 | **Pin the ABI-guard runner image** — `runs-on: ubuntu-latest` is the last floating input in the job that compiles the C oracle. | `.github/workflows/abi-guard.yml` | in flight |
-| 4 | **Fix the stale count** — `vp9_enc.rs:126` says H.264 answers "20 of 58" attribute ids; it measures **21 of 59** (ids `0..=58`). Small, but it does not reproduce as written. | `crates/platform/src/vaapi/vp9_enc.rs` | queued — serializes behind #1 |
+| 4 | **Fix the stale count** — `vp9_enc.rs` said H.264 answers "20 of 58" attribute ids. Re-measured over the range the header actually puts in range, `0..=58`, it is **21 of 59**: `vaMaxNumConfigAttributes` returns 59 as a *buffer size*, and `va.h:1610-1612` requires an array holding at least that many, so the old sweep dropped id 0 (`VAConfigAttribRTFormat`) that every control answers. HEVC 20, AV1 21; totals 885/708/177; VP9 still 0 of 708. | `crates/platform/src/vaapi/vp9_enc.rs`, `docs/vaapi-progress.md` | **done**, `423d751a` |
 | 5 | **Re-verify `cargo fmt --check`** on a clean tree and record the result in *Honest limits* above. | — | queued behind #1 |
 | 6 | **A regression test for the `CK_CLASS` line.** Without `__typeof__` the union and pointer *shape* checks silently become passes rather than failures — every other line in `abi_guard.rs` fails loudly when broken, and this one does not. | `crates/platform/src/vaapi/abi_guard.rs`, `abi_tests.rs` | queued behind #1 |
 | 7 | `stash@{0}` — debug scaffolding from a blocked readback, exported to `.tmpwork/stash0.patch` so nothing is lost. | — | **needs the go-ahead**: destructive, and the one item here that is |
